@@ -1,13 +1,15 @@
 openapi: 3.1.0
 info:
   title: zkAPI v2
-  version: 2.0.0-testnet
+  version: 2.1.0-testnet
   description: >-
     Native ETH lease, settlement and withdrawal Groth16 protocol API.
     Sepolia deployments may require a shared password, advertised by public
     /health testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
-    or incorrect. Mainnet does not use this gate.
+    or incorrect. Mainnet does not use this gate. Mutual-close clearance
+    requires an escape-form withdrawal proof of note ownership unless /health
+    reports clearance_ownership_proof_required false.
 security:
   - TestnetPassword: []
   - {}
@@ -15,10 +17,12 @@ paths:
   /health:
     get:
       security: []
-      summary: Public deployment summary and testnet password requirement
+      summary: Public deployment summary and access requirements
       responses:
         "200":
-          description: Public health, including chain_id and testnet_password_required
+          description: >-
+            Public health, including chain_id, current_root,
+            testnet_password_required and clearance_ownership_proof_required
   /v2/auth:
     get:
       summary: Validate the Sepolia service password without side effects
@@ -53,9 +57,12 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
         "400": {description: Invalid request, proof, or disabled lease mode}
-        "409": {description: Existing active or settling lease}
+        "409": {description: Existing active or settling lease, or a used nullifier}
         "429":
-          description: OA key capacity is temporarily limited; the exact request is safe to retry
+          description: >-
+            OA key capacity is temporarily limited, or the reference gateway
+            throttled the network source (gateway_rate_limited); the exact
+            request is safe to retry
           headers:
             Retry-After:
               description: Seconds until the server recommends retrying the same request
@@ -72,24 +79,82 @@ paths:
           required: true
           schema: {type: string}
       responses:
-        "200": {description: Lease timing, status, and finalized aggregate usage}
+        "200":
+          description: Lease timing, status, settlement deadline, and finalized aggregate usage
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OpenRouterLeaseStatus"}
         "404": {description: Unknown lease}
   /v2/withdraw/clearance:
     post:
-      summary: Request a mutual-close clearance signature
+      summary: Request a mutual-close clearance signature for a note whose ownership is proven
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ClearanceRequestV2"}
       responses:
-        "200": {description: Schnorr clearance signature}
+        "200":
+          description: >-
+            Schnorr clearance signature. The nullifier stays reserved for
+            withdrawal permanently; the signature has no expiry.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ClearanceResponseV2"}
+        "400":
+          description: >-
+            clearance_ownership_required (no ownership_proof; nothing reserved;
+            not retriable), invalid_proof, invalid_request (nullifier,
+            has_clearance or signing-key mismatch), or protocol_mismatch
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "409":
+          description: >-
+            stale_root (retriable; latest_root is the vault's currentRoot();
+            retry the same body, then prove again) or nullifier_used
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "429": {$ref: "#/components/responses/GatewayRateLimited"}
+        "503":
+          description: capacity_exhausted; retry the same body after a backoff
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
   /v2/requests/{client_request_id}:
     get:
-      summary: Recover a request transcript
+      summary: Recover a request transcript by client request ID
       parameters:
         - in: path
           name: client_request_id
           required: true
           schema: {type: string}
       responses:
-        "200": {description: Finalized transcript}
-        "404": {description: Unknown request}
+        "200":
+          description: Recovery state; status not_found with nullifier_status unknown for an unknown request
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RecoveryResponseV2"}
+  /v2/nullifiers/{nullifier}:
+    get:
+      summary: Recover a transcript or reservation state by nullifier
+      parameters:
+        - in: path
+          name: nullifier
+          required: true
+          schema: {$ref: "#/components/schemas/Felt"}
+      responses:
+        "200":
+          description: Recovery state; status not_found with nullifier_status unknown for an unknown nullifier
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RecoveryResponseV2"}
+        "400":
+          description: invalid_request for a malformed nullifier
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
 components:
   securitySchemes:
     TestnetPassword:
@@ -112,13 +177,44 @@ components:
               error_code: {const: testnet_password_required}
               error: {const: "Sepolia password required or invalid"}
               retriable: {const: false}
+    GatewayRateLimited:
+      description: >-
+        The reference gateway throttled POST requests from this network source.
+        The request never reached the server; retry the same request after
+        Retry-After.
+      headers:
+        Retry-After:
+          schema: {const: 5}
+        Cache-Control:
+          schema: {const: no-store}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: "#/components/schemas/ErrorResponse"}
+              - type: object
+                properties:
+                  error_code: {const: gateway_rate_limited}
+                  retriable: {const: true}
+                  retry_after_seconds: {const: 5}
   schemas:
+    Felt:
+      type: string
+      pattern: "^0x[0-9a-f]+$"
+      description: Canonical BN254 scalar-field element in hexadecimal
     Groth16Proof:
       type: object
       required: [backend, proof]
       properties:
         backend: {const: groth16_bn254}
         proof: {type: string, contentEncoding: base64}
+    SchnorrSignature:
+      type: object
+      required: [r_x, r_y, s]
+      properties:
+        r_x: {$ref: "#/components/schemas/Felt"}
+        r_y: {$ref: "#/components/schemas/Felt"}
+        s: {$ref: "#/components/schemas/Felt"}
     ApiRequestV2:
       type: object
       required: [client_request_id, payload, payload_hash, public_inputs, proof]
@@ -128,6 +224,144 @@ components:
         payload_hash: {type: string, pattern: "^0x[0-9a-f]+$"}
         public_inputs: {type: object, additionalProperties: true}
         proof: {$ref: "#/components/schemas/Groth16Proof"}
+    WithdrawalPublicInputsV2:
+      type: object
+      description: The 14 withdrawal public inputs, in circuit order.
+      required:
+        - protocol_version
+        - chain_id
+        - contract_address
+        - active_root
+        - state_signing_key_x
+        - state_signing_key_y
+        - clearance_signing_key_x
+        - clearance_signing_key_y
+        - note_id
+        - final_balance
+        - destination
+        - withdrawal_nullifier
+        - has_clearance
+        - withdrawal_tag
+      properties:
+        protocol_version: {const: 2}
+        chain_id: {type: integer, minimum: 1}
+        contract_address: {$ref: "#/components/schemas/Felt"}
+        active_root: {$ref: "#/components/schemas/Felt"}
+        state_signing_key_x: {$ref: "#/components/schemas/Felt"}
+        state_signing_key_y: {$ref: "#/components/schemas/Felt"}
+        clearance_signing_key_x: {$ref: "#/components/schemas/Felt"}
+        clearance_signing_key_y: {$ref: "#/components/schemas/Felt"}
+        note_id: {type: integer, minimum: 0, maximum: 4294967295}
+        final_balance: {type: integer, minimum: 0, description: Final balance in gwei}
+        destination:
+          type: array
+          description: Payout address as 20 byte values
+          minItems: 20
+          maxItems: 20
+          items: {type: integer, minimum: 0, maximum: 255}
+        withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
+        has_clearance: {type: boolean}
+        withdrawal_tag: {$ref: "#/components/schemas/Felt"}
+    ClearanceOwnershipProof:
+      type: object
+      description: >-
+        Escape-form withdrawal proof for the same nullifier, built for the real
+        destination and current balance. It is also a valid escape input.
+      additionalProperties: false
+      required: [public_inputs, proof]
+      properties:
+        public_inputs:
+          allOf:
+            - {$ref: "#/components/schemas/WithdrawalPublicInputsV2"}
+            - type: object
+              properties:
+                has_clearance: {const: false}
+        proof: {$ref: "#/components/schemas/Groth16Proof"}
+    ClearanceRequestV2:
+      type: object
+      required: [withdrawal_nullifier, ownership_proof]
+      properties:
+        withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
+        ownership_proof:
+          $ref: "#/components/schemas/ClearanceOwnershipProof"
+          description: Optional only while the server runs with --allow-legacy-clearance.
+    ClearanceResponseV2:
+      type: object
+      required: [status, withdrawal_nullifier, signature]
+      properties:
+        status: {const: ok}
+        withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
+        signature: {$ref: "#/components/schemas/SchnorrSignature"}
+    RequestResponseV2:
+      type: object
+      description: Signed settlement and next private state; the client verifies it before installing.
+      required:
+        - status
+        - client_request_id
+        - request_nullifier
+        - response_code
+        - response_payload
+        - response_hash
+        - charge_applied
+        - next_commitment
+        - next_anchor
+        - blind_delta_srv
+        - next_state_signature
+      properties:
+        status: {type: string}
+        client_request_id: {type: string}
+        request_nullifier: {$ref: "#/components/schemas/Felt"}
+        response_code: {type: integer}
+        response_payload:
+          type: string
+          description: Settlement JSON, including billing_quote and charge_basis
+        response_hash: {$ref: "#/components/schemas/Felt"}
+        charge_applied: {type: integer, minimum: 0}
+        next_commitment:
+          type: object
+          required: [x, y]
+          properties:
+            x: {$ref: "#/components/schemas/Felt"}
+            y: {$ref: "#/components/schemas/Felt"}
+        next_anchor: {$ref: "#/components/schemas/Felt"}
+        blind_delta_srv: {$ref: "#/components/schemas/Felt"}
+        next_state_signature: {$ref: "#/components/schemas/SchnorrSignature"}
+        policy_reason_code: {type: integer}
+        policy_evidence_hash: {$ref: "#/components/schemas/Felt"}
+    RecoveryResponseV2:
+      type: object
+      required: [status, nullifier_status]
+      properties:
+        status: {type: string, enum: [ok, not_found]}
+        nullifier_status: {type: string, enum: [reserved, finalized, clearance_reserved, unknown]}
+        request_response:
+          $ref: "#/components/schemas/RequestResponseV2"
+          description: Present only once the request is finalized
+        settlement_deadline:
+          type: integer
+          description: For a reserved lease request, the UNIX time by which the server finalizes it
+    OpenRouterLeaseStatus:
+      type: object
+      required: [status, client_request_id, issued_at, expires_at, settle_after, spending_limit_usd]
+      properties:
+        status: {type: string, enum: [provisioning, active, retiring, disabled, revoking, finalized, cancelled]}
+        client_request_id: {type: string}
+        issued_at: {type: integer}
+        expires_at: {type: integer}
+        settle_after: {type: integer}
+        spending_limit_usd: {type: number}
+        usage_usd: {type: number}
+        charge_applied: {type: integer, minimum: 0}
+        last_error: {type: string}
+        charge_basis:
+          type: string
+          enum: [measured, clamped, worst_case, unissued]
+          description: How a finalized charge was determined
+        settlement_deadline:
+          type: integer
+          description: >-
+            Write-once UNIX time by which the lease is finalized, at worst at
+            the request's solvency bound; absent once terminal
     ErrorResponse:
       type: object
       required: [status, client_request_id, error_code, error_message, retriable]
@@ -136,7 +370,11 @@ components:
         client_request_id: {type: string}
         error_code:
           type: string
-          description: Stable machine code; OA limits use oa_minute_request_limit, oa_hourly_issuance_budget, or oa_rate_limited.
+          description: >-
+            Stable machine code. OA limits use oa_minute_request_limit,
+            oa_hourly_issuance_budget, or oa_rate_limited. Clearance adds
+            clearance_ownership_required, nullifier_used and capacity_exhausted.
+            The reference gateway uses gateway_rate_limited.
         error_message: {type: string}
         retriable: {type: boolean}
         latest_root: {type: string, pattern: "^0x[0-9a-f]+$"}

@@ -61,7 +61,14 @@ Request proofs hide the note ID, deposit, exact balance, expiry, anchor, and
 state signature. They do not hide information outside the proof: deposits and
 withdrawals are public, network and timing metadata remain observable, and
 the upstream provider sees prompts. Direct leases keep prompts out of the
-billing authorization.
+billing authorization. A mutual close shows the server the note ID, final
+balance and destination when it requests clearance.
+
+The vault owner can pause deposits and exits without a time limit and
+schedule time-locked treasury changes. In this repository's vault revision a
+pause cannot move user funds or make notes expire. The operator signs every
+balance update and clearance. See
+[owner and operator powers](/docs/protocol#owner-and-operator-powers).
 
 The current Groth16 and Baby-JubJub construction is not post-quantum. The
 checked-in proving keys use a single-party setup with no multiparty ceremony;

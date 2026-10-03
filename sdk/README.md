@@ -172,7 +172,10 @@ revision checks, and signed receipt validation to manage wallet state. Hosting
 the same SDK on a different origin does not transfer browser wallet data. A model adapter must select one of
 `CHAT_SPENDING_TIER_USD` (`1`, `2`, `3`, `4.5`, `6`) without disclosing the user's
 exact balance. The SDK settles/rekeys when a selected cap changes; only actual
-usage is charged. Expiry and withdrawal contract behavior are unchanged.
+usage is charged. Requests stop at the note's original expiry. On a
+`vault_revision` 2 vault the treasury can claim the note only after
+`effectiveExpiry(noteId)`, which paused time and a challenge can extend; the
+SDK reads that view only for the escape override below.
 
 Run `npm run test:sdk` in this checkout. For an installed package, run
 `node --test node_modules/@openanonymity/zkapi-browser-sdk/sdk/test/*.test.mjs`
@@ -196,7 +199,7 @@ Resolved records are compacted (no proof, payload or rerandomization), bounded
 per note state, and pruned per deployment. No host action is needed. In-flight
 journals from older builds migrate on the first read.
 
-Escape and clearance behaviour depends on two optional keys in
+Escape and clearance behavior depends on two optional keys in
 `browser-config.json`'s `trusted_deployment`, read only from that build-pinned
 trust anchor and never from the served manifest:
 
@@ -378,7 +381,10 @@ The packaged mainnet and Sepolia configurations use
 `https://zkapi-mainnet.openanonymity.ai` and
 `https://zkapi-sepolia.openanonymity.ai`. Each profile pins its native ETH vault,
 signing keys, proof artifacts, and circuit hashes. Hosts may supply reviewed
-explicit profiles as described above.
+explicit profiles as described above. The packaged profiles declare neither
+`vault_revision` nor `clearance_ownership_proof`: they run in strict mode and
+send clearance requests without a proof first, adding one only when the server
+answers `clearance_ownership_required`.
 
 The runtime checks that active notes, pending deposits, leases, and unfinished
 recovery state match the selected deployment. Preserve wallet state and recovery

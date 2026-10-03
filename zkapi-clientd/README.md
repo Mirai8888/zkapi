@@ -42,6 +42,14 @@ To update, stop `serve`, rerun the install command, then start `serve` again. Yo
 
 To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks for the destination and waits for extra ETH for fees only if needed.
 
+For chain and protocol access the client uses only the RPC, zkAPI indexer and
+protocol server packaged with the release. A deposit activates only after the
+vault, read at the deposit's block, and the indexer's whole-tree snapshot both
+show it at the same note; a withdrawal finishes only after both show the note
+closed. A withdrawal first proves note ownership to the protocol server, which
+then clears the cooperative close. See
+[chain verification and recovery](docs/CLI_ZKAPI.md#chain-verification-and-recovery).
+
 [More options, including Tor, Sepolia and Docker clients](docs/CLI_ZKAPI.md) · [Installation details](docs/CLI_PACKAGING.md) · [Privacy](docs/PRIVACY.md)
 
 [NixOS, AUR, and Homebrew packages with background services](docs/CLI_PACKAGING.md#platform-packages-and-background-services) are also available in this repository.

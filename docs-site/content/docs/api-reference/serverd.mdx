@@ -13,7 +13,7 @@ settlement. Billing uses native ETH units of one gwei.
 |---|---|
 | `GET /v2/billing/quote` | Obtain the native ETH billing quote |
 | `POST /v2/openrouter/leases` | Verify an `ApiRequestV2`, reserve its nullifier, and return a spending-limited runtime key (201) |
-| `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, and status |
+| `GET /v2/openrouter/leases/{client_request_id}` | Return non-secret lease timing, usage, status, and settlement deadline |
 | `POST /v2/openrouter/leases/{client_request_id}` | Retire the lease using the original authenticated request |
 | `POST /v2/openrouter/leases/{client_request_id}/expire` | Reconcile an unaccepted native lease authorization |
 
@@ -33,6 +33,31 @@ The prompt-free payload binds the billing quote and lease authorization.
 Inference goes directly between the browser and OpenRouter. Issuance returns
 the runtime key once; recovery and lease-status responses never return that
 key. There is no ordinary proxy request endpoint.
+
+Lease status is `provisioning`, `active`, `retiring`, `disabled`, `revoking`,
+`finalized`, or `cancelled`. Until the lease is terminal, the status response
+carries `settlement_deadline`, a write-once UNIX time fixed when the lease
+record is created (issuance plus TTL, grace and
+`--openrouter-settlement-deadline-seconds`, default 21600). A finalized lease
+reports `charge_basis`:
+
+| `charge_basis` | Charge |
+|---|---|
+| `measured` | Measured provider usage |
+| `clamped` | Usage above the lease limit, clamped to the proof's `solvency_bound` before conversion |
+| `worst_case` | `solvency_bound`: usage was still unavailable at the deadline, or could not be settled at all |
+| `unissued` | Zero: the key never reached the client |
+
+The signed settlement payload repeats `charge_basis`, adds `settlement_reason`
+(`settlement_deadline` or `unsettleable`) to fallback settlements, and keeps
+the frozen `billing_quote`. Settlement never re-validates that quote against
+the server's current price configuration. `cancelled` marks a server record
+whose binding is corrupt: it is never signed, its nullifier stays reserved,
+and a retry returns `409 nullifier_used`. The server refuses to start unless
+TTL, grace, settlement deadline and polling slack fit within half of the
+vault's `challengePeriod()`. See
+[settlement terminality](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#settlement-terminality)
+for the operator review records.
 
 `RequestPublicInputsV2` has these fields, in Groth16 public-input order:
 
@@ -63,7 +88,10 @@ directly; no public-output hash or witness envelope is part of the proof object.
 Both return `RecoveryResponseV2` with `status`, `nullifier_status`, and an
 optional `request_response`. Nullifier statuses are `reserved`, `finalized`,
 `clearance_reserved`, or `unknown`. Unknown requests return
-`status: "not_found"` without a transcript.
+`status: "not_found"` without a transcript. `request_response` is present
+only once the request is finalized. A `reserved` lease request also carries
+`settlement_deadline`, the time by which the server finalizes it; wait for that
+response instead of escaping from the same state.
 
 After usage settlement, `request_response` contains:
 
@@ -82,37 +110,87 @@ Baby-JubJub. The client verifies it before committing the next wallet state.
 Preserve the exact prepared request for retries and recovery. A reserved lease
 remains pending until settlement produces a signed response.
 
+These routes are the only source of a successor state after an escape from a
+spent state is challenged, and clients consult `GET /v2/nullifiers/{nullifier}`
+before discarding a transmitted request on `stale_root` or
+`clearance_reserved`. Keep them available through every challenge window.
+
 ## Request mutual-close clearance
 
 | Field | Value |
 |---|---|
 | Method + path | `POST /v2/withdraw/clearance` |
-| Request | `{ withdrawal_nullifier: Felt252 }` |
+| Request | `ClearanceRequest { withdrawal_nullifier: Felt252, ownership_proof: { public_inputs: WithdrawalPublicInputsV2, proof: { backend: "groth16_bn254", proof: base64 } } }` |
 | Response (200) | `ClearanceResponseV2 { status, withdrawal_nullifier, signature: {r_x,r_y,s} }` |
-| Errors | `409 nullifier_used` |
+| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `503 capacity_exhausted` |
 
-The client includes this Schnorr signature as a private witness in a
-withdrawal proof with `has_clearance = true`. Escape withdrawals use
-`has_clearance = false` and require no server clearance.
+`ownership_proof` is an escape-form withdrawal proof for the same nullifier.
+Its `public_inputs` use the JSON form of the 14 withdrawal inputs, with
+`has_clearance: false`, `final_balance` as an integer, and `destination` as an
+array of 20 byte values. An `ownership_proof` with fields other than
+`public_inputs` and `proof` is rejected.
+Build it for the real destination and current balance of the intended close,
+because it is also a valid escape input for whoever holds it.
+
+The server first rejects a nullifier it has already used for a request
+(`409 nullifier_used`). It then requires the proof's nullifier,
+`has_clearance = false` and both signing keys to match (`invalid_request`),
+and its protocol, chain and vault (`protocol_mismatch`). The root must be the
+server's current root or one it observed within
+`--clearance-root-window-seconds` (default 3600). Otherwise the server reads
+the vault's `currentRoot()` (cached for a few seconds) and, if the proof's root
+differs, returns `409 stale_root` with that vault root in `latest_root`; a
+failed vault read returns retriable `500 internal_error`. Groth16
+verification failures return `400 invalid_proof`. Verification runs
+under a small concurrency limit; saturation returns retriable
+`503 capacity_exhausted`. Retry `stale_root` and `capacity_exhausted` with the
+same body and backoff, then prove again against a fresh root. A missing proof
+returns `400 clearance_ownership_required`, which is not retriable, and
+reserves nothing. The server never logs or stores ownership proofs.
+
+A successful request reserves the nullifier permanently
+(`clearance_reserved`); repeating it with a valid proof signs the clearance
+again. The clearance signature has no expiry. The client includes it as a
+private witness in a withdrawal proof with `has_clearance = true`. Escape
+withdrawals use `has_clearance = false` and require no server clearance.
+
+`--allow-legacy-clearance` (`ZKAPI_ALLOW_LEGACY_CLEARANCE`, default off) is a
+transitional setting that also signs proof-less requests from older clients.
+New proof-less reservations are then capped per process at
+`--legacy-clearance-max-per-minute` (default 60; beyond it
+`503 capacity_exhausted`). `GET /health` reports
+`clearance_ownership_proof_required: false` while the setting is on.
 
 ## Operations and errors
 
 | Method and path | Purpose |
 |---|---|
-| `GET /health` | Liveness, protocol/deployment identity, current root, and `direct_openrouter` request mode |
+| `GET /health` | Liveness, protocol/deployment identity, current root, `direct_openrouter` request mode, `testnet_password_required`, and `clearance_ownership_proof_required` |
 | `GET /v1/attestation` | Protocol/deployment identity, current root, `state_signing_key: {x,y}`, and `clearance_signing_key: {x,y}` |
-| `GET /v1/dashboard/summary` | Read-only deployment and usage summary |
+| `GET /v1/dashboard/summary` | Read-only deployment and usage summary, including settlement counts |
+| `GET /v1/dashboard/settlement` | Pending leases with their deadlines, and settlements that need operator review |
 | `GET /v1/dashboard/recent` | Recent request events |
 | `GET /v1/dashboard/events` | Server-sent dashboard events |
 
 The attestation endpoint publishes signer metadata. It does not supply a
 platform-signed enclave attestation. Compare its identity and keys with
 independently pinned deployment values; the endpoint alone is not a trust
-anchor.
+anchor. The server requires both signing seeds, refuses the published
+development keys, and refuses to start unless the derived keys equal the
+vault's immutable `stateSigningKeyX/Y` and `clearanceSigningKeyX/Y`. It reads
+them, after an `eth_chainId` check, over the native billing RPC and records
+the verified binding in its database. A restart with a matching record starts
+without the RPC, re-verifies in the background, and exits if the vault
+contradicts the record. The dashboard routes are operator surfaces; the
+reference gateway does not expose them.
 
 Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
-`409 stale_root`, `409 replay`, and `410 note_expired`. Throttled responses
-also carry `Retry-After` when available. A deployment's reverse proxy defines
-which protocol routes the browser may access.
+`400 clearance_ownership_required`, `409 stale_root`, `409 replay`,
+`409 nullifier_used`, `410 note_expired`, and `503 capacity_exhausted`.
+Throttled responses also carry `Retry-After` when available. A deployment's
+reverse proxy defines which protocol routes the browser may access. The
+reference gateway also limits `POST /v2/*` per network source and answers a
+throttled request itself with `429 gateway_rate_limited` and `Retry-After: 5`;
+that request never reached the server, so retry it unchanged.

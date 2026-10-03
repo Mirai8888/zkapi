@@ -52,11 +52,16 @@ recovery journals are bound to that configuration. See
 
 Operate `zkapi-challenged` alongside the server and indexer, with durable retries
 and an explicit restricted signer. Challenges preserve the historical request
-root and use a current restoration path. See
-[service operation](challenge-service.md).
+root and use a current restoration path. Only a finalized transcript is
+challenge evidence, so an escape from a state whose lease is still settling
+waits for that settlement. Keep the API server available through every
+challenge window. See [service operation](challenge-service.md).
 
 Direct OpenRouter retirement persists disable, grace, usage capture and
-revocation stages and does not sign before confirmed deletion. Its aggregate
-usage API supplies no authoritative final receipt: the configured grace must
-cover in-flight calls and accounting delay. OA-org finalized receipts provide
-a separate settlement path.
+revocation stages and does not sign before confirmed deletion while its
+settlement deadline has not passed. At that write-once deadline the server
+signs the captured usage, or the proof's solvency bound if none was captured,
+and keeps deleting the key in the background. Its aggregate usage API supplies
+no authoritative final receipt: the configured grace must cover in-flight
+calls and accounting delay. OA-org finalized receipts provide a separate
+settlement path.

@@ -257,9 +257,13 @@ The withdrawal tag also binds the nullifier to the destination, final balance, a
 
 ### Mutual Close (Instant Path)
 
-1. The user sends only $x_w$ to the server.
-2. The server checks whether $x_w$ is already in `spent_nullifiers`.
-3. If it is clean, the server signs:
+1. The user sends $x_w$ together with an ownership proof $\pi_{\text{own}}$:
+   an escape-form withdrawal proof (no clearance) for the same $x_w$,
+   destination and final balance.
+2. The server checks whether $x_w$ is already in `spent_nullifiers`, and
+   verifies $\pi_{\text{own}}$ against its deployment, signing keys and a
+   recent root. Only the note owner can produce it.
+3. If both checks pass, the server signs:
 
 $$
 \sigma_{\text{clear}}(x_w)
@@ -277,7 +281,7 @@ to the contract.
 
 5. The contract verifies $\pi_{\text{wd}}$ and $\sigma_{\text{clear}}$, then immediately settles the note.
 
-The server learns no balance or routing data from this clearance request; it only sees the nullifier $x_w$.
+The ownership proof's public statement shows the server the note ID, $B_{\text{final}}$ and $\text{Dest}$ when clearance is requested, slightly before the contract publishes them. $\pi_{\text{own}}$ is also a valid escape-hatch payload, so whoever holds it can start an escape for the same destination and balance; that delays the payout by the challenge window but cannot redirect it.
 
 ### Escape Hatch (Fallback Path)
 
@@ -287,7 +291,7 @@ $$
 (B_{\text{final}}, \text{Dest}, x_w, \pi_{\text{wd}})
 $$
 
-The contract verifies $\pi_{\text{wd}}$, removes the active note leaf immediately, and starts the configured challenge window (24 hours by default).
+The contract verifies $\pi_{\text{wd}}$, removes the active note leaf immediately, and starts the configured challenge window (24 hours by default). The proof may use the current Merkle root or one replaced within the last day; the leaf removal always applies to the current tree.
 
 If the withdrawal is not challenged during that window, the contract settles the note exactly as in the mutual-close path.
 
@@ -309,8 +313,8 @@ $$
 
 But if that old state was already consumed by a later accepted request, then the server already has a valid prior transcript using the same nullifier.
 
-During the escape-hatch challenge window, the server can submit that prior accepted transcript.  
-The contract then rejects the stale withdrawal.
+During the escape-hatch challenge window, the server can submit that prior accepted transcript, once the request's settlement is final.  
+The contract then rejects the stale withdrawal and restores the note. It releases $x_w$ from its spent set but records it as challenged: no later escape may use $x_w$, so the defeated withdrawal cannot be replayed, while a cleared mutual close still can. The honest user continues from the state the server signed after the request that consumed $\tau_{\text{old}}$, obtained from the server's recovery interface, and withdraws from it.
 
 This is the clean replacement for RLN-style secret-recovery slashing in the simplified design.
 
@@ -332,13 +336,13 @@ and closes the note / removes the commitment.
 
 This means the server is paid for the user's entire lifetime of API usage in one aggregated settlement transaction, including any optional policy deductions reflected in the final private balance.
 
-To handle abandoned accounts, each note carries the expiry time $T_{\text{exp}}$. If the note is still open and no withdrawal is in progress when it expires, the server may call:
+To handle abandoned accounts, each note carries the expiry time $T_{\text{exp}}$. If the note is still open and no withdrawal is in progress after its effective expiry, the server may call:
 
 $$
 \text{claimExpired}(\text{noteId}, \text{siblings})
 $$
 
-The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$.
+The contract then closes the note and transfers the full deposit $D$ to the server treasury $A_{\text{srv}}$. The effective expiry is $T_{\text{exp}}$ extended by any time the contract spent paused, and by at least one challenge window after a successful challenge. The claim is unavailable while the contract is paused and for a grace period after each unpause. Requests still require $T_{\text{exp}}$ to be at least the request time.
 
 This guarantees that the server is eventually paid even if the user disappears without withdrawing. An implementation may additionally offer a separate rollover / renewal transaction that extends $T_{\text{exp}}$, but that mechanism is orthogonal to the accounting model described here.
 
@@ -348,7 +352,7 @@ The current state anchor $\tau$ and the server signature $\sigma_{\text{srv}}$ s
 
 This is important because it prevents the server from trivially correlating requests by directly observing the user's carried state.
 
-In the mutual-close path, the server sees only the withdrawal nullifier $x_w$. The final balance and destination address are revealed only to the contract when the user actually closes the note.
+In the mutual-close path, the server sees the withdrawal nullifier $x_w$ and, through the ownership proof, the note ID, final balance and destination address. The contract reveals the same values publicly when the user closes the note.
 
 If additional hardening is desired, the next anchor $\tau_{\text{new}}$ can be derived from both server randomness and user-contributed randomness. However, this is best treated as an implementation refinement rather than part of the core protocol.
 

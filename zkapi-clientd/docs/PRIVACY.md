@@ -77,7 +77,9 @@ and OA key before retiring it; that recovered credential never enters the
 inference cache or bridge response. A confirmed unissued cancellation advances
 the wallet only through the normal matching signed response. Missing keys,
 expiry, HTTP errors and ambiguous issuance never authorize clearing a journal.
-Stopping or failing recovery keeps the original note and request for retry.
+A `stale_root` reply clears it only when the server's nullifier record also
+reports the request unknown. Stopping or failing recovery keeps the original
+note and request for retry.
 
 Inference is loopback-only and key-free by default. Other local processes can
 use it. Optional local API-key authentication affects only the UI-to-daemon hop.
@@ -88,7 +90,10 @@ account/storage metadata are stripped before inference.
 
 A local Ethereum signing key and private recovery journals are stored in
 owner-only files. Public funding addresses, amounts, withdrawal destinations
-and chain transactions are visible to RPC providers and chain observers.
+and chain transactions are visible to RPC providers and chain observers. The
+client sends chain reads and transactions only to the RPC packaged with the
+release, and refuses a wallet companion that reports another RPC, indexer or
+protocol server.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
@@ -105,18 +110,36 @@ reverts never automatically sign a replacement. Wallet state is preserved
 across updates.
 
 Successful native ETH deposits activate after the saved transaction's successful
-mined receipt, canonical block and deposit event are validated, matching the web
-wallet. Success does not wait for Ethereum finality. Failed receipts retain the
-finality gate before explicit retry; missing or ambiguous receipts preserve the
-exact signed transaction without authorizing a replacement. Withdrawals and
-public ETH returns require their own finality checks.
+mined receipt, canonical block and deposit event are validated, and two further
+sources agree: the vault's `notes(noteId)` at the receipt's block hash, and the
+zkAPI indexer's whole-tree snapshot, which must hold this deposit's leaf at that
+note. The note secret reaches the wallet companion only after they agree. The
+vault read goes to the packaged RPC, which already serves the deposit and sees
+its note ID in the public deposit event. The snapshot is the same response for
+every client, so the indexer does not learn which note is yours. Disagreement
+leaves the deposit in `verification_conflict`; nothing is activated, retired or
+replaced until a later check agrees. Success does not wait for Ethereum
+finality. Failed receipts retain the finality gate before explicit retry; a
+deposit signed by this release is also retired only after the indexer shows
+its note did not land. Missing or ambiguous receipts preserve the exact signed
+transaction without authorizing a replacement. Withdrawals and public ETH
+returns require their own finality checks, and a withdrawal completes locally
+only after the vault and the indexer both show the note closed.
 
 Pre-finality activation exposes the same reorganization risk as the web wallet:
 a block can be replaced after a private note or inference credit becomes usable.
-Current wallet/indexer state does not provide complete rollback and reconciliation
-for that event. Local reset cannot undo credit already issued, and later inference
+The wallet does not provide complete rollback and reconciliation for that
+event. Local reset cannot undo credit already issued, and later inference
 or withdrawal may require recovery. Canonical receipt validation establishes the
 observed chain state, not a guarantee against a later reorganization.
+
+A withdrawal builds two withdrawal proofs. The first, an ownership proof, goes
+to the protocol server with the clearance request; its public statement shows
+the server the note ID, the payout amount and the destination before the close
+transaction publishes them. It is also a valid escape input, so a server that
+kept it could start an escape to the same destination and amount, delaying the
+payout by the vault's challenge period without changing it. The ownership proof
+is never written to disk.
 
 The daemon creates no request-history log files. Foreground output includes
 HTTP route/method/status/timing, local sequential `request=` numbers and local

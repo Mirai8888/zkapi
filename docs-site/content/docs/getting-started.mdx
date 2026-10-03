@@ -72,6 +72,19 @@ The root workspace builds the server and indexer runtime libraries,
 server with `zkapi serverd`; use `--help` for current configuration flags. The server and browser must use the same deployment,
 keys, and `zkapi-v2-note-bound-v1` circuit revision.
 
+`ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` are required, with no defaults, even
+on a local chain. Generate each one independently, for example with
+`printf '0x%s\n' "$(openssl rand -hex 31)"`. `zkapi signing-keys` derives the
+public keys to pass to the vault constructor; it and the server refuse zero
+or guessable seeds, one key for both roles, and the published development
+keys in either role. `zkapi serverd` then refuses to start unless its native
+billing RPC serves `--chain-id` and the derived keys equal the vault's
+immutable keys. See the
+[deployment](https://github.com/ethereum/zkapi/blob/main/docs/deployment.md),
+[challenge service](https://github.com/ethereum/zkapi/blob/main/docs/challenge-service.md)
+and [hardened vault migration](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md)
+guides for operation.
+
 ## Select the matching setup
 
 The checked-in `protocol/setup/v2` keys belong to the

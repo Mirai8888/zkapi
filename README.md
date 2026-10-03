@@ -63,14 +63,20 @@ protocol services, wallet proofs and contracts are real. See the
 ## Operator services
 
 - `zkapi serverd`: native ETH lease authorization, settlement and Schnorr signing.
-- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and Merkle paths.
-- `zkapi-challenged`: durable escape monitoring and challenge submission.
-- `zkapi signing-keys`: derive deployment public keys from operator seeds.
+- `zkapi-indexerd` / `zkapi indexer`: vault event indexing and Merkle paths
+  from a view verified against the vault.
+- `zkapi-challenged`: durable escape monitoring, challenge submission and
+  private status endpoints.
+- `zkapi signing-keys`: derive deployment public keys from operator seeds
+  (the published development keys are rejected).
 - `zkapi setup --output-dir NEW_DIRECTORY`: generate a fresh single-party Groth16 setup.
 
-Native server startup requires a pinned oracle RPC/feed and a lease issuer.
-Use [deployment instructions](docs/deployment.md), [Docker operation](docker/aws/README.md)
-and [challenge service operation](docs/challenge-service.md). The browser sends
+Native server startup requires a pinned oracle RPC/feed, a lease issuer, and
+both `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED`; there are no default seeds. The
+server refuses to start unless their keys equal the vault's immutable keys.
+Use [deployment instructions](docs/deployment.md), [Docker operation](docker/aws/README.md),
+[challenge service operation](docs/challenge-service.md) and the
+[hardened vault migration](docs/migration-hardened-vault.md). The browser sends
 prompts directly to the inference provider; the server handles authorization
 and settlement.
 

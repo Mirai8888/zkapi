@@ -100,7 +100,12 @@ Clearance uses a separate Schnorr key to sign the protocol version, chain ID,
 vault address and withdrawal nullifier under `zkapi.v2.clear`. Mutual-close
 proofs verify this signature inside the circuit. Escape proofs use the same
 withdrawal circuit with `has_clearance = false`, and follow the vault's
-challenge process described in [Protocol](/docs/protocol).
+challenge process described in [Protocol](/docs/protocol). The server signs a
+clearance only after verifying an escape-form withdrawal proof for the same
+nullifier and deployment keys, which proves knowledge of the note secret,
+unless it runs with the transitional `--allow-legacy-clearance` setting. A
+request proof is never accepted for this. That ownership proof is itself a
+valid escape input for its destination and balance.
 
 The withdrawal tag binds the nullifier to the payout destination, final
 balance and clearance mode:
@@ -147,7 +152,10 @@ anonymous_commitment_x, anonymous_commitment_y
 Its private witness contains the secret, request context, note ID, deposit,
 expiry, Merkle siblings, balance, blinding, rerandomization, anchor, genesis
 flag and state signature. The circuit checks that the balance covers
-`solvency_bound` and that the note expiry is at least `request_time`.
+`solvency_bound` and that the note expiry is at least `request_time`. On the
+signed-state branch it does not bound the balance by the deposit; that bound
+is a planned circuit change (see
+[known limitations](/docs/protocol#known-limitations)).
 
 The withdrawal proof has **14 public field elements**, in this exact order:
 
@@ -162,7 +170,9 @@ has_clearance, withdrawal_tag
 Its private witness contains the secret, deposit, expiry, Merkle siblings,
 final blinding, anchor, genesis flag, state signature and clearance signature.
 The circuit also enforces that `final_balance` does not exceed the deposit.
-Withdrawal intentionally reveals the note ID, final balance and destination.
+Withdrawal intentionally reveals the note ID, final balance and destination:
+to the server when a mutual close requests clearance, and on-chain when the
+note closes.
 
 “Private witness” describes what the proof reveals, not all surrounding
 activity: deposits are on-chain, and the server receives the prompt-free lease

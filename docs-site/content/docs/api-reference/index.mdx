@@ -24,7 +24,9 @@ Native ETH vault <-------- challenge service
 
 `protocol/rust/crates/zkapi-types/src/wire.rs` defines the protocol's JSON
 messages. Runtime handlers in `crates/zkapi-serverd/src/routes.rs` and
-`crates/zkapi-indexerd/src/http.rs` define the supported routes.
+`crates/zkapi-indexerd/src/http.rs` define the supported routes. The challenge
+service reads finalized server transcripts and pending escapes, and submits
+challenges through a restricted signer.
 
 ## Proof and field encoding
 

@@ -91,6 +91,16 @@ accepted native ETH price quote is part of the proof-bound authorization and
 stays fixed through recovery and settlement. The billing server does not proxy
 inference requests.
 
+Settlement always ends in a signed next state. A lease whose key never reached
+the wallet settles at zero. A delivered lease is charged its measured usage,
+clamped to the proven `solvency_bound` before conversion. If its usage cannot
+be settled at all, or is still unavailable when the server's write-once
+settlement deadline passes, the lease settles at `solvency_bound`. The server
+only refuses to sign a lease whose own record is corrupt. It refuses to start unless the lease lifetime
+plus that deadline fit within half the vault's challenge period, so every
+signed transcript exists well before an escape from the same state could
+finalize.
+
 ## Refunds
 
 No funds move on-chain per request. Only the actual charge reduces the private
@@ -109,29 +119,61 @@ address.
 ## Withdrawal
 
 **Mutual close.** The wallet requests clearance for its current nullifier from
-`POST /v2/withdraw/clearance`. The server reserves the nullifier and returns a
-Schnorr signature under its separate clearance key. The wallet includes that
-signature as a private witness to the withdrawal proof, then submits
-`mutualClose(inputs, proof, siblings)`. The vault checks its immutable deployment
-keys, the current root, and the Groth16 proof, removes the leaf, and pays out.
+`POST /v2/withdraw/clearance`. With the request it proves that it owns the
+note: an escape-form withdrawal proof (`has_clearance = false`) for the same
+nullifier, built for the destination and current balance it will close with.
+The server checks that proof, its deployment and keys, and a recent root, then
+reserves the nullifier and returns a Schnorr signature under its separate
+clearance key. The wallet includes that signature as a private witness to a
+second withdrawal proof, then submits `mutualClose(inputs, proof, siblings)`.
+The vault checks its immutable deployment keys and the Groth16 proof, removes
+the leaf, and pays out.
+
+The ownership proof reveals the note ID, final balance and destination to the
+server when clearance is requested, before `mutualClose` publishes them. It is
+also a valid escape input: whoever holds it, including the server, can start
+an escape with it while its root is accepted. That delays the payout by the
+challenge period but cannot change its amount or destination.
 
 **Escape hatch.** Without clearance, the wallet submits
 `initiateEscapeWithdrawal(inputs, proof, siblings)`. The vault removes the leaf
 immediately and records a pending withdrawal. The challenge window is the
 vault's configured `challengePeriod`; the default is 24 hours.
 
+A withdrawal proof's `activeRoot` may be the vault's current root or a root
+replaced within the last day (`ROOT_HISTORY_WINDOW`); an older one reverts
+`UnknownRoot()`. The `siblings` must still match the current root, because the
+vault removes the leaf from the live tree; stale siblings revert `StaleRoot()`
+and can be refreshed without proving again.
+
 An operator must run the challenge service. If the escaped state already
 authorized usage, a challenger supplies the original request proof with the
-same nullifier. That proof retains its historical active root even if other
+same nullifier. Only a request whose settlement the server has finalized is
+evidence; an escape at a state whose lease is still settling waits for that
+settlement. The proof retains its historical active root even if other
 deposits or closes have since changed the tree. A current zero-slot path lets
-the vault restore the note to the current tree. A successful challenge cancels
-the pending payout and makes the note active again; it does not impose a
-separate monetary penalty. Otherwise, `finalizeEscapeWithdrawal(noteId)` pays
-the recorded amounts after the deadline.
+the vault restore the note to the current tree.
 
-An active note that expires without close-out can be claimed for the treasury
-with `claimExpired(noteId, siblings)`. The SDK preserves deposit and withdrawal
-journals for transaction recovery.
+A successful challenge cancels the pending payout and makes the note active
+again; it does not impose a separate monetary penalty. The vault releases the
+nullifier from `usedNullifiers` and records it in `challengedNullifiers`. An
+escape at that nullifier then reverts `ChallengedNullifier()`, so nobody can
+replay the defeated escape, while a clearance-backed mutual close can still
+use it. The owner continues from the server-signed successor state of the
+request that spent it, which `GET /v2/nullifiers/{nullifier}` returns, and
+withdraws from that state. After a challenge the note keeps at least one
+challenge period of unpaused time before it can be claimed as expired.
+Otherwise, `finalizeEscapeWithdrawal(noteId)` pays the recorded amounts after
+the deadline.
+
+An active note that is not withdrawn can be claimed for the treasury with
+`claimExpired(noteId, siblings)` once its effective expiry has passed, while
+the vault is not paused. `effectiveExpiry(noteId)` is the deposit's expiry
+extended by all time the vault spent paused since the deposit and by any
+post-challenge grace, and is never earlier than `unpauseClaimGrace` after the
+latest unpause. Requests still end at the note's original expiry, which the
+request proof checks; the note can be withdrawn until it is claimed. The SDK
+preserves deposit and withdrawal journals for transaction recovery.
 
 ## Compatibility and trust
 
@@ -144,3 +186,66 @@ The current elliptic-curve construction is **not post-quantum**. The checked-in
 setup is single-party; no multiparty ceremony has been conducted.
 Read the [setup and compatibility requirements](/docs/cryptography#setup-and-compatibility)
 before choosing deployment artifacts.
+
+The vault rules on this page are those of the vault in this repository,
+declared to clients as `vault_revision: 2`. The deployments currently packaged
+with the SDK and `zkapi-clientd` run an earlier revision. Such vaults keep
+their original rules: a successful challenge consumes the nullifier
+permanently, withdrawals must prove against the exact current root, and
+`claimExpired` and a one-step `setTreasury` remain available while paused.
+Wallets refuse escapes that such a vault could burn. See the
+[hardened vault migration](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md).
+
+### Owner and operator powers
+
+One owner address controls the vault's pause switch and treasury. The proof
+adapter, signing keys, challenge period and note lifetime are immutable, and
+the vault has no upgrade path. The deployment script requires an explicit
+`OWNER` outside local chains; use a multisig or timelock.
+
+- **Pause.** `pause()` stops deposits, `mutualClose`,
+  `initiateEscapeWithdrawal`, `claimExpired`, scheduling or accepting a
+  treasury change, and `withdrawTreasuryArrears`. Challenges and
+  `finalizeEscapeWithdrawal` stay open, so pending escapes still resolve. A
+  pause has no time limit: the owner can freeze every exit indefinitely, but
+  no vault function lets it take user funds. Paused time extends every note's
+  claim deadline, and after any `unpause()` no note can be claimed as expired
+  for `unpauseClaimGrace = max(challengePeriod, 1 day)`. Pause and unpause
+  emit `Paused(address)` and `Unpaused(address)`; redundant calls revert. The
+  one-day root window counts wall-clock time, so a long pause can retire the
+  root of a prepared withdrawal proof, which must then be proved again.
+- **Treasury.** `setTreasury(address)` only schedules a change.
+  `acceptTreasury()` applies it after
+  `treasuryChangeDelay = max(challengePeriod, 2 days)` of unpaused time, and
+  `cancelTreasuryChange()` withdraws it at any time, including while paused.
+  The treasury receives closed notes' spent balances and expired deposits. A
+  treasury that rejects a payment, or needs more than 100,000 gas to accept
+  it, cannot block a user payout: its share accrues in `treasuryArrears`, which
+  anyone can pay to the current treasury with `withdrawTreasuryArrears()`.
+- **Ownership.** `transferOwnership` remains available while paused, for key
+  rotation. `renounceOwnership` reverts while paused, so a pause cannot become
+  permanent by mistake.
+
+The operator runs the API server, indexer and challenge service. It signs
+every successor state and every clearance, so it can refuse service or
+clearance; the escape hatch remains. It must keep the API available through
+every challenge window: after a challenge, the owner's next state comes from
+`GET /v2/nullifiers/{nullifier}`. Wallets take Merkle paths from the
+operator's indexer, but the vault checks every path against its own root and
+anyone can run `zkapi-indexerd` against the vault. The server refuses to start
+unless its signing seeds derive the vault's immutable keys and are not the
+published development keys.
+
+### Known limitations
+
+- An operator that finalizes a request but withholds its signed successor
+  state can defeat every escape the user can still build. The note can then
+  leave only through a mutual close that the same operator must clear, or be
+  claimed for the treasury after its effective expiry. Closing this gap needs
+  a circuit change that lets an escape concede the request's solvency bound.
+- The request circuit does not bound a server-signed balance by the note's
+  deposit; only withdrawals enforce that bound. A leaked state-signing key can
+  therefore authorize spending beyond the attacker's collateral. The bound is
+  a planned circuit change.
+- Clearance signatures do not expire, so a clearance reservation is
+  permanent: that state can then only withdraw, never authorize a request.

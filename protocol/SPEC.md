@@ -64,7 +64,9 @@ valid signed state, balance solvency, expiry at least the request time, correct
 rerandomization, and the nullifier/authorization tag. The authorization tag
 binds the nullifier to a private context derived from the exact client request
 ID and payload hash. Runtime validation binds the public deployment, keys,
-root, time, and charge bound to the configured service.
+root, time, and charge bound to the configured service. The request statement
+does not bound a signed balance by the deposit; adding that constraint is a
+planned circuit change.
 
 The withdrawal statement contains these 14 field elements:
 
@@ -86,12 +88,16 @@ The withdrawal statement contains these 14 field elements:
 The withdrawal proof establishes membership and the note-bound final state,
 reveals the final balance, and binds the nullifier to the destination, balance,
 and clearance mode. Mutual close additionally proves the clearance signature.
-The vault checks the deployment, pinned keys, current root, note status,
+The vault checks the deployment, pinned keys, a nonzero destination, the
+proof's root (the current root, or one replaced within the one-day
+`ROOT_HISTORY_WINDOW`), siblings against the current root, note status,
 nullifier use, and final balance before settlement.
 
 ## Wire format and persistence
 
 [wire.rs](rust/crates/zkapi-types/src/wire.rs) defines the active HTTP schemas.
+A clearance request carries `ownership_proof`, an escape-form withdrawal
+statement and proof for the same nullifier.
 `Groth16ProofWire` carries backend `groth16_bn254` and base64-encoded Arkworks
 canonical compressed proof bytes. Public inputs are part of the enclosing
 request and are verified directly. The Solidity adapter accepts the EVM proof
@@ -105,6 +111,8 @@ shapes; numeric handling at browser boundaries is defined by the SDK.
 The native wallet journals prepared requests before transport. The runtime
 server persists nullifier reservations and finalized transcripts to make
 request retries idempotent and to preserve evidence for escape challenges.
+Only a finalized transcript is challenge evidence, and every lease is
+finalized by a write-once settlement deadline, at worst at its solvency bound.
 The browser wallet receives storage and transport from its caller.
 
 ## Native ETH settlement
@@ -118,8 +126,17 @@ chosen destination and the spent amount to the treasury. Escape initiation
 removes the leaf immediately and starts the configured challenge period. A
 valid archived request with the matching nullifier challenges the escape and
 restores the leaf; unrelated root updates do not invalidate that historical
-proof. An uncontested escape can be finalized after its deadline. Expired
-active notes can be claimed for the treasury.
+proof. The challenge clears the nullifier from `usedNullifiers` and sets
+`challengedNullifiers`, so a later escape at it reverts `ChallengedNullifier()`
+while a cleared mutual close remains possible. An uncontested escape can be
+finalized after its deadline. Active notes can be claimed for the treasury
+after `effectiveExpiry`, which adds paused time and a post-challenge grace and
+is never earlier than `unpauseClaimGrace` after an unpause.
+
+The owner can pause deposits, withdrawals and expiry claims indefinitely;
+challenges and escape finalization stay open. Treasury changes are scheduled,
+then accepted after `treasuryChangeDelay` of unpaused time, and failed treasury
+payments accrue `treasuryArrears` instead of reverting payouts.
 
 ## Source ownership
 

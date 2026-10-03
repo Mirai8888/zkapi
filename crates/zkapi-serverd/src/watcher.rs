@@ -654,7 +654,9 @@ pub(crate) mod tests {
     async fn clearance_and_unknown_nullifiers_are_not_evidence() {
         let store = Arc::new(NullifierStore::in_memory().unwrap());
         let clearance = Felt252::from_u64(5);
-        store.reserve_clearance(&clearance).unwrap();
+        store
+            .reserve_clearance(&clearance, "ownership_proof")
+            .unwrap();
         let watcher = ChallengeWatcher::new(store);
         assert!(matches!(
             watcher.evidence_status(&clearance).unwrap(),

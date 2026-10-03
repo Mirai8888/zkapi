@@ -180,6 +180,24 @@ enum Commands {
         poll_interval_ms: u64,
         #[arg(long)]
         cursor_path: Option<String>,
+        /// Blocks a vault event must be buried before the checkpoint commits it.
+        #[arg(long, default_value_t = 12)]
+        confirmations: u64,
+        /// Expected chain id for the RPC and checkpoint. Separate from the
+        /// top-level --chain-id; there is no fallback to its default.
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Archive the checkpoint and replay from --from-block.
+        #[arg(long)]
+        resync: bool,
+        /// Seconds without a verified poll before the indexer reports stale.
+        #[arg(long, default_value_t = 120)]
+        stale_after_secs: u64,
+        #[arg(long, default_value_t = 1_000)]
+        max_block_range: u64,
+        /// Seconds the RPC head may age before the indexer reports stale; 0 disables.
+        #[arg(long, default_value_t = 180)]
+        max_head_age_secs: u64,
     },
 }
 
@@ -325,6 +343,12 @@ async fn main() -> anyhow::Result<()> {
             from_block,
             poll_interval_ms,
             cursor_path,
+            confirmations,
+            chain_id,
+            resync,
+            stale_after_secs,
+            max_block_range,
+            max_head_age_secs,
         } => {
             let config = zkapi_indexerd::IndexerConfig {
                 listen_addr: listen,
@@ -333,6 +357,12 @@ async fn main() -> anyhow::Result<()> {
                 from_block,
                 poll_interval_ms,
                 cursor_path,
+                confirmations,
+                chain_id,
+                resync,
+                stale_after_secs,
+                max_block_range,
+                max_head_age_secs,
             };
             zkapi_indexerd::run_indexer(config).await?;
         }
@@ -811,5 +841,69 @@ mod tests {
             ]),
             (3600, 18)
         );
+    }
+
+    #[test]
+    fn indexer_accepts_reorg_safety_flags() {
+        let cli =
+            Cli::try_parse_from(["zkapi", "indexer", "--contract-address", "0x1234"]).unwrap();
+        let Commands::Indexer {
+            confirmations,
+            chain_id,
+            resync,
+            stale_after_secs,
+            max_block_range,
+            max_head_age_secs,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the indexer command");
+        };
+        assert_eq!(confirmations, 12);
+        assert_eq!(chain_id, None, "no fallback to the top-level --chain-id");
+        assert!(!resync);
+        assert_eq!(stale_after_secs, 120);
+        assert_eq!(max_block_range, 1_000);
+        assert_eq!(max_head_age_secs, 180);
+
+        let cli = Cli::try_parse_from([
+            "zkapi",
+            "--chain-id",
+            "1",
+            "indexer",
+            "--contract-address",
+            "0x1234",
+            "--confirmations",
+            "3",
+            "--chain-id",
+            "11155111",
+            "--resync",
+            "--stale-after-secs",
+            "60",
+            "--max-block-range",
+            "500",
+            "--max-head-age-secs",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(cli.chain_id, 1);
+        let Commands::Indexer {
+            confirmations,
+            chain_id,
+            resync,
+            stale_after_secs,
+            max_block_range,
+            max_head_age_secs,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the indexer command");
+        };
+        assert_eq!(confirmations, 3);
+        assert_eq!(chain_id, Some(11_155_111));
+        assert!(resync);
+        assert_eq!(stale_after_secs, 60);
+        assert_eq!(max_block_range, 500);
+        assert_eq!(max_head_age_secs, 0);
     }
 }

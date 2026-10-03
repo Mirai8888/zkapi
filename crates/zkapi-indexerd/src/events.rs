@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
 /// Events emitted by the ZkApiVault contract that affect the Merkle tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VaultEvent {
     NoteDeposited {
         note_id: u32,

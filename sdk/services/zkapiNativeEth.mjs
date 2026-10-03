@@ -68,6 +68,29 @@ export function validateNativeQuote(quote, funding, { now = Math.floor(Date.now(
     return quote;
 }
 
+/**
+ * Validate a quote that is already bound into a proved request payload. Its
+ * own fields must be internally consistent and on this deployment's chain, but
+ * it is deliberately not compared with the current feed, decimals or maximum
+ * age pins: those may change after the proof was made, and re-validating a
+ * proof-bound value against mutable configuration would strand its receipt.
+ * Callers still require sameNativeQuote against the settlement payload.
+ */
+export function validateProofBoundQuote(quote, funding) {
+    if (!quote || quote.asset !== 'native_eth' || quote.units_per_eth !== Number(NATIVE_UNITS_PER_ETH)
+        || !Number.isSafeInteger(Number(funding?.chain_id)) || quote.chain_id !== Number(funding.chain_id)
+        || !ADDRESS.test(quote.feed_address || '') || ZERO.test(quote.feed_address)
+        || !Number.isSafeInteger(quote.decimals) || quote.decimals < 0 || quote.decimals > 36
+        || !unsigned(quote.round_id) || BigInt(quote.round_id) <= 0n || BigInt(quote.round_id) >= (1n << 80n)
+        || !unsigned(quote.answer) || BigInt(quote.answer) <= 0n || BigInt(quote.answer) > 1_000_000_000_000_000_000n
+        || !Number.isSafeInteger(quote.updated_at) || quote.updated_at <= 0
+        || !Number.isSafeInteger(quote.expires_at) || quote.expires_at <= quote.updated_at
+        || quote.expires_at - quote.updated_at > 86_400) {
+        throw new Error('The saved request carries an invalid ETH/USD quote.');
+    }
+    return quote;
+}
+
 export function nativeUnitsForUsd(usd, quote) {
     const micros = parseUnits(usd, 6);
     const numerator = micros * NATIVE_UNITS_PER_ETH * 10n ** BigInt(quote.decimals);
@@ -111,6 +134,24 @@ async function assertNativeVaultAtBlock(funding, blockTag, signal) {
         || BigInt(scale) !== NATIVE_WEI_PER_UNIT || BigInt(token) !== 0n) {
         throw new Error('The pinned vault does not accept native ETH in the configured denomination.');
     }
+}
+
+/**
+ * Read one 32-byte word from the pinned vault through the trusted deployment
+ * RPC (never the injected wallet or a server-supplied URL), after checking the
+ * chain. Used as an independent chain witness for server claims.
+ */
+export async function readVaultWord(funding, data, {
+    blockTag = 'latest',
+    signal = AbortSignal.timeout(20_000)
+} = {}) {
+    validateNativeFunding(funding);
+    if (BigInt(await rpc(funding, 'eth_chainId', [], signal)) !== BigInt(funding.chain_id)) {
+        throw new Error('The vault RPC is on the wrong chain.');
+    }
+    const word = await rpc(funding, 'eth_call', [{ to: funding.contract_address, data }, blockTag], signal);
+    if (!/^0x[0-9a-f]{64}$/i.test(word || '')) throw new Error('The vault returned an invalid value.');
+    return BigInt(word);
 }
 
 export async function assertNativeVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {

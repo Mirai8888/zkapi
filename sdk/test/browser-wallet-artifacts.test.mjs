@@ -274,8 +274,19 @@ test('browser withdrawal refreshes stale Merkle roots before retrying', () => {
     assert.match(runtime, /sameFelt\(existing\.public_inputs\?\.active_root, path\.active_root\)/);
     assert.match(rootSync, /indexer_root_lag/);
     assert.match(client, /`0x\$\{ABI\.currentRoot\}`/);
+    // Deposits still re-prove on any stale root.
     assert.match(client, /const attempts = 3/);
     assert.match(client, /Refreshing the Merkle path and proof/);
+    // A hardened vault (root history) refreshes siblings without a new proof;
+    // a repeated rejection or UnknownRoot() asks the runtime to re-prove.
+    const prepare = sourceMethodAt(runtime, 'async prepareWithdrawalLocked(');
+    assert.match(prepare, /if \(!reprove && provenForState && this\.vaultCapabilities\(\)\.hardenedVault\)/);
+    assert.match(prepare, /siblings: path\.siblings, siblingsRoot: path\.active_root/);
+    const withdraw = sourceMethodAt(client, 'async performWithdrawal(');
+    assert.match(withdraw, /const withdrawalAttempts = 4/);
+    assert.match(withdraw, /\['stale_root', 'unknown_root'\]\.includes\(error\?\.code\)/);
+    assert.match(withdraw, /reprove = error\.code === 'unknown_root' \|\| rootRejections > 1/);
+    assert.match(withdraw, /expectedActiveRoot,\s*reprove,/);
 });
 
 test('withdrawal root synchronization waits for the indexer and fails closed', async () => {

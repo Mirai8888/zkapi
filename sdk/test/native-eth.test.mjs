@@ -211,8 +211,9 @@ test('native manifest trust pins asset, denomination, feed, freshness and RPC wi
 
 test('native lease proves a fixed USD tier with its exact feed quote and keeps pending proof unchanged', async () => {
     const runtime = new BrowserWalletRuntime();
+    runtime.manifest = { deployment_id: 'native-tier-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000 } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
     const q = quote();
     runtime.nativeBillingQuote = async () => q;
     runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
@@ -220,8 +221,9 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     let proof;
     runtime.worker = { call: async (_operation, inputs) => {
         proof = inputs;
-        const request = { payload: inputs.args.payload, public_inputs: { solvency_bound: inputs.config.request_charge_cap } };
-        return { request, journal: { prepared_request: request } };
+        const request = { client_request_id: inputs.args.client_request_id, payload: inputs.args.payload,
+            public_inputs: { request_nullifier: '0x42', solvency_bound: inputs.config.request_charge_cap } };
+        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request } };
     } };
     const result = await runtime.prepareLeaseRequest(undefined, null, 4.5);
     assert.equal(result.public_inputs.solvency_bound, 1_500_000);
@@ -238,9 +240,10 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     const feedAddress = '0x694AA1769357215DE4FAC081bf1f309aDC325306';
     const { q } = priceRpc(t, { feedAddress });
     const runtime = new BrowserWalletRuntime();
+    runtime.manifest = { deployment_id: 'native-checksum-test' };
     runtime.config = { funding: { ...funding, native_price_feed_address: feedAddress },
         wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000 } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
     runtime.remoteJson = async url => {
         assert.equal(url, `${funding.protocol_server_url}/v2/billing/quote`);
         return q;
@@ -248,8 +251,9 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
     runtime.commit = async next => { runtime.runtime = next; };
     runtime.worker = { call: async (_operation, input) => {
-        const request = { payload: input.args.payload, public_inputs: { solvency_bound: input.config.request_charge_cap } };
-        return { request, journal: { prepared_request: request } };
+        const request = { client_request_id: input.args.client_request_id, payload: input.args.payload,
+            public_inputs: { request_nullifier: '0x42', solvency_bound: input.config.request_charge_cap } };
+        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request } };
     } };
     const request = await runtime.prepareLeaseRequest(undefined, null, 1);
     const authorized = JSON.parse(request.payload).billing_quote;
@@ -357,8 +361,9 @@ test('recovery preserves its journal when authoritative expiry is unavailable or
 
 test('a finalized price update cannot reprice a pending proof until exact superseded-unaccepted recovery succeeds', async () => {
     const runtime = new BrowserWalletRuntime();
+    runtime.manifest = { deployment_id: 'native-reprice-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    const note = { note_id: 1, current_balance: 2_000_000 };
+    const note = { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' };
     runtime.runtime = { state: note };
     let current = quote();
     let quoteReads = 0;

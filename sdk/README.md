@@ -61,7 +61,8 @@ dialog in background polling. Offer an explicit password action that calls
 
 Cooperative withdrawal authenticates before wallet work and refuses to continue
 if the selected private note changes while its password dialog is open.
-Unilateral escape does not request the service password.
+Unilateral escape requests the service password only when it must check a
+private request this device already sent from the current note state.
 
 Public `/health` must report the configured Sepolia `chain_id` and boolean
 `testnet_password_required`; missing or invalid discovery fails closed. The
@@ -177,6 +178,82 @@ Run `npm run test:sdk` in this checkout. For an installed package, run
 `node --test node_modules/@openanonymity/zkapi-browser-sdk/sdk/test/*.test.mjs`
 from a host that provides esbuild as a development dependency. The tests use
 local fixtures and do not connect a wallet or broadcast transactions.
+
+## Transmitted requests and safe withdrawals
+
+A proved request leaves the device when it is sent, and every request and
+withdrawal at one note state shares that state's nullifier. The SDK therefore
+keeps an append-only archive of transmitted requests in the existing IndexedDB
+`archives` store (records `request_journal` and `request_evidence`; the database
+version stays 3, so older builds keep opening it). The archive record and the
+write-ahead journal are committed in one transaction before the request is
+sent. A journal leaves the wallet only in the same write that installs a
+verified next state or records its outcome in the archive. A server error string
+alone never discards it. A `stale_root` reply is first checked against the
+pinned vault RPC (the same request is retried while the vault still has the
+proof's root). Only then is the server's own nullifier record consulted.
+Resolved records are compacted (no proof, payload or rerandomization), bounded
+per note state, and pruned per deployment. No host action is needed. In-flight
+journals from older builds migrate on the first read.
+
+Escape and clearance behaviour depends on two optional keys in
+`browser-config.json`'s `trusted_deployment`, read only from that build-pinned
+trust anchor and never from the served manifest:
+
+- `vault_revision` (integer; absent means `1`, the deployed vaults). With `2`
+  (a vault whose challenge is non-destructive and that keeps recent roots), an
+  escape at a transmitted state is allowed when the server reports the
+  nullifier `unknown` or `clearance_reserved` and no challenge was observed.
+  Withdrawal proofs are reused with refreshed Merkle siblings when only the
+  vault root moved. Without it (strict mode) an escape at a transmitted state is
+  always refused (`transmitted_anchor_escape_unsafe`), and a moved root always
+  re-proves.
+- `clearance_ownership_proof` (`"required"` or `"optional"`). Mutual close
+  then sends an escape-form ownership proof (a second withdrawal proof, to the
+  user's real destination and current balance) with
+  `POST /v2/withdraw/clearance`. This also happens when `vault_revision` is 2 or
+  more. Otherwise the request is sent without a proof first and, on
+  `400 clearance_ownership_required`, once more with one. An ownership proof is
+  never generated for a transmitted state unless the server reports its
+  nullifier `unknown` or `clearance_reserved`. It is never persisted. The returned
+  clearance is persisted with the plan and reused while the state's nullifier
+  is unchanged.
+
+On a revision-2 vault, `client.withdraw('escape', onStatus, { destination,
+overrideUnsettledRequest: true })` is an explicit, separately keyed escape
+override for a request the server never settles. It is available once
+`browser-config.json`'s `unsettled_request_escape_after_seconds` has elapsed
+since this device sent the request (default 43200, clamped to 3600–604800;
+keep it above the server's settlement deadline), or earlier when the note's
+`effectiveExpiry` is within a challenge period plus a margin. A receipt the
+server finalized installs instead. The override never abandons another tab's
+live key, and the archived journal still installs a later receipt. Show
+`snapshot().config.escape_override.warning` to the user; it is `null` on
+strict vaults, where no override exists. Escape gates contact the server only
+for a transmitted state; on Sepolia that read may prompt for the password.
+
+New 409 codes: `request_settlement_pending`, `transmitted_anchor_unconfirmed`,
+`transmitted_anchor_escape_unsafe`, `anchor_challenged`, `nullifier_challenged`,
+`receipt_journal_missing`, `receipt_response_missing`, `receipt_pending_install`,
+`request_archive_limit` and `withdrawal_submission_pending`. Vault reverts map to
+`unknown_root`, `challenged_nullifier`, `invalid_destination` and
+`vault_paused`. Refusals carry `error.data.escape_override_after` (milliseconds)
+when an override applies. `snapshot().config` adds `vault_revision`,
+`escape_override`, `unresolved_requests` (per request at the selected state:
+`client_request_id`, `kind`, `disposition`, `created_at`, `server_status`,
+`server_status_at`, `escape_override_after`; no proofs) and `last_settlement`
+(`charge_applied`, `charge_basis`, `settlement_reason`). Receipts are installed
+against the proof-bound billing quote, never re-validated against changed
+manifest price pins. A worst-case charge equal to the proven bound is valid.
+
+Challenge evidence is recorded only from a finalized
+`EscapeWithdrawalChallenged` log for the note and nullifier. A server reply such
+as `nullifier_used` is advisory. A challenged state is never escaped again; the
+wallet installs the server-signed successor (from the archived journal) and
+withdraws from that next state. A finalized receipt this browser holds no
+journal for (`receipt_journal_missing`) needs operator intervention. The runtime
+holds one selected note per origin, so exit or set aside a note on an older
+deployment before selecting a newly pinned one.
 
 ## Native ETH deployments
 

@@ -33,6 +33,7 @@
     "./withdrawal-recovery": "./sdk/services/zkapiWithdrawalRecovery.mjs",
     "./expiry-history": "./sdk/services/zkapiExpiryHistory.mjs",
     "./withdrawal-root": "./sdk/services/zkapiWithdrawalRoot.mjs",
+    "./request-archive": "./sdk/services/zkapiRequestArchive.mjs",
     "./gas": "./sdk/services/zkapiGas.mjs",
     "./contract-error": "./sdk/services/zkapiContractError.mjs",
     "./wallet-error": "./sdk/services/zkapiWalletError.mjs",

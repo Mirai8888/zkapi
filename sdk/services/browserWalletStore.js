@@ -1,6 +1,22 @@
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
+import {
+    REQUEST_JOURNAL_TYPE,
+    anchorArchiveCapacity,
+    buildRequestEvidenceRecord,
+    buildRequestJournalRecord,
+    feltKey,
+    isRequestArchiveRecord,
+    isUnresolved,
+    journalClientRequestId,
+    mergeRequestArchiveRecord,
+    requestJournalArchiveId,
+    terminalRequestArchiveToPrune
+} from './zkapiRequestArchive.mjs';
 
 const DB_NAME = 'zkapi-browser-wallet-v1';
+// Never bump: older builds must keep opening this shared same-origin database
+// (they are the legacy exit route for notes in an older immutable vault).
+// Request-archive records reuse the existing 'archives' store instead.
 const DB_VERSION = 3;
 const RUNTIME_STORE = 'runtime';
 const ARCHIVE_STORE = 'archives';
@@ -248,6 +264,123 @@ function pendingDepositRecords(runtime, deploymentId) {
     return [...records.values()];
 }
 
+function requestArchiveMap(archives) {
+    return new Map((archives || []).filter(isRequestArchiveRecord)
+        .map(record => [record.archiveId, record]));
+}
+
+function requestArchiveRecords(archive, deploymentId) {
+    return [...archive.values()]
+        .filter(record => !deploymentId || record.deploymentId === deploymentId)
+        .map(record => structuredClone(record));
+}
+
+function sameFeltValue(left, right) {
+    try {
+        return feltKey(left) === feltKey(right);
+    } catch {
+        return false;
+    }
+}
+
+function requestArchiveError(message, code, status = null) {
+    return Object.assign(new Error(message), { code, ...(status ? { status } : {}) });
+}
+
+/**
+ * Merge request-archive updates into an in-memory snapshot of the store.
+ * Throws on an identity conflict or when a new unresolved request would exceed
+ * its anchor's bound. Returns the ids that must be written.
+ */
+function mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity = true } = {}) {
+    const changed = new Set();
+    for (const update of updates) {
+        const previous = archive.get(update?.archiveId) || null;
+        if (!previous && enforceCapacity && update?.type === REQUEST_JOURNAL_TYPE && isUnresolved(update)) {
+            const capacity = anchorArchiveCapacity([...archive.values()], update);
+            if (!capacity.available) {
+                throw requestArchiveError(
+                    'Too many unsettled private requests are recorded for this balance. Wait for the server to settle them before starting another chat.',
+                    'request_archive_limit',
+                    409
+                );
+            }
+            for (const archiveId of capacity.evict) {
+                const evicted = mergeRequestArchiveRecord(archive.get(archiveId),
+                    { archiveId, disposition: 'superseded' }, now);
+                archive.set(archiveId, evicted);
+                changed.add(archiveId);
+            }
+        }
+        const merged = mergeRequestArchiveRecord(previous, update, now);
+        if (merged && merged !== previous) {
+            archive.set(merged.archiveId, merged);
+            changed.add(merged.archiveId);
+        }
+    }
+    return changed;
+}
+
+function writeRequestArchiveChanges(store, archive, changed) {
+    if (!changed.size) return;
+    for (const archiveId of changed) store.put(archive.get(archiveId));
+    const deployments = new Set([...changed].map(archiveId => archive.get(archiveId)?.deploymentId).filter(Boolean));
+    for (const deploymentId of deployments) {
+        for (const archiveId of terminalRequestArchiveToPrune([...archive.values()], deploymentId)) {
+            // Prune filters by request type and prefix, so note archives are untouched.
+            archive.delete(archiveId);
+            store.delete(archiveId);
+        }
+    }
+}
+
+/** Supersede every unresolved request record of a closed or sanitized note. */
+function supersedeNoteRequestArchive(archive, deploymentId, noteId, now) {
+    if (!deploymentId || noteId == null) return new Set();
+    const updates = [...archive.values()]
+        .filter(record => record.deploymentId === deploymentId && Number(record.noteId) === Number(noteId)
+            && isUnresolved(record))
+        .map(record => ({ archiveId: record.archiveId, disposition: 'superseded' }));
+    return mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity: false });
+}
+
+/**
+ * The archive record an existing transmitted journal needs before this write
+ * may drop it: null when the journal is kept, has no request identity (legacy),
+ * or the write installs a different note or a later anchor (a verified receipt).
+ */
+function journalDropArchiveId(current, next) {
+    const clientRequestId = journalClientRequestId(current?.journal);
+    if (!clientRequestId || !current?.deploymentId || current.state?.note_id == null
+        || current.state.current_anchor == null) return null;
+    if (journalClientRequestId(next?.journal) === clientRequestId) return null;
+    if (next?.state && (Number(next.state.note_id) !== Number(current.state.note_id)
+        || !sameFeltValue(next.state.current_anchor, current.state.current_anchor))) return null;
+    try {
+        return requestJournalArchiveId(current.deploymentId, current.state.note_id, clientRequestId);
+    } catch {
+        return null;
+    }
+}
+
+/** A durable request journal written by an older build becomes archive-covered on first read. */
+function migratedRuntimeJournal(runtime, archive) {
+    if (!runtime.deploymentId || !runtime.state || runtime.state.current_anchor == null
+        || runtime.journal?.nullifier == null || !journalClientRequestId(runtime.journal)) return null;
+    let record;
+    try {
+        record = buildRequestJournalRecord({
+            deploymentId: runtime.deploymentId,
+            state: runtime.state,
+            journal: runtime.journal,
+            source: 'migrated_runtime_journal'
+        });
+    } catch {
+        return null;
+    }
+    return archive.has(record.archiveId) ? null : record;
+}
+
 /** Project public rows without another fallible storage operation after commit. */
 export function projectBrowserDeposits(runtime, records, deploymentId, depositConfirmation = {}) {
     const history = depositRecordMap((records || []).filter(record => record.status === 'confirmed'));
@@ -288,8 +421,18 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
     for (const record of records) {
         mergeDepositRecord(history, depositRecord(record.state, record.deploymentId), depositStore);
     }
+    // Request-archive records carry no note state, so older builds running
+    // this same loop derive no deposit row from them.
     for (const archive of archives) {
         mergeDepositRecord(history, depositRecord(archive.state, archiveDeploymentId(archive)), depositStore);
+    }
+    const requestArchive = requestArchiveMap(archives);
+    // Lazy, cap-exempt migration: an in-flight journal from an older build
+    // becomes a transmitted-anchor record without touching the runtime slot.
+    const migrated = migratedRuntimeJournal(runtime, requestArchive);
+    if (migrated) {
+        requestArchive.set(migrated.archiveId, migrated);
+        transaction.objectStore(ARCHIVE_STORE).put(migrated);
     }
     await transactionDone(transaction);
     return {
@@ -297,30 +440,99 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
         deposits: projectBrowserDeposits(runtime, [...history.values()], deploymentId),
         withdrawals: records
             .filter(record => !deploymentId || record.deploymentId === deploymentId)
-            .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+            .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0)),
+        requestArchive: requestArchiveRecords(requestArchive, deploymentId)
     };
 }
 
 /**
- * Commit the entire private wallet snapshot in one IndexedDB write. The caller
- * must put a write-ahead journal here before transmitting a proved request and
- * clear it only in the same write that installs the verified next note state.
+ * Commit the entire private wallet snapshot in one IndexedDB write, together
+ * with any transmitted-request archive records. The caller must put a
+ * write-ahead journal and its archive record here before transmitting a proved
+ * request. This boundary enforces that a transmitted journal leaves the
+ * runtime only in the same write that installs a verified next note state
+ * (a later anchor or a different note) or records a non-pending archive
+ * disposition for it. Returns the runtime and, when the archive was read, the
+ * deployment's merged request records (no fallible read after commit).
  */
-export async function writeBrowserWallet(next, { depositConfirmation = null } = {}) {
+export async function commitBrowserWallet(next, { depositConfirmation = null, requestArchive = [] } = {}) {
+    const updates = (Array.isArray(requestArchive) ? requestArchive : []).filter(Boolean);
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [RUNTIME_STORE, DEPOSIT_STORE]);
+    const transaction = durableTransaction(database, [RUNTIME_STORE, DEPOSIT_STORE, ARCHIVE_STORE]);
     const value = normalizeRuntime({ ...next, updatedAt: Date.now() });
     const depositStore = transaction.objectStore(DEPOSIT_STORE);
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
     const [current, deposits] = await Promise.all([
         requestResult(transaction.objectStore(RUNTIME_STORE).get(RUNTIME_KEY)),
         requestResult(depositStore.getAll())
     ]);
+    const requiredArchiveId = journalDropArchiveId(normalizeRuntime(current), value);
+    let archive = null;
+    let changed = new Set();
+    // Validate before any put: a rejected write must leave every store unchanged.
+    try {
+        if (updates.length || requiredArchiveId) {
+            archive = requestArchiveMap(await requestResult(archiveStore.getAll()));
+            changed = mergeRequestArchiveUpdates(archive, updates, value.updatedAt);
+            const record = requiredArchiveId ? archive.get(requiredArchiveId) : null;
+            if (requiredArchiveId && (!record || record.disposition === 'pending')) {
+                throw requestArchiveError(
+                    'A transmitted request journal can only be cleared after the archive records its outcome.',
+                    'request_journal_unarchived'
+                );
+            }
+        }
+    } catch (error) {
+        try { transaction.abort(); } catch { /* Preserve the validation failure. */ }
+        throw error;
+    }
     const history = depositRecordMap(deposits);
     mergeDepositRecord(history, depositRecord(current?.state, current?.deploymentId), depositStore);
     mergeDepositRecord(history, depositRecord(value.state, value.deploymentId, depositConfirmation || {}), depositStore);
     transaction.objectStore(RUNTIME_STORE).put(value, RUNTIME_KEY);
+    if (archive) writeRequestArchiveChanges(archiveStore, archive, changed);
     await transactionDone(transaction);
-    return value;
+    return {
+        runtime: value,
+        requestArchive: archive ? requestArchiveRecords(archive, value.deploymentId) : null
+    };
+}
+
+/** Commit the wallet snapshot; see commitBrowserWallet for the journal invariant. */
+export async function writeBrowserWallet(next, options = {}) {
+    return (await commitBrowserWallet(next, options)).runtime;
+}
+
+/** Read the deployment's transmitted-request archive records. */
+export async function listBrowserRequestArchive(deploymentId = null) {
+    const database = await openDatabase();
+    const transaction = database.transaction(ARCHIVE_STORE, 'readonly');
+    const archives = await requestResult(transaction.objectStore(ARCHIVE_STORE).getAll());
+    await transactionDone(transaction);
+    return requestArchiveRecords(requestArchiveMap(archives), deploymentId);
+}
+
+/**
+ * Durably merge request-archive records or patches (observations, evidence,
+ * dispositions) without touching the runtime slot. Returns the merged records
+ * of the given deployment.
+ */
+export async function putBrowserRequestArchive(records, { deploymentId = null } = {}) {
+    const updates = (Array.isArray(records) ? records : [records]).filter(Boolean);
+    const database = await openDatabase();
+    const transaction = durableTransaction(database, ARCHIVE_STORE);
+    const store = transaction.objectStore(ARCHIVE_STORE);
+    const archive = requestArchiveMap(await requestResult(store.getAll()));
+    let changed;
+    try {
+        changed = mergeRequestArchiveUpdates(archive, updates, Date.now());
+    } catch (error) {
+        try { transaction.abort(); } catch { /* Preserve the validation failure. */ }
+        throw error;
+    }
+    writeRequestArchiveChanges(store, archive, changed);
+    await transactionDone(transaction);
+    return requestArchiveRecords(archive, deploymentId);
 }
 
 /**
@@ -393,6 +605,15 @@ export async function archiveBrowserWallet(reason = 'closed', expectedNoteId = n
             throw new Error('This private note has no matching confirmed expiry claim.');
         }
     }
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+    // A closed note's transmitted requests can never install again. Compact
+    // them so their proofs and rerandomization do not outlive the note.
+    const requestArchive = current.state
+        ? requestArchiveMap(await requestResult(archiveStore.getAll()))
+        : new Map();
+    const supersededRequests = current.state
+        ? supersedeNoteRequestArchive(requestArchive, current.deploymentId, current.state.note_id, Date.now())
+        : new Set();
     if (current.state) {
         transaction.objectStore(ARCHIVE_STORE).put({
             archiveId: `${current.deploymentId || 'deployment'}:${current.state.note_id}:${Date.now()}`,
@@ -417,6 +638,7 @@ export async function archiveBrowserWallet(reason = 'closed', expectedNoteId = n
         updatedAt: Date.now()
     });
     runtimeStore.put(next, RUNTIME_KEY);
+    writeRequestArchiveChanges(archiveStore, requestArchive, supersededRequests);
     await transactionDone(transaction);
     return next;
 }
@@ -1694,12 +1916,14 @@ export async function parkBrowserWithdrawal(record) {
  */
 export async function restoreBrowserWithdrawal(recordId, identity = {}, expectedRevision = null) {
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [RUNTIME_STORE, WITHDRAWAL_STORE]);
+    const transaction = durableTransaction(database, [RUNTIME_STORE, WITHDRAWAL_STORE, ARCHIVE_STORE]);
     const runtimeStore = transaction.objectStore(RUNTIME_STORE);
     const withdrawalStore = transaction.objectStore(WITHDRAWAL_STORE);
-    const [current, record] = await Promise.all([
+    const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+    const [current, record, archives] = await Promise.all([
         requestResult(runtimeStore.get(RUNTIME_KEY)).then(normalizeRuntime),
-        requestResult(withdrawalStore.get(recordId))
+        requestResult(withdrawalStore.get(recordId)),
+        requestResult(archiveStore.getAll())
     ]);
     if (!record?.state) {
         transaction.abort();
@@ -1782,6 +2006,30 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
         delete preparedWithdrawal.submissionOwner;
         delete preparedWithdrawal.submissionStartedAt;
     }
+    // Only a finalized EscapeWithdrawalChallenged log for this exact note and
+    // nullifier (verified by the reconciler) becomes challenge evidence. A
+    // reorged-out start or a canceled replacement carries none.
+    const requestArchive = requestArchiveMap(archives);
+    let evidenceChanges = new Set();
+    const challenge = record.challengeEvidence;
+    if (record.mode === 'escape' && challenge && record.state.current_anchor != null
+        && Number(challenge.noteId) === Number(record.noteId)
+        && challenge.nullifier != null && record.withdrawalNullifier != null
+        && sameFeltValue(challenge.nullifier, record.withdrawalNullifier)) {
+        try {
+            evidenceChanges = mergeRequestArchiveUpdates(requestArchive, [buildRequestEvidenceRecord({
+                deploymentId: record.deploymentId,
+                noteId: record.noteId,
+                anchor: record.state.current_anchor,
+                nullifier: challenge.nullifier,
+                source: 'escape_challenged',
+                evidence: challenge
+            })], Date.now(), { enforceCapacity: false });
+        } catch (error) {
+            transaction.abort();
+            throw error;
+        }
+    }
     const next = normalizeRuntime({
         deploymentId: record.deploymentId,
         state: record.state,
@@ -1792,6 +2040,7 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
     });
     runtimeStore.put(next, RUNTIME_KEY);
     withdrawalStore.delete(recordId);
+    writeRequestArchiveChanges(archiveStore, requestArchive, evidenceChanges);
     await transactionDone(transaction);
     return next;
 }
@@ -1803,7 +2052,8 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
     expectedFinalizeTransactionHash = undefined
 } = {}) {
     const database = await openDatabase();
-    const transaction = durableTransaction(database, [WITHDRAWAL_STORE, DEPOSIT_STORE]);
+    const transaction = durableTransaction(database,
+        sanitize ? [WITHDRAWAL_STORE, DEPOSIT_STORE, ARCHIVE_STORE] : [WITHDRAWAL_STORE, DEPOSIT_STORE]);
     const store = transaction.objectStore(WITHDRAWAL_STORE);
     const current = await requestResult(store.get(recordId));
     if (!current) {
@@ -1838,7 +2088,17 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         // Preserve the original deposit before finality removes the last copy
         // of a legacy note's private recovery state.
         const depositStore = transaction.objectStore(DEPOSIT_STORE);
-        const deposits = await requestResult(depositStore.getAll());
+        const archiveStore = transaction.objectStore(ARCHIVE_STORE);
+        const [deposits, archives] = await Promise.all([
+            requestResult(depositStore.getAll()),
+            requestResult(archiveStore.getAll())
+        ]);
+        if (next.phase === 'closed') {
+            // A finalized close retires every transmitted request of this note.
+            const requestArchive = requestArchiveMap(archives);
+            writeRequestArchiveChanges(archiveStore, requestArchive, supersedeNoteRequestArchive(
+                requestArchive, current.deploymentId, current.noteId ?? current.state?.note_id, Date.now()));
+        }
         mergeDepositRecord(depositRecordMap(deposits),
             depositRecord(current.state, current.deploymentId), depositStore);
         if (next.phase === 'closed') {

@@ -3,9 +3,31 @@ const CONTRACT_ERRORS = Object.freeze({
         code: 'invalid_proof',
         message: 'The vault rejected the withdrawal proof. Refresh the page and prepare the withdrawal again.'
     },
+    // StaleRoot(): on a vault with root history the proof's root is still
+    // known and only the Merkle siblings are stale against the live root.
     '0x607447de': {
         code: 'stale_root',
-        message: 'The vault changed while the withdrawal was being prepared. The Merkle path and proof must be refreshed.'
+        message: 'The vault changed while the withdrawal was being prepared. The Merkle path (and, on older vaults, the proof) must be refreshed.'
+    },
+    // UnknownRoot(): the proof's root left the vault's recent-root window.
+    '0x8c520116': {
+        code: 'unknown_root',
+        message: 'The vault no longer accepts this withdrawal proof’s Merkle root. The proof must be generated again.'
+    },
+    // ChallengedNullifier(): an escape at this state was already challenged.
+    '0x2845df70': {
+        code: 'challenged_nullifier',
+        message: 'An escape at this balance state was already challenged, so it cannot escape again. Withdraw from the server-signed next state instead.'
+    },
+    // InvalidDestination(): a zero payout address.
+    '0xac6b05f5': {
+        code: 'invalid_destination',
+        message: 'The vault rejected the withdrawal address.'
+    },
+    // Paused(): the owner paused the vault.
+    '0x9e87fac8': {
+        code: 'vault_paused',
+        message: 'The vault is paused by its owner. Withdrawals resume when it is unpaused.'
     },
     '0x947e59c5': {
         code: 'replayed_nullifier',

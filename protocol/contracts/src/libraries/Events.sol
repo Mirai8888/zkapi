@@ -28,5 +28,21 @@ abstract contract Events {
 
     event ProofAdapterSet(address indexed newAdapter);
 
+    /// @notice Emitted when a scheduled treasury change takes effect.
     event TreasurySet(address indexed newTreasury);
+
+    /// @notice `readyAt` is on the vault's active clock (wall clock minus all paused time).
+    event TreasuryChangeScheduled(address indexed newTreasury, uint64 readyAt);
+
+    event TreasuryChangeCancelled(address indexed cancelledTreasury);
+
+    /// @notice A treasury push failed; `amount` gwei units were added to treasuryArrears.
+    event TreasuryPaymentDeferred(address indexed treasury, uint128 amount);
+
+    event TreasuryArrearsPaid(address indexed treasury, uint128 amount);
+
+    /// @dev Same signatures as OpenZeppelin Pausable for monitoring compatibility.
+    event Paused(address account);
+
+    event Unpaused(address account);
 }

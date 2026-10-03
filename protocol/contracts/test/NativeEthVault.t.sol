@@ -5,6 +5,7 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
+import {Events} from "../src/libraries/Events.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
 
 contract NativeProofFixture is IZkApiProofAdapter {
@@ -131,20 +132,32 @@ contract NativeEthVaultTest is Test {
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
     }
 
-    function test_rejectedTreasuryPayoutRollsBackUserPayout() public {
+    function test_rejectedTreasuryPayoutAccruesWithoutBlockingUser() public {
         deposit();
-        vault.setTreasury(address(new RejectNativePayout()));
-        uint256 root = vault.currentRoot();
+        address rejecting = address(new RejectNativePayout());
+        vault.setTreasury(rejecting);
+        vm.warp(block.timestamp + vault.treasuryChangeDelay());
+        vault.acceptTreasury();
         uint256 userBalance = user.balance;
         Types.WithdrawalPublicInputs memory inputs = withdrawal(user, true);
-        vm.expectRevert(Errors.NativeTransferFailed.selector);
+        vm.expectEmit(address(vault));
+        emit Events.TreasuryPaymentDeferred(rejecting, 300_000);
         vault.mutualClose(inputs, "", siblings);
-        assertEq(user.balance, userBalance);
-        assertEq(vault.currentRoot(), root);
-        assertEq(address(vault).balance, uint256(UNITS) * 1 gwei);
-        assertFalse(vault.usedNullifiers(99));
+        assertEq(user.balance - userBalance, 700_000 gwei);
+        assertEq(vault.treasuryArrears(), 300_000);
+        assertEq(address(vault).balance, 300_000 gwei);
+        assertTrue(vault.usedNullifiers(99));
         (,,, Types.NoteStatus status) = vault.notes(0);
-        assertEq(uint256(status), uint256(Types.NoteStatus.Active));
+        assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
+        vm.expectRevert(Errors.NativeTransferFailed.selector);
+        vault.withdrawTreasuryArrears();
+        vault.setTreasury(treasury);
+        vm.warp(block.timestamp + vault.treasuryChangeDelay());
+        vault.acceptTreasury();
+        vault.withdrawTreasuryArrears();
+        assertEq(treasury.balance, 300_000 gwei);
+        assertEq(vault.treasuryArrears(), 0);
+        assertEq(address(vault).balance, 0);
     }
 
     function test_rejectedEscapePayoutPreservesPendingWithdrawal() public {

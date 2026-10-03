@@ -36,6 +36,9 @@ struct Fixtures {
     escape_after_deposit: Fixture,
     escape_after_close: Fixture,
     close_b: Fixture,
+    close_a_after_deposit: Fixture,
+    escape_after_deposit_other_destination: Fixture,
+    escape_next_after_deposit: Fixture,
 }
 
 struct Generator {
@@ -67,6 +70,19 @@ impl Generator {
             DEPOSIT,
             self.expiry,
         )
+    }
+
+    /// The operator's state signature over the note's balance commitment and anchor.
+    fn sign_state(&self, note: &Note) -> SchnorrSignature {
+        let commitment = balance_commitment(note.balance, &note.blinding, &self.leaf(note));
+        self.state_signer.sign(&core::state_message(
+            2,
+            31_337,
+            &self.vault,
+            &commitment.x,
+            &commitment.y,
+            &note.anchor,
+        ))
     }
 
     fn request(&self, note: &Note, siblings: [Felt252; MERKLE_DEPTH]) -> Result<Fixture> {
@@ -123,6 +139,16 @@ impl Generator {
         siblings: [Felt252; MERKLE_DEPTH],
         clearance: bool,
     ) -> Result<Fixture> {
+        self.withdrawal_to(note, siblings, clearance, [0x11; 20])
+    }
+
+    fn withdrawal_to(
+        &self,
+        note: &Note,
+        siblings: [Felt252; MERKLE_DEPTH],
+        clearance: bool,
+        destination: [u8; 20],
+    ) -> Result<Fixture> {
         let key = self.state_signer.public_key();
         let clear_key = self.clearance_signer.public_key();
         let nullifier = core::nullifier(&note.secret, &note.anchor);
@@ -137,7 +163,7 @@ impl Generator {
             clearance_signing_key_y: clear_key.y,
             note_id: note.id,
             final_balance: note.balance,
-            destination: [0x11; 20],
+            destination,
             withdrawal_nullifier: nullifier,
             has_clearance: clearance,
             withdrawal_tag: Felt252::ZERO,
@@ -214,15 +240,17 @@ fn main() -> Result<()> {
         anchor: Felt252::from_u64(12_345),
         signature: None,
     };
-    let commitment = balance_commitment(a.balance, &a.blinding, &generator.leaf(&a));
-    a.signature = Some(generator.state_signer.sign(&core::state_message(
-        2,
-        31_337,
-        &generator.vault,
-        &commitment.x,
-        &commitment.y,
-        &a.anchor,
-    )));
+    a.signature = Some(generator.sign_state(&a));
+    // The successor state the operator signs when it settles A's request: a lower
+    // balance under a fresh anchor, so its nullifier is one no request has spent.
+    let mut a_next = Note {
+        balance: 850_000,
+        blinding: Felt252::from_u64(17),
+        anchor: Felt252::from_u64(67_890),
+        signature: None,
+        ..a.clone()
+    };
+    a_next.signature = Some(generator.sign_state(&a_next));
     let b = Note {
         id: 1,
         secret: Felt252::from_u64(43),
@@ -251,6 +279,13 @@ fn main() -> Result<()> {
         escape_after_deposit: generator.withdrawal(&a, a_with_b, false)?,
         escape_after_close: generator.withdrawal(&a, empty, false)?,
         close_b: generator.withdrawal(&b, b_with_a, true)?,
+        // Clearance-backed close of A's challenged anchor at the two-note root.
+        close_a_after_deposit: generator.withdrawal(&a, a_with_b, true)?,
+        // A's challenged anchor escaping to another destination.
+        escape_after_deposit_other_destination: generator
+            .withdrawal_to(&a, a_with_b, false, [0x22; 20])?,
+        // The honest exit after a challenge: escape from the signed successor state.
+        escape_next_after_deposit: generator.withdrawal(&a_next, a_with_b, false)?,
     };
     println!("{}", serde_json::to_string_pretty(&fixtures)?);
     Ok(())

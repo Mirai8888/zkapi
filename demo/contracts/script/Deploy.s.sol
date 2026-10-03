@@ -13,7 +13,11 @@ import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.
 ///         $OUTPUT_PATH. Add proof hashes and oracle pins separately when
 ///         preparing the SDK's public deployment manifest.
 /// @dev    Reads these environment variables:
-///           PRIVATE_KEY – deployer key (becomes vault owner).
+///           PRIVATE_KEY – deployer key (also the vault owner on local chains
+///                         unless OWNER is set).
+///           OWNER       – vault owner (pause/unpause, timelocked treasury changes).
+///                         Required except on local chains (31337/1337); use a
+///                         multisig or timelock contract.
 ///           TREASURY    – operator payout address.
 ///           OUTPUT_PATH – absolute path for the deployment manifest JSON.
 ///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key.
@@ -29,6 +33,11 @@ contract DeployScript is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         string memory outputPath = vm.envString("OUTPUT_PATH");
         address deployer = vm.addr(deployerKey);
+        // The owner can pause every exit and schedule treasury changes, so public
+        // deployments must name it explicitly instead of defaulting to the deployer.
+        address owner =
+            (block.chainid == 31337 || block.chainid == 1337) ? vm.envOr("OWNER", deployer) : vm.envAddress("OWNER");
+        require(owner != address(0), "OWNER must be nonzero");
         uint256 stateKeyX = vm.envUint("STATE_SIGNING_KEY_X");
         uint256 stateKeyY = vm.envUint("STATE_SIGNING_KEY_Y");
         uint256 clearanceKeyX = vm.envUint("CLEARANCE_SIGNING_KEY_X");
@@ -67,7 +76,7 @@ contract DeployScript is Script {
             stateKeyY,
             clearanceKeyX,
             clearanceKeyY,
-            deployer
+            owner
         );
 
         vm.stopBroadcast();
@@ -76,7 +85,7 @@ contract DeployScript is Script {
         vm.serializeUint(manifest, "chainId", block.chainid);
         vm.serializeUint(manifest, "protocolVersion", 2);
         vm.serializeString(manifest, "circuitId", "zkapi-v2-note-bound-v1");
-        vm.serializeAddress(manifest, "owner", deployer);
+        vm.serializeAddress(manifest, "owner", owner);
         vm.serializeAddress(manifest, "vault", address(vault));
         vm.serializeAddress(manifest, "billingToken", vault.billingToken());
         vm.serializeAddress(manifest, "proofAdapter", address(proofAdapter));
@@ -87,6 +96,8 @@ contract DeployScript is Script {
         vm.serializeString(manifest, "billing_unit", "gwei");
         vm.serializeUint(manifest, "nativeAssetWeiPerUnit", vault.nativeAssetWeiPerUnit());
         vm.serializeUint(manifest, "challengePeriod", challengePeriod);
+        vm.serializeUint(manifest, "treasuryChangeDelay", vault.treasuryChangeDelay());
+        vm.serializeUint(manifest, "rootHistoryWindow", vault.ROOT_HISTORY_WINDOW());
         vm.serializeUint(manifest, "stateSigningKeyX", stateKeyX);
         vm.serializeUint(manifest, "stateSigningKeyY", stateKeyY);
         vm.serializeUint(manifest, "clearanceSigningKeyX", clearanceKeyX);
@@ -96,6 +107,10 @@ contract DeployScript is Script {
 
         console2.log("vault       ", address(vault));
         console2.log("treasury    ", treasury);
+        console2.log("owner       ", owner);
+        if (block.chainid == 1 && owner.code.length == 0) {
+            console2.log("WARNING: OWNER has no code; use a multisig or timelock contract on mainnet");
+        }
         console2.log("proofAdapter", address(proofAdapter));
         console2.log("noteTtl     ", uint256(NOTE_TTL));
         console2.log("manifest    ", outputPath);

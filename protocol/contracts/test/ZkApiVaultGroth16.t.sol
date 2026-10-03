@@ -107,6 +107,125 @@ contract ZkApiVaultGroth16Test is Test {
         assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
     }
 
+    function test_realReplayOfChallengedEscapeReverts() public {
+        _depositA();
+        (Types.RequestPublicInputs memory request, bytes memory requestProof) = _request("request_before_deposit");
+        _depositB();
+        uint256 restoredRoot = vault.currentRoot();
+        (Types.WithdrawalPublicInputs memory withdrawal, bytes memory withdrawalProof) =
+            _withdrawal("escape_after_deposit");
+        uint256[32] memory siblings = _siblingsWithOtherLeaf(1);
+        vm.prank(USER);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+        _challenge(request, requestProof, siblings, restoredRoot);
+
+        // Days later the proof root is still current, so the public calldata is otherwise valid.
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        assertEq(vault.currentRoot(), withdrawal.activeRoot);
+        vm.prank(address(0xBAD));
+        vm.expectRevert(Errors.ChallengedNullifier.selector);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+        vm.prank(USER);
+        vm.expectRevert(Errors.ChallengedNullifier.selector);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+        // A genuine proof of the same state to another destination is refused as well.
+        (Types.WithdrawalPublicInputs memory redirected, bytes memory redirectedProof) =
+            _withdrawal("escape_after_deposit_other_destination");
+        assertEq(redirected.withdrawalNullifier, withdrawal.withdrawalNullifier);
+        assertNotEq(redirected.destination, withdrawal.destination);
+        adapter.assertValidWithdrawal(redirected, redirectedProof);
+        vm.prank(USER);
+        vm.expectRevert(Errors.ChallengedNullifier.selector);
+        vault.initiateEscapeWithdrawal(redirected, redirectedProof, siblings);
+
+        // The replay cannot push the note back to pending ahead of a clearance-backed close.
+        (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a_after_deposit");
+        vm.prank(USER);
+        vault.mutualClose(close, closeProof, siblings);
+        assertEq(USER.balance, uint256(close.finalBalance) * 1 gwei);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - close.finalBalance) * 1 gwei);
+    }
+
+    /// Honest recovery: after a stale escape is defeated, the note exits from the
+    /// successor state the operator signed when it settled the archived request.
+    function test_realChallengedEscapeThenWithdrawalAtNextAnchorSucceeds() public {
+        _depositA();
+        (Types.RequestPublicInputs memory request, bytes memory requestProof) = _request("request_before_deposit");
+        _depositB();
+        uint256 restoredRoot = vault.currentRoot();
+        (Types.WithdrawalPublicInputs memory stale, bytes memory staleProof) = _withdrawal("escape_after_deposit");
+        uint256[32] memory siblings = _siblingsWithOtherLeaf(1);
+        vault.initiateEscapeWithdrawal(stale, staleProof, siblings);
+        _challenge(request, requestProof, siblings, restoredRoot);
+
+        (Types.WithdrawalPublicInputs memory next, bytes memory nextProof) = _withdrawal("escape_next_after_deposit");
+        assertNotEq(next.withdrawalNullifier, stale.withdrawalNullifier);
+        assertLt(next.finalBalance, stale.finalBalance);
+        assertFalse(vault.challengedNullifiers(next.withdrawalNullifier));
+        vault.initiateEscapeWithdrawal(next, nextProof, siblings);
+        assertTrue(vault.usedNullifiers(next.withdrawalNullifier));
+        // The only archived request spent the old anchor; it cannot defeat this escape.
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        vm.warp(deadline - 1);
+        vm.expectRevert(Errors.ReplayedNullifier.selector);
+        vault.challengeEscapeWithdrawal(0, request, requestProof, emptySiblings);
+        vm.warp(deadline);
+        vault.finalizeEscapeWithdrawal(0);
+        assertEq(USER.balance, uint256(next.finalBalance) * 1 gwei);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - next.finalBalance) * 1 gwei);
+        assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
+        (,,, Types.NoteStatus status) = vault.notes(0);
+        assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
+    }
+
+    function test_realChallengeClearsNullifierThenMutualCloseAtSameAnchor() public {
+        _depositA();
+        (Types.RequestPublicInputs memory request, bytes memory requestProof) = _request("request_before_deposit");
+        _depositB();
+        uint256 restoredRoot = vault.currentRoot();
+        (Types.WithdrawalPublicInputs memory withdrawal, bytes memory withdrawalProof) =
+            _withdrawal("escape_after_deposit");
+        uint256[32] memory siblings = _siblingsWithOtherLeaf(1);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+        _challenge(request, requestProof, siblings, restoredRoot);
+        // The operator's clearance for the challenged anchor completes the exit.
+        (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a_after_deposit");
+        assertEq(close.withdrawalNullifier, withdrawal.withdrawalNullifier);
+        assertTrue(close.hasClearance);
+        vault.mutualClose(close, closeProof, siblings);
+        assertTrue(vault.usedNullifiers(close.withdrawalNullifier));
+        assertEq(USER.balance, uint256(close.finalBalance) * 1 gwei);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - close.finalBalance) * 1 gwei);
+        (,,, Types.NoteStatus status) = vault.notes(0);
+        assertEq(uint256(status), uint256(Types.NoteStatus.Closed));
+    }
+
+    function test_realEscapeAcceptsRecentProofRootWithLiveSiblings() public {
+        _depositA();
+        (Types.RequestPublicInputs memory request, bytes memory requestProof) = _request("request_before_deposit");
+        // escape_after_close was proven against the root holding only note A.
+        (Types.WithdrawalPublicInputs memory withdrawal, bytes memory withdrawalProof) =
+            _withdrawal("escape_after_close");
+        assertEq(withdrawal.activeRoot, vault.currentRoot());
+        _depositB();
+        uint256 restoredRoot = vault.currentRoot();
+        assertNotEq(withdrawal.activeRoot, restoredRoot);
+        uint256[32] memory siblings = _siblingsWithOtherLeaf(1);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+        _challenge(request, requestProof, siblings, restoredRoot);
+    }
+
+    function test_realEscapeRejectsProofRootOutsideHistoryWindow() public {
+        _depositA();
+        (Types.WithdrawalPublicInputs memory withdrawal, bytes memory withdrawalProof) =
+            _withdrawal("escape_after_close");
+        _depositB();
+        vm.warp(block.timestamp + vault.ROOT_HISTORY_WINDOW() + 1);
+        uint256[32] memory siblings = _siblingsWithOtherLeaf(1);
+        vm.expectRevert(Errors.UnknownRoot.selector);
+        vault.initiateEscapeWithdrawal(withdrawal, withdrawalProof, siblings);
+    }
+
     function _depositA() private {
         bytes32 registration = vm.parseJsonBytes32(fixtures, ".note_a_registration");
         vm.prank(USER);
@@ -159,7 +278,8 @@ contract ZkApiVaultGroth16Test is Test {
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         (bool exists,,,,,) = vault.pendingWithdrawals(0);
         assertFalse(exists);
-        assertTrue(vault.usedNullifiers(request.requestNullifier));
+        assertFalse(vault.usedNullifiers(request.requestNullifier));
+        assertTrue(vault.challengedNullifiers(request.requestNullifier));
         vm.warp(deadline);
         vm.expectRevert(Errors.NotPendingWithdrawal.selector);
         vault.finalizeEscapeWithdrawal(0);

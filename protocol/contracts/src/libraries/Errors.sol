@@ -8,11 +8,20 @@ library Errors {
     /// @notice The supplied proof did not verify.
     error InvalidProof();
 
-    /// @notice The Merkle root provided is not the current active root.
+    /// @notice The Merkle siblings do not reproduce the current root.
     error StaleRoot();
+
+    /// @notice A withdrawal proof's activeRoot is neither current nor retired within ROOT_HISTORY_WINDOW.
+    error UnknownRoot();
 
     /// @notice The nullifier has already been consumed.
     error ReplayedNullifier();
+
+    /// @notice An escape at this nullifier was defeated by a challenge; exit from the successor state.
+    error ChallengedNullifier();
+
+    /// @notice The withdrawal destination is the zero address.
+    error InvalidDestination();
 
     /// @notice The note is not in Active status.
     error NoteNotActive();
@@ -55,6 +64,15 @@ library Errors {
 
     /// @notice The contract is paused.
     error Paused();
+
+    /// @notice The contract is not paused.
+    error NotPaused();
+
+    /// @notice No treasury change is scheduled.
+    error NoPendingTreasuryChange();
+
+    /// @notice The scheduled treasury change is still inside its timelock.
+    error TreasuryChangeNotReady();
 
     /// @notice The caller is not authorized for this operation.
     error Unauthorized();

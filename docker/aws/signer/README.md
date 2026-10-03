@@ -3,51 +3,268 @@
 This internal JSON-RPC sidecar supplies `eth_sendTransaction` to
 `zkapi-challenged`. It signs only canonical `challengeEscapeWithdrawal` calls
 for one configured vault and explicitly configured chain (Mainnet 1 or
-Sepolia 11155111), from its dedicated key, with
-zero ETH value. It decodes the complete ABI, checks the proof's deployment,
-simulates the call again, and checks current gas and fee bounds before signing
-with ethers. It does not expose generic signing or raw-transaction forwarding.
+Sepolia 11155111), from its dedicated key, with zero ETH value. It decodes the
+complete ABI, checks the proof's deployment, simulates the call again, and
+checks the gas, fee and balance bounds before signing an EIP-1559 (type 2)
+transaction with ethers. It does not expose generic signing or raw-transaction
+forwarding.
 
-Required environment, supplied only to this container:
+## Configuration
+
+Copy [`../signer.env.example`](../signer.env.example) to `/etc/zkapi/signer.env`
+(root-owned, mode `0600`). Only the signer container receives this file. Wei and
+gas values are positive decimal integers: hex, signs, exponents, whitespace and
+leading zeros are refused, and an empty value means the default.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ZKAPI_CHALLENGE_PRIVATE_KEY` | required | Dedicated, funded sender key for this deployment. |
+| `ZKAPI_CHALLENGE_RPC_URL` | required | Upstream RPC for the chain: HTTPS, or HTTP on loopback only. |
+| `ZKAPI_CHALLENGE_CHAIN_ID` | required | Canonical `1` or `11155111`; no default or fallback. |
+| `ZKAPI_CHALLENGE_VAULT` | required | The vault this signer may challenge on. |
+| `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | required on chain 1; 10 gwei on Sepolia | Fee cap: the highest `maxFeePerGas` the signer signs, and the bid when the caller proposes no fees. |
+| `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | min(1 gwei, tip cap) | Tip of a bid made without proposed fees. |
+| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | min(fee cap, 10 x default tip) | Tip cap: the highest `maxPriorityFeePerGas` the signer signs. At most the fee cap. |
+| `ZKAPI_CHALLENGE_FEE_CEILING_WEI` | 10,000 gwei; at most 1,000,000 gwei | Typo guard: the fee cap must not exceed it. |
+| `ZKAPI_CHALLENGE_MAX_GAS` | 12,000,000; at most 16,777,216 | Gas limit cap. |
+| `ZKAPI_CHALLENGE_LISTEN_HOST`, `ZKAPI_CHALLENGE_PORT` | `127.0.0.1`, `8547` | Bind address. Compose sets the host to `0.0.0.0` on its private backend network and publishes no signer port. |
+| `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` | removed | Startup refuses while it is present, even when empty, because its meaning changed. |
+
+**Mainnet rule:** with `ZKAPI_CHALLENGE_CHAIN_ID=1` the signer refuses to start
+unless `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` is set. Only Sepolia has a default
+cap, which status and the startup line report as `fee_cap_source: "default"`.
+Use a fresh exclusive sender for each network and deployment. Daemon
+chain/vault, signer chain/vault, decoded proof and upstream chain must all
+agree.
+
+Never proxy this service to the public internet. `GET /health` returns 200 only
+while the upstream reports the configured chain, with the sender, vault and
+static fee policy; otherwise 503. Use its sender as the challenge daemon's
+`--sender`, and point that daemon's RPC URL at `http://signer:8547`. At startup
+the signer prints one JSON line with `fee_model: "eip1559"`, the effective
+policy, the balance, the latest base fee and any warnings (decimal wei). It
+refuses to start when the upstream is unreachable, reports another chain or
+returns a block without a base fee; balance and fee warnings do not block
+startup.
+
+## Fee model
+
+Every transaction is type 2. The chain charges `min(maxFeePerGas, baseFee +
+maxPriorityFeePerGas)` per gas, so `maxFeePerGas` is the most it can ever pay.
+The caller may propose both `maxFeePerGas` and `maxPriorityFeePerGas`, or
+neither:
+
+- with neither (a challenger that predates fee proposals), the signer bids
+  the fee cap with the default tip;
+- with both, the signer signs exactly those values if `0 < tip <= maxFeePerGas
+  <= fee cap` and `tip <= tip cap`; otherwise it refuses with
+  `fee_out_of_bounds` and calls nothing upstream.
+
+The upgraded `zkapi-challenged` always proposes both. Its own caps
+(`ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` and
+`ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` in `challenge.env`) must not
+exceed this signer's. The default tip cap is deliberately a small multiple of
+the default tip, so a caller on the backend network cannot make every challenge
+pay the whole cap as tip unless the operator raises it.
+
+Choose the fee cap at or above the highest base fee the deployment must survive
+for a whole challenge window times 1.125, plus the tip you expect to pay: the
+next block's base fee can be 12.5% higher than the latest, and a bid whose cap
+only matches the base fee leaves builders no tip. The signer refuses to sign
+while the latest base fee exceeds the transaction's `maxFeePerGas`. Status warns
+before that, when `baseFee x 1.125 + default tip > fee cap`.
+
+There is deliberately no aggregate spending budget beyond the sender balance.
+The signer is stateless: each transaction is bounded by gas limit x
+`maxFeePerGas` (at most `MAX_GAS` x fee cap), and the total only by what the
+sender holds. Fund it to the target below rather than far beyond it.
+
+## Funding
+
+Pools reserve gas limit x `maxFeePerGas` for each pending transaction before
+any fee is paid, and geth sums the cost of all of a sender's pending
+transactions. The signer checks each transaction against gas limit x its
+`maxFeePerGas` before signing. Fund the sender with at least:
 
 ```text
-ZKAPI_CHALLENGE_PRIVATE_KEY=<dedicated funded key for this deployment>
-ZKAPI_CHALLENGE_RPC_URL=https://<upstream RPC for the selected chain>
-ZKAPI_CHALLENGE_CHAIN_ID=11155111
-ZKAPI_CHALLENGE_VAULT=0x<fresh vault>
+(N + K) x gasLimit x feeCap
 ```
 
-`ZKAPI_CHALLENGE_CHAIN_ID` is required; only canonical `1` and `11155111` are
-accepted. There is no default or fallback. Use a fresh exclusive sender for
-each network and deployment. Daemon chain/vault, signer chain/vault, decoded
-proof and upstream chain must all agree.
+`N` is the number of challenges that may be pending at once, and `K` a budget of
+reverted attempts. A challenge that reverts still pays for its gas, for example
+when an unrelated deposit changes the vault root after the simulation, and the
+daemon then retries. A real Groth16 challenge measured 6,278,618 gas; with the
+daemon's 20% buffer its gas limit is about 7.53M: 0.75 ETH per challenge at a
+100 gwei cap and 2.26 ETH at 300 gwei. Re-measure after redeploying the vault.
+`zkapi_signerStatus.required_balance` is `MAX_GAS` x fee cap, a conservative
+figure for one challenge. Multiply it for concurrency and the retry budget.
 
-Bind options are `ZKAPI_CHALLENGE_LISTEN_HOST` (default `127.0.0.1`) and
-`ZKAPI_CHALLENGE_PORT` (default `8547`). Compose sets the host to `0.0.0.0`
-on its private backend network and publishes no signer port. Never proxy this
-service to the public internet. `GET /health` checks the upstream chain and
-returns only public sender/vault metadata. Use its sender as the challenge
-daemon's `--sender`; point that daemon's RPC URL at `http://signer:8547`.
+## JSON-RPC interface
 
-The default `ZKAPI_CHALLENGE_MAX_GAS` is 12,000,000 (hard ceiling 16,777,216).
-`ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` defaults to 10,000,000,000 (10 gwei; hard
-ceiling 100 gwei). The same caps apply on both networks. Before Mainnet funding,
-choose explicit caps and a bounded dedicated account balance; maximum authorized
-fee is gas limit multiplied by gas price. Calls exceeding a bound remain in the daemon's durable retry
-queue. Transactions are legacy EIP-155 transactions with the current upstream
-gas price; the signer does not autonomously increase fees or replace a pending
-transaction. Monitor the dedicated sender's gas balance, stuck transactions,
-and daemon retry/deadline logs.
+`eth_sendTransaction [{from, to, data, gas, nonce, maxFeePerGas?,
+maxPriorityFeePerGas?}]` takes canonical hex quantities. `value` (only `0x0`)
+and `chainId` (only the configured chain) are also accepted. `gasPrice`, `type`,
+`accessList`, `authorizationList`, `input` and blob fields are refused. The
+caller's nonce is always used; the signer never allocates one. Sends are
+serialized. The result is the transaction hash, keccak256 of the signed raw
+transaction. Errors have the form `{code, message, data: {reason, ...}}`, with
+wei values as hex quantities:
+
+| Code | `data.reason` | Other `data` | Meaning |
+| --- | --- | --- | --- |
+| -32602 | `fee_out_of_bounds` | `max_fee_per_gas`, `max_priority_fee_per_gas` (the configured caps) | Fee fields not both-or-neither, or outside the bounds above. |
+| -32602 | `gas_limit_exceeds_cap` | `max_gas` | Gas limit above `ZKAPI_CHALLENGE_MAX_GAS`. |
+| -32602 | `gas_estimate_exceeds_limit` | `estimate` | A fresh estimate exceeds the requested gas limit. |
+| -32602 | none | none | Any other authorization failure; the message is a fixed string. |
+| -32003 | `base_fee_above_max_fee` | `base_fee_per_gas`, `max_fee_per_gas` | The latest base fee exceeds this transaction's `maxFeePerGas`. Retry the same nonce later or with a higher bid. |
+| -32003 | `insufficient_balance` | `balance`, `required_balance` | The balance is below gas limit x `maxFeePerGas`. Fund the sender. |
+| -32000 | `upstream_unavailable`, `upstream_rejected`, `upstream_chain_mismatch`, `base_fee_unavailable`, `simulation_failed` | none | Upstream or simulation failure. Transient. |
+| -32603 | none | none | Signer self-check failed or an internal error. |
+| -32000 | `broadcast_ambiguous` | `transaction_hash` | The broadcast was attempted and its outcome is unknown. |
+
+Every error except `broadcast_ambiguous` is returned before
+`eth_sendRawTransaction` is attempted, so nothing was broadcast.
+`broadcast_ambiguous` always carries the candidate hash: keep every candidate
+hash for the nonce until the nonce is consumed, and look them up before sending
+a different payload on it. A transport failure or timeout between the daemon
+and the signer must also be treated as possibly broadcast. Signing is
+deterministic, so re-sending an identical request is idempotent: an "already
+known" answer from the pool returns the same hash as success.
+`simulation_failed` covers every upstream error from `eth_call` or
+`eth_estimateGas`, including provider rate limits, so it is transient and never
+proves the evidence invalid. Each upstream call times out after 8 seconds, and a
+send waits on at most six sequential upstream round trips (the base-fee and
+balance reads run in parallel), about 48 seconds at worst. Give the daemon an
+`eth_sendTransaction` timeout of at least 90 seconds.
+
+`zkapi_signerStatus []` returns `{chain_id, sender, vault, transaction_type:
+"0x2", fee_cap_source, max_fee_per_gas, priority_fee_per_gas,
+max_priority_fee_per_gas, fee_ceiling, max_gas, required_balance, block_number,
+base_fee_per_gas, balance, warnings}`. Wei values are hex quantities that can
+exceed 64 bits (parse them as u128). `warnings` lists:
+
+- `base_fee_above_cap`: the latest base fee exceeds the fee cap; every bid is
+  refused;
+- `base_fee_near_cap`: base fee x 1.125 + default tip exceeds the fee cap, so
+  the next blocks may price out the default bid (also present whenever
+  `base_fee_above_cap` is);
+- `balance_below_required`: the balance is below `required_balance`.
+
+The read-only passthrough allows `eth_chainId`, `eth_blockNumber`,
+`eth_getBlockByNumber`, `eth_getLogs`, `eth_getTransactionReceipt`,
+`eth_getTransactionByHash`, `eth_getTransactionCount`, `eth_call`,
+`eth_estimateGas`, `eth_getBalance` and `eth_feeHistory`. Every other method
+returns -32601.
+
+## Replacing a pending challenge
+
+Geth and reth accept a transaction on the same nonce as a pending one only when
+both `maxFeePerGas` and `maxPriorityFeePerGas` rise by at least 10% (geth
+`txpool.pricebump`). Raise both by at least 12.5%. A tip-only bump is rejected
+everywhere and returns `broadcast_ambiguous` with the rejected candidate's hash.
+Either transaction may still mine, so keep both hashes. Re-sending after the
+pool dropped a transaction has no bump requirement. A legacy transaction still
+pending from signer 0.1 counts its `gasPrice` as both fees, so replacing it needs
+a tip of at least 1.1 x that `gasPrice`. Anvil accepts any replacement with a
+higher `maxFeePerGas`, so the anvil tests cannot prove the 10% rule.
+
+## Fee-spike runbook
+
+With the **current `zkapi-challenged`** (it proposes no fees, so every challenge
+bids the fee cap with the default tip):
+
+- A refused challenge (`base_fee_above_max_fee`, `insufficient_balance`) signs
+  on the daemon's next poll after you raise `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`
+  or fund the sender. Restart the signer to apply a new cap:
+  `sudo docker compose -f docker/aws/compose.yml --profile challenge up -d signer`.
+- A dropped challenge is re-sent on the same nonce at the new cap.
+- This daemon never replaces a still-pending challenge. Geth and reth usually
+  keep a transaction whose `maxFeePerGas` is below the base fee in their pools
+  until the base fee falls. To replace it by hand, raise both
+  `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` and
+  `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` by at least 12.5%, restart the
+  signer, read the pending transaction with `eth_getTransactionByHash`, and send
+  its `from`, `to`, `input` (as `data`), `gas` and `nonce` back through the
+  signer without fee fields. Run both calls from the challenger container:
+
+  ```sh
+  sudo docker compose -f docker/aws/compose.yml --profile challenge exec challenger \
+    curl -s -X POST http://signer:8547 -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByHash","params":["0x<pending hash>"]}'
+  sudo docker compose -f docker/aws/compose.yml --profile challenge exec challenger \
+    curl -s -X POST http://signer:8547 -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"eth_sendTransaction","params":[{"from":"0x..","to":"0x..","data":"0x..","gas":"0x..","nonce":"0x.."}]}'
+  ```
+
+  The daemon may log send errors until the replacement mines. If the vault root
+  changed since the original was built, the simulation fails and the original
+  would revert anyway. On Mainnet, do not rely on this procedure: deploy this
+  signer together with the upgraded challenger.
+
+With the **upgraded `zkapi-challenged`** (it proposes both fees), the daemon
+replaces its own pending challenge on the same nonce, raising both fees by at
+least the bump up to its caps, and jumps to its caps near the deadline. When its
+status reports that it reached its caps, raise the signer's caps in `signer.env`
+and restart the signer first, then raise the daemon's caps in `challenge.env`
+(never above the signer's) and restart the challenger.
+
+**Private relays.** The upstream is used for reads, simulation and broadcast. A
+private or MEV-protection relay may not expose pending transactions through
+`eth_getTransactionByHash`. Then the idempotent re-send check and the daemon's
+pending tracking report unknown transactions, which leads to
+`broadcast_ambiguous` errors and re-sends. Relays may also delay, refuse or
+silently drop same-nonce replacements and transactions, and some do not serve
+the reads above. Prefer a full-node RPC. Verify a relay's pending visibility and
+replacement behaviour on Sepolia before Mainnet.
+
+## Upgrading from 0.1
+
+The new signer is backward compatible with the current challenger and the
+unchanged challenge ABI.
+
+1. Remove `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` from `signer.env`. It capped
+   `eth_gasPrice` for legacy transactions; the new fee cap is bid as
+   `maxFeePerGas`. Set `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`, which is required
+   on Mainnet.
+2. Fund the sender as above, then rebuild and restart the signer, and check its
+   startup line and `zkapi_signerStatus`:
+
+   ```sh
+   sudo docker compose -f docker/aws/compose.yml --profile challenge build signer
+   sudo docker compose -f docker/aws/compose.yml --profile challenge up -d signer
+   sudo docker compose -f docker/aws/compose.yml --profile challenge exec challenger \
+     curl -s -X POST http://signer:8547 -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"zkapi_signerStatus","params":[]}'
+   ```
+
+   Expect `warnings: []` before relying on the deployment.
+3. Upgrade the existing deployment in place: same vault, same sender. Run a
+   redeployed vault as a separate stack with its own signer, fresh sender key,
+   challenger and data directory. Never repoint a signer or challenger away
+   from a vault that still has active notes or pending escapes.
+4. On Mainnet, deploy the upgraded challenger together with this signer.
+
+## Operation
 
 The challenge daemon owns nonce reservation and its durable checkpoint. This
 sidecar requires the explicit nonce and never allocates another on ambiguous
 send failures. Run only one challenge daemon for the deployment and never use
 its dedicated sender for other transactions. No signer state is written to
-disk; the container can use a read-only filesystem. Keep the private key out of
-the server/indexer/challenger environments and deployment manifests.
+disk; the container can use a read-only filesystem. Its audit lines
+(`challenge_refused` once per reason change of a nonce, `challenge_signed` once
+per hash) contain no raw transactions, upstream text or key material. Keep the
+private key out of the server/indexer/challenger environments and deployment
+manifests.
 
-Run `npm ci --ignore-scripts && npm test` here. Tests use a public fixture key
-and mock RPC responses, decode actual ethers signatures, and cover mismatched
-deployment bindings, forbidden methods, failed simulation, fee/gas bounds,
-durable nonce retries, and sanitized HTTP errors. No test broadcasts a chain
-transaction.
+## Tests
+
+Run `npm ci --ignore-scripts && npm test` here. The unit tests use a public
+fixture key and mock RPC responses. They decode the actual ethers signatures and
+cover the fee bounds, the Mainnet cap rule, strict configuration, refusal
+reasons, the no-broadcast guarantee, candidate hashes, idempotent re-sends,
+status warnings, mismatched deployment bindings, forbidden methods, durable
+nonce retries and sanitized HTTP errors. `npm run test:anvil` runs a disposable
+anvil (`--chain-id 11155111`, automine off). It checks the price actually
+charged, the base-fee and balance refusals, and same-nonce replacement. Without
+anvil those tests are skipped unless `ZKAPI_REQUIRE_ANVIL=1`, which makes a
+missing anvil a failure. No test broadcasts to a public chain.

@@ -113,6 +113,18 @@ output is constructor metadata, including `owner`, `treasuryChangeDelay` and
 `rootHistoryWindow`; prepare the public SDK manifest with circuit/key hashes and
 oracle/deployment pins separately. The vault accepts native ETH.
 
+forge cannot link `Bn254Poseidon` through the relative remappings in the
+committed `foundry.toml`, so pass a canonical absolute remapping when running
+the script (CI simulates exactly this):
+
+```sh
+cd demo/contracts
+mkdir -p ../../.demo
+FOUNDRY_REMAPPINGS="zkapi-contracts/=$(cd ../../protocol/contracts/src && pwd -P)/" \
+  OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
+  forge script script/Deploy.s.sol --rpc-url "$RPC_URL" --broadcast   # plus the variables above
+```
+
 The owner controls an emergency pause and the treasury address. Use a multisig,
 ideally behind a timelock, never a single deployer key:
 

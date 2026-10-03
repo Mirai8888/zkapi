@@ -100,6 +100,38 @@ type withdrawalPlan struct {
 var withdrawalSelector = hex.EncodeToString(crypto.Keccak256([]byte("mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,bool,uint256),bytes,uint256[32])"))[:4])
 var withdrawalEventTopic = crypto.Keccak256Hash([]byte("MutualClose(uint32,uint256,uint128,address)")).Hex()
 
+// A finalized escape of the same reservation pays the same nullifier, final
+// balance and destination. An ownership proof sent for clearance is a valid
+// escape proof, so anyone holding it can close the note this way instead.
+var escapeFinalizedEventTopic = crypto.Keccak256Hash([]byte("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)")).Hex()
+
+const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
+
+// requireClearanceOwnershipCapability runs only before a companion reserves a
+// note for a new withdrawal. Where the pinned deployment's server may require
+// clearance ownership proofs, an older companion would reserve the note, fail
+// clearance and leave inference paused, so refuse before any reservation.
+func (h *FundingHandler) requireClearanceOwnershipCapability(ctx context.Context) error {
+	required, err := h.client.clearanceOwnershipRequired()
+	if err != nil {
+		return err
+	}
+	if !required {
+		return nil
+	}
+	raw, err := h.client.request(ctx, http.MethodGet, "/oa/v1/status", nil)
+	if err != nil {
+		return err
+	}
+	var capability struct {
+		Version *int `json:"clearance_ownership_proof_version"`
+	}
+	if json.Unmarshal(raw, &capability) != nil || capability.Version == nil || *capability.Version < 1 {
+		return errors.New("this deployment requires withdrawal clearance ownership proofs; update the zkAPI native bundle before withdrawing (nothing was reserved)")
+	}
+	return nil
+}
+
 // NormalizeWithdrawalDestination rejects zero and bad mixed-case checksums.
 // Lower/upper-case addresses remain accepted, as with standard Ethereum tools.
 func NormalizeWithdrawalDestination(value string) (string, error) {
@@ -260,6 +292,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if status.Phase == "recovery_required" {
 		return status, errors.New("the saved withdrawal does not match the active note; preserve recovery files")
 	}
+	capabilityChecked := false
 	if record.Withdrawal != nil {
 		if !strings.EqualFold(record.Withdrawal.Destination, destination) {
 			return status, errors.New("a withdrawal destination is already saved; resume with that same destination")
@@ -277,6 +310,10 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if record.Pending != nil && (record.Pending.Kind != "deposit" || record.Phase != "active") {
 			return status, errors.New("finish the saved deposit before withdrawing")
 		}
+		if err := h.requireClearanceOwnershipCapability(ctx); err != nil {
+			return status, err
+		}
+		capabilityChecked = true
 		// One atomic save transfers the finalized deposit into nonce history
 		// and records intent, before asking the companion to reserve clearance.
 		if record.Pending != nil {
@@ -290,6 +327,18 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		}
 	}
 	w := record.Withdrawal
+	// Payout evidence comes from the pinned RPC. The vault and indexer must
+	// also show the note closed before the companion deletes its state; while
+	// they do not, a saved withdrawal keeps polling and an explicit alternate
+	// confirmation reports why nothing changed.
+	closeUnconfirmed := func(err error) (AddressWithdrawalStatus, error) {
+		if errors.Is(err, errWithdrawalVerificationPending) && (w.Phase == "withdrawal_pending" || w.Phase == "confirming") {
+			next := update()
+			next.Message = withdrawalVerifyingMessage
+			return next, nil
+		}
+		return update(), err
+	}
 	var retrying *addressTransaction
 	if w.SettlementHash != "" {
 		if retryHash != "" || (confirmationHash != "" && !strings.EqualFold(confirmationHash, w.SettlementHash)) {
@@ -347,6 +396,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			if err := validateWithdrawalReceipt(alternate, config, w, true); err != nil {
 				return update(), err
 			}
+			if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, alternate); err != nil {
+				return closeUnconfirmed(err)
+			}
 			if err := h.completeAddressWithdrawal(ctx, config, record, confirmationHash, true); err != nil {
 				return update(), err
 			}
@@ -372,6 +424,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			if err := validateWithdrawalReceipt(receipt, config, w, false); err != nil {
 				return update(), err
 			}
+			if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, receipt); err != nil {
+				return closeUnconfirmed(err)
+			}
 			if err := h.completeAddressWithdrawal(ctx, config, record, record.Pending.Hash, false); err != nil {
 				return update(), err
 			}
@@ -381,6 +436,13 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	}
 	if !*wallet.HasNote {
 		return update(), errors.New("the reserved private note is missing; restore its recovery state")
+	}
+	// Until a proof plan has been bound, this prepare call is what creates the
+	// companion's reservation and requests clearance.
+	if w.Binding == "" && !capabilityChecked {
+		if err := h.requireClearanceOwnershipCapability(ctx); err != nil {
+			return update(), err
+		}
 	}
 	body, _ := json.Marshal(map[string]string{"destination": destination})
 	raw, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/prepare", body)
@@ -540,10 +602,11 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 	// An independently relayed payout can call the vault through a wrapper.
 	// Its exact authenticated vault event is the payout evidence; the outer
 	// recipient remains bound to the vault for our own signed transaction.
+	// Only a relayed payout may be a finalized escape of the same reservation.
 	if receipt.Status == "0x1" && (relayed || strings.EqualFold(receipt.To, config.Contract)) {
 		matches := 0
 		for _, log := range receipt.Logs {
-			if !strings.EqualFold(log.Address, config.Contract) || len(log.Topics) != 2 || !strings.EqualFold(log.Topics[0], withdrawalEventTopic) {
+			if !strings.EqualFold(log.Address, config.Contract) || len(log.Topics) != 2 || !(strings.EqualFold(log.Topics[0], withdrawalEventTopic) || (relayed && strings.EqualFold(log.Topics[0], escapeFinalizedEventTopic))) {
 				continue
 			}
 			if log.Removed || !strings.EqualFold(log.Topics[1], fmt.Sprintf("0x%064x", saved.NoteID)) || !isHex(log.Data, 96) {

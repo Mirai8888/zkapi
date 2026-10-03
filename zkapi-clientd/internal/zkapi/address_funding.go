@@ -144,7 +144,9 @@ func addressPublicStatus(record *addressFundingRecord) AddressFundingStatus {
 		status.Message = "The deposit is awaiting confirmation. Checking again reuses the same transaction."
 	case "confirming":
 		status.DepositStage = "activating"
-		status.Message = "The deposit is confirmed. Retry to activate its saved private note."
+		status.Message = "The deposit is mined. Checking again verifies it and activates the saved private note."
+	case "verification_conflict":
+		status.Message = errDepositVerificationConflict.Error() + "." + conflictGuidance
 	case "active":
 		status.DepositStage = "active"
 		status.Message = "Your private balance is ready."
@@ -184,7 +186,44 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		if depositStage != "" {
 			next.DepositStage = depositStage
 		}
+		if depositStage == "verifying" {
+			next.Message = "The deposit is mined; waiting for the zkAPI indexer to confirm it before activating the private note."
+		}
 		return next
+	}
+	// A verification conflict is never terminal: report it, keep the saved
+	// transaction, and re-verify on every later resume.
+	conflicted := func(err error) AddressFundingStatus {
+		next := update()
+		next.Phase, next.DepositStage = "verification_conflict", ""
+		next.Message = err.Error() + "." + conflictGuidance
+		return next
+	}
+	// A finalized deposit revert is retired, or reported as retryable, only
+	// after the indexer shows the note did not land where it could have.
+	revertUnconfirmed := func(receipt *addressReceipt) (AddressFundingStatus, bool, error) {
+		deposit, err := h.readAddressDeposit(config)
+		if err != nil {
+			return update(), true, err
+		}
+		err = h.checkDepositRevert(ctx, config, deposit, record.Pending, receipt)
+		switch {
+		case err == nil:
+			return AddressFundingStatus{}, false, nil
+		case errors.Is(err, errDepositVerificationConflict):
+			if record.Phase != "verification_conflict" {
+				record.Phase = "verification_conflict"
+				if saveErr := h.saveAddress(record); saveErr != nil {
+					return update(), true, saveErr
+				}
+			}
+			return conflicted(err), true, nil
+		case errors.Is(err, errRevertVerificationPending):
+			next := update()
+			next.Message = "The saved deposit reported a revert; " + errRevertVerificationPending.Error() + " before any retry is allowed."
+			return next, true, nil
+		}
+		return update(), true, err
 	}
 	if record.Pending != nil && record.Pending.Kind != "deposit" && record.Pending.Kind != "approval" && record.Pending.Kind != "approval_reset" {
 		return update(), errors.New("a different public transaction is saved; resume its withdrawal or return command before funding")
@@ -221,6 +260,11 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		}
 		if receipt.Status != "0x0" {
 			return update(), errors.New("the saved transaction no longer has a reverted receipt; check its status")
+		}
+		if record.Pending.Kind == "deposit" {
+			if next, stop, err := revertUnconfirmed(receipt); stop {
+				return next, err
+			}
 		}
 		deposit, err := h.readAddressDeposit(config)
 		if err != nil {
@@ -296,7 +340,7 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		// addressFinalReceipt before a later explicit retry may use a new nonce.
 		receipt, confirmed, receiptErr := h.addressFinalReceipt(ctx, config, record.Pending.Hash, record.Pending.Kind == "deposit" && !config.nativeETH())
 		if receiptErr != nil {
-			if record.Pending.Kind == "deposit" && record.Phase == "confirming" {
+			if record.Pending.Kind == "deposit" && (record.Phase == "confirming" || record.Phase == "verification_conflict") {
 				record.Phase = "deposit_pending"
 				if err := h.saveAddress(record); err != nil {
 					return update(), err
@@ -306,7 +350,7 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		}
 		if !confirmed {
 			if record.Pending.Kind == "deposit" {
-				if record.Phase == "confirming" {
+				if record.Phase == "confirming" || record.Phase == "verification_conflict" {
 					record.Phase = "deposit_pending"
 					if err := h.saveAddress(record); err != nil {
 						return update(), err
@@ -341,6 +385,12 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			return update(), err
 		}
 		if receipt.Status == "0x0" {
+			if record.Pending.Kind == "deposit" && record.Phase == "verification_conflict" {
+				// A conflicting revert never silently becomes retryable.
+				if next, stop, err := revertUnconfirmed(receipt); stop {
+					return next, err
+				}
+			}
 			record.Phase = "reverted"
 			if err := h.saveAddress(record); err != nil {
 				return update(), err
@@ -353,14 +403,26 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 				return update(), err
 			}
 			if _, err := h.confirm(ctx, record.Pending.Hash); err != nil {
-				// Inclusion can change between the first check and activation.
-				// Keep the transaction journal, but do not leave durable status
-				// claiming that an unverified receipt is ready to activate.
-				if errors.Is(err, errUnconfirmedDepositReceipt) {
+				switch {
+				case errors.Is(err, errUnconfirmedDepositReceipt):
+					// Inclusion can change between the first check and
+					// activation. Keep the transaction journal, but do not
+					// leave durable status claiming the receipt is ready.
 					record.Phase = "deposit_pending"
 					if saveErr := h.saveAddress(record); saveErr != nil {
 						return update(), saveErr
 					}
+				case errors.Is(err, errDepositVerificationPending):
+					// Mined, but the vault and indexer have not both
+					// confirmed it; keep polling without activating.
+					depositStage = "verifying"
+					return update(), nil
+				case errors.Is(err, errDepositVerificationConflict):
+					record.Phase = "verification_conflict"
+					if saveErr := h.saveAddress(record); saveErr != nil {
+						return update(), saveErr
+					}
+					return conflicted(err), nil
 				}
 				return update(), err
 			}
@@ -427,28 +489,13 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			kind, data = "approval_reset", "0x095ea7b3"+addressABIWord(config.Contract)+strings.Repeat("0", 64)
 		}
 	} else {
-		// Approval may take minutes. Obtain the current empty-leaf witness
-		// immediately before simulating/signing the deposit.
-		path, pathErr := h.depositPath(ctx)
-		if pathErr != nil {
-			return update(), pathErr
+		// Approval may take minutes. Obtain the current empty-leaf witness,
+		// bound to its indexer slot, immediately before simulating/signing.
+		bound, bindErr := h.bindDepositPath(ctx, config, deposit)
+		if bindErr != nil {
+			return update(), bindErr
 		}
-		encoded, _ := json.Marshal(path)
-		var refreshed struct {
-			ZeroPath []string `json:"zero_path"`
-		}
-		if json.Unmarshal(encoded, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
-			return update(), errors.New("invalid refreshed deposit path")
-		}
-		deposit.ZeroPath = refreshed.ZeroPath
-		if err := h.save(*deposit); err != nil {
-			return update(), err
-		}
-		kind, to = "deposit", config.Contract
-		data = "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", amount)
-		for _, sibling := range refreshed.ZeroPath {
-			data += addressABIWord(sibling)
-		}
+		kind, to, data = "deposit", config.Contract, bound
 	}
 	if err := h.signAddressTransaction(ctx, config, record, kind, to, data); err != nil {
 		if errors.Is(err, errAddressNeedsETH) {
@@ -507,10 +554,25 @@ func (h *FundingHandler) readAddressDeposit(config fundingConfig) (*depositRecor
 		return nil, errors.New("cannot read the pending private deposit")
 	}
 	var record depositRecord
-	if json.Unmarshal(raw, &record) != nil || !depositDeploymentMatches(record, config) {
+	if json.Unmarshal(raw, &record) != nil || !depositDeploymentMatches(record, config) || !validDepositRecovery(record) {
 		return nil, errors.New("pending private deposit belongs to another deployment or is invalid; preserve it for recovery")
 	}
 	return &record, nil
+}
+
+// The additive recovery fields are written only by this daemon. A malformed
+// one means the file was damaged or edited; preserve it rather than act on it.
+func validDepositRecovery(record depositRecord) bool {
+	if b := record.Binding; b != nil && (b.ExpiryTs == 0 || !isHex(b.BlockHash, 32)) {
+		return false
+	}
+	if r := record.Rebind; r != nil && r.ExpiryTs == 0 {
+		return false
+	}
+	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0) {
+		return false
+	}
+	return true
 }
 
 func addressABIWord(value string) string {
@@ -895,7 +957,7 @@ func (h *FundingHandler) confirmedDepositReceipt(ctx context.Context, config fun
 			}
 			return ethReceipt{}, errors.New("the saved deposit is awaiting a canonical mined receipt; retry confirmation later")
 		}
-		return ethReceipt{Status: receipt.Status, To: receipt.To, TransactionHash: receipt.TransactionHash, Logs: receipt.Logs}, nil
+		return ethReceipt{Status: receipt.Status, To: receipt.To, TransactionHash: receipt.TransactionHash, BlockNumber: receipt.BlockNumber, BlockHash: receipt.BlockHash, Logs: receipt.Logs}, nil
 	}
 	// Keep the historical token-wallet confirmation policy for recovery.
 	if _, err := os.Lstat(h.addressStatePath()); errors.Is(err, os.ErrNotExist) {

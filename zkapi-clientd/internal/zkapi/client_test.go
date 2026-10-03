@@ -43,8 +43,20 @@ func newTestClient(t *testing.T, handler http.HandlerFunc, inference *httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Fixtures serve chain and indexer reads from local TLS servers; a
+	// companion must still name these exact endpoints.
+	c.endpoints = &chainEndpoints{RPC: inference.URL, Indexer: inference.URL, ProtocolServer: testProtocolServerURL(t, "mainnet")}
 	addTestModelPolicy(c, map[string]uint64{"example/model": 1}, nil)
 	return c
+}
+
+func testProtocolServerURL(t *testing.T, network string) string {
+	t.Helper()
+	deployment, _, err := pinnedDeployment(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deployment.ProtocolServerURL
 }
 
 func TestCompleteReturnsLiveSSEAndSendsNoPromptToCompanion(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -41,6 +42,7 @@ type withdrawalFixture struct {
 	noteID                     uint64
 	reservedNoteID             uint64
 	reservedNullifier          string
+	ownershipProofVersion      int
 }
 
 func withdrawalJSONResponse(r *http.Request, status int, value any) *http.Response {
@@ -87,6 +89,9 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			}
 			policy := testPolicy("mainnet")
 			policy["withdrawal_bridge_version"] = version
+			if w.ownershipProofVersion != 0 {
+				policy["clearance_ownership_proof_version"] = w.ownershipProofVersion
+			}
 			return withdrawalJSONResponse(r, 200, policy), nil
 		case "/wallet/status":
 			return withdrawalJSONResponse(r, 200, map[string]any{"has_note": f.active, "pending_request": w.pending, "note": map[string]any{"note_id": w.noteID, "deposit_amount": 100000, "current_balance": w.walletBalance, "expiry_ts": 2000000000, "current_anchor": "0x55", "current_commitment_x": "0x66", "current_commitment_y": "0x77"}}), nil
@@ -255,6 +260,10 @@ func (f *withdrawalFixture) mineWithdrawal(t *testing.T, hash string, destinatio
 	logs := []map[string]any{{"address": addressTestVault, "topics": []string{crypto.Keccak256Hash([]byte("MutualClose(uint32,uint256,uint128,address)")).Hex(), fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x", f.reservedBalance) + addressABIWord(destination)}}
 	f.receipts[hash] = map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestVault, "logs": logs}
 	f.nonce = fmt.Sprintf("0x%x", tx.Nonce()+1)
+	if !reverted {
+		// The vault and the indexer both observe the close.
+		f.closeNote(uint32(f.reservedNoteID))
+	}
 }
 
 func TestAddressWithdrawalSignsExactBoundCallAndPreservesDepositHistory(t *testing.T) {
@@ -526,7 +535,10 @@ func (f *withdrawalFixture) competingClose(t *testing.T, original, other string)
 		t.Fatal(err)
 	}
 	receipt["status"], receipt["transactionHash"] = "0x1", other
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.receipts[other] = receipt
+	f.closeNote(uint32(f.reservedNoteID)) // The competing payout closed the note.
 }
 
 func TestAddressWithdrawalConfirmsCompetingPayoutThenRefillsWithoutSigningAgain(t *testing.T) {
@@ -754,10 +766,13 @@ func TestAddressWithdrawalAllowsSecondWithdrawalAfterLegacyRefill(t *testing.T) 
 		t.Fatal(err)
 	}
 	legacyHash := "0x" + strings.Repeat("e", 64)
-	receipt := sampleReceipt(deposit)
+	expiry := uint64(time.Now().Unix()) + 3600
+	receipt := depositEventReceipt(addressTestVault, 13, deposit.Commitment, deposit.Amount, expiry)
 	receipt.TransactionHash = legacyHash
-	receipt.Logs[0].Topics[1] = fmt.Sprintf("0x%064x", 13)
-	receipt.Logs[0].Topics[2] = "0x" + addressABIWord(deposit.Commitment)
+	// Activation needs the vault and the indexer to show the refill too.
+	f.mu.Lock()
+	f.registerDeposit(13, deposit.Commitment, deposit.Amount, expiry)
+	f.mu.Unlock()
 	receiptRaw, _ := json.Marshal(receipt)
 	var storedReceipt map[string]any
 	if err := json.Unmarshal(receiptRaw, &storedReceipt); err != nil {

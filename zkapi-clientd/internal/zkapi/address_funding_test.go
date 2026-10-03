@@ -38,12 +38,103 @@ type addressFixture struct {
 	active                                                         bool
 	prepared, activated, paths                                     int
 	rpcCalls                                                       []string
+	// Independent corroboration sources. The RPC answers vault notes() from
+	// vaultNotes; the separate indexer server serves leaves. mine registers
+	// a deposit in both, and tests make them disagree deliberately.
+	vaultNotes                 map[uint32]fixtureNote
+	vaultReadsAt               []string
+	leaves                     []*big.Int
+	indexer                    *httptest.Server
+	indexerBlock               uint64
+	indexerHash                string
+	indexerStatus              int // >0: HTTP error, <0: inconsistent snapshot
+	indexerWithoutBlock        bool
+	snapshotReads              int
+	cachedRoot                 *big.Int
+	cachedPath                 []*big.Int
+	cachedVersion, leafVersion int
+	mined                      map[string]uint32
+	minedExpiry                map[uint32]uint64
+	// Companion wallet state for activation and rebind.
+	walletNote      map[string]any
+	walletPending   bool
+	withdrawalPhase map[string]any
+	confirmBodies   []map[string]any
+	resetCalls      int
+}
+
+// addressTestFirstNote is the first fixture deposit's note: the indexer
+// starts with this many unrelated leaves.
+const addressTestFirstNote = 12
+
+func (f *addressFixture) setLeaf(id uint32, leaf *big.Int) {
+	for uint32(len(f.leaves)) <= id {
+		f.leaves = append(f.leaves, new(big.Int))
+	}
+	f.leaves[id] = leaf
+	f.leafVersion++
+}
+
+func (f *addressFixture) registerDeposit(id uint32, commitment string, amount, expiry uint64) {
+	f.vaultNotes[id] = fixtureNote{commitment: "0x" + addressABIWord(commitment), amount: amount, expiry: expiry, status: noteActive}
+	f.setLeaf(id, noteLeaf(id, fieldValue(commitment), amount, expiry))
+}
+
+func (f *addressFixture) closeNote(id uint32) {
+	note := f.vaultNotes[id]
+	note.status = noteClosed
+	f.vaultNotes[id] = note
+	f.setLeaf(id, new(big.Int))
+}
+
+// tree returns the root and the empty-slot path at next_note_id, cached
+// until a leaf changes. Callers hold f.mu.
+func (f *addressFixture) tree() (*big.Int, []*big.Int) {
+	if f.cachedRoot == nil || f.cachedVersion != f.leafVersion {
+		f.cachedRoot, f.cachedPath = testTree(f.leaves, uint32(len(f.leaves)))
+		f.cachedVersion = f.leafVersion
+	}
+	return f.cachedRoot, f.cachedPath
 }
 
 func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	t.Helper()
 	f := &addressFixture{chain: "0x1", decimals: "0x6", gas: "0x10000", gasPrice: "0x3b9aca00", balance: "0xf4240", eth: "0xde0b6b3a7640000", allowance: "0x0", nonce: "0x0", finalized: "0x20", canonical: addressTestBlock, accepted: map[string]*types.Transaction{}, receipts: map[string]map[string]any{}}
 	f.native = len(native) > 0 && native[0]
+	f.vaultNotes, f.mined, f.minedExpiry = map[uint32]fixtureNote{}, map[string]uint32{}, map[uint32]uint64{}
+	for i := range addressTestFirstNote {
+		f.setLeaf(uint32(i), big.NewInt(int64(0x1000+i)))
+	}
+	f.indexerBlock, f.indexerHash = 0x20, addressTestBlock
+	f.walletNote = map[string]any{"note_id": addressTestFirstNote, "current_balance": 99999}
+	f.indexer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+			t.Error("identity reached the indexer")
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/tree/snapshot" {
+			t.Errorf("unexpected indexer request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		f.snapshotReads++
+		if f.indexerStatus > 0 {
+			w.WriteHeader(f.indexerStatus)
+			_, _ = io.WriteString(w, `{"status":"unavailable","error_code":"indexer_unavailable"}`)
+			return
+		}
+		root, _ := f.tree()
+		body := map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(f.leaves), "leaves": fieldHexes(f.leaves)}
+		if f.indexerStatus < 0 { // An internally inconsistent snapshot.
+			body["next_note_id"] = len(f.leaves) + 1
+		}
+		if !f.indexerWithoutBlock {
+			body["block_number"], body["block_hash"] = f.indexerBlock, f.indexerHash
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	t.Cleanup(f.indexer.Close)
 	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -107,6 +198,24 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				if len(request.Params) == 3 {
 					f.overrideReads++
 				}
+				break
+			}
+			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, notesSelector) {
+				var block struct {
+					BlockHash        string `json:"blockHash"`
+					RequireCanonical bool   `json:"requireCanonical"`
+				}
+				if len(request.Params) == 2 && json.Unmarshal(request.Params[1], &block) == nil {
+					f.vaultReadsAt = append(f.vaultReadsAt, block.BlockHash)
+					if !block.RequireCanonical || !strings.EqualFold(block.BlockHash, f.canonical) {
+						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32000, "message": "header not found"}})
+						return
+					}
+				} else {
+					f.vaultReadsAt = append(f.vaultReadsAt, string(request.Params[1]))
+				}
+				id, _ := new(big.Int).SetString(call.Data[10:], 16)
+				result = encodeVaultNote(f.vaultNotes[uint32(id.Uint64())])
 				break
 			}
 			if !strings.EqualFold(call.To, addressTestToken) {
@@ -186,7 +295,7 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		defer f.mu.Unlock()
 		switch r.URL.Path {
 		case "/funding/config":
-			config := map[string]any{"chain_id": 1, "contract_address": addressTestVault, "demo_billing_token_address": addressTestToken, "demo_rpc_url": rpc.URL}
+			config := map[string]any{"chain_id": 1, "contract_address": addressTestVault, "demo_billing_token_address": addressTestToken, "demo_rpc_url": rpc.URL, "indexer_url": f.indexer.URL, "protocol_server_url": testProtocolServerURL(t, "mainnet")}
 			if f.native {
 				config["demo_billing_token_address"] = nil
 				deployment, _, err := pinnedDeployment("mainnet")
@@ -200,7 +309,7 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			_ = json.NewEncoder(w).Encode(config)
 		case "/wallet/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": f.active, "note": map[string]any{"note_id": 12, "current_balance": 99999}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": f.active, "pending_request": f.walletPending, "note": f.walletNote})
 		case "/funding/api/deposit/prepare":
 			f.prepared++
 			var input struct {
@@ -214,19 +323,33 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			_ = json.NewEncoder(w).Encode(map[string]any{"amount": input.Amount, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path})
 		case "/oa/v1/deposit/path":
 			f.paths++
-			path := make([]string, 32)
-			for i := range path {
-				path[i] = "0xa"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": path})
+			_, path := f.tree()
+			_ = json.NewEncoder(w).Encode(map[string]any{"zero_path": fieldHexes(path)})
 		case "/funding/api/deposit/confirm":
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("invalid deposit confirmation")
+			}
+			f.confirmBodies = append(f.confirmBodies, body)
 			f.activated++
 			f.active = true
+			f.walletNote = map[string]any{"note_id": body["note_id"], "deposit_amount": body["amount"], "current_balance": body["amount"], "expiry_ts": body["expiry_ts"], "is_genesis": true}
 			_, _ = io.WriteString(w, `{}`)
+		case "/wallet/reset":
+			f.resetCalls++
+			f.active = false
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": false, "pending_request": false})
+		case "/oa/v1/withdraw/status":
+			phase := f.withdrawalPhase
+			if phase == nil {
+				phase = map[string]any{"phase": "none"}
+			}
+			_ = json.NewEncoder(w).Encode(phase)
 		default:
 			t.Errorf("unexpected companion path %s", r.URL.Path)
 		}
 	}, rpc)
+	client.endpoints.Indexer = f.indexer.URL
 	var err error
 	f.h, err = NewFundingHandler(client, "http://127.0.0.1:8787", t.TempDir())
 	if err != nil {
@@ -235,6 +358,9 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	return f
 }
 
+// mine includes a broadcast transaction. A successful deposit lands at the
+// indexer's next slot, in both the vault state and the indexer snapshot; a
+// re-inclusion of the same transaction keeps its note and expiry.
 func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 	t.Helper()
 	f.mu.Lock()
@@ -254,9 +380,15 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 			value, _ := new(big.Int).SetString(data[72:], 16)
 			f.allowance = "0x" + value.Text(16)
 		} else {
+			commitment := "0x" + data[8:72]
 			amount, _ := new(big.Int).SetString(data[72:136], 16)
-			record := depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: amount.Uint64()}
-			receipt["logs"] = sampleReceipt(record).Logs
+			id, ok := f.mined[hash]
+			if !ok {
+				id = uint32(len(f.leaves))
+				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
+				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
+			}
+			receipt["logs"] = depositEventReceipt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id]).Logs
 			f.allowance = "0x0"
 		}
 	}
@@ -403,9 +535,21 @@ func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testin
 	if tx == nil || tx.Nonce() != 1 || !strings.EqualFold(tx.To().Hex(), addressTestVault) {
 		t.Fatal("invalid deposit transaction")
 	}
+	// The prepared "0x0" path was replaced by the refreshed empty-slot path,
+	// bound to the indexer slot the deposit targets.
+	f.mu.Lock()
+	_, path := f.tree()
+	f.mu.Unlock()
+	expectedPath := ""
+	for _, sibling := range fieldHexes(path) {
+		expectedPath += addressABIWord(sibling)
+	}
 	data := hex.EncodeToString(tx.Data())
-	if len(data) != 8+64*34 || !strings.HasSuffix(data, strings.Repeat(addressABIWord("0xa"), 32)) {
+	if len(data) != 8+64*34 || !strings.HasSuffix(data, expectedPath) || strings.HasSuffix(data, strings.Repeat(addressABIWord("0x0"), 32)) {
 		t.Fatal("deposit witness was not refreshed")
+	}
+	if saved, err := f.h.readAddressDeposit(fundingConfig{ChainID: 1, Contract: addressTestVault, Token: addressTestToken}); err != nil || saved.Slot == nil || saved.Slot.NoteID != addressTestFirstNote {
+		t.Fatalf("deposit slot was not recorded before signing: %+v %v", saved, err)
 	}
 	f.mine(t, deposit.TransactionHash, false)
 	before := len(f.submitted)

@@ -443,7 +443,11 @@ func finishGuidedDeposit(ctx context.Context, service guidedFundingService, init
 				clearSetupProgress(ui)
 				ui.Printf("Deposit confirmed. Private inference balance activated.\n")
 			case "confirming":
-				setupProgress(ui, "Deposit confirmed; activating your private balance.")
+				if state.DepositStage == "verifying" {
+					setupProgress(ui, "Deposit mined; waiting for the zkAPI indexer to confirm it before activation.")
+				} else {
+					setupProgress(ui, "Deposit confirmed; activating your private balance.")
+				}
 			case "deposit_pending":
 				switch state.DepositStage {
 				case "activating":

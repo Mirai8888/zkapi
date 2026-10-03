@@ -53,6 +53,37 @@ type Client struct {
 	config         Config
 	local          *http.Client
 	inference      *http.Client
+	// Package tests point these pins at local servers; production leaves
+	// them nil and always uses the packaged deployment manifest.
+	endpoints    *chainEndpoints
+	capabilities *deploymentCapabilities
+}
+
+// chainEndpoints are the packaged deployment's remote origins. The payment RPC
+// and indexer are independent sources: deposits and withdrawals are activated
+// or closed only when both agree, and neither string comes from the companion.
+type chainEndpoints struct{ RPC, Indexer, ProtocolServer string }
+
+func (c *Client) packagedEndpoints() (chainEndpoints, error) {
+	if c.endpoints != nil {
+		return *c.endpoints, nil
+	}
+	deployment, _, err := pinnedDeployment(c.config.Network)
+	if err != nil {
+		return chainEndpoints{}, err
+	}
+	return chainEndpoints{RPC: deployment.RPC, Indexer: deployment.IndexerURL, ProtocolServer: deployment.ProtocolServerURL}, nil
+}
+
+func (c *Client) clearanceOwnershipRequired() (bool, error) {
+	if c.capabilities != nil {
+		return c.capabilities.requiresClearanceOwnershipProof(), nil
+	}
+	deployment, _, err := pinnedDeployment(c.config.Network)
+	if err != nil {
+		return false, err
+	}
+	return deployment.requiresClearanceOwnershipProof(), nil
 }
 
 // Error is safe to return to API consumers: raw companion/provider messages

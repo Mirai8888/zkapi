@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,16 +24,36 @@ import (
 var deploymentFiles embed.FS
 
 type deploymentIdentity struct {
-	ID       string             `json:"deployment_id"`
-	ChainID  uint64             `json:"chain_id"`
-	Contract string             `json:"contract_address"`
-	Asset    string             `json:"billing_asset"`
-	Unit     string             `json:"billing_unit"`
-	Proof    proofSetupIdentity `json:"proof_setup"`
-	Privacy  struct {
+	ID       string `json:"deployment_id"`
+	ChainID  uint64 `json:"chain_id"`
+	Contract string `json:"contract_address"`
+	Asset    string `json:"billing_asset"`
+	Unit     string `json:"billing_unit"`
+	// Go sends chain and indexer reads only to these packaged origins. A
+	// companion's copies are compared with them as a substitution tripwire.
+	RPC               string `json:"rpc_url"`
+	IndexerURL        string `json:"indexer_url"`
+	ProtocolServerURL string `json:"protocol_server_url"`
+	NoteTTL           uint64 `json:"note_ttl_seconds"`
+	deploymentCapabilities
+	Proof   proofSetupIdentity `json:"proof_setup"`
+	Privacy struct {
 		IssuerURL   string `json:"issuer_url"`
 		VerifierURL string `json:"verifier_url"`
 	} `json:"privacy_mode"`
+}
+
+// deploymentCapabilities are optional manifest keys for redeployed vaults.
+// Absent keys describe the currently deployed vaults and legacy servers.
+type deploymentCapabilities struct {
+	VaultRevision           int    `json:"vault_revision"`
+	ClearanceOwnershipProof string `json:"clearance_ownership_proof"`
+}
+
+// A server that may require withdrawal-clearance ownership proofs needs a
+// companion able to send them before any note is reserved for withdrawal.
+func (c deploymentCapabilities) requiresClearanceOwnershipProof() bool {
+	return c.ClearanceOwnershipProof == "required" || c.ClearanceOwnershipProof == "optional" || c.VaultRevision >= 2
 }
 
 type proofSetupIdentity struct {
@@ -53,16 +75,71 @@ func pinnedDeployment(network string) (deploymentIdentity, []byte, error) {
 	if network == "" {
 		network = "mainnet"
 	}
-	chain, err := ChainID(network)
-	if err != nil {
+	if _, err := ChainID(network); err != nil {
 		return deploymentIdentity{}, nil, err
 	}
 	raw, err := deploymentFiles.ReadFile("deployments/" + network + ".json")
-	var identity deploymentIdentity
-	if err != nil || json.Unmarshal(raw, &identity) != nil || identity.ChainID != chain || identity.ID == "" || identity.Asset != "native_eth" || identity.Unit != "gwei" || identity.Proof.Circuit != "zkapi-v2-note-bound-v1" {
+	if err != nil {
 		return deploymentIdentity{}, nil, errors.New("invalid packaged zkAPI deployment")
 	}
+	identity, err := parseDeploymentIdentity(network, raw)
+	if err != nil {
+		return deploymentIdentity{}, nil, err
+	}
 	return identity, raw, nil
+}
+
+func parseDeploymentIdentity(network string, raw []byte) (deploymentIdentity, error) {
+	chain, err := ChainID(network)
+	if err != nil {
+		return deploymentIdentity{}, err
+	}
+	var identity deploymentIdentity
+	if json.Unmarshal(raw, &identity) != nil || identity.ChainID != chain || identity.ID == "" || identity.Asset != "native_eth" || identity.Unit != "gwei" || identity.Proof.Circuit != "zkapi-v2-note-bound-v1" || identity.NoteTTL == 0 || identity.VaultRevision < 0 {
+		return deploymentIdentity{}, errors.New("invalid packaged zkAPI deployment")
+	}
+	switch identity.ClearanceOwnershipProof {
+	case "", "required", "optional":
+	default:
+		return deploymentIdentity{}, errors.New("invalid packaged zkAPI deployment")
+	}
+	for _, endpoint := range []string{identity.RPC, identity.IndexerURL, identity.ProtocolServerURL} {
+		if _, ok := canonicalEndpoint(endpoint); !ok {
+			return deploymentIdentity{}, errors.New("invalid packaged zkAPI deployment")
+		}
+	}
+	return identity, nil
+}
+
+// canonicalEndpoint normalizes only spellings that address the same HTTPS
+// origin and path: scheme and host case, an explicit :443 and one trailing
+// slash. Anything else (credentials, query, fragment, another port or path,
+// a trailing-dot host) stays distinct. The result is used for comparison
+// only; requests always use the packaged string.
+func canonicalEndpoint(raw string) (string, bool) {
+	if strings.Contains(raw, "#") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" || !strings.EqualFold(u.Scheme, "https") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.HasSuffix(u.Host, ":") {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", false
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return "https://" + host + strings.TrimSuffix(u.EscapedPath(), "/"), true
+}
+
+func sameEndpoint(a, b string) bool {
+	left, leftOK := canonicalEndpoint(a)
+	right, rightOK := canonicalEndpoint(b)
+	return leftOK && rightOK && left == right
 }
 
 // The companion reads this local, package-pinned manifest. It still validates

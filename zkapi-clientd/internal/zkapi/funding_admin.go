@@ -102,6 +102,20 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 				result, err = h.FundAddress(ctx, body.Amount)
 			}
 		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/funding/rebind":
+		// Both IDs are optional; the handler re-derives and verifies the
+		// binding itself. Range-check before any companion or chain access.
+		var body struct {
+			NoteID        *uint64 `json:"note_id"`
+			ReplaceNoteID *uint64 `json:"replace_note_id"`
+		}
+		if err = decode(&body); err == nil {
+			if (body.NoteID != nil && *body.NoteID > 0xffffffff) || (body.ReplaceNoteID != nil && *body.ReplaceNoteID > 0xffffffff) {
+				err = errors.New("note IDs must be 32-bit vault note IDs")
+			} else {
+				result, err = h.RebindDeposit(ctx, body.NoteID, body.ReplaceNoteID)
+			}
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/admin/return/quote":
 		var body struct {
 			Destination string `json:"destination"`

@@ -14,7 +14,9 @@ for ETH and updates the receiving balance. Once funded, Enter approves the
 fixed deposit with network fees that adjust automatically while the receiving
 balance covers the principal and required fees. It checks a fresh quote before
 signing, deposits and activates the private balance once its successful mined
-receipt is validated against the canonical block and saved deposit. There is
+receipt is validated against the canonical block and saved deposit, and the
+vault state and the zkAPI indexer confirm the same note (see
+[chain verification](#chain-verification-and-recovery)). There is
 no additional 15-minute finality gate for successful native ETH deposits, matching
 the web wallet. No model is selected or priced during funding.
 
@@ -112,6 +114,67 @@ closed. Do not delete recovery data to bypass a configuration mismatch.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
+
+## Chain verification and recovery
+
+The embedded manifest also pins the payment RPC (`rpc_url`), the zkAPI indexer
+(`indexer_url`) and the protocol server (`protocol_server_url`). The wallet
+companion must report the same three endpoints; scheme and host case, an
+explicit `:443` and one trailing slash are ignored, and any other difference
+stops funding before any network read with "reinstall the zkAPI bundle". The
+client always sends its chain and indexer requests to the packaged strings.
+Transactions are signed for the network's pinned chain ID; the RPC's
+`eth_chainId` is only a consistency check.
+
+The RPC is a third party, so its answers are corroborated before they change
+private state:
+
+- **Deposit activation.** After a successful receipt, the vault's
+  `notes(noteId)` is read at the receipt's own block hash (EIP-1898, canonical
+  only), and the indexer's whole-tree snapshot (the same response for every
+  client, so it does not reveal which note is yours) must have applied that
+  block and hold this deposit's leaf at the receipt's note ID. The client
+  recomputes the leaf with zkAPI Poseidon. The note secret is handed to the
+  wallet only after both agree. While the indexer is behind, unavailable or an
+  older version without snapshot block metadata, the deposit stays in phase
+  `confirming` with stage `verifying` and polling continues. Disagreement sets
+  phase `verification_conflict`; this is not final, and every later
+  `zkapi-clientd fund --resume` or `config` re-verifies the saved transaction.
+- **Reverted deposits.** Before a finalized failed deposit is retired or
+  requoted, the indexer must show that this note did not land at the empty
+  slot the signed transaction was built for. The slot is checked against the
+  indexer's tree and saved with the note just before signing. If the note is
+  there, the revert is reported as a `verification_conflict` and no
+  replacement is signed. Deposits that reuse your public commitment with a
+  different amount are ignored, so they cannot block a genuine retry.
+- **Withdrawals.** Before the wallet companion deletes its note state, the
+  vault (at the payout receipt's block) must show the note closed and the
+  indexer must no longer list its leaf; until then the withdrawal keeps
+  waiting. A finalized escape of the same reservation (same note, nullifier,
+  payout and destination) is accepted as an independently relayed payout via
+  `zkapi-clientd withdraw --confirm`.
+
+If a deposit shows `verification_conflict`, compare its transaction on a block
+explorer, then run:
+
+```sh
+zkapi-clientd fund --rebind                       # derive the note from the saved transaction
+zkapi-clientd fund --rebind --note-id 12          # name the vault note holding the deposit
+zkapi-clientd fund --rebind --replace-note-id 42148  # also replace a wrongly bound wallet note
+```
+
+Rebind never changes the note secret, commitment or amount; it accepts a note
+only when the finalized vault state and the indexer both hold exactly this
+deposit there. It refuses while a withdrawal, public return or unconfirmed
+deposit transaction is saved, while the wallet has an unsettled request or a
+withdrawal reservation, and it replaces an existing wallet note only when you
+name it and it is an unspent genesis note of the same amount. The replacement
+is saved before the wallet is reset, so an interrupted rebind resumes with
+`zkapi-clientd fund --rebind`.
+
+A manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
+later requires a wallet companion able to prove note ownership for withdrawal
+clearance; an older companion is refused before any note is reserved.
 
 ## Withdrawals
 

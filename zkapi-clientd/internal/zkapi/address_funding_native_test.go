@@ -147,7 +147,7 @@ func TestNativeFundingDoesNotSilentlyRebindLegacySignerOrDeposit(t *testing.T) {
 }
 
 func TestNativeFundingConfigurationMustMatchPackagedDeploymentAndGwei(t *testing.T) {
-	for _, mutation := range []string{"deployment_id", "contract_address", "billing_unit", "native_asset_wei_per_unit", "token"} {
+	for _, mutation := range []string{"deployment_id", "contract_address", "billing_unit", "native_asset_wei_per_unit", "token", "demo_rpc_url", "indexer_url", "protocol_server_url"} {
 		t.Run(mutation, func(t *testing.T) {
 			f := newAddressFixture(t, true)
 			upstream := f.h.client.local.Transport
@@ -172,6 +172,8 @@ func TestNativeFundingConfigurationMustMatchPackagedDeploymentAndGwei(t *testing
 					body[mutation] = "1"
 				case "token":
 					body["demo_billing_token_address"] = addressTestToken
+				case "demo_rpc_url", "indexer_url", "protocol_server_url":
+					body[mutation] = "https://ethereum-rpc.publicnode.com.evil"
 				}
 				return withdrawalJSONResponse(r, 200, body), nil
 			})
@@ -191,10 +193,16 @@ func TestNativeManualConfirmationAcceptsMinedReceiptWithoutSignerJournal(t *test
 		t.Fatal(err)
 	}
 	hash := "0x" + strings.Repeat("a", 64)
+	receipt := sampleReceipt(depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: 100000})
 	f.receipts[hash] = map[string]any{
 		"transactionHash": hash, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock,
-		"to": addressTestVault, "logs": sampleReceipt(depositRecord{Contract: addressTestVault, Commitment: "0x1234", Amount: 100000}).Logs,
+		"to": addressTestVault, "logs": receipt.Logs,
 	}
+	// The receipt is corroborated by the vault state and the indexer.
+	expiry, _ := new(big.Int).SetString(receipt.Logs[0].Data[66:130], 16)
+	f.mu.Lock()
+	f.registerDeposit(addressTestFirstNote, "0x1234", 100000, expiry.Uint64())
+	f.mu.Unlock()
 	f.finalized = "0x1"
 	if _, err := f.h.confirm(context.Background(), hash); err != nil || f.activated != 1 {
 		t.Fatalf("canonical mined native receipt rejected: %v", err)

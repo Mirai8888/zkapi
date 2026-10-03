@@ -120,6 +120,14 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 		if !final || receipt.Status != "0x0" {
 			return quote, errors.New("the saved deposit must have a finalized revert before requoting")
 		}
+		// The RPC's revert alone never authorizes reusing the note secret.
+		deposit, err := h.readAddressDeposit(config)
+		if err != nil {
+			return quote, err
+		}
+		if err := h.checkDepositRevert(ctx, config, deposit, record.Pending, receipt); err != nil {
+			return quote, err
+		}
 		retryHash = record.Pending.Hash
 	}
 	if _, err = h.prepare(ctx, amount); err != nil {

@@ -11,7 +11,6 @@ import (
 	"io"
 	"math/big"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +35,7 @@ type fundingConfig struct {
 	Contract        string `json:"contract_address"`
 	Token           string `json:"token_address"`
 	RPC             string `json:"rpc_url"`
+	Indexer         string `json:"indexer_url"`
 	DemoMintEnabled bool   `json:"demo_mint_enabled"`
 }
 type depositRecord struct {
@@ -51,6 +51,37 @@ type depositRecord struct {
 	ZeroPath        []string `json:"zero_path"`
 	TransactionHash string   `json:"transaction_hash,omitempty"`
 	Active          bool     `json:"active,omitempty"`
+	// Additive recovery fields; older releases ignore them.
+	Binding *depositBinding `json:"binding,omitempty"`
+	Rebind  *depositRebind  `json:"rebind,omitempty"`
+	Slot    *depositSlot    `json:"slot,omitempty"`
+}
+
+// depositBinding is the note identity both the vault and the indexer agreed
+// on before the note secret was handed to the companion.
+type depositBinding struct {
+	NoteID       uint32 `json:"note_id"`
+	ExpiryTs     uint64 `json:"expiry_ts"`
+	BlockNumber  uint64 `json:"block_number"`
+	BlockHash    string `json:"block_hash"`
+	IndexerBlock uint64 `json:"indexer_applied_block"`
+}
+
+// depositRebind journals a companion note replacement before /wallet/reset,
+// so an interrupted rebind resumes to the same verified note.
+type depositRebind struct {
+	FromNoteID uint32 `json:"from_note_id"`
+	ToNoteID   uint32 `json:"to_note_id"`
+	ExpiryTs   uint64 `json:"expiry_ts"`
+}
+
+// depositSlot is the empty slot a signed deposit's zero path was checked
+// against, in the indexer's tree, just before signing. PathSHA256 identifies
+// the exact 32 sibling words in that transaction's calldata.
+type depositSlot struct {
+	NoteID     uint32 `json:"note_id"`
+	PathSHA256 string `json:"path_sha256"`
+	PreparedAt int64  `json:"prepared_at"`
 }
 
 // NewFundingHandler manages local custody through the authenticated CLI admin API.
@@ -98,22 +129,25 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 		return fundingConfig{}, err
 	}
 	var wire struct {
-		DeploymentID    string `json:"deployment_id"`
-		BillingAsset    string `json:"billing_asset"`
-		BillingUnit     string `json:"billing_unit"`
-		WeiPerUnit      string `json:"native_asset_wei_per_unit"`
-		ChainID         uint64 `json:"chain_id"`
-		Contract        string `json:"contract_address"`
-		Token           string `json:"demo_billing_token_address"`
-		RPC             string `json:"demo_rpc_url"`
-		DemoMintEnabled bool   `json:"demo_mint_enabled"`
+		DeploymentID      string `json:"deployment_id"`
+		BillingAsset      string `json:"billing_asset"`
+		BillingUnit       string `json:"billing_unit"`
+		WeiPerUnit        string `json:"native_asset_wei_per_unit"`
+		ChainID           uint64 `json:"chain_id"`
+		Contract          string `json:"contract_address"`
+		Token             string `json:"demo_billing_token_address"`
+		RPC               string `json:"demo_rpc_url"`
+		IndexerURL        string `json:"indexer_url"`
+		ProtocolServerURL string `json:"protocol_server_url"`
+		DemoMintEnabled   bool   `json:"demo_mint_enabled"`
 	}
 	if json.Unmarshal(raw, &wire) != nil {
 		return fundingConfig{}, errors.New("invalid funding configuration")
 	}
+	// The signing chain is the network's pinned chain ID; an RPC's eth_chainId
+	// is only a consistency check against it.
 	expected, _ := ChainID(h.client.config.Network)
-	rpc, err := url.Parse(wire.RPC)
-	if wire.ChainID != expected || !isHex(wire.Contract, 20) || err != nil || rpc.Scheme != "https" || rpc.Host == "" || rpc.User != nil || rpc.Fragment != "" {
+	if wire.ChainID != expected || !isHex(wire.Contract, 20) {
 		return fundingConfig{}, errors.New("invalid funding network or contract")
 	}
 	if wire.BillingAsset == "native_eth" {
@@ -127,9 +161,16 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 	} else if (wire.BillingAsset != "" && wire.BillingAsset != "erc20") || !isHex(wire.Token, 20) || wire.WeiPerUnit != "" {
 		return fundingConfig{}, errors.New("invalid billing asset configuration")
 	}
+	// A companion whose manifest names other chain endpoints was substituted
+	// or misconfigured. Refuse before any RPC read or custody state, and never
+	// send requests to the companion's strings, only to the packaged pins.
+	pins, err := h.client.packagedEndpoints()
+	if err != nil || !sameEndpoint(wire.RPC, pins.RPC) || !sameEndpoint(wire.IndexerURL, pins.Indexer) || !sameEndpoint(wire.ProtocolServerURL, pins.ProtocolServer) {
+		return fundingConfig{}, errors.New("the companion's chain endpoints do not match this client's packaged deployment; reinstall the zkAPI bundle")
+	}
 	return fundingConfig{
 		DeploymentID: wire.DeploymentID, BillingAsset: wire.BillingAsset, BillingUnit: wire.BillingUnit, WeiPerUnit: wire.WeiPerUnit,
-		ChainID: wire.ChainID, Contract: wire.Contract, Token: wire.Token, RPC: wire.RPC,
+		ChainID: wire.ChainID, Contract: wire.Contract, Token: wire.Token, RPC: pins.RPC, Indexer: pins.Indexer,
 		DemoMintEnabled: wire.DemoMintEnabled && wire.ChainID == 11155111 && wire.BillingAsset != "native_eth",
 	}, nil
 }
@@ -219,9 +260,18 @@ func (h *FundingHandler) prepare(ctx context.Context, amount uint64) (any, error
 	if err != nil {
 		return nil, err
 	}
-	if json.Unmarshal(raw, &record) != nil || record.Amount != amount || !isField(record.Secret) || !isField(record.Commitment) || len(record.ZeroPath) != 32 {
+	// Only the note material comes from the companion. Activation, transaction
+	// and binding fields are Go's own journal and are never seeded remotely.
+	var plan struct {
+		Amount     uint64   `json:"amount"`
+		Secret     string   `json:"secret"`
+		Commitment string   `json:"commitment"`
+		ZeroPath   []string `json:"zero_path"`
+	}
+	if json.Unmarshal(raw, &plan) != nil || plan.Amount != amount || !isField(plan.Secret) || !isField(plan.Commitment) || len(plan.ZeroPath) != 32 {
 		return nil, errors.New("invalid deposit preparation")
 	}
+	record = depositRecord{Amount: plan.Amount, Secret: plan.Secret, Commitment: plan.Commitment, ZeroPath: plan.ZeroPath}
 	for _, sibling := range record.ZeroPath {
 		if !isField(sibling) {
 			return nil, errors.New("invalid deposit path")
@@ -344,6 +394,19 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if err := h.save(record); err != nil {
 		return nil, err
 	}
+	// The receipt alone is one third-party RPC's claim. The vault state at the
+	// receipt block and the indexer's snapshot must agree before the secret
+	// leaves this process; disagreement and lag keep the saved transaction.
+	binding, err := h.corroborateDeposit(ctx, config, record, receipt, noteID, expiry)
+	if err != nil {
+		return nil, err
+	}
+	if record.Binding == nil || *record.Binding != *binding {
+		record.Binding = binding
+		if err := h.save(record); err != nil {
+			return nil, err
+		}
+	}
 	// A retry must never reinitialize an already used note to its deposit
 	// balance. Read the companion before calling its initialization endpoint.
 	walletRaw, err := h.client.WalletStatus(ctx)
@@ -353,14 +416,18 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	var wallet struct {
 		HasNote bool `json:"has_note"`
 		Note    struct {
-			NoteID uint32 `json:"note_id"`
+			NoteID   uint32  `json:"note_id"`
+			ExpiryTs *uint64 `json:"expiry_ts"`
 		} `json:"note"`
 	}
 	if json.Unmarshal(walletRaw, &wallet) != nil {
 		return nil, errors.New("invalid wallet status")
 	}
 	if wallet.HasNote {
-		if wallet.Note.NoteID != noteID {
+		if wallet.Note.NoteID != noteID || (wallet.Note.ExpiryTs != nil && *wallet.Note.ExpiryTs != expiry) {
+			if record.Active {
+				return nil, fmt.Errorf("the companion holds note %d, but the chain assigns this deposit note %d; run zkapi-clientd fund --rebind --replace-note-id %d", wallet.Note.NoteID, noteID, wallet.Note.NoteID)
+			}
 			return nil, errors.New("another private note is active; refusing to replace it")
 		}
 		record.Active = true
@@ -396,6 +463,8 @@ type ethReceipt struct {
 	Status          string `json:"status"`
 	To              string `json:"to"`
 	TransactionHash string `json:"transactionHash"`
+	BlockNumber     string `json:"blockNumber"`
+	BlockHash       string `json:"blockHash"`
 	Logs            []struct {
 		Address string   `json:"address"`
 		Topics  []string `json:"topics"`
@@ -430,6 +499,12 @@ func (h *FundingHandler) receipt(ctx context.Context, rpc, tx string) (ethReceip
 }
 
 func validateReceipt(receipt ethReceipt, record depositRecord) (uint32, uint64, error) {
+	return matchDepositEvent(receipt, record, time.Now().Unix())
+}
+
+// matchDepositEvent finds the one vault deposit event for this note. A zero
+// now skips the expiry check, for rebinding an older note that is still active.
+func matchDepositEvent(receipt ethReceipt, record depositRecord, now int64) (uint32, uint64, error) {
 	if receipt.Status != "0x1" {
 		return 0, 0, errors.New("deposit transaction reverted; no private balance was activated")
 	}
@@ -457,7 +532,7 @@ func validateReceipt(receipt ethReceipt, record depositRecord) (uint32, uint64, 
 		note, _ := new(big.Int).SetString(log.Topics[1][2:], 16)
 		amount, _ := new(big.Int).SetString(log.Data[2:66], 16)
 		expiry, _ := new(big.Int).SetString(log.Data[66:130], 16)
-		if !note.IsUint64() || note.Uint64() > 0xffffffff || !amount.IsUint64() || amount.Uint64() != record.Amount || !expiry.IsUint64() || expiry.Uint64() <= uint64(time.Now().Unix()) {
+		if !note.IsUint64() || note.Uint64() > 0xffffffff || !amount.IsUint64() || amount.Uint64() != record.Amount || !expiry.IsUint64() || expiry.Uint64() == 0 || (now != 0 && expiry.Uint64() <= uint64(now)) {
 			return 0, 0, errors.New("deposit event values do not match the pending note")
 		}
 		matchingNote, matchingExpiry = uint32(note.Uint64()), expiry.Uint64()

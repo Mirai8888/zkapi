@@ -280,6 +280,9 @@ func TestPaymentQuoteGetterNeverSigns(t *testing.T) {
 	}
 }
 func ioReadAndRestore(r *http.Request) ([]byte, error) {
+	if r.Body == nil { // Indexer snapshot reads share the transport.
+		return nil, nil
+	}
 	raw, err := io.ReadAll(r.Body)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	return raw, err

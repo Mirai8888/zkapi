@@ -10,9 +10,11 @@
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
 
 use std::convert::Infallible;
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -31,10 +33,14 @@ use zkapi_types::wire::{
 };
 use zkapi_types::Felt252;
 
+use crate::config::ServerConfig;
 use crate::dashboard::{DashboardEvent, DashboardHub, DashboardTotals};
 use crate::error::ServerError;
+use crate::native_billing::{vault_address_hex, NativeBillingOracle, VaultSigningKeys};
+use crate::nullifier_store::{DeploymentBinding, NullifierStore};
 use crate::oa_org::IssuedOpenRouterLease;
 use crate::processor::RequestProcessor;
+use crate::signer::ServerSigner;
 use crate::testnet_auth::{
     handle_auth_check, require_testnet_password, TestnetPassword, TESTNET_PASSWORD_HEADER,
 };
@@ -54,19 +60,47 @@ impl IntoResponse for ErrorHttpResponse {
 // Compact proofs are small; leave headroom for ordinary API payloads.
 const PROTOCOL_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
+/// Retry policy for reading the vault's immutable keys at startup.
+#[derive(Clone, Copy, Debug)]
+struct StartupRetry {
+    attempts: u32,
+    first_delay: Duration,
+}
+
+/// Five attempts with 1, 2, 4 and 8 s backoff; each RPC call keeps the
+/// oracle's 15 s timeout. A wrong chain or a key mismatch is never retried.
+const VAULT_BINDING_RETRY: StartupRetry = StartupRetry {
+    attempts: 5,
+    first_delay: Duration::from_secs(1),
+};
+/// Background re-verification of a recorded binding retries indefinitely.
+const VAULT_REVERIFY_FIRST_DELAY: Duration = Duration::from_secs(1);
+const VAULT_REVERIFY_MAX_DELAY: Duration = Duration::from_secs(60);
+
 /// Start the HTTP server with the given config.
-pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Result<()> {
+///
+/// The signing seeds must pass the operator key policy, and their public keys
+/// must equal the vault's immutable stateSigningKeyX/Y and
+/// clearanceSigningKeyX/Y, read over the native billing RPC (which must serve
+/// `chain_id`), before the database is opened for writes. The verified binding
+/// is recorded in the database; a restart with a matching record starts
+/// without the RPC and re-verifies in the background.
+pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
+    run_server_with(config, VAULT_BINDING_RETRY).await
+}
+
+async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyhow::Result<()> {
     if let Some(password) = TestnetPassword::from_env()? {
         config.testnet_password = Some(password);
     }
     config.validate_native_mode()?;
-    let store = Arc::new(crate::nullifier_store::NullifierStore::new(
-        &config.db_path,
-    )?);
-    let signer = Arc::new(crate::signer::ServerSigner::new(
-        &config.state_seed,
-        &config.clear_seed,
-    ));
+    let signer = Arc::new(
+        ServerSigner::try_new(&config.state_seed, &config.clear_seed).context(
+            "refusing to start: invalid signing seeds (ZKAPI_STATE_SEED / ZKAPI_CLEAR_SEED)",
+        )?,
+    );
+    let (binding, binding_source) = establish_deployment_binding(&config, &signer, retry).await?;
+    let store = Arc::new(NullifierStore::new(&config.db_path)?);
     let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
         match fetch_indexer_root(indexer_url).await {
             Ok(root) => root,
@@ -83,6 +117,10 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
         RequestProcessor::try_new(config.clone(), store, signer, initial_root)?
             .with_dashboard(dashboard),
     );
+    // Record a fresh verification only while holding the writer lock.
+    if binding_source == BindingSource::VerifiedNow {
+        processor.store().write_deployment_binding(&binding)?;
+    }
     if let Some(indexer_url) = config.indexer_url.clone() {
         spawn_root_poller(
             processor.clone(),
@@ -99,8 +137,270 @@ pub async fn run_server(mut config: crate::config::ServerConfig) -> anyhow::Resu
     let router = create_router(processor);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!("Server listening on {}", config.listen_addr);
-    axum::serve(listener, router).await?;
+    let serve = axum::serve(listener, router).into_future();
+    if binding_source == BindingSource::Recorded {
+        // Started without the RPC gate: stop serving, and so signing, if the
+        // vault definitively contradicts the recorded binding.
+        tokio::select! {
+            result = serve => result?,
+            Err(mismatch) = reverify_deployment_binding(&config, &binding, VAULT_REVERIFY_FIRST_DELAY) => {
+                return Err(mismatch);
+            }
+        }
+    } else {
+        serve.await?;
+    }
     Ok(())
+}
+
+/// Whether the deployment binding was verified against the vault during this
+/// startup or read from a previous successful verification in the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingSource {
+    VerifiedNow,
+    Recorded,
+}
+
+/// Bind this database to the vault's immutable keys before it is opened for
+/// writes. A database bound to another deployment is refused without any RPC.
+async fn establish_deployment_binding(
+    config: &ServerConfig,
+    signer: &ServerSigner,
+    retry: StartupRetry,
+) -> anyhow::Result<(DeploymentBinding, BindingSource)> {
+    let contract_address = vault_address_hex(&config.contract_address);
+    if let Some(recorded) = recorded_deployment_binding(&config.db_path) {
+        anyhow::ensure!(
+            recorded.chain_id == config.chain_id && recorded.contract_address == contract_address,
+            "refusing to start: server database {} is bound to vault {} on chain {}, not vault {} on chain {}; use a separate database for each deployment",
+            config.db_path,
+            recorded.contract_address,
+            recorded.chain_id,
+            contract_address,
+            config.chain_id
+        );
+        if recorded.state_signing_key == signer.state_public_key()
+            && recorded.clearance_signing_key == signer.clearance_public_key()
+        {
+            tracing::info!(
+                vault = %recorded.contract_address,
+                chain_id = recorded.chain_id,
+                verified_at = recorded.verified_at,
+                "starting from the recorded vault signing-key binding; re-verifying in the background"
+            );
+            return Ok((recorded, BindingSource::Recorded));
+        }
+        tracing::warn!(
+            "configured signing keys differ from the keys recorded for this vault; checking the vault"
+        );
+    }
+    let binding = verify_vault_binding(config, signer, retry).await?;
+    Ok((binding, BindingSource::VerifiedNow))
+}
+
+/// Read the binding of an existing database without opening it for writes.
+/// One that cannot be read this way (an older schema, a hot journal) falls
+/// back to the vault check rather than failing open.
+fn recorded_deployment_binding(db_path: &str) -> Option<DeploymentBinding> {
+    if !std::path::Path::new(db_path).is_file() {
+        return None;
+    }
+    match NullifierStore::open_read_only(db_path).and_then(|store| store.read_deployment_binding())
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            tracing::warn!(error = %error, "cannot read the recorded deployment binding; checking the vault");
+            None
+        }
+    }
+}
+
+struct VaultDeployment {
+    keys: VaultSigningKeys,
+    challenge_period_seconds: u64,
+}
+
+enum VaultReadError {
+    WrongChain(u64),
+    Unavailable(String),
+}
+
+/// eth_chainId, then the four immutable key getters and challengePeriod(),
+/// all at "latest". Nothing else is read at startup.
+async fn read_vault_deployment(
+    oracle: &NativeBillingOracle,
+    chain_id: u64,
+) -> Result<VaultDeployment, VaultReadError> {
+    // rpc() already maps failures to generic messages that never contain the URL.
+    let unavailable = |error: ServerError| {
+        VaultReadError::Unavailable(match error {
+            ServerError::InvalidRequest(message) | ServerError::Internal(message) => message,
+            other => other.to_string(),
+        })
+    };
+    let served = oracle.rpc_chain_id().await.map_err(unavailable)?;
+    if served != chain_id {
+        return Err(VaultReadError::WrongChain(served));
+    }
+    Ok(VaultDeployment {
+        keys: oracle.vault_signing_keys().await.map_err(unavailable)?,
+        challenge_period_seconds: oracle.vault_challenge_period().await.map_err(unavailable)?,
+    })
+}
+
+fn wrong_chain_message(served: u64, expected: u64) -> String {
+    format!(
+        "native billing RPC serves chain {served}, but --chain-id is {expected}; the vault signing-key check needs an RPC on the vault's chain"
+    )
+}
+
+/// The startup gate for a database with no matching recorded binding.
+async fn verify_vault_binding(
+    config: &ServerConfig,
+    signer: &ServerSigner,
+    retry: StartupRetry,
+) -> anyhow::Result<DeploymentBinding> {
+    let oracle = NativeBillingOracle::for_server(config)?;
+    let derived = VaultSigningKeys {
+        state: signer.state_public_key(),
+        clearance: signer.clearance_public_key(),
+    };
+    let mut delay = retry.first_delay;
+    let mut attempt = 0;
+    let vault = loop {
+        attempt += 1;
+        match read_vault_deployment(&oracle, config.chain_id).await {
+            Ok(vault) => break vault,
+            Err(VaultReadError::WrongChain(served)) => {
+                anyhow::bail!(wrong_chain_message(served, config.chain_id))
+            }
+            Err(VaultReadError::Unavailable(error)) if attempt >= retry.attempts => {
+                anyhow::bail!(
+                    "could not read the vault's pinned signing keys over the native billing RPC after {attempt} attempts: {error}"
+                )
+            }
+            Err(VaultReadError::Unavailable(error)) => {
+                tracing::warn!(attempt, error = %error, "vault signing-key check failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    };
+    ensure_vault_keys_match(config, &derived, &vault.keys)?;
+    let contract_address = vault_address_hex(&config.contract_address);
+    tracing::info!(
+        vault = %contract_address,
+        chain_id = config.chain_id,
+        state_signing_key_x = %derived.state.x,
+        state_signing_key_y = %derived.state.y,
+        clearance_signing_key_x = %derived.clearance.x,
+        clearance_signing_key_y = %derived.clearance.y,
+        challenge_period_seconds = vault.challenge_period_seconds,
+        "server signing keys match the vault's immutable keys"
+    );
+    Ok(DeploymentBinding {
+        chain_id: config.chain_id,
+        contract_address,
+        state_signing_key: derived.state,
+        clearance_signing_key: derived.clearance,
+        challenge_period_seconds: vault.challenge_period_seconds,
+        verified_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        verified_block: None,
+    })
+}
+
+fn ensure_vault_keys_match(
+    config: &ServerConfig,
+    derived: &VaultSigningKeys,
+    vault: &VaultSigningKeys,
+) -> anyhow::Result<()> {
+    if derived == vault {
+        return Ok(());
+    }
+    let verdict = |matches: bool| if matches { "ok" } else { "MISMATCH" };
+    let mut message = format!(
+        "server signing keys do not match the vault's immutable keys (vault {}, chain {}): \
+         state {} (vault x={},y={}; ZKAPI_STATE_SEED derives x={},y={}), \
+         clearance {} (vault x={},y={}; ZKAPI_CLEAR_SEED derives x={},y={})",
+        vault_address_hex(&config.contract_address),
+        config.chain_id,
+        verdict(vault.state == derived.state),
+        vault.state.x,
+        vault.state.y,
+        derived.state.x,
+        derived.state.y,
+        verdict(vault.clearance == derived.clearance),
+        vault.clearance.x,
+        vault.clearance.y,
+        derived.clearance.x,
+        derived.clearance.y,
+    );
+    if vault.state == derived.clearance && vault.clearance == derived.state {
+        message.push_str("; ZKAPI_STATE_SEED and ZKAPI_CLEAR_SEED appear swapped");
+    }
+    message.push_str(
+        ". Use the seeds whose `zkapi signing-keys` output was passed to the vault constructor; vault keys cannot change without redeploying.",
+    );
+    anyhow::bail!(message)
+}
+
+/// Re-verify a recorded binding while serving. Unavailable or wrong-chain RPCs
+/// cannot prove a mismatch and are retried indefinitely; only vault keys (or a
+/// challenge period) that contradict the record end the server.
+async fn reverify_deployment_binding(
+    config: &ServerConfig,
+    recorded: &DeploymentBinding,
+    first_delay: Duration,
+) -> anyhow::Result<Infallible> {
+    let oracle = NativeBillingOracle::for_server(config)?;
+    let expected = VaultSigningKeys {
+        state: recorded.state_signing_key.clone(),
+        clearance: recorded.clearance_signing_key.clone(),
+    };
+    let mut delay = first_delay;
+    loop {
+        match read_vault_deployment(&oracle, config.chain_id).await {
+            Ok(vault) => {
+                let outcome = ensure_vault_keys_match(config, &expected, &vault.keys).and_then(|()| {
+                    anyhow::ensure!(
+                        vault.challenge_period_seconds == recorded.challenge_period_seconds,
+                        "vault challengePeriod() is {} s, but this database recorded {} s for vault {}",
+                        vault.challenge_period_seconds,
+                        recorded.challenge_period_seconds,
+                        recorded.contract_address
+                    );
+                    Ok(())
+                });
+                if let Err(mismatch) = outcome {
+                    tracing::error!(
+                        error = %mismatch,
+                        "the vault contradicts this database's recorded deployment binding; shutting down instead of signing"
+                    );
+                    return Err(mismatch);
+                }
+                tracing::info!(
+                    vault = %recorded.contract_address,
+                    chain_id = recorded.chain_id,
+                    "re-verified the recorded vault signing-key binding"
+                );
+                return std::future::pending().await;
+            }
+            Err(VaultReadError::WrongChain(served)) => {
+                tracing::error!(
+                    "{}; signing continues under the recorded binding",
+                    wrong_chain_message(served, config.chain_id)
+                );
+            }
+            Err(VaultReadError::Unavailable(error)) => {
+                tracing::warn!(error = %error, "vault signing-key re-verification failed; retrying");
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(VAULT_REVERIFY_MAX_DELAY);
+    }
 }
 
 /// Create the Axum router with all zkAPI server routes.
@@ -638,5 +938,546 @@ mod rate_limit_tests {
         assert_eq!(response.error_code, "lease_settlement_pending");
         assert!(response.retriable);
         assert_eq!(response.retry_after_seconds, Some(15));
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::native_billing::{
+        NativeBillingConfig, CHALLENGE_PERIOD_SELECTOR, CLEARANCE_SIGNING_KEY_X_SELECTOR,
+        CLEARANCE_SIGNING_KEY_Y_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR,
+        STATE_SIGNING_KEY_Y_SELECTOR,
+    };
+    use crate::signer::strong_test_seeds;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+    use tokio::sync::Semaphore;
+
+    const TEST_RETRY: StartupRetry = StartupRetry {
+        attempts: 3,
+        first_delay: Duration::from_millis(1),
+    };
+    const KEY_READS: [&str; 5] = [
+        STATE_SIGNING_KEY_X_SELECTOR,
+        STATE_SIGNING_KEY_Y_SELECTOR,
+        CLEARANCE_SIGNING_KEY_X_SELECTOR,
+        CLEARANCE_SIGNING_KEY_Y_SELECTOR,
+        CHALLENGE_PERIOD_SELECTOR,
+    ];
+
+    /// Independent strong seeds for a vault the configured seeds do not match.
+    fn other_strong_seeds() -> (Felt252, Felt252) {
+        (
+            Felt252::from_hex("0x2c9e7a5b3d1f8e6c4a2b0d9f7e5c3a1b8d6f4e2c0a9b7d5e3f1c8a6b4d2e0f")
+                .unwrap(),
+            Felt252::from_hex("0x47b2e9d6c3a0f7e4b1d8c5a2f9e6b3d0c7a4f1e8b5d2c9a6f3e0b7d4c1a8e5")
+                .unwrap(),
+        )
+    }
+
+    fn keys_of((state, clearance): (Felt252, Felt252)) -> VaultSigningKeys {
+        let signer = ServerSigner::try_new(&state, &clearance).unwrap();
+        VaultSigningKeys {
+            state: signer.state_public_key(),
+            clearance: signer.clearance_public_key(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct VaultRpc {
+        chain: &'static str,
+        /// None answers every eth_call with "0x": no code at the vault address.
+        keys: Option<VaultSigningKeys>,
+        unavailable: bool,
+        /// Holds every response until permits are added.
+        gate: Option<Arc<Semaphore>>,
+    }
+
+    impl VaultRpc {
+        fn serving(keys: VaultSigningKeys) -> Self {
+            Self {
+                chain: "0x1",
+                keys: Some(keys),
+                unavailable: false,
+                gate: None,
+            }
+        }
+    }
+
+    type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    /// Records (method, call data, block) and answers like the vault would.
+    async fn vault_rpc(vault: VaultRpc) -> (String, Calls) {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let vault = vault.clone();
+                let calls = recorded.clone();
+                async move {
+                    if let Some(gate) = vault.gate.as_ref() {
+                        let _permit = gate.acquire().await.unwrap();
+                    }
+                    let method = request["method"].as_str().unwrap_or_default().to_string();
+                    let data = request["params"][0]["data"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let block = request["params"][1]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), data.clone(), block));
+                    if vault.unavailable {
+                        return Err(StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    let word = |value: &Felt252| format!("0x{}", hex::encode(value.as_bytes()));
+                    let result = match (method.as_str(), vault.keys.as_ref()) {
+                        ("eth_chainId", _) => vault.chain.to_string(),
+                        ("eth_call", None) => "0x".to_string(),
+                        ("eth_call", Some(keys)) => match data.as_str() {
+                            STATE_SIGNING_KEY_X_SELECTOR => word(&keys.state.x),
+                            STATE_SIGNING_KEY_Y_SELECTOR => word(&keys.state.y),
+                            CLEARANCE_SIGNING_KEY_X_SELECTOR => word(&keys.clearance.x),
+                            CLEARANCE_SIGNING_KEY_Y_SELECTOR => word(&keys.clearance.y),
+                            CHALLENGE_PERIOD_SELECTOR => format!("0x{:064x}", 86_400),
+                            _ => return Err(StatusCode::BAD_REQUEST),
+                        },
+                        _ => return Err(StatusCode::BAD_REQUEST),
+                    };
+                    Ok(Json(json!({"jsonrpc":"2.0", "id":1, "result":result})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, calls)
+    }
+
+    fn config(rpc_url: &str, db_path: &std::path::Path, seeds: (Felt252, Felt252)) -> ServerConfig {
+        ServerConfig {
+            contract_address: Felt252::from_u64(0x1234),
+            state_seed: seeds.0,
+            clear_seed: seeds.1,
+            db_path: db_path.to_string_lossy().into_owned(),
+            native_billing: Some(NativeBillingConfig {
+                rpc_url: rpc_url.into(),
+                ..crate::test_support::native_config()
+            }),
+            openrouter_leases: Some(crate::test_support::lease_config()),
+            proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+            ..Default::default()
+        }
+    }
+
+    fn recorded_binding(seeds: (Felt252, Felt252)) -> DeploymentBinding {
+        let keys = keys_of(seeds);
+        DeploymentBinding {
+            chain_id: 1,
+            contract_address: "0x0000000000000000000000000000000000001234".into(),
+            state_signing_key: keys.state,
+            clearance_signing_key: keys.clearance,
+            challenge_period_seconds: 86_400,
+            verified_at: 1_700_000_000,
+            verified_block: None,
+        }
+    }
+
+    async fn free_listen_addr() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    async fn wait_for_health(listen_addr: &str) {
+        let url = format!("http://{listen_addr}/health");
+        for _ in 0..400 {
+            if let Ok(response) = reqwest::get(&url).await {
+                if response.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("server never became healthy");
+    }
+
+    fn methods(calls: &Calls) -> Vec<(String, String, String)> {
+        calls.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_unsafe_seeds_before_any_rpc_or_database() {
+        let (strong_state, strong_clear) = strong_test_seeds();
+        let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(strong_test_seeds()))).await;
+        let felt = |hex: &str| Felt252::from_hex(hex).unwrap();
+        let l = "0x60c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f1";
+        let one_plus_l = "0x60c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f2";
+        let two_plus_3l = "0x12259d6b14729c0fa51e1a247090812301bcc928ab62ca1f3657c794ab6374d5";
+        let unset = ServerConfig::default();
+        for (state_seed, clear_seed) in [
+            (unset.state_seed, unset.clear_seed),
+            (felt("0x0"), strong_clear),
+            (felt("1"), strong_clear),
+            (felt("0X1"), strong_clear),
+            (felt("0x0001"), strong_clear),
+            (felt(l), strong_clear),
+            (felt(one_plus_l), strong_clear),
+            (strong_state, felt(two_plus_3l)),
+            (strong_state, felt("0x2")),
+            (felt("0x1"), felt("0x2")),
+            (felt("0x2"), felt("0x1")),
+            (felt("0x7"), felt("0x8")),
+            (felt("0xb"), felt("0xc")),
+            (felt("0x2a"), strong_clear),
+            (strong_state, felt("0x63")),
+            (strong_state, strong_state),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("must-not-exist.db");
+            let error =
+                run_server_with(config(&rpc, &db_path, (state_seed, clear_seed)), TEST_RETRY)
+                    .await
+                    .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("refusing to start: invalid signing seeds"),
+                "{state_seed}/{clear_seed}: {message}"
+            );
+            assert!(!message.contains(&strong_state.to_hex()[2..]));
+            assert!(!message.contains(&strong_clear.to_hex()[2..]));
+            assert!(!db_path.exists());
+        }
+        assert!(methods(&calls).is_empty(), "the RPC was contacted");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_vault_signing_key_mismatch_before_opening_database() {
+        let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(other_strong_seeds()))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("must-not-exist.db");
+        let error = run_server_with(config(&rpc, &db_path, strong_test_seeds()), TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("do not match the vault's immutable keys")
+                && error.contains("state MISMATCH")
+                && error.contains("clearance MISMATCH")
+                && !error.contains("swapped"),
+            "{error}"
+        );
+        assert!(!db_path.exists());
+        // A mismatch is definitive: one read of the chain and the vault, no retry.
+        assert_eq!(methods(&calls).len(), 1 + KEY_READS.len());
+    }
+
+    #[tokio::test]
+    async fn vault_binding_accepts_matching_keys_read_at_latest() {
+        let seeds = strong_test_seeds();
+        let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&rpc, &directory.path().join("server.db"), seeds);
+        let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
+        let binding = verify_vault_binding(&config, &signer, TEST_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding,
+            DeploymentBinding {
+                verified_at: binding.verified_at,
+                ..recorded_binding(seeds)
+            }
+        );
+        assert!(binding.verified_at > 1_700_000_000);
+        // Only eth_chainId, the four key getters and challengePeriod(), at
+        // "latest": no feed decimals() or nativeAssetWeiPerUnit() at startup.
+        let calls = methods(&calls);
+        assert_eq!(calls[0].0, "eth_chainId");
+        let reads: Vec<_> = calls[1..]
+            .iter()
+            .map(|(method, data, block)| {
+                assert_eq!((method.as_str(), block.as_str()), ("eth_call", "latest"));
+                data.as_str()
+            })
+            .collect();
+        assert_eq!(reads, KEY_READS);
+    }
+
+    #[tokio::test]
+    async fn vault_binding_reports_swapped_seeds() {
+        let (state, clear) = strong_test_seeds();
+        let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of((clear, state)))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&rpc, &directory.path().join("server.db"), (state, clear));
+        let signer = ServerSigner::try_new(&state, &clear).unwrap();
+        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("appear swapped"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn vault_binding_refuses_rpc_on_another_chain_without_retrying() {
+        let seeds = strong_test_seeds();
+        let (rpc, calls) = vault_rpc(VaultRpc {
+            chain: "0xaa36a7",
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&rpc, &directory.path().join("server.db"), seeds);
+        let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
+        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("serves chain 11155111, but --chain-id is 1"),
+            "{error}"
+        );
+        assert_eq!(
+            methods(&calls)
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            ["eth_chainId"]
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_binding_retries_unavailable_rpc_then_refuses() {
+        let seeds = strong_test_seeds();
+        let (rpc, calls) = vault_rpc(VaultRpc {
+            unavailable: true,
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("must-not-exist.db");
+        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after 3 attempts"), "{error}");
+        assert!(!error.contains(&rpc), "{error}");
+        assert_eq!(methods(&calls).len(), 3);
+        assert!(!db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn vault_binding_refuses_address_without_vault_code() {
+        let seeds = strong_test_seeds();
+        let (rpc, calls) = vault_rpc(VaultRpc {
+            keys: None,
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(&rpc, &directory.path().join("server.db"), seeds);
+        let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
+        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("after 3 attempts") && error.contains("no 32-byte word"),
+            "{error}"
+        );
+        assert_eq!(methods(&calls).len(), 3 * 2);
+    }
+
+    #[test]
+    fn startup_records_binding_then_restarts_without_rpc() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+
+        // First start: the vault check passes and the binding is recorded.
+        let first = tokio::runtime::Runtime::new().unwrap();
+        first.block_on(async {
+            let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+            let mut config = config(&rpc, &db_path, seeds);
+            config.listen_addr = free_listen_addr().await;
+            tokio::spawn(run_server_with(config.clone(), TEST_RETRY));
+            wait_for_health(&config.listen_addr).await;
+        });
+        // Dropping the runtime stops the server and releases its writer lock.
+        // A child process spawned concurrently by another test can briefly
+        // hold a duplicate of the lock descriptor, so wait for the release.
+        drop(first);
+        let released = std::time::Instant::now();
+        while crate::writer_lock::ServerWriterLock::acquire(&db_path).is_err() {
+            assert!(released.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = NullifierStore::open_read_only(&db_path)
+            .unwrap()
+            .read_deployment_binding()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            DeploymentBinding {
+                verified_at: recorded.verified_at,
+                ..recorded_binding(seeds)
+            }
+        );
+
+        // Restart while the RPC is down: a single-attempt gate would refuse, so
+        // becoming healthy proves the recorded binding was used.
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async {
+            let (rpc, calls) = vault_rpc(VaultRpc {
+                unavailable: true,
+                ..VaultRpc::serving(keys_of(seeds))
+            })
+            .await;
+            let mut config = config(&rpc, &db_path, seeds);
+            config.listen_addr = free_listen_addr().await;
+            let server = tokio::spawn(run_server_with(
+                config.clone(),
+                StartupRetry {
+                    attempts: 1,
+                    first_delay: Duration::from_millis(1),
+                },
+            ));
+            wait_for_health(&config.listen_addr).await;
+            // The background re-verification keeps trying without stopping the server.
+            while methods(&calls).is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!server.is_finished());
+        });
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn restart_stops_serving_when_the_vault_contradicts_the_recorded_binding() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+        NullifierStore::new(&db_path)
+            .unwrap()
+            .write_deployment_binding(&recorded_binding(seeds))
+            .unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let (rpc, _) = vault_rpc(VaultRpc {
+            gate: Some(gate.clone()),
+            ..VaultRpc::serving(keys_of(other_strong_seeds()))
+        })
+        .await;
+        let mut config = config(&rpc, &db_path, seeds);
+        config.listen_addr = free_listen_addr().await;
+        let server = tokio::spawn(run_server_with(config.clone(), TEST_RETRY));
+        // Serving before the RPC has answered anything: no startup gate ran.
+        wait_for_health(&config.listen_addr).await;
+        gate.add_permits(1_000);
+        let error = tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("do not match the vault's immutable keys"),
+            "{error}"
+        );
+        assert_eq!(
+            NullifierStore::open_read_only(&db_path)
+                .unwrap()
+                .read_deployment_binding()
+                .unwrap(),
+            Some(recorded_binding(seeds))
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_refuses_a_database_bound_to_another_deployment_before_rpc() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+        let other_vault = DeploymentBinding {
+            contract_address: "0x0000000000000000000000000000000000009999".into(),
+            ..recorded_binding(seeds)
+        };
+        NullifierStore::new(&db_path)
+            .unwrap()
+            .write_deployment_binding(&other_vault)
+            .unwrap();
+        let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is bound to vault 0x0000000000000000000000000000000000009999"),
+            "{error}"
+        );
+        assert!(methods(&calls).is_empty());
+        assert_eq!(
+            NullifierStore::open_read_only(&db_path)
+                .unwrap()
+                .read_deployment_binding()
+                .unwrap(),
+            Some(other_vault)
+        );
+    }
+
+    #[tokio::test]
+    async fn background_reverification_retries_until_the_vault_answers() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let recorded = recorded_binding(seeds);
+        for vault in [
+            VaultRpc {
+                unavailable: true,
+                ..VaultRpc::serving(keys_of(seeds))
+            },
+            VaultRpc {
+                chain: "0xaa36a7",
+                ..VaultRpc::serving(keys_of(seeds))
+            },
+            VaultRpc {
+                keys: None,
+                ..VaultRpc::serving(keys_of(seeds))
+            },
+            VaultRpc::serving(keys_of(seeds)),
+        ] {
+            let matching =
+                vault.keys == Some(keys_of(seeds)) && !vault.unavailable && vault.chain == "0x1";
+            let (rpc, calls) = vault_rpc(vault).await;
+            let config = config(&rpc, &directory.path().join("server.db"), seeds);
+            // Neither an outage, a wrong chain nor a missing vault is definitive.
+            assert!(tokio::time::timeout(
+                Duration::from_millis(300),
+                reverify_deployment_binding(&config, &recorded, Duration::from_millis(1)),
+            )
+            .await
+            .is_err());
+            let calls = methods(&calls);
+            if matching {
+                // Verified once, then idle.
+                assert_eq!(calls.len(), 1 + KEY_READS.len());
+            } else {
+                assert!(calls.len() > 2);
+            }
+        }
+        let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of(other_strong_seeds()))).await;
+        let config = config(&rpc, &directory.path().join("server.db"), seeds);
+        let error = reverify_deployment_binding(&config, &recorded, Duration::from_millis(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("do not match the vault's immutable keys"),
+            "{error}"
+        );
     }
 }

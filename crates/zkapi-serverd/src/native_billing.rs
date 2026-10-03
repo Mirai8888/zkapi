@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use zkapi_types::wire::CurvePointWire;
 use zkapi_types::Felt252;
 
 use crate::error::ServerError;
@@ -12,12 +13,47 @@ use crate::error::ServerError;
 pub const UNITS_PER_ETH: u128 = 1_000_000_000;
 pub const MAX_SAFE_UNITS: u128 = 9_007_199_254_740_991;
 
-#[derive(Debug, Clone)]
+/// Immutable vault getters read at startup, all at block "latest".
+pub const STATE_SIGNING_KEY_X_SELECTOR: &str = "0x15fa2a9a"; // stateSigningKeyX()
+pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY()
+pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
+pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
+pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
+
+#[derive(Clone)]
 pub struct NativeBillingConfig {
     pub rpc_url: String,
     pub feed_address: String,
     pub decimals: u8,
     pub max_age_seconds: u64,
+}
+
+// RPC URLs commonly embed a provider API key.
+impl std::fmt::Debug for NativeBillingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeBillingConfig")
+            .field("rpc_url", &"[redacted]")
+            .field("feed_address", &self.feed_address)
+            .field("decimals", &self.decimals)
+            .field("max_age_seconds", &self.max_age_seconds)
+            .finish()
+    }
+}
+
+/// The vault's immutable signing keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultSigningKeys {
+    pub state: CurvePointWire,
+    pub clearance: CurvePointWire,
+}
+
+/// The vault address in the form used for RPC reads and the deployment
+/// binding: 0x followed by 40 lowercase hex digits.
+pub fn vault_address_hex(contract_address: &Felt252) -> String {
+    let address = contract_address.to_hex();
+    let body = address.strip_prefix("0x").unwrap_or(&address);
+    format!("0x{body:0>40}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +214,58 @@ impl NativeBillingOracle {
         })
     }
 
+    /// The oracle a server configuration pins: its chain and its vault.
+    pub fn for_server(config: &crate::config::ServerConfig) -> anyhow::Result<Self> {
+        let native = config
+            .native_billing
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("native ETH billing configuration is required"))?;
+        Self::new(
+            native,
+            config.chain_id,
+            vault_address_hex(&config.contract_address),
+        )
+    }
+
+    /// The chain the RPC actually serves.
+    pub async fn rpc_chain_id(&self) -> Result<u64, ServerError> {
+        self.rpc("eth_chainId", json!([]))
+            .await?
+            .as_str()
+            .and_then(|s| s.strip_prefix("0x"))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .ok_or_else(|| invalid("native oracle RPC returned an invalid chain ID"))
+    }
+
+    /// One 32-byte field word from a vault getter at "latest".
+    async fn vault_word(&self, selector: &str) -> Result<Felt252, ServerError> {
+        decode_field_word(&self.call(&self.contract_address, selector).await?)
+    }
+
+    /// The vault's immutable stateSigningKeyX/Y and clearanceSigningKeyX/Y.
+    pub async fn vault_signing_keys(&self) -> Result<VaultSigningKeys, ServerError> {
+        Ok(VaultSigningKeys {
+            state: CurvePointWire {
+                x: self.vault_word(STATE_SIGNING_KEY_X_SELECTOR).await?,
+                y: self.vault_word(STATE_SIGNING_KEY_Y_SELECTOR).await?,
+            },
+            clearance: CurvePointWire {
+                x: self.vault_word(CLEARANCE_SIGNING_KEY_X_SELECTOR).await?,
+                y: self.vault_word(CLEARANCE_SIGNING_KEY_Y_SELECTOR).await?,
+            },
+        })
+    }
+
+    /// The vault's immutable challengePeriod(), in seconds.
+    pub async fn vault_challenge_period(&self) -> Result<u64, ServerError> {
+        self.vault_word(CHALLENGE_PERIOD_SELECTOR)
+            .await?
+            .to_u64()
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| invalid("vault challenge period is zero or out of range"))
+    }
+
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ServerError> {
         let response = self
             .http
@@ -233,12 +321,7 @@ impl NativeBillingOracle {
     }
 
     async fn assert_chain(&self) -> Result<(), ServerError> {
-        let actual = self.rpc("eth_chainId", json!([])).await?;
-        let chain = actual
-            .as_str()
-            .and_then(|s| s.strip_prefix("0x"))
-            .and_then(|s| u64::from_str_radix(s, 16).ok());
-        if chain != Some(self.chain_id) {
+        if self.rpc_chain_id().await? != self.chain_id {
             return Err(invalid("native oracle RPC returned the wrong chain"));
         }
         Ok(())
@@ -388,6 +471,24 @@ fn valid_address(value: &str) -> bool {
         && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
         && value[2..].bytes().any(|b| b != b'0')
 }
+/// Exactly one ABI word holding a BN254 field element, e.g. a vault key
+/// coordinate (decode_word rejects values of 128 bits or more).
+fn decode_field_word(raw: &str) -> Result<Felt252, ServerError> {
+    let word = raw
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid("malformed vault ABI word"))?;
+    if word.is_empty() {
+        return Err(invalid(
+            "vault getter returned no 32-byte word (is the vault deployed at this address on this chain?)",
+        ));
+    }
+    if word.len() != 64 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid("malformed vault ABI word"));
+    }
+    Felt252::from_hex_checked(word)
+        .map_err(|_| invalid("vault getter value is not a field element"))
+}
+
 fn decode_word(raw: &str, index: usize) -> Result<u128, ServerError> {
     let word = raw
         .strip_prefix("0x")
@@ -435,6 +536,100 @@ mod tests {
         assert!(quote().limit_micro_usd(MAX_SAFE_UNITS + 1).is_err());
         assert!(decode_word(&format!("0x{}", "f".repeat(64)), 0).is_err());
     }
+    #[test]
+    fn vault_signing_key_selectors_match_abi() {
+        for (signature, selector) in [
+            ("stateSigningKeyX()", STATE_SIGNING_KEY_X_SELECTOR),
+            ("stateSigningKeyY()", STATE_SIGNING_KEY_Y_SELECTOR),
+            ("clearanceSigningKeyX()", CLEARANCE_SIGNING_KEY_X_SELECTOR),
+            ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
+            ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
+        ] {
+            let digest = Keccak256::digest(signature.as_bytes());
+            assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
+        }
+        // Independent literals from the ABI, rather than the encoder above.
+        assert_eq!(
+            [
+                STATE_SIGNING_KEY_X_SELECTOR,
+                STATE_SIGNING_KEY_Y_SELECTOR,
+                CLEARANCE_SIGNING_KEY_X_SELECTOR,
+                CLEARANCE_SIGNING_KEY_Y_SELECTOR,
+                CHALLENGE_PERIOD_SELECTOR
+            ],
+            [
+                "0x15fa2a9a",
+                "0x230e2a24",
+                "0xdc41d636",
+                "0x112cd6bc",
+                "0xf3f480d9"
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_field_word_rejects_short_and_out_of_field_words() {
+        let error = decode_field_word("0x").unwrap_err().to_string();
+        assert!(error.contains("no 32-byte word"), "{error}");
+        for malformed in [
+            String::new(),
+            "0x0".into(),
+            format!("0x{}", "0".repeat(63)),
+            format!("0x{}", "0".repeat(65)),
+            format!("0x{}", "0".repeat(128)),
+            format!("0x{}g", "0".repeat(63)),
+            format!("0x+{}", "0".repeat(63)),
+            "0".repeat(64),
+        ] {
+            let error = decode_field_word(&malformed).unwrap_err().to_string();
+            assert!(
+                error.contains("malformed vault ABI word"),
+                "{malformed}: {error}"
+            );
+        }
+        let modulus = zkapi_types::FIELD_MODULUS_HEX.trim_start_matches("0x");
+        let error = decode_field_word(&format!("0x{modulus:0>64}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a field element"), "{error}");
+        assert!(decode_field_word(&format!("0x{}", "f".repeat(64))).is_err());
+        // Key coordinates are full-width field elements, unlike decode_word values.
+        let coordinate =
+            crate::signer::ServerSigner::new(&Felt252::from_u64(7), &Felt252::from_u64(8))
+                .state_public_key()
+                .x;
+        assert!(coordinate.to_u128().is_none());
+        assert_eq!(
+            decode_field_word(&format!("0x{}", hex::encode(coordinate.as_bytes()))).unwrap(),
+            coordinate
+        );
+    }
+
+    #[test]
+    fn server_oracle_pins_the_configured_vault_address() {
+        assert_eq!(
+            vault_address_hex(&Felt252::from_hex("0xABCDEF").unwrap()),
+            "0x0000000000000000000000000000000000abcdef"
+        );
+        let config = crate::config::ServerConfig {
+            contract_address: Felt252::from_u64(0x1234),
+            native_billing: Some(crate::test_support::native_config()),
+            ..Default::default()
+        };
+        let oracle = NativeBillingOracle::for_server(&config).unwrap();
+        assert_eq!(
+            oracle.contract_address,
+            "0x0000000000000000000000000000000000001234"
+        );
+        assert_eq!(oracle.chain_id, config.chain_id);
+        let error = NativeBillingOracle::for_server(&crate::config::ServerConfig::default())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("native ETH billing configuration is required"));
+        assert!(!format!("{:?}", crate::test_support::native_config()).contains("127.0.0.1:9"));
+    }
+
     #[test]
     fn quote_identity_is_exact() {
         let mut q = quote();

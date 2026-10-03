@@ -3,9 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
-use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+use ark_ec::{AdditiveGroup, AffineRepr, CurveGroup, PrimeGroup};
 use ark_ed_on_bn254::{EdwardsAffine, EdwardsProjective, Fr as EdwardsScalarField};
 use ark_ff::{BigInteger, PrimeField, UniformRand};
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
@@ -39,6 +39,14 @@ pub const WITHDRAWAL_VERIFYING_KEY_FILE: &str = "withdrawal.vk";
 pub const SETUP_MANIFEST_FILE: &str = "manifest.json";
 pub const SOLIDITY_POSEIDON_FILE: &str = "Bn254Poseidon.sol";
 pub const SOLIDITY_VERIFIER_FILE: &str = "Groth16ProofAdapter.sol";
+
+/// Seeds of the published development signing keys. Every fixture, example and
+/// test vault in this repository uses them, so their public keys
+/// (x=0x2b8cfd91…6c32 and x=0x1812b84c…5be4) have publicly known secrets.
+pub const DEVELOPMENT_SIGNING_SEEDS: [u64; 2] = [1, 2];
+/// An operator secret `s` must keep `min(s, l - s) >= 2^128`, where `l` is the
+/// Baby-JubJub subgroup order; smaller secrets fall to a ~2^64 kangaroo search.
+pub const MIN_SIGNING_SECRET_BITS: u32 = 128;
 
 #[derive(Serialize)]
 struct SetupManifest {
@@ -254,10 +262,24 @@ pub struct CompactSigner {
 }
 
 impl CompactSigner {
+    /// Fixture constructor with no operator-key policy. Panics on a seed that
+    /// reduces to zero; operators use [`validate_operator_signing_seeds`].
     pub fn from_seed(seed: &Felt252) -> Self {
-        Self {
-            key: StateSigningKey::from_secret(scalar(seed)),
+        Self::try_from_seed(seed).expect("signing seed must not reduce to zero")
+    }
+
+    /// Reject a seed whose secret `seed mod l` is zero: 0x0, an empty or
+    /// unset value, and the subgroup-order multiples l..7l below the field.
+    pub fn try_from_seed(seed: &Felt252) -> Result<Self> {
+        let secret = scalar(seed);
+        if secret == EdwardsScalarField::ZERO {
+            bail!(
+                "signing seed is zero or a multiple of the Baby-JubJub subgroup order (an unset seed is zero)"
+            );
         }
+        Ok(Self {
+            key: StateSigningKey::from_secret(secret),
+        })
     }
 
     pub fn public_key(&self) -> CurvePointWire {
@@ -275,6 +297,48 @@ impl CompactSigner {
             signature_from_wire(*signature)?,
         ))
     }
+}
+
+/// Return the development seed whose published public key equals `public_key`.
+/// Comparing derived keys catches every spelling and `n + k*l` alias.
+pub fn development_seed_for_public_key(public_key: &CurvePointWire) -> Option<u64> {
+    DEVELOPMENT_SIGNING_SEEDS.into_iter().find(|seed| {
+        CompactSigner::from_seed(&Felt252::from_u64(*seed)).public_key() == *public_key
+    })
+}
+
+/// Operator signing-key policy shared by `zkapi signing-keys` and serverd.
+/// Rejects zero and subgroup-order multiples, the published development keys
+/// in either role, secrets within 2^128 of zero or of the subgroup order, and
+/// one key reused for both roles. Errors name the role, never the seed.
+pub fn validate_operator_signing_seeds(
+    state_seed: &Felt252,
+    clearance_seed: &Felt252,
+) -> Result<(CompactSigner, CompactSigner)> {
+    let state = operator_signer("state", state_seed)?;
+    let clearance = operator_signer("clearance", clearance_seed)?;
+    if state.public_key() == clearance.public_key() {
+        bail!(
+            "state and clearance signing seeds derive the same public key; use independent seeds"
+        );
+    }
+    Ok((state, clearance))
+}
+
+fn operator_signer(role: &str, seed: &Felt252) -> Result<CompactSigner> {
+    let signer = CompactSigner::try_from_seed(seed).map_err(|error| anyhow!("{role} {error}"))?;
+    if let Some(development) = development_seed_for_public_key(&signer.public_key()) {
+        bail!("{role} signing seed derives the published development key of seed {development:#x}");
+    }
+    let secret = scalar(seed);
+    if secret.into_bigint().num_bits() <= MIN_SIGNING_SECRET_BITS
+        || (-secret).into_bigint().num_bits() <= MIN_SIGNING_SECRET_BITS
+    {
+        bail!(
+            "{role} signing seed is guessable: its secret lies within 2^128 of zero or of the subgroup order; generate 31 random bytes"
+        );
+    }
+    Ok(signer)
 }
 
 pub fn setup(directory: impl AsRef<Path>) -> Result<()> {
@@ -1171,6 +1235,190 @@ mod tests {
         let message = core::hash_felts(&[Felt252::from_u64(7)]);
         let signature = signer.sign(&message);
         assert!(signer.verify(&message, &signature).unwrap());
+    }
+
+    /// k*l for k = 1..=7, where l is the Baby-JubJub subgroup order; 8l exceeds the field.
+    const SUBGROUP_ORDER_MULTIPLES: [&str; 7] = [
+        "0x60c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f1",
+        "0xc19139cb84c680a6e14116da0605617567ddb707241dc14cee52fb872424de2",
+        "0x12259d6b14729c0fa51e1a247090812301bcc928ab62ca1f3657c794ab6374d3",
+        "0x183227397098d014dc2822db40c0ac2eacfbb6e0e483b8299dca5f70e4849bc4",
+        "0x1e3eb107ccbf041a13322b9210f0d73a583aa4991da4a634053cf74d1da5c2b5",
+        "0x244b3ad628e5381f4a3c3448e12102460379925156c5943e6caf8f2956c6e9a6",
+        "0x2a57c4a4850b6c2481463cffb1512d51aeb880098fe68248d42227058fe81097",
+    ];
+
+    fn seed(hex: &str) -> Felt252 {
+        Felt252::from_hex(hex).unwrap()
+    }
+
+    fn subgroup_order() -> Fr {
+        Fr::from_bigint(EdwardsScalarField::MODULUS).unwrap()
+    }
+
+    fn plus_subgroup_multiple(value: &Felt252, k: u64) -> Felt252 {
+        felt(&(field(value) + Fr::from(k) * subgroup_order()))
+    }
+
+    fn random_31_byte_seed() -> Felt252 {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut bytes[1..]);
+        Felt252(bytes)
+    }
+
+    fn policy_error(state: &Felt252, clearance: &Felt252) -> String {
+        match validate_operator_signing_seeds(state, clearance) {
+            Ok(_) => panic!("operator seed policy accepted a rejected pair"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn operator_seed_policy_rejects_zero_and_subgroup_order_multiples() {
+        let strong = random_31_byte_seed();
+        let mut degenerate = vec![seed("0x0"), seed(""), seed("0x")];
+        for (index, literal) in SUBGROUP_ORDER_MULTIPLES.iter().enumerate() {
+            assert_eq!(
+                seed(literal),
+                plus_subgroup_multiple(&Felt252::ZERO, index as u64 + 1)
+            );
+            degenerate.push(seed(literal));
+        }
+        for value in degenerate {
+            assert!(CompactSigner::try_from_seed(&value).is_err());
+            for (state, clearance, role) in
+                [(value, strong, "state "), (strong, value, "clearance ")]
+            {
+                let error = policy_error(&state, &clearance);
+                assert!(
+                    error.starts_with(role) && error.contains("zero or a multiple"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operator_seed_policy_rejects_every_spelling_of_the_development_keys() {
+        let strong = random_31_byte_seed();
+        let one_plus_l = plus_subgroup_multiple(&Felt252::ONE, 1);
+        let two_plus_3l = plus_subgroup_multiple(&Felt252::from_u64(2), 3);
+        assert_eq!(
+            one_plus_l,
+            seed("0x60c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f2")
+        );
+        assert_eq!(
+            two_plus_3l,
+            seed("0x12259d6b14729c0fa51e1a247090812301bcc928ab62ca1f3657c794ab6374d5")
+        );
+        for state in [
+            seed("0x1"),
+            seed("1"),
+            seed("0X1"),
+            seed("0x0001"),
+            one_plus_l,
+        ] {
+            let error = policy_error(&state, &strong);
+            assert!(
+                error.contains(
+                    "state signing seed derives the published development key of seed 0x1"
+                ),
+                "{error}"
+            );
+        }
+        for clearance in [seed("0x2"), two_plus_3l] {
+            let error = policy_error(&strong, &clearance);
+            assert!(
+                error.contains(
+                    "clearance signing seed derives the published development key of seed 0x2"
+                ),
+                "{error}"
+            );
+        }
+        // Either published key is refused in either role, so the swapped pair is too.
+        assert!(policy_error(&seed("0x2"), &seed("0x1"))
+            .contains("state signing seed derives the published development key of seed 0x2"));
+        assert!(policy_error(&strong, &seed("0x1"))
+            .contains("clearance signing seed derives the published development key of seed 0x1"));
+        assert_eq!(
+            development_seed_for_public_key(&CompactSigner::from_seed(&two_plus_3l).public_key()),
+            Some(2)
+        );
+        assert_eq!(
+            development_seed_for_public_key(&CompactSigner::from_seed(&strong).public_key()),
+            None
+        );
+    }
+
+    #[test]
+    fn operator_seed_policy_rejects_guessable_secrets() {
+        let strong = random_31_byte_seed();
+        for guessable in [
+            "0x3",
+            "0x7",
+            "0x8",
+            "0xb",
+            "0xc",
+            "0x2a",
+            "0x63",
+            // 2^128 - 1
+            "0xffffffffffffffffffffffffffffffff",
+            // l - 1, the negated development key of seed 0x1
+            "0x60c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f0",
+            // l - 2^128 + 1
+            "0x60c89ce5c263405370a08b6d0302b0aab3eedb83920ee0a677297dc392126f2",
+        ] {
+            let error = policy_error(&seed(guessable), &strong);
+            assert!(
+                error.contains("state signing seed is guessable"),
+                "{guessable}: {error}"
+            );
+            let error = policy_error(&strong, &seed(guessable));
+            assert!(
+                error.contains("clearance signing seed is guessable"),
+                "{guessable}: {error}"
+            );
+        }
+        // 2^128 and l - 2^128 are the closest accepted secrets.
+        for boundary in [
+            "0x100000000000000000000000000000000",
+            "0x60c89ce5c263405370a08b6d0302b0aab3eedb83920ee0a677297dc392126f1",
+        ] {
+            assert!(validate_operator_signing_seeds(&seed(boundary), &strong).is_ok());
+            assert!(validate_operator_signing_seeds(&strong, &seed(boundary)).is_ok());
+        }
+    }
+
+    #[test]
+    fn operator_seed_policy_rejects_reused_keys() {
+        let reused = random_31_byte_seed();
+        for clearance in [reused, plus_subgroup_multiple(&reused, 1)] {
+            let error = policy_error(&reused, &clearance);
+            assert!(error.contains("same public key"), "{error}");
+            assert!(!error.contains(&reused.to_hex()[2..]));
+        }
+    }
+
+    #[test]
+    fn operator_seed_policy_accepts_independent_random_seeds() {
+        let state_seed = random_31_byte_seed();
+        let clearance_seed = random_31_byte_seed();
+        let (state, clearance) =
+            validate_operator_signing_seeds(&state_seed, &clearance_seed).unwrap();
+        assert_eq!(
+            state.public_key(),
+            CompactSigner::from_seed(&state_seed).public_key()
+        );
+        assert_eq!(
+            clearance.public_key(),
+            CompactSigner::from_seed(&clearance_seed).public_key()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "signing seed must not reduce to zero")]
+    fn from_seed_panics_instead_of_remapping_zero() {
+        CompactSigner::from_seed(&Felt252::ZERO);
     }
 
     #[test]

@@ -3,13 +3,13 @@
 //! Stores nullifier reservations and finalized transcripts. Each nullifier
 //! progresses through: Reserved -> Finalized (or ClearanceReserved for withdrawals).
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha3::{Digest, Keccak256};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zkapi_types::wire::ApiRequestV2;
+use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
 use zkapi_types::{Felt252, NullifierStatus, SchnorrSignature};
 
 use crate::error::ServerError;
@@ -86,6 +86,22 @@ pub struct OpenRouterLeaseRecord {
     pub last_error: Option<String>,
 }
 
+/// The deployment a server database serves (table `deployment_binding`, single
+/// row id=1). serverd writes it only after verifying its derived signing keys
+/// against the vault's immutable getters; zkapi-challenged requires it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentBinding {
+    pub chain_id: u64,
+    /// 0x followed by 40 lowercase hex digits.
+    pub contract_address: String,
+    pub state_signing_key: CurvePointWire,
+    pub clearance_signing_key: CurvePointWire,
+    pub challenge_period_seconds: u64,
+    /// UNIX seconds of the successful vault read.
+    pub verified_at: u64,
+    pub verified_block: Option<u64>,
+}
+
 /// SQLite-backed nullifier store.
 pub struct NullifierStore {
     conn: Mutex<Connection>,
@@ -153,6 +169,18 @@ impl NullifierStore {
                 charge_applied INTEGER,
                 last_error TEXT,
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deployment_binding (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                chain_id INTEGER NOT NULL,
+                contract_address TEXT NOT NULL,
+                state_key_x TEXT NOT NULL,
+                state_key_y TEXT NOT NULL,
+                clearance_key_x TEXT NOT NULL,
+                clearance_key_y TEXT NOT NULL,
+                challenge_period_seconds INTEGER NOT NULL,
+                verified_at INTEGER NOT NULL,
+                verified_block INTEGER
             );",
         )
         .map_err(|e| ServerError::Database(format!("failed to create table: {}", e)))?;
@@ -192,6 +220,113 @@ impl NullifierStore {
     /// Create an in-memory store (for testing).
     pub fn in_memory() -> Result<Self, ServerError> {
         Self::new(":memory:")
+    }
+
+    /// Open an existing server database for reading only: no DDL, migrations
+    /// or backfills run, and every write fails. Refuses a schema that lacks a
+    /// column the record decoders read, rather than misreporting evidence.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, ServerError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| ServerError::Database(format!("failed to open db read-only: {e}")))?;
+        conn.execute_batch("PRAGMA query_only = ON")
+            .map_err(|e| ServerError::Database(format!("failed to make db query-only: {e}")))?;
+        for (table, required) in [
+            ("nullifiers", TRANSCRIPT_RECORD_COLUMNS),
+            ("openrouter_leases", OPENROUTER_LEASE_RECORD_COLUMNS),
+        ] {
+            let present = conn
+                .prepare("SELECT name FROM pragma_table_info(?1)")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([table], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|e| ServerError::Database(format!("schema check failed: {e}")))?;
+            if required
+                .iter()
+                .any(|column| !present.iter().any(|name| name == column))
+            {
+                return Err(ServerError::Database(
+                    "server database schema is older than this reader; upgrade and start the API server first"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Record the vault-verified deployment this database serves.
+    pub fn write_deployment_binding(&self, binding: &DeploymentBinding) -> Result<(), ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        conn.execute(
+            "INSERT INTO deployment_binding (
+                id, chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
+                clearance_key_y, challenge_period_seconds, verified_at, verified_block
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                chain_id = excluded.chain_id, contract_address = excluded.contract_address,
+                state_key_x = excluded.state_key_x, state_key_y = excluded.state_key_y,
+                clearance_key_x = excluded.clearance_key_x,
+                clearance_key_y = excluded.clearance_key_y,
+                challenge_period_seconds = excluded.challenge_period_seconds,
+                verified_at = excluded.verified_at, verified_block = excluded.verified_block",
+            // u64 values above i64::MAX fail to bind instead of wrapping.
+            params![
+                binding.chain_id,
+                binding.contract_address,
+                binding.state_signing_key.x.to_hex(),
+                binding.state_signing_key.y.to_hex(),
+                binding.clearance_signing_key.x.to_hex(),
+                binding.clearance_signing_key.y.to_hex(),
+                binding.challenge_period_seconds,
+                binding.verified_at,
+                binding.verified_block,
+            ],
+        )
+        .map_err(|error| {
+            ServerError::Database(format!("deployment binding write failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// The recorded deployment, or None for a database that predates it.
+    pub fn read_deployment_binding(&self) -> Result<Option<DeploymentBinding>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'deployment_binding')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                ServerError::Database(format!("deployment binding lookup failed: {error}"))
+            })?;
+        if !exists {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
+                clearance_key_y, challenge_period_seconds, verified_at, verified_block
+             FROM deployment_binding WHERE id = 1",
+            [],
+            row_to_deployment_binding,
+        )
+        .optional()
+        .map_err(|error| ServerError::Database(format!("deployment binding read failed: {error}")))
     }
 
     /// Acquire the long-lived server writer lock for the actual SQLite file,
@@ -357,17 +492,26 @@ impl NullifierStore {
 
     /// Look up a transcript record by nullifier.
     pub fn lookup_by_nullifier(&self, nullifier: &Felt252) -> Option<TranscriptRecord> {
-        let conn = self.conn.lock().ok()?;
-        let null_hex = nullifier.to_hex();
+        self.try_lookup_by_nullifier(nullifier).ok().flatten()
+    }
 
+    /// Like `lookup_by_nullifier`, but a lock or SQLite failure is an error,
+    /// never a missing record.
+    pub fn try_lookup_by_nullifier(
+        &self,
+        nullifier: &Felt252,
+    ) -> Result<Option<TranscriptRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
         conn.query_row(
             "SELECT * FROM nullifiers WHERE nullifier = ?1",
-            params![null_hex],
+            params![nullifier.to_hex()],
             row_to_record,
         )
         .optional()
-        .ok()
-        .flatten()
+        .map_err(|e| ServerError::Database(format!("nullifier lookup failed: {}", e)))
     }
 
     /// Look up a transcript record by client request ID.
@@ -721,15 +865,28 @@ impl NullifierStore {
         &self,
         client_request_id: &str,
     ) -> Option<OpenRouterLeaseRecord> {
-        let conn = self.conn.lock().ok()?;
+        self.try_lookup_openrouter_lease(client_request_id)
+            .ok()
+            .flatten()
+    }
+
+    /// Like `lookup_openrouter_lease`, but a lock, SQLite or decoding failure
+    /// is an error, never a missing lease.
+    pub fn try_lookup_openrouter_lease(
+        &self,
+        client_request_id: &str,
+    ) -> Result<Option<OpenRouterLeaseRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
         conn.query_row(
             "SELECT * FROM openrouter_leases WHERE client_request_id = ?1",
             params![client_request_id],
             row_to_openrouter_lease,
         )
         .optional()
-        .ok()
-        .flatten()
+        .map_err(|error| ServerError::Database(format!("lease lookup failed: {error}")))
     }
 
     pub fn due_openrouter_leases(&self, now: u64) -> Vec<OpenRouterLeaseRecord> {
@@ -947,6 +1104,32 @@ fn parse_opt_felt(s: Option<String>) -> Option<Felt252> {
     s.and_then(|h| Felt252::from_hex(&h).ok())
 }
 
+/// Every `nullifiers` column `row_to_record` reads; `open_read_only` refuses a
+/// schema without them. Whoever makes `row_to_record` read a column MUST add it.
+pub(crate) const TRANSCRIPT_RECORD_COLUMNS: &[&str] = &[
+    "nullifier",
+    "status",
+    "reservation_kind",
+    "client_request_id",
+    "payload_hash",
+    "charge_applied",
+    "response_code",
+    "response_payload",
+    "response_hash",
+    "next_commitment_x",
+    "next_commitment_y",
+    "next_anchor",
+    "blind_delta_srv",
+    "next_state_sig_json",
+    "policy_reason_code",
+    "policy_evidence_hash",
+    "proof_blob",
+    "request_inputs_json",
+    "api_request_binding",
+    "created_at",
+    "finalized_at",
+];
+
 /// Convert a database row into a TranscriptRecord.
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> {
     let nullifier_hex: String = row.get("nullifier")?;
@@ -999,6 +1182,26 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
     })
 }
 
+/// Every `openrouter_leases` column `row_to_openrouter_lease` reads; keep in
+/// sync exactly like `TRANSCRIPT_RECORD_COLUMNS`.
+pub(crate) const OPENROUTER_LEASE_RECORD_COLUMNS: &[&str] = &[
+    "client_request_id",
+    "request_nullifier",
+    "api_request_json",
+    "oa_client_request_id",
+    "key_hash",
+    "key_source",
+    "oa_provisioning_outcome",
+    "status",
+    "issued_at",
+    "expires_at",
+    "settle_after",
+    "spending_limit_usd",
+    "usage_usd",
+    "charge_applied",
+    "last_error",
+];
+
 fn row_to_openrouter_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenRouterLeaseRecord> {
     let request_json: String = row.get("api_request_json")?;
     let api_request = serde_json::from_str(&request_json).map_err(|error| {
@@ -1029,6 +1232,34 @@ fn row_to_openrouter_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenRout
             .get::<_, Option<i64>>("charge_applied")?
             .map(|value| value as u128),
         last_error: row.get("last_error")?,
+    })
+}
+
+fn row_to_deployment_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentBinding> {
+    fn felt(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Felt252> {
+        let value: String = row.get(index)?;
+        Felt252::from_hex(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                error.into(),
+            )
+        })
+    }
+    Ok(DeploymentBinding {
+        chain_id: row.get(0)?,
+        contract_address: row.get(1)?,
+        state_signing_key: CurvePointWire {
+            x: felt(row, 2)?,
+            y: felt(row, 3)?,
+        },
+        clearance_signing_key: CurvePointWire {
+            x: felt(row, 4)?,
+            y: felt(row, 5)?,
+        },
+        challenge_period_seconds: row.get(6)?,
+        verified_at: row.get(7)?,
+        verified_block: row.get(8)?,
     })
 }
 
@@ -1452,5 +1683,308 @@ mod tests {
             .contains("sk-or-"));
         assert_eq!(store.due_openrouter_leases(20).len(), 0);
         assert_eq!(store.due_openrouter_leases(21).len(), 1);
+    }
+
+    fn deployment_binding() -> DeploymentBinding {
+        let signer = crate::signer::ServerSigner::new(&Felt252::from_u64(7), &Felt252::from_u64(8));
+        DeploymentBinding {
+            chain_id: 11_155_111,
+            contract_address: "0x00000000000000000000000000000000000000aa".into(),
+            state_signing_key: signer.state_public_key(),
+            clearance_signing_key: signer.clearance_public_key(),
+            challenge_period_seconds: 86_400,
+            verified_at: 1_700_000_000,
+            verified_block: None,
+        }
+    }
+
+    fn finalized(nullifier: Felt252) -> TranscriptRecord {
+        TranscriptRecord {
+            nullifier,
+            status: NullifierStatus::Finalized,
+            reservation_kind: "proxy".to_string(),
+            client_request_id: Some("req-1".to_string()),
+            payload_hash: Some(Felt252::from_u64(1)),
+            charge_applied: Some(100),
+            response_code: Some(200),
+            response_payload: Some("{}".to_string()),
+            response_hash: Some(Felt252::from_u64(999)),
+            next_commitment_x: None,
+            next_commitment_y: None,
+            next_anchor: Some(Felt252::from_u64(30)),
+            blind_delta_srv: None,
+            next_state_sig: None,
+            policy_reason_code: None,
+            policy_evidence_hash: None,
+            proof_blob: Some(vec![7; 256]),
+            request_inputs_json: Some("{}".to_string()),
+            api_request_binding: None,
+            created_at: 0,
+            finalized_at: None,
+        }
+    }
+
+    #[test]
+    fn read_only_store_sees_server_writes_but_cannot_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let server = NullifierStore::new(&path).unwrap();
+        let reader = NullifierStore::open_read_only(&path).unwrap();
+        let nullifier = Felt252::from_u64(42);
+        assert!(reader
+            .try_lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .is_none());
+        assert_eq!(reader.read_deployment_binding().unwrap(), None);
+        server
+            .reserve(&nullifier, "req-1", &Felt252::from_u64(1))
+            .unwrap();
+        server.finalize(&nullifier, &finalized(nullifier)).unwrap();
+        server
+            .create_openrouter_lease(&lease_request("lease", 9), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        server
+            .write_deployment_binding(&deployment_binding())
+            .unwrap();
+
+        let record = reader.try_lookup_by_nullifier(&nullifier).unwrap().unwrap();
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.proof_blob.as_deref(), Some(&[7; 256][..]));
+        assert_eq!(
+            reader
+                .try_lookup_openrouter_lease("lease")
+                .unwrap()
+                .unwrap()
+                .status,
+            "provisioning"
+        );
+        assert_eq!(
+            reader.read_deployment_binding().unwrap(),
+            Some(deployment_binding())
+        );
+
+        // Every write fails on the reader and leaves the database unchanged.
+        assert!(reader.reserve_clearance(&Felt252::from_u64(43)).is_err());
+        assert!(reader
+            .reserve(&Felt252::from_u64(44), "req-2", &Felt252::from_u64(2))
+            .is_err());
+        assert!(reader
+            .write_deployment_binding(&DeploymentBinding {
+                chain_id: 1,
+                ..deployment_binding()
+            })
+            .is_err());
+        assert!(reader
+            .record_openrouter_lease_error("lease", "reader write")
+            .is_err());
+        assert!(server.lookup_by_nullifier(&Felt252::from_u64(43)).is_none());
+        assert!(server.lookup_by_nullifier(&Felt252::from_u64(44)).is_none());
+        assert_eq!(
+            server.read_deployment_binding().unwrap(),
+            Some(deployment_binding())
+        );
+        assert!(server
+            .lookup_openrouter_lease("lease")
+            .unwrap()
+            .last_error
+            .is_none());
+
+        // A read-only open never creates a database.
+        let missing = directory.path().join("missing.db");
+        assert!(NullifierStore::open_read_only(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn read_only_store_rejects_outdated_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let unrelated = directory.path().join("unrelated.db");
+        Connection::open(&unrelated)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (value TEXT);")
+            .unwrap();
+        // A server database from before api_request_binding was read.
+        let legacy = directory.path().join("legacy.db");
+        let legacy_columns = TRANSCRIPT_RECORD_COLUMNS
+            .iter()
+            .filter(|column| **column != "api_request_binding")
+            .copied()
+            .collect::<Vec<_>>();
+        Connection::open(&legacy)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE nullifiers ({}); CREATE TABLE openrouter_leases ({});",
+                legacy_columns.join(", "),
+                OPENROUTER_LEASE_RECORD_COLUMNS.join(", ")
+            ))
+            .unwrap();
+        for path in [&unrelated, &legacy] {
+            let error = NullifierStore::open_read_only(path)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("schema is older"), "{error}");
+        }
+        // The read-only open did not migrate the file; the server's open does.
+        let column_count = |path: &std::path::Path| -> i64 {
+            Connection::open(path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('nullifiers')
+                     WHERE name = 'api_request_binding'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(column_count(&legacy), 0);
+        NullifierStore::new(&legacy).unwrap();
+        assert_eq!(column_count(&legacy), 1);
+        assert!(NullifierStore::open_read_only(&legacy).is_ok());
+    }
+
+    #[test]
+    fn deployment_binding_round_trips_and_is_absent_from_older_databases() {
+        let store = NullifierStore::in_memory().unwrap();
+        assert_eq!(store.read_deployment_binding().unwrap(), None);
+        store
+            .write_deployment_binding(&deployment_binding())
+            .unwrap();
+        assert_eq!(
+            store.read_deployment_binding().unwrap(),
+            Some(deployment_binding())
+        );
+        let reverified = DeploymentBinding {
+            verified_at: 1_700_000_100,
+            verified_block: Some(123),
+            ..deployment_binding()
+        };
+        store.write_deployment_binding(&reverified).unwrap();
+        assert_eq!(store.read_deployment_binding().unwrap(), Some(reverified));
+        {
+            // One row, felts as Felt252::to_hex prints them.
+            let conn = store.conn.lock().unwrap();
+            let (rows, address, state_x, clearance_y): (i64, String, String, String) = conn
+                .query_row(
+                    "SELECT COUNT(*), contract_address, state_key_x, clearance_key_y
+                     FROM deployment_binding",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
+            assert_eq!(address, deployment_binding().contract_address);
+            assert_eq!(state_x, deployment_binding().state_signing_key.x.to_hex());
+            assert_eq!(
+                clearance_y,
+                deployment_binding().clearance_signing_key.y.to_hex()
+            );
+        }
+        assert!(store
+            .write_deployment_binding(&DeploymentBinding {
+                chain_id: u64::MAX,
+                ..deployment_binding()
+            })
+            .is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        NullifierStore::new(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE deployment_binding;")
+            .unwrap();
+        assert_eq!(
+            NullifierStore::open_read_only(&path)
+                .unwrap()
+                .read_deployment_binding()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn required_column_lists_cover_every_column_the_row_decoders_read() {
+        // Tables holding only the listed columns: a decoder that reads any
+        // other column fails here until its list is updated.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("minimal.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE nullifiers ({}); CREATE TABLE openrouter_leases ({});",
+                TRANSCRIPT_RECORD_COLUMNS.join(", "),
+                OPENROUTER_LEASE_RECORD_COLUMNS.join(", ")
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nullifiers (nullifier, status, reservation_kind, created_at)
+                 VALUES (?1, 'Reserved', 'openrouter_lease', 1)",
+                params![Felt252::from_u64(5).to_hex()],
+            )
+            .unwrap();
+            let request = lease_request("minimal", 5);
+            conn.execute(
+                "INSERT INTO openrouter_leases (client_request_id, request_nullifier,
+                    api_request_json, key_source, oa_provisioning_outcome, status, issued_at,
+                    expires_at, settle_after, spending_limit_usd)
+                 VALUES ('minimal', ?1, ?2, 'openrouter', 'may_have_issued', 'active', 1, 2, 3, 1.5)",
+                params![
+                    request.public_inputs.request_nullifier.to_hex(),
+                    serde_json::to_string(&request).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let reader = NullifierStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reader
+                .try_lookup_by_nullifier(&Felt252::from_u64(5))
+                .unwrap()
+                .unwrap()
+                .reservation_kind,
+            "openrouter_lease"
+        );
+        assert_eq!(
+            reader
+                .try_lookup_openrouter_lease("minimal")
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+    }
+
+    #[test]
+    fn try_lookups_report_database_errors_instead_of_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let server = NullifierStore::new(&path).unwrap();
+        server
+            .create_openrouter_lease(&lease_request("corrupt", 6), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        server
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET api_request_json = 'not json'",
+                [],
+            )
+            .unwrap();
+        let reader = NullifierStore::open_read_only(&path).unwrap();
+        assert!(reader.try_lookup_openrouter_lease("corrupt").is_err());
+        assert!(reader.lookup_openrouter_lease("corrupt").is_none());
+        server
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE nullifiers; DROP TABLE openrouter_leases;")
+            .unwrap();
+        assert!(reader
+            .try_lookup_by_nullifier(&Felt252::from_u64(1))
+            .is_err());
+        assert!(reader.lookup_by_nullifier(&Felt252::from_u64(1)).is_none());
+        assert!(reader.try_lookup_openrouter_lease("corrupt").is_err());
     }
 }

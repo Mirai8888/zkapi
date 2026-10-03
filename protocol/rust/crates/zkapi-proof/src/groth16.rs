@@ -171,10 +171,12 @@ pub struct StateSigningKey {
 }
 
 impl StateSigningKey {
-    pub fn from_secret(mut secret: EdwardsScalarField) -> Self {
-        if secret == EdwardsScalarField::ZERO {
-            secret = EdwardsScalarField::ONE;
-        }
+    /// A zero secret is never remapped: it would silently become a public key.
+    pub fn from_secret(secret: EdwardsScalarField) -> Self {
+        assert!(
+            secret != EdwardsScalarField::ZERO,
+            "Schnorr signing secret must be nonzero"
+        );
         let public = EdwardsProjective::generator()
             .mul_bigint(secret.into_bigint())
             .into_affine();
@@ -182,7 +184,12 @@ impl StateSigningKey {
     }
 
     pub fn generate(rng: &mut (impl RngCore + CryptoRng)) -> Self {
-        Self::from_secret(EdwardsScalarField::rand(rng))
+        loop {
+            let secret = EdwardsScalarField::rand(rng);
+            if secret != EdwardsScalarField::ZERO {
+                return Self::from_secret(secret);
+            }
+        }
     }
 
     pub fn sign(
@@ -941,6 +948,12 @@ mod tests {
                 .into_affine()
                 .is_in_correct_subgroup_assuming_on_curve());
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "Schnorr signing secret must be nonzero")]
+    fn zero_signing_secret_is_rejected() {
+        StateSigningKey::from_secret(EdwardsScalarField::ZERO);
     }
 
     #[test]

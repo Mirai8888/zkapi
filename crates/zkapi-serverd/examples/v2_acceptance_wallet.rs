@@ -6,6 +6,8 @@
 //! It calls the same pure wallet operations used by the browser SDK. Named
 //! snapshots deliberately retain a genuine server-signed state for the stale
 //! escape scenario; the helper never constructs a synthetic signed state.
+//! It knows no signing keys: the harness derives per-run keys from random
+//! seeds with `zkapi signing-keys` and passes them to `init`.
 
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
@@ -20,7 +22,7 @@ use zkapi_browser::{
     BrowserNoteState, BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs,
     PendingRequestJournal, PrepareRequestArgs, PrepareWithdrawalArgs, TreeSnapshot,
 };
-use zkapi_proof::compact::{CompactSigner, RequestProver, CIRCUIT_ID};
+use zkapi_proof::compact::{RequestProver, CIRCUIT_ID};
 use zkapi_types::Felt252;
 
 struct WalletDriver {
@@ -75,11 +77,7 @@ impl WalletDriver {
             .as_str()
             .context("command must be a string")?
         {
-            "public_keys" => Ok(json!({
-                "state_signing_key": CompactSigner::from_seed(&Felt252::from_u64(1)).public_key(),
-                "clearance_signing_key": CompactSigner::from_seed(&Felt252::from_u64(2)).public_key(),
-                "circuit_id": CIRCUIT_ID,
-            })),
+            "circuit" => Ok(json!({"circuit_id": CIRCUIT_ID})),
             "init" => {
                 ensure!(self.config.is_none(), "wallet is already initialized");
                 let config: BrowserWalletConfig =

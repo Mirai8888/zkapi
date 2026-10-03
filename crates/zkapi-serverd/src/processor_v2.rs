@@ -63,6 +63,9 @@ impl RequestProcessor {
         current_root: Felt252,
     ) -> anyhow::Result<Self> {
         config.validate_native_mode()?;
+        // Library embeddings can bypass run_server's full seed policy; never
+        // serve the published development keys or one key for both roles.
+        signer.ensure_serving_keys()?;
         let writer_lock = store.acquire_writer_lock()?;
         if let Some(lease) = config.openrouter_leases.as_ref() {
             anyhow::ensure!(
@@ -92,14 +95,7 @@ impl RequestProcessor {
                 }
             }
         }
-        let native = config
-            .native_billing
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("native ETH billing configuration is required"))?;
-        let address = config.contract_address.to_hex();
-        let body = address.strip_prefix("0x").unwrap_or(&address);
-        let native_oracle =
-            NativeBillingOracle::new(native, config.chain_id, format!("0x{:0>40}", body))?;
+        let native_oracle = NativeBillingOracle::for_server(&config)?;
         let verifier = RequestVerifier::load(&config.proof_setup_dir)?;
         let openrouter = config
             .openrouter_leases
@@ -3458,5 +3454,198 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.current_balance, 2_000_000 - charge);
+    }
+
+    /// Review regression: a real signed-branch request proof whose state
+    /// signature was forged with the published seed-0x1 secret mints nothing
+    /// from a deployment with strong keys, through the full issuance path.
+    #[tokio::test]
+    async fn forged_development_key_state_signature_mints_nothing_under_strong_keys() {
+        use crate::native_billing::NativeBillingConfig;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use zkapi_browser::{BrowserNoteState, BrowserWalletConfig, ConfirmDepositArgs};
+        use zkapi_core::merkle::MerkleTree;
+        use zkapi_proof::compact::{balance_commitment, CompactSigner};
+
+        // The latest finalized oracle round, quoted by the forged payload, so
+        // the request reaches proof admission exactly as it would over HTTP.
+        let updated_at = current_timestamp() - 30;
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = reads.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    let data = request["params"][0]["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    recorded.lock().unwrap().push(data.clone());
+                    let result = if request["method"] == "eth_chainId" {
+                        "0x1".to_string()
+                    } else if data == "0x313ce567" {
+                        format!("0x{:064x}", 8)
+                    } else if data == "0x4d1352fd" {
+                        format!("0x{:064x}", 1_000_000_000)
+                    } else {
+                        assert_eq!(request["params"][1], "finalized");
+                        format!(
+                            "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
+                            123, 250_000_000_000u64, updated_at, updated_at, 123
+                        )
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (state_seed, clear_seed) = crate::signer::strong_test_seeds();
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = RequestProcessor::try_new(
+            ServerConfig {
+                request_charge_cap: 400_000,
+                contract_address: Felt252::from_u64(1),
+                native_billing: Some(NativeBillingConfig {
+                    rpc_url,
+                    max_age_seconds: 3600,
+                    ..crate::test_support::native_config()
+                }),
+                openrouter_leases: Some(crate::test_support::lease_config()),
+                proof_setup_dir: setup_directory(),
+                ..Default::default()
+            },
+            store.clone(),
+            Arc::new(ServerSigner::try_new(&state_seed, &clear_seed).unwrap()),
+            Felt252::ZERO,
+        )
+        .unwrap();
+
+        // A 1 gwei note, then a "signed" state with an arbitrary anchor and an
+        // inflated balance, signed with the publicly known development secret.
+        let development = CompactSigner::from_seed(&Felt252::ONE);
+        let config = BrowserWalletConfig {
+            protocol_version: 2,
+            chain_id: 1,
+            contract_address: Felt252::from_u64(1),
+            request_charge_cap: 400_000,
+            policy_charge_cap: 400_000,
+            policy_enabled: false,
+            state_signing_key: development.public_key(),
+            clearance_signing_key: CompactSigner::from_seed(&Felt252::from_u64(2)).public_key(),
+        };
+        let params = zkapi_browser::generate_deposit_params();
+        let genesis = zkapi_browser::confirm_deposit(
+            &config,
+            ConfirmDepositArgs {
+                secret: params.secret,
+                note_id: 0,
+                amount: 1,
+                expiry_ts: 4_000_000_000,
+            },
+        )
+        .unwrap();
+        let leaf = core::note_leaf(0, &params.registration_commitment, 1, 4_000_000_000);
+        let balance = 1_777_000_000_000_000;
+        let blinding = random_scalar();
+        let anchor = random_field();
+        let commitment = balance_commitment(balance, &blinding, &leaf);
+        let message = core::state_message(
+            2,
+            1,
+            &config.contract_address,
+            &commitment.x,
+            &commitment.y,
+            &anchor,
+        );
+        let forged = BrowserNoteState {
+            current_balance: balance,
+            balance_blinding: blinding.to_hex(),
+            current_commitment_x: commitment.x,
+            current_commitment_y: commitment.y,
+            current_anchor: anchor,
+            is_genesis: false,
+            state_signature: Some(development.sign(&message)),
+            ..genesis
+        };
+        let mut tree = MerkleTree::new();
+        tree.set_leaf(0, leaf);
+        processor.update_root(tree.root());
+        let quote = NativeBillingQuote {
+            asset: "native_eth".into(),
+            units_per_eth: 1_000_000_000,
+            chain_id: 1,
+            feed_address: "0x694aa1769357215de4fac081bf1f309adc325306".into(),
+            round_id: "123".into(),
+            answer: "250000000000".into(),
+            decimals: 8,
+            updated_at,
+            expires_at: updated_at + 3600,
+        };
+        let key =
+            std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
+        let request = zkapi_browser::prepare_request(
+            &config,
+            &forged,
+            zkapi_browser::PrepareRequestArgs {
+                payload:
+                    json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote})
+                        .to_string(),
+                active_root: tree.root(),
+                merkle_siblings: tree.get_siblings(0).to_vec(),
+                client_request_id: "forged-development-key".into(),
+                request_time: current_timestamp(),
+                created_at_ms: current_timestamp_ms(),
+            },
+            &key,
+        )
+        .unwrap()
+        .request;
+        // The proof itself is genuine for the development key.
+        assert!(processor
+            .verifier
+            .verify(&request.public_inputs, &request.proof)
+            .unwrap());
+
+        let error = processor
+            .issue_openrouter_lease(&request)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&error, ServerError::InvalidRequest(message)
+                if message == "state signing key does not match this deployment"),
+            "{error}"
+        );
+        // Claiming this deployment's key instead leaves a signature the real
+        // Groth16 verifier rejects.
+        let mut relabelled = request.clone();
+        let deployment_key = processor.state_signing_key();
+        relabelled.public_inputs.state_signing_key_x = deployment_key.x;
+        relabelled.public_inputs.state_signing_key_y = deployment_key.y;
+        let error = processor
+            .issue_openrouter_lease(&relabelled)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(&error, ServerError::InvalidProof(_)), "{error}");
+
+        assert!(store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .is_none());
+        assert!(store
+            .lookup_openrouter_lease(&request.client_request_id)
+            .is_none());
+        // Neither attempt reached the vault spend check that precedes key issuance.
+        assert!(!reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|data| data.starts_with("0xaad24061")));
+        rpc.abort();
     }
 }

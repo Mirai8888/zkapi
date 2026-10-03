@@ -59,7 +59,7 @@ pub struct OpenRouterLeaseConfig {
 }
 
 /// Configuration for the zkAPI server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Protocol version (must be 2).
     pub protocol_version: u16,
@@ -75,9 +75,12 @@ pub struct ServerConfig {
     pub listen_addr: String,
     /// Path to the SQLite database file.
     pub db_path: String,
-    /// Seed for the proof-friendly state-signing key.
+    /// Required secret seed for the proof-friendly state-signing key. There is
+    /// no default: zero means unset, and startup refuses any seed whose key is
+    /// not the vault's immutable stateSigningKeyX/Y.
     pub state_seed: Felt252,
-    /// Seed for the proof-friendly clearance-signing key.
+    /// Required secret seed for the clearance-signing key; startup requires
+    /// its key to equal the vault's clearanceSigningKeyX/Y.
     pub clear_seed: Felt252,
     /// Initial Merkle root the server should accept until the indexer updates it.
     pub initial_root: Felt252,
@@ -123,6 +126,49 @@ impl ServerConfig {
     }
 }
 
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive on purpose: a new field fails to compile here until its
+        // author decides whether it is secret.
+        let Self {
+            protocol_version,
+            chain_id,
+            testnet_password,
+            contract_address,
+            request_charge_cap,
+            listen_addr,
+            db_path,
+            state_seed: _,
+            clear_seed: _,
+            initial_root,
+            indexer_url,
+            root_poll_interval_ms,
+            openrouter_leases,
+            native_billing,
+            proof_setup_dir,
+        } = self;
+        formatter
+            .debug_struct("ServerConfig")
+            .field("protocol_version", protocol_version)
+            .field("chain_id", chain_id)
+            .field("testnet_password", testnet_password)
+            .field("contract_address", contract_address)
+            .field("request_charge_cap", request_charge_cap)
+            .field("listen_addr", listen_addr)
+            .field("db_path", db_path)
+            .field("state_seed", &"[redacted]")
+            .field("clear_seed", &"[redacted]")
+            .field("initial_root", initial_root)
+            .field("indexer_url", indexer_url)
+            .field("root_poll_interval_ms", root_poll_interval_ms)
+            .field("openrouter_leases", openrouter_leases)
+            // NativeBillingConfig's Debug redacts its RPC URL (provider API keys).
+            .field("native_billing", native_billing)
+            .field("proof_setup_dir", proof_setup_dir)
+            .finish()
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -133,14 +179,64 @@ impl Default for ServerConfig {
             request_charge_cap: 1_000_000,
             listen_addr: "0.0.0.0:3000".to_string(),
             db_path: "zkapi_server.db".to_string(),
-            state_seed: Felt252::from_u64(1),
-            clear_seed: Felt252::from_u64(2),
+            // Zero means unset; ServerSigner::try_new and run_server reject it.
+            state_seed: Felt252::ZERO,
+            clear_seed: Felt252::ZERO,
             initial_root: Felt252::ZERO,
             indexer_url: None,
             root_poll_interval_ms: 1_000,
             openrouter_leases: None,
             native_billing: None,
             proof_setup_dir: "protocol/setup/v2".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_debug_redacts_signing_seeds_and_credentials() {
+        let (state_seed, clear_seed) = crate::signer::strong_test_seeds();
+        let mut config = ServerConfig {
+            state_seed,
+            clear_seed,
+            testnet_password: Some(
+                crate::testnet_auth::TestnetPassword::new("SECRET-TESTNET-PASSWORD").unwrap(),
+            ),
+            native_billing: Some(crate::native_billing::NativeBillingConfig {
+                rpc_url: "https://eth-mainnet.example/v2/SECRET_PROVIDER_KEY".into(),
+                ..crate::test_support::native_config()
+            }),
+            openrouter_leases: Some(OpenRouterLeaseConfig {
+                source: OpenRouterLeaseSourceConfig::OpenRouter {
+                    management_key: "sk-or-v1-SECRET_MANAGEMENT_KEY".into(),
+                    api_base: "https://openrouter.example/api".into(),
+                },
+                ..crate::test_support::lease_config()
+            }),
+            ..Default::default()
+        };
+        let mut rendered = vec![format!("{config:?}"), format!("{config:#?}")];
+        config.openrouter_leases = Some(crate::test_support::lease_config());
+        rendered.push(format!("{config:#?}"));
+        for output in rendered {
+            for secret in [
+                state_seed.to_hex(),
+                clear_seed.to_hex(),
+                state_seed.to_hex()[2..].to_string(),
+                clear_seed.to_hex()[2..].to_string(),
+                "SECRET_PROVIDER_KEY".into(),
+                "SECRET_MANAGEMENT_KEY".into(),
+                "SECRET-TESTNET-PASSWORD".into(),
+                "test-secret".into(),
+            ] {
+                assert!(!output.contains(&secret), "{output}");
+            }
+            assert!(output.contains("[redacted]"));
+            assert!(output.contains("chain_id"));
+            assert!(output.contains("0x694aa1769357215de4fac081bf1f309adc325306"));
         }
     }
 }

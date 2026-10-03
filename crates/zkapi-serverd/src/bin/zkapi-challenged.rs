@@ -1,9 +1,12 @@
 //! Operator-run v2 challenge daemon; see docs/challenge-service.md.
 use anyhow::Context;
 use clap::Parser;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use zkapi_serverd::{
-    challenge_service::{ChallengeService, ChallengeServiceConfig},
+    challenge_service::{
+        ChallengeService, ChallengeServiceConfig, DeploymentCheckError, FeePolicy,
+    },
+    challenge_status::{self, AlarmPolicy},
     nullifier_store::NullifierStore,
 };
 use zkapi_types::Felt252;
@@ -30,6 +33,8 @@ struct Args {
     from_block: u64,
     #[arg(long, default_value_t = 2)]
     confirmations: u64,
+    /// The API server's database, opened read-only. Start the upgraded API
+    /// server first: it records the verified deployment binding.
     #[arg(long)]
     db_path: PathBuf,
     #[arg(long)]
@@ -38,6 +43,58 @@ struct Args {
     proof_setup_dir: PathBuf,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    /// Highest maxFeePerGas (wei) the daemon proposes; at most the signer's cap.
+    #[arg(long, env = "ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI")]
+    max_fee_per_gas_wei: u128,
+    /// Highest maxPriorityFeePerGas (wei); at most the signer's tip cap and at
+    /// least twice --priority-fee-per-gas-wei.
+    #[arg(long, env = "ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI")]
+    max_priority_fee_per_gas_wei: u128,
+    /// Tip of a first attempt (wei).
+    #[arg(long, env = "ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI", default_value_t = FeePolicy::DEFAULT_PRIORITY_FEE_PER_GAS)]
+    priority_fee_per_gas_wei: u128,
+    /// Blocks a challenge may stay pending before a same-nonce replacement.
+    #[arg(long, default_value_t = FeePolicy::DEFAULT_BUMP_AFTER_BLOCKS)]
+    fee_bump_after_blocks: u64,
+    /// Fee-cap increase of a replacement, in percent (10-100).
+    #[arg(long, default_value_t = FeePolicy::DEFAULT_BUMP_PERCENT)]
+    fee_bump_percent: u64,
+    /// Internal status listener (GET /livez, /health, /status). Never publish it.
+    #[arg(
+        long,
+        env = "ZKAPI_CHALLENGE_STATUS_LISTEN",
+        default_value = "127.0.0.1:3002"
+    )]
+    status_listen: SocketAddr,
+    /// Remaining seconds at which an obligation warns (default challengePeriod/2).
+    #[arg(long)]
+    warning_remaining_seconds: Option<u64>,
+    /// Remaining seconds at which an obligation is critical and fees escalate
+    /// to the caps (default challengePeriod/4).
+    #[arg(long)]
+    critical_remaining_seconds: Option<u64>,
+    #[arg(long, default_value_t = 120)]
+    blocked_warning_seconds: u64,
+    #[arg(long, default_value_t = 1800)]
+    critical_blocked_seconds: u64,
+    #[arg(long, default_value_t = 3600)]
+    settlement_overdue_seconds: u64,
+    #[arg(long, default_value_t = 600)]
+    indexer_divergence_seconds: u64,
+    #[arg(long, default_value_t = 3)]
+    indexer_divergence_polls: u32,
+    #[arg(long, default_value_t = 64)]
+    indexer_lag_warning_blocks: u64,
+    #[arg(long, default_value_t = 300)]
+    stale_poll_seconds: u64,
+    #[arg(long, default_value_t = 300)]
+    startup_grace_seconds: u64,
+    /// Interval of the sender balance and indexer root observations.
+    #[arg(long, default_value_t = 15)]
+    observe_interval_seconds: u64,
+    /// Default: 7.6M gas times --max-fee-per-gas-wei.
+    #[arg(long)]
+    min_sender_balance_wei: Option<u128>,
 }
 
 #[tokio::main]
@@ -65,6 +122,20 @@ async fn main() -> anyhow::Result<()> {
         .open(args.checkpoint.with_extension("lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another challenge daemon holds this checkpoint")?;
+    let alarms = AlarmPolicy {
+        warning_remaining_seconds: args.warning_remaining_seconds,
+        critical_remaining_seconds: args.critical_remaining_seconds,
+        blocked_warning_seconds: args.blocked_warning_seconds,
+        critical_blocked_seconds: args.critical_blocked_seconds,
+        settlement_overdue_seconds: args.settlement_overdue_seconds,
+        indexer_divergence_seconds: args.indexer_divergence_seconds,
+        indexer_divergence_polls: args.indexer_divergence_polls,
+        indexer_lag_warning_blocks: args.indexer_lag_warning_blocks,
+        stale_poll_seconds: args.stale_poll_seconds,
+        startup_grace_seconds: args.startup_grace_seconds,
+        observe_interval_seconds: args.observe_interval_seconds,
+        min_sender_balance_wei: args.min_sender_balance_wei,
+    };
     let config = ChallengeServiceConfig {
         rpc_url: args.rpc_url,
         indexer_url: args.indexer_url,
@@ -75,9 +146,50 @@ async fn main() -> anyhow::Result<()> {
         confirmations: args.confirmations,
         checkpoint: args.checkpoint,
         proof_setup_dir: args.proof_setup_dir,
+        fee: FeePolicy {
+            max_fee_per_gas: args.max_fee_per_gas_wei,
+            max_priority_fee_per_gas: args.max_priority_fee_per_gas_wei,
+            priority_fee_per_gas: args.priority_fee_per_gas_wei,
+            bump_after_blocks: args.fee_bump_after_blocks,
+            bump_percent: args.fee_bump_percent,
+        },
+        alarms: alarms.clone(),
     };
-    let store = Arc::new(NullifierStore::new(&args.db_path)?);
+    // Least privilege: the API server is the only writer of this database.
+    let store = Arc::new(NullifierStore::open_read_only(&args.db_path)?);
     let mut service = ChallengeService::new(config, store)?;
+    let listener = tokio::net::TcpListener::bind(args.status_listen)
+        .await
+        .with_context(|| format!("failed to bind --status-listen {}", args.status_listen))?;
+    tracing::info!(address = %listener.local_addr()?, "challenge status listening (internal only)");
+    let status = challenge_status::router(service.status_handle(), alarms);
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, status).await {
+            tracing::error!(error = %error, "challenge status listener failed");
+        }
+    });
+    // Never poll a database bound to another deployment: every escape would
+    // read as having no evidence and silently go unchallenged.
+    loop {
+        match service.verify_deployment_binding().await {
+            Ok(binding) => {
+                tracing::info!(
+                    chain_id = binding.chain_id,
+                    vault = %binding.contract_address,
+                    "server database deployment binding verified against the vault"
+                );
+                break;
+            }
+            Err(DeploymentCheckError::Mismatch(message)) => anyhow::bail!(message),
+            Err(error) => {
+                tracing::warn!(error = %error, "deployment binding verification will retry");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+        }
+    }
     let mut ticker = tokio::time::interval(Duration::from_millis(args.poll_interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

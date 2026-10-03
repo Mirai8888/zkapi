@@ -3371,7 +3371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collateral_change_during_issuance_never_exposes_key_and_retains_evidence() {
+    async fn collateral_change_during_issuance_never_exposes_key_and_awaits_settlement_evidence() {
         for oa in [false, true] {
             for rpc_failure in [false, true] {
                 let state = Arc::new(std::sync::Mutex::new(IssuanceMock {
@@ -3397,11 +3397,16 @@ mod tests {
                     api_request_binding(&lease.api_request).unwrap(),
                     api_request_binding(&request).unwrap()
                 );
-                assert!(
-                    crate::watcher::ChallengeWatcher::new(processor.store.clone())
-                        .challenge_transcript(&request.public_inputs.request_nullifier)
-                        .is_some()
-                );
+                // An issued but unsettled lease is not challenge evidence; the
+                // retained active row lets bounded settlement finalize it.
+                let watcher = crate::watcher::ChallengeWatcher::new(processor.store.clone());
+                let nullifier = request.public_inputs.request_nullifier;
+                assert!(watcher.challenge_transcript(&nullifier).is_none());
+                assert!(matches!(
+                    watcher.evidence_status(&nullifier),
+                    Ok(crate::watcher::EvidenceStatus::AwaitingSettlement(progress))
+                        if progress.lease_status.as_deref() == Some("active") && progress.key_issued
+                ));
                 // Recovery of already activated access needs no fresh chain
                 // read and cannot repeat provider issuance after either error.
                 assert!(matches!(

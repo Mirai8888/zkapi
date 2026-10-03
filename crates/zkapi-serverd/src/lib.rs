@@ -4,6 +4,7 @@
 //! Baby-JubJub Schnorr signing, and HTTP routes for the zkAPI server.
 
 pub mod challenge_service;
+pub mod challenge_status;
 pub mod config;
 pub mod dashboard;
 pub mod error;

@@ -14,7 +14,12 @@ integer gwei and requires exactly `amount * 1 gwei` in `msg.value`. Wrong values
 revert atomically. Native deposits are capped at JavaScript's maximum exact
 integer, 9,007,199,254,740,991 units. Withdrawal and expiry payouts convert ledger
 units back to wei and enforce proof, nullifier, destination, timing
-and reentrancy protections. Failed recipient transfers revert the complete close.
+and reentrancy protections. A failed transfer to the withdrawal destination
+reverts the complete close. On vaults deployed from this release a treasury
+that rejects its share, or needs more than 100,000 gas to receive it, cannot
+block a close: the share accrues to `treasuryArrears()` with a
+`TreasuryPaymentDeferred` event, and anyone can pay it out later with
+`withdrawTreasuryArrears()`.
 
 The deployment manifest pins the vault address, native asset, and circuit
 `zkapi-v2-note-bound-v1` with its exact setup/WASM/key hashes. The circuit binds
@@ -98,7 +103,12 @@ new issuance rejects it with `native_quote_superseded`; the exact old request
 must be recovered before constructing a new proof. The exact accepted request,
 including its quote, is persisted before upstream key provisioning. The rate is
 never refreshed on a matching retry or during settlement. In particular, a
-restart or an oracle outage cannot reprice an existing lease.
+restart or an oracle outage cannot reprice an existing lease. Settlement checks
+the saved quote only for internal consistency and never compares it with the
+server's current `--native-price-*` settings, so changing the feed address,
+decimals or maximum age affects only new admissions (and the acknowledgement of
+an unaccepted quote that has not yet expired). Keep those settings equal to the
+published manifest.
 
 An accepted reservation does not authorize new access after its state has been
 withdrawn. Before contacting either provider to create a key, including an exact
@@ -109,18 +119,23 @@ wrong-chain or malformed RPC responses fail closed with a retriable server error
 This live authorization read does not refresh the frozen quote or require the
 original Merkle root to remain current after unrelated deposits.
 
-After provider creation, the server durably activates the lease and repeats the
-same check before returning its secret. If a withdrawal consumed the nullifier
-during provider I/O, or the read fails, no key is returned. The active record is
-retained for challenge evidence and normal status/settlement recovery; the server
-does not erase an already issued key's accounting obligation. RPC availability
-is therefore required for new key delivery, including retries. Existing lease
-status and settlement recovery do not require this issuance check.
+The lease row is created, with its frozen TTL and write-once settlement
+deadline, right after the reservation and before that check. After provider
+creation, the server durably activates the lease and repeats the same check
+before returning its secret, and it records that the key was delivered only
+immediately before returning it. If a withdrawal consumed the nullifier during
+provider I/O, or the read fails, no key is returned; the active record stays for
+status and settlement, which charges such an undelivered key nothing. RPC
+availability is therefore required for new key delivery, including retries.
+Existing lease status and settlement do not require this issuance check.
 
 A withdrawal started after key delivery still requires timely operation of the
-challenger. These checks do not replace the configured challenge window, a
-trustworthy view of the selected chain, or sufficient operational time to observe
-and challenge a stale escape. The deployment's 24-hour window is unchanged.
+challenger. The challenger contests an escape at a lease's state only after
+settlement finalizes it, which the settlement deadline below bounds. These
+checks do not replace the configured challenge window, a trustworthy view of the
+selected chain, or sufficient operational time to observe and challenge a stale
+escape. The challenge window is fixed when the vault is deployed (24 hours in
+the current deployments).
 
 For ledger units `U`, oracle integer answer `P`, and decimals `D`, the upstream
 budget in micro-USD is:
@@ -133,9 +148,12 @@ native charge is:
 
 `ceil(C * 1,000,000,000 * 10^D / (P * 1,000,000))`.
 
-Zero usage stays zero. Integer conversion is checked for overflow and browser
-safe bounds. The signed state transition charges gwei and remains capped by the
-proof's solvency bound. Issuance and the settlement response payload echo the
+Zero usage stays zero. Settlement clamps measured usage to the micro-USD limit
+of the proof's solvency bound before converting it, so the conversion cannot
+overflow and the signed charge never exceeds the solvency bound; a clamped
+charge carries `charge_basis: "clamped"` with the reported and charged usage,
+and records a `usage_clamped` review. OA receipts above the lease limit are
+clamped the same way. Issuance and the settlement response payload echo the
 exact quote so the browser can compare it with its persisted journal.
 
 A `native_quote_expired` response is emitted only before any nullifier
@@ -163,9 +181,11 @@ require prompt-private leases with a proof-bound native quote.
 ## Deployment
 
 The deploy script creates a native-only vault and accepts `REQUEST_CHARGE_CAP`
-in gwei. It checks an optional `CHAIN_ID` against the connected chain. Publish
-a manifest that pins the resulting vault, circuit artifacts, signing keys, and
-native asset configuration.
+in gwei. It checks an optional `CHAIN_ID` against the connected chain and, off
+local chains, requires an explicit `OWNER`; see
+[deployment](deployment.md#contracts). Publish a manifest that pins the
+resulting vault, circuit artifacts, signing keys, and native asset
+configuration.
 
 Start the native server with its vault/chain/request cap and
 signer, indexer, proof and OA-source settings, plus:
@@ -179,13 +199,20 @@ zkapi ... serverd ... \
 ```
 
 The server requires native oracle and prompt-private lease configuration.
-Operate the compatible v2 [challenge daemon](challenge-service.md)
-alongside server and indexer, with a dedicated funded signer restricted to the
-configured vault. It reads the exact historical request root from the native server's
-finalized transcript or exact active-lease request and uses a current zero-slot
-restoration path. A missing station usage receipt does not prevent an already
-issued lease from being challenged. Native usage
-settlement preserves the original proof/public inputs required for that challenge.
+`--openrouter-settlement-deadline-seconds` (default 21600) sets the settlement
+deadline described below. Operate the compatible v2
+[challenge daemon](challenge-service.md) alongside server and indexer, with a
+dedicated funded signer restricted to the configured vault. Its only evidence is
+the server's finalized transcript: the exact historical request root, inputs and
+proof of a request whose settlement is signed. A reserved request, including an
+issued lease whose usage is not settled yet, is not evidence; the daemon waits
+for settlement, which the deadline bounds, and uses a current zero-slot
+restoration path. Native usage settlement preserves the original proof/public
+inputs required for that challenge. After a successful challenge on a vault
+deployed from this release, `usedNullifiers(nullifier)` reads `false` and
+`challengedNullifiers(nullifier)` reads `true`: no escape can use that
+nullifier again, and the owner exits from the signed successor state. On vaults
+deployed before this release the nullifier stays consumed.
 Do not reuse a daemon, verifier or setup from another circuit. Configure the published manifest separately; these flags do
 not rewrite static frontend manifests. The browser SDK handles funding and
 withdrawals; the operator CLI runs setup, signing-key, server and indexer commands.
@@ -194,8 +221,10 @@ OA provisioning retries accept a shortened remaining lifetime only when the
 relay explicitly marks the station response `replayed: true`. Its original
 expiry stays unchanged and must remain in the future and within the requested
 maximum TTL; absent flags and ordinary new issuance retain strict lifetime
-bounds. Expired replays remain pending/error recovery rather than creating a
-second key for the same accepted request.
+bounds. A resumed OA issuance uses the lease's frozen TTL, and is refused with
+`lease_pending` when the lease's settlement deadline no longer leaves room for
+TTL + grace + 900 seconds; such a lease is later finalized at zero. A replay
+never creates a second key for the same accepted request.
 
 Native OA issuance uses a deployment-bound upstream request ID: a versioned
 Keccak domain hash of the complete accepted request binding (chain, vault,
@@ -205,7 +234,7 @@ recovery. It prevents two deployments that share an org from redeeming the same
 key by choosing the same browser request ID. The browser-visible ID stays
 unchanged. OA lease recovery rejects a missing or mismatched native upstream ID.
 
-## Recovering rejected OA provisioning
+## Recovering OA provisioning
 
 The server records whether a new OA lease has ever attempted issuance. Before
 provider I/O, it durably changes `not_started` to `may_have_issued`; a timeout,
@@ -227,44 +256,118 @@ and has type `oa_org_unissued_lease_cancellation`, `issued: false`, and zero usa
 The nullifier is finalized, never deleted or made reusable.
 
 If finalization is interrupted, the next background scan or exact saved-proof
-settlement request finishes it. A tracked request with no issuance attempt can
-also be retired, or recovered by the scanner after its original settlement
-deadline. Cancellation excludes concurrent issuance, verifies the saved full
-request, deployment, signer, quote, allowance and upstream ID, and requires an
-explicit unspent-nullifier RPC result before signing. A persisted signed
-successor is reused after a crash; it is never replaced with a new signature.
-Active leases still require normal provider usage reconciliation. Their network
-waits do not hold the global issuance lock.
+settlement request finishes it. A persisted signed successor is reused after a
+crash; it is never replaced with a new signature. A provisioning row is
+finalized at zero only while no issuance attempt for it is in progress and only
+while it still has no key.
 
-Historical rows migrate conservatively to `may_have_issued`. After their
-settlement deadline, these and ambiguous attempts enter read-only issuer
-reconciliation. An exact saved-proof settlement request can also start it.
-Authenticated `POST /api/zkapi/reconcile_key` reads the org's existing durable
-issuance binding; it never creates, replays or returns a plaintext key, consumes
-issuance quota, or writes issuer state. The server validates request namespace,
-cap, integer credits, duration, station request ID and expiry bounds, then
-atomically records the existing key hash and original expiry. Normal
-station-signed actual-usage settlement supplies the successor signature using
-the frozen quote. Expired provider keys can follow this path. Usage outages
-preserve the active metadata and retry normal settlement after restart.
-
-A missing issuer binding, unavailable endpoint, malformed/mismatched response,
-or unknown outcome stays pending. This API has no durable cancellation fence
-for unknown issuance and never authorizes an automatic zero-charge refund.
-Reconciliation does not apply current issuance policy caps, but the existing
-usage endpoint still requires those caps and the server's configured TTL to
-be compatible with the historical lease. Incompatible policy changes fail
-closed and need operator reconciliation rather than refunding automatically.
+Every other OA lease that never returned a key to the client is also finalized
+at zero once its settlement is due, whatever its outcome: `not_started`,
+`may_have_issued`, or a historical row whose outcome is unknown. Its receipt has
+the same type with `reason` `issuance_not_started` or `issuance_not_completed`,
+and no provider or chain call is needed. A key the org may have issued was never
+delivered through this lease, so nothing can have used it. The read-only issuer
+reconciliation of earlier releases (`POST /api/zkapi/reconcile_key`) is no
+longer used. Rows that an earlier release reconciled are treated as possibly
+delivered and settle from measured usage. Usage settlement uses the TTL frozen
+in the lease row; only rows created by earlier releases, which have none, use
+the server's current setting.
 
 A crash after nullifier reservation but before the lease row is created still
-requires exact issuance replay. This cancellation path cannot infer an outcome
-from that incomplete state and does not clear the reservation.
+requires exact issuance replay. Nothing can infer an outcome from that
+incomplete state, nothing settles it automatically, and the challenger never
+treats it as evidence.
+
+## Settlement terminality
+
+Every accepted lease reaches a signed transcript by a deadline, so a lease can
+no longer hold its note state reserved indefinitely:
+
+- The deadline (`settlement_deadline_at`) is written once, when the lease row is
+  created: issuance + TTL + grace + `--openrouter-settlement-deadline-seconds`
+  (`ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, default 21600). Retirement
+  steps, timing updates and a provider that keeps reporting a key enabled never
+  move it, and the first error time is never reset. A row created by an earlier
+  release receives one at first sight: the later of its expiry and that moment,
+  plus grace and the deadline setting.
+- A lease that never delivered a key is finalized at zero, signed, without any
+  provider or chain call: a provisioning row (direct, or OA in any outcome), or
+  an activated lease whose key was never returned. The receipt keeps its
+  source's type (`openrouter_ephemeral_lease_settlement`, or
+  `oa_org_unissued_lease_cancellation` for OA) with `charge_basis: "unissued"`,
+  `issued: false`, `delivered: false` and a `reason`
+  (`issuance_not_started`, `issuer_policy_rejected`, `issuance_not_completed`
+  or `key_never_delivered`).
+- A lease that may have been delivered (active, retiring, disabled or revoking)
+  is settled from measured usage, clamped to its solvency bound
+  (`charge_basis` `measured` or `clamped`). Transient failures, such as an
+  unavailable provider, org or RPC or an unconfirmed key deletion, are retried
+  until the deadline. At the deadline it is finalized without further I/O: a
+  revoking direct key whose usage was already captured is charged that usage
+  (`key_deleted: false`, review `finalized_before_key_deletion`); any other is
+  charged its solvency bound (`charge_basis: "worst_case"`,
+  `settlement_reason: "settlement_deadline"`, review `deadline_worst_case`).
+- A deterministic failure, such as a corrupt saved quote, missing revocation
+  usage, or an invalid saved TTL, namespace or limit, is finalized at the
+  solvency bound at once (`settlement_reason: "unsettleable"`, review
+  `unsettleable_worst_case`).
+- A charge is final once signed; there is no refund transaction. The solvency
+  bound is the most the user's own proof authorized, and the provider key's
+  spending limit was derived from it.
+- `cancelled` is used only for a lease whose saved binding does not match its
+  nullifier record. The server never signs it and records a `binding_corrupt`
+  review, and a retry of the request returns `nullifier_used`. Its nullifier
+  stays reserved without evidence, so its owner exits from that state by escape,
+  which the challenger does not contest.
+- Keys of terminal direct leases that may still exist at the provider (worst
+  case, never delivered or cancelled) are disabled and then deleted in the
+  background, outside the settlement lock; a 404 counts as done, and failures
+  are retried with backoff up to one hour.
+
+Lease status responses carry `charge_basis` and, until the lease is terminal,
+`settlement_deadline`; nullifier and request recovery responses for a reserved
+lease request carry `settlement_deadline` too. Every settlement payload carries
+`charge_basis` and the original `billing_quote`, and fallback settlements add
+`settlement_reason`. The payload `type` of each key source is unchanged.
+
+The server refuses to start unless TTL + grace + deadline + twice the settlement
+poll interval + 600 seconds is at most half the vault's `challengePeriod()`
+(read with the startup key check), and unless the deadline leaves at least 900
+seconds of retries after the grace. Finalized evidence therefore exists before
+half of the challenge window has passed. With a 24-hour challenge period and
+the defaults (300 + 5 + 21600 + 4 + 600 seconds) the check passes; a shorter
+challenge period needs a smaller deadline.
+
+## Operator review
+
+Every clamped, deadline, deletion-pending, unsettleable or corrupt-binding
+settlement writes a row to the `settlement_reviews` table with one of the
+reasons `usage_clamped`, `deadline_worst_case`, `unsettleable_worst_case`,
+`finalized_before_key_deletion` or `binding_corrupt`, and logs
+`settlement required operator review` at error level. Alert on that line.
+`GET /v1/dashboard/settlement?limit=N` (operator-only and never proxied by the
+gateway; password-gated like the other dashboard routes on Sepolia) returns:
+
+- `counts`: `pending`, `retrying`, `provisioning`, `cancelled`,
+  `unknown_status`, `open_reviews`, `pending_key_cleanups` and
+  `next_deadline_in_seconds`;
+- `pending`: each unsettled lease with its status, delivery, deadline, seconds
+  remaining, attempts, first error time and last error;
+- `reviews`: each review with its reason, charge basis, reported usage, applied
+  charge, solvency bound and acknowledgement time.
+
+`GET /v1/dashboard/summary` includes the same counts as `settlement`.
+Acknowledge a handled review by setting `acknowledged_at`; the
+[Docker guide](../docker/aws/README.md#monitoring) has the commands.
 
 Every file-backed signing processor holds an exclusive database sidecar lock
 for its lifetime. Challenger reads remain available. Stop all older server
 writers before deployment: old binaries and manual database writes do not honor
 this lock. Preserve the sidecar, database and backup together; never unlink the
 lock to bypass an active writer. Do not downgrade a migrated live database to an
-older writer, whose issuance does not update the new outcome field. Rollback
-requires a compatible writer or stopped-service reconciliation of affected
-provisioning rows, not restoring an old database over newer wallet activity.
+older writer. An older writer ignores the settlement deadline, delivery and
+review columns, compares saved quotes with its live settings again, and treats
+`cancelled` and direct provisioning rows as not due, so its settlement can stall
+again; rows already finalized stay finalized. Rollback requires a compatible
+writer or stopped-service reconciliation of affected rows, not restoring an old
+database over newer wallet activity.

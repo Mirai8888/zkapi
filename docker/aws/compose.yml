@@ -28,11 +28,14 @@ services:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/indexer.env
     healthcheck:
+      # 200 only while a verified view is served. The start period covers a full
+      # replay from DEPLOY_BLOCK (first start of a new checkpoint, or a resync);
+      # health turns 200 as soon as the replay verifies against the vault.
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3001/health"]
       interval: 10s
       timeout: 6s
       retries: 6
-      start_period: 60s
+      start_period: 900s
 
   server:
     <<: *daemon
@@ -41,14 +44,17 @@ services:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/server.env
     depends_on:
+      # Not service_healthy: a stale, diverged or replaying indexer answers 503,
+      # which the server tolerates; it must not keep the API down.
       indexer:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3000/health"]
       interval: 10s
       timeout: 6s
       retries: 3
-      start_period: 30s
+      # Covers the startup vault signing-key check and its RPC retries.
+      start_period: 120s
 
   challenger:
     <<: *daemon
@@ -58,10 +64,20 @@ services:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/challenge.env
     depends_on:
+      # The challenger opens the server database read-only and waits for its
+      # deployment binding; an unhealthy API or indexer must never keep it down.
       server:
-        condition: service_healthy
+        condition: service_started
       signer:
         condition: service_healthy
+    healthcheck:
+      # Liveness of the poll loop only. /health returns 503 for alarms (a
+      # missed deadline, a diverged indexer) and is for alerting, not restarts.
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3002/livez"]
+      interval: 10s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
 
   signer:
     image: zkapi/signer:${ZKAPI_IMAGE_TAG:-note-bound-v1}

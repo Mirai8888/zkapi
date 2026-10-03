@@ -186,19 +186,20 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 		return action(ctx, dir, c, "setup", ui, out)
 	}
 	for {
-		choices := "check setup, edit settings, withdraw, return public ETH, api-key, or quit"
+		choices := "check setup, edit settings, withdraw, return public ETH, repair deposit, api-key, or quit"
 		menu := []setupChoice{
 			{value: "check", label: "Check setup / fund wallet"},
 			{value: "edit", label: "Edit settings"},
 		}
 		sepolia := c.ZKAPI.Network == "sepolia"
 		if sepolia {
-			choices = "check setup, edit settings, password, withdraw, return public ETH, api-key, or quit"
+			choices = "check setup, edit settings, password, withdraw, return public ETH, repair deposit, api-key, or quit"
 			menu = append(menu, setupChoice{value: "password", label: "Set Sepolia password"})
 		}
 		menu = append(menu,
 			setupChoice{value: "withdraw", label: "Withdraw private balance"},
 			setupChoice{value: "return", label: "Return public ETH"},
+			setupChoice{value: "repair", label: "Repair deposit note binding"},
 			setupChoice{value: "api-key", label: "Show local API key"},
 			setupChoice{value: "quit", label: "Quit"},
 		)
@@ -215,7 +216,7 @@ func configure(ctx context.Context, dir string, args []string, ui setupPrompter,
 				return err
 			}
 			return saveConfiguredSettings(ctx, dir, c, next, ui, out, action)
-		case "withdraw", "return":
+		case "withdraw", "return", "repair":
 			return action(ctx, dir, c, strings.ToLower(strings.TrimSpace(choice)), ui, out)
 		case "password":
 			if sepolia {

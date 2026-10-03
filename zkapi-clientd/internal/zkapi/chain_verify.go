@@ -52,7 +52,7 @@ var (
 	errWithdrawalVerificationPending = errors.New("the withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed")
 )
 
-const conflictGuidance = " Checking again re-verifies automatically. If this persists, compare the transaction on a block explorer and run zkapi-clientd fund --rebind."
+const conflictGuidance = " Checking again re-verifies automatically. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair."
 
 type vaultNoteState struct {
 	Commitment string // 0x + 64 lowercase hex
@@ -372,7 +372,7 @@ func (h *FundingHandler) checkDepositRevert(ctx context.Context, config fundingC
 		return fmt.Errorf("%w (%v)", errRevertVerificationPending, err)
 	}
 	if id, found := findDepositLeaf(snapshot, slot, commitment, deposit.Amount, ttl, time.Now().Unix()); found {
-		return fmt.Errorf("%w: the zkAPI indexer records this private note's deposit at note %d; no replacement will be signed; run zkapi-clientd fund --rebind", errDepositVerificationConflict, id)
+		return fmt.Errorf("%w: the zkAPI indexer records this private note's deposit at note %d; no replacement will be signed; run zkapi-clientd config --menu, then choose repair", errDepositVerificationConflict, id)
 	}
 	// Another leaf holds the slot, it was emptied, or it is still free. A
 	// retry is rebuilt from the then-current tree: while the slot is free it

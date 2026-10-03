@@ -94,7 +94,7 @@ func TestDepositActivationRequiresVaultAndIndexerAgreement(t *testing.T) {
 			mutate(f)
 			f.mu.Unlock()
 			status, err := f.h.FundAddress(context.Background(), 100000)
-			if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "fund --rebind") {
+			if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "config --menu, then choose repair") {
 				t.Fatalf("disagreement was not reported as a conflict: %+v %v", status, err)
 			}
 			if f.activated != 0 || len(f.confirmBodies) != 0 {
@@ -542,7 +542,7 @@ func TestConfirmGuidesRebindForMismatchedCompanionNote(t *testing.T) {
 			}
 			f.mu.Unlock()
 			_, err := f.h.confirm(context.Background(), hash)
-			if err == nil || !strings.Contains(err.Error(), "fund --rebind --replace-note-id") {
+			if err == nil || !strings.Contains(err.Error(), "choose repair, and replace companion note") {
 				t.Fatalf("mismatched companion note was not guided to rebind: %v", err)
 			}
 			if f.activated != 1 {

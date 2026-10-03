@@ -138,8 +138,10 @@ private state:
   wallet only after both agree. While the indexer is behind, unavailable or an
   older version without snapshot block metadata, the deposit stays in phase
   `confirming` with stage `verifying` and polling continues. Disagreement sets
-  phase `verification_conflict`; this is not final, and every later
-  `zkapi-clientd fund --resume` or `config` re-verifies the saved transaction.
+  phase `verification_conflict`. The conflict is not final: running
+  `zkapi-clientd config` again checks the saved transaction against the vault
+  and the indexer once more, and activates the deposit if they now agree.
+  Otherwise it stops and points to the repair below.
 - **Reverted deposits.** Before a finalized failed deposit is retired or
   requoted, the indexer must show that this note did not land at the empty
   slot the signed transaction was built for. The slot is checked against the
@@ -151,30 +153,40 @@ private state:
   vault (at the payout receipt's block) must show the note closed and the
   indexer must no longer list its leaf; until then the withdrawal keeps
   waiting. A finalized escape of the same reservation (same note, nullifier,
-  payout and destination) is accepted as an independently relayed payout via
-  `zkapi-clientd withdraw --confirm`.
+  payout and destination) is accepted as an independently relayed payout:
+  after a reverted withdrawal, choose `confirm` in the `withdraw` menu action
+  and enter that transaction's hash.
 
-If a deposit shows `verification_conflict`, compare its transaction on a block
-explorer, then run:
-
-```sh
-zkapi-clientd fund --rebind                       # derive the note from the saved transaction
-zkapi-clientd fund --rebind --note-id 12          # name the vault note holding the deposit
-zkapi-clientd fund --rebind --replace-note-id 42148  # also replace a wrongly bound wallet note
-```
+If a deposit stays in `verification_conflict`, compare its transaction on a
+block explorer, then run `zkapi-clientd config --menu` (with the same
+`--config-dir`, if set) and choose **repair**. It asks for the vault note ID
+that holds the deposit (leave it blank to derive it from the saved
+transaction) and for a wrongly bound wallet note to replace (blank if none),
+and asks for confirmation before anything changes. The repair calls the
+daemon's wallet-management route `POST /admin/funding/rebind` (optional JSON
+fields `note_id` and `replace_note_id`), which verifies the deposit against
+finalized vault state and the indexer itself. It succeeds when the private
+balance is active again.
 
 Rebind never changes the note secret, commitment or amount; it accepts a note
 only when the finalized vault state and the indexer both hold exactly this
 deposit there. It refuses while a withdrawal, public return or unconfirmed
-deposit transaction is saved, while the wallet has an unsettled request or a
-withdrawal reservation, and it replaces an existing wallet note only when you
-name it and it is an unspent genesis note of the same amount. The replacement
-is saved before the wallet is reset, so an interrupted rebind resumes with
-`zkapi-clientd fund --rebind`.
+deposit transaction is saved, or while the wallet has an unsettled request,
+and it replaces an existing wallet note only when you name it and it is an
+unspent genesis note of the same amount. A withdrawal reservation of that note
+is released first through the companion's `POST /oa/v1/withdraw/release`,
+which refuses when the withdrawal has a prepared plan or the protocol server
+knows its nullifier; any other reservation blocks the rebind. The replacement
+is saved before the wallet is reset, so an interrupted rebind resumes when
+**repair** is chosen again with both fields left blank.
 
-A manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
-later requires a wallet companion able to prove note ownership for withdrawal
-clearance; an older companion is refused before any note is reserved.
+Every withdrawal sends the protocol server an ownership proof, a second
+withdrawal proof that shows the server the note ID, payout and destination
+before the close is on chain (see [privacy boundaries](PRIVACY.md)). A
+manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
+later requires a wallet companion whose `/oa/v1/status` reports
+`clearance_ownership_proof_version`; an older companion is refused before any
+note is reserved.
 
 ## Withdrawals
 

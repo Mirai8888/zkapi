@@ -301,7 +301,7 @@ func TestConfigureStatusAndExplicitKeyNeverStartService(t *testing.T) {
 }
 
 func TestConfigureMenuActionsAndNoOpCheck(t *testing.T) {
-	for _, choice := range []string{"check", "withdraw", "return", "quit"} {
+	for _, choice := range []string{"check", "withdraw", "return", "repair", "quit"} {
 		t.Run(choice, func(t *testing.T) {
 			dir, original := startTestConfig(t)
 			before, _ := os.ReadFile(filepath.Join(dir, "config.json"))

@@ -426,7 +426,7 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if wallet.HasNote {
 		if wallet.Note.NoteID != noteID || (wallet.Note.ExpiryTs != nil && *wallet.Note.ExpiryTs != expiry) {
 			if record.Active {
-				return nil, fmt.Errorf("the companion holds note %d, but the chain assigns this deposit note %d; run zkapi-clientd fund --rebind --replace-note-id %d", wallet.Note.NoteID, noteID, wallet.Note.NoteID)
+				return nil, fmt.Errorf("the companion holds note %d, but the chain assigns this deposit note %d; run zkapi-clientd config --menu, choose repair, and replace companion note %d", wallet.Note.NoteID, noteID, wallet.Note.NoteID)
 			}
 			return nil, errors.New("another private note is active; refusing to replace it")
 		}

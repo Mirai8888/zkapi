@@ -128,6 +128,10 @@ func runConfigActionWithUSD(ctx context.Context, dir string, c config.Config, ac
 		runtime.fund = func(ctx context.Context, c config.Config, _, _ string, ui setupPrompter) error {
 			return configurePayment(ctx, c, action, ui)
 		}
+	case "repair":
+		runtime.fund = func(ctx context.Context, c config.Config, _, _ string, ui setupPrompter) error {
+			return runGuidedRepair(ctx, c, ui)
+		}
 	case "status":
 		runtime.fund = checkConfiguredZKAPI
 	default:

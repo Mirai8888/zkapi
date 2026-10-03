@@ -65,10 +65,23 @@ pub struct SettlementProgress {
     pub expires_at: Option<u64>,
     /// Server time at which settlement is next due.
     pub settle_after: Option<u64>,
+    /// Write-once server deadline by which the lease is finalized, at the
+    /// worst-case charge if needed; None until the server assigns one.
+    #[serde(default)]
+    pub settlement_deadline_at: Option<u64>,
     pub last_error: Option<String>,
     /// The lease row exists but could not be read; the server's settlement
     /// scan cannot read it either, so evidence may never be produced.
     pub lease_read_error: Option<String>,
+}
+
+impl SettlementProgress {
+    /// Latest server time by which finalized evidence is expected: the
+    /// write-once settlement deadline when assigned, else the next scheduled
+    /// settlement.
+    pub fn evidence_expected_by(&self) -> Option<u64> {
+        self.settlement_deadline_at.or(self.settle_after)
+    }
 }
 
 /// Fully reconstructed challenge action for the v2 vault.
@@ -201,6 +214,7 @@ impl ChallengeWatcher {
                 progress.key_source = Some(lease.key_source);
                 progress.expires_at = Some(lease.expires_at);
                 progress.settle_after = Some(lease.settle_after);
+                progress.settlement_deadline_at = lease.settlement_deadline_at;
                 // Upstream errors may echo the key name, which embeds the ID.
                 progress.last_error = lease.last_error.as_deref().map(|error| {
                     let mut error = error.replace(id, "[request]");
@@ -501,6 +515,10 @@ pub(crate) mod tests {
                     assert_eq!(progress.key_source.as_deref(), Some("oa_org"));
                     assert_eq!(progress.expires_at, Some(2));
                     assert_eq!(progress.settle_after, Some(3));
+                    // A row without a write-once deadline falls back to the
+                    // next scheduled attempt.
+                    assert_eq!(progress.settlement_deadline_at, None);
+                    assert_eq!(progress.evidence_expected_by(), Some(3));
                     assert_eq!(progress.reservation_kind, "openrouter_lease");
                 }
                 other => panic!("{status} lease must await settlement, got {other:?}"),

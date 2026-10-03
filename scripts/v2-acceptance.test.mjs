@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { localJSON, mockProvider } from './v2-acceptance.mjs';
+import { challengeFees, localJSON, mockProvider, proxyJsonRpc } from './v2-acceptance.mjs';
 
 test('provider mock accounts only accepted calls against the issued child key', async () => {
     const mock = mockProvider('test-management');
@@ -92,5 +92,58 @@ test('provider mock fails one creation before creating any key, then recovers', 
     } finally {
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
+    }
+});
+
+test('challenge transactions admit only bounded EIP-1559 fees', () => {
+    const cap = 100_000_000_000n;
+    const tx = { from: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8', to: '0x5fbdb2315678afecb367f032d93f642f64180aa3',
+        data: '0x1234', gas: '0x72f840', nonce: '0x0', maxFeePerGas: '0xee6b2800', maxPriorityFeePerGas: '0x77359400' };
+    assert.deepEqual(challengeFees(tx, cap), { maxFeePerGas: 4_000_000_000n, maxPriorityFeePerGas: 2_000_000_000n });
+    assert.deepEqual(challengeFees({ ...tx, maxFeePerGas: '0x174876e800', maxPriorityFeePerGas: '0x174876e800' }, cap),
+        { maxFeePerGas: cap, maxPriorityFeePerGas: cap });
+    for (const extra of [{ gasPrice: '0x1' }, { type: '0x2' }, { value: '0x0' }, { chainId: '0x7a69' }, { accessList: [] }]) {
+        assert.throws(() => challengeFees({ ...tx, ...extra }, cap), /EIP-1559 send fields/, JSON.stringify(extra));
+    }
+    for (const field of ['maxFeePerGas', 'maxPriorityFeePerGas', 'nonce']) {
+        const missing = { ...tx };
+        delete missing[field];
+        assert.throws(() => challengeFees(missing, cap), /EIP-1559 send fields/, field);
+    }
+    for (const [field, value] of [['nonce', '0x00'], ['gas', '0X72F840'], ['maxFeePerGas', '4000000000']]) {
+        assert.throws(() => challengeFees({ ...tx, [field]: value }, cap), /canonical hex quantity/, `${field}=${value}`);
+    }
+    assert.throws(() => challengeFees({ ...tx, maxPriorityFeePerGas: '0x0' }, cap), /0 < maxPriorityFeePerGas/);
+    assert.throws(() => challengeFees({ ...tx, maxPriorityFeePerGas: '0xee6b2801' }, cap), /0 < maxPriorityFeePerGas/);
+    assert.throws(() => challengeFees({ ...tx, maxFeePerGas: '0x174876e801' }, cap), /0 < maxPriorityFeePerGas/);
+});
+
+test('challenger RPC proxy relays upstream errors with their revert data', async () => {
+    const calls = [];
+    const upstream = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const call = JSON.parse(Buffer.concat(chunks).toString());
+        calls.push(call);
+        const reply = call.method === 'eth_call'
+            ? { error: { code: 3, message: 'execution reverted', data: '0x607447de' } }
+            : call.method === 'eth_estimateGas' ? { error: { code: -32000, message: 'gas required exceeds allowance' } }
+                : { result: '0x7a69' };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, ...reply }));
+    });
+    await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${upstream.address().port}`;
+    try {
+        assert.deepEqual(await proxyJsonRpc(url, { id: 7, method: 'eth_call', params: [{ to: '0x1', data: '0x' }, 'latest'] }),
+            { jsonrpc: '2.0', id: 7, error: { code: 3, message: 'execution reverted', data: '0x607447de' } });
+        assert.deepEqual(await proxyJsonRpc(url, { id: 8, method: 'eth_estimateGas', params: [] }),
+            { jsonrpc: '2.0', id: 8, error: { code: -32000, message: 'gas required exceeds allowance' } });
+        assert.deepEqual(await proxyJsonRpc(url, { id: 9, method: 'eth_chainId' }), { jsonrpc: '2.0', id: 9, result: '0x7a69' });
+        assert.deepEqual(calls.map(call => [call.id, call.method, call.params]),
+            [[7, 'eth_call', [{ to: '0x1', data: '0x' }, 'latest']], [8, 'eth_estimateGas', []], [9, 'eth_chainId', []]]);
+    } finally {
+        upstream.closeAllConnections();
+        await new Promise(resolve => upstream.close(resolve));
     }
 });

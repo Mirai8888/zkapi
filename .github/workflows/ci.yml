@@ -27,9 +27,14 @@ jobs:
       - name: Test SDK and package both network asset sets
         run: |
           npm test
-          node --test docker/aws/run-daemon.test.mjs
+          node --test docker/aws/*.test.mjs
           npm run build:browser
           npm run build:mainnet
+
+      - name: Test challenge signer
+        run: |
+          npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
+          npm test --prefix docker/aws/signer
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,7 +58,7 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Validate operator scripts
-        run: bash -n scripts/build-browser-client.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
+        run: bash -n scripts/build-browser-client.sh scripts/run-v2-acceptance.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
 
   protocol-rust:
     runs-on: ubuntu-latest
@@ -84,6 +89,10 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Forge build
         working-directory: protocol/contracts
         run: forge build
@@ -91,6 +100,62 @@ jobs:
       - name: Forge test
         working-directory: protocol/contracts
         run: forge test -vvv
+
+      - name: Build demo deployment script
+        working-directory: demo/contracts
+        run: forge build
+
+      # forge cannot link Bn254Poseidon through the relative ../../ remapping
+      # (see demo/contracts/foundry.toml), so the simulation passes a canonical
+      # absolute zkapi-contracts/ remapping. No RPC: a local chain-31337 dry run
+      # with the public Anvil development key.
+      - name: Simulate the demo deployment script
+        working-directory: demo/contracts
+        run: |
+          mkdir -p ../../.demo
+          FOUNDRY_REMAPPINGS="zkapi-contracts/=$(cd ../../protocol/contracts/src && pwd -P)/" \
+            PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4ff80 \
+            OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
+            STATE_SIGNING_KEY_X=11 STATE_SIGNING_KEY_Y=12 CLEARANCE_SIGNING_KEY_X=13 CLEARANCE_SIGNING_KEY_Y=14 \
+            forge script script/Deploy.s.sol
+          node -e 'const m = require(process.argv[1]); if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400) { console.error(m); process.exit(1); }' "$PWD/../../.demo/deployment.json"
+
+      - name: Test challenge signer against Anvil
+        run: |
+          npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
+          ZKAPI_REQUIRE_ANVIL=1 npm run test:anvil --prefix docker/aws/signer
+
+  # Full local lifecycle: real vault, proofs, API server, indexer and
+  # challenger on Anvil, with mock provider and price feed (docs/v2-acceptance.md).
+  lifecycle-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run the v2 lifecycle acceptance
+        run: bash scripts/run-v2-acceptance.sh
+
+      - name: Keep acceptance evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-acceptance-evidence
+          path: .zkapi/acceptance/
+          retention-days: 7
 
   docker:
     runs-on: ubuntu-latest

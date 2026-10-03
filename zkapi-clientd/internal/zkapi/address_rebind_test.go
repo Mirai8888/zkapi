@@ -87,22 +87,36 @@ func TestRebindReplacesOnlyNamedGenesisCompanionNote(t *testing.T) {
 			f.walletNote["deposit_amount"], f.walletNote["current_balance"] = 100000, 100000
 		}},
 		"pending request": {&wrong, func() { f.walletPending = true }, func() { f.walletPending = false }},
-		"reserved withdrawal": {&wrong, func() {
-			f.withdrawalPhase = map[string]any{"phase": "reserved", "note_id": 0xA4A4, "destination": withdrawalTestDestination, "final_balance": "100000", "withdrawal_nullifier": "0x123"}
-		}, func() { f.withdrawalPhase = nil }},
+		// The companion refuses to release a reservation the server knows.
+		"reservation with server state": {&wrong, func() {
+			f.withdrawalPhase, f.releaseRefusal = reservedWithdrawal(0xA4A4), "withdrawal_pending"
+		}, func() { f.withdrawalPhase, f.releaseRefusal = nil, "" }},
+		// ... or one with a prepared withdrawal plan.
+		"planned reservation": {&wrong, func() {
+			f.withdrawalPhase, f.releaseRefusal = reservedWithdrawal(0xA4A4), "withdrawal_conflict"
+		}, func() { f.withdrawalPhase, f.releaseRefusal = nil, "" }},
+		"reservation of another note": {&wrong, func() { f.withdrawalPhase = reservedWithdrawal(7) }, func() { f.withdrawalPhase = nil }},
 	} {
 		f.mu.Lock()
 		refusal.mutate()
+		releases := len(f.releaseBodies)
 		f.mu.Unlock()
 		_, err := f.h.RebindDeposit(context.Background(), nil, refusal.replace)
 		f.mu.Lock()
 		refusal.restore()
+		released := len(f.releaseBodies) - releases
 		f.mu.Unlock()
 		if err == nil {
 			t.Fatalf("%s: rebind replaced the companion note", name)
 		}
 		if name == "unnamed" && !strings.Contains(err.Error(), "--replace-note-id 42148") {
 			t.Fatalf("unnamed replacement did not explain the flag: %v", err)
+		}
+		if refusedRelease := name == "reservation with server state" || name == "planned reservation"; refusedRelease != (released == 1) || released > 1 {
+			t.Fatalf("%s: unexpected withdrawal release attempts: %d", name, released)
+		}
+		if released == 1 && !strings.Contains(err.Error(), "finish that withdrawal") {
+			t.Fatalf("%s: refused release did not explain the withdrawal: %v", name, err)
 		}
 		if f.resetCalls != 0 || f.activated != 0 || f.savedDeposit(t).Rebind != nil {
 			t.Fatalf("%s: refused rebind reset, confirmed, or journaled a replacement", name)
@@ -111,6 +125,37 @@ func TestRebindReplacesOnlyNamedGenesisCompanionNote(t *testing.T) {
 	status, err := f.h.RebindDeposit(context.Background(), nil, &wrong)
 	if err != nil || status.Phase != "active" || f.resetCalls != 1 || f.activated != 1 {
 		t.Fatalf("named genesis note was not replaced exactly once: %+v %v", status, err)
+	}
+	if body := f.confirmBodies[0]; body["note_id"] != float64(12) || body["expiry_ts"] != float64(expiry) {
+		t.Fatalf("replacement used the wrong binding: %+v", body)
+	}
+	if record := f.savedDeposit(t); record.Rebind != nil || record.Binding == nil || record.Binding.NoteID != 12 || !record.Active {
+		t.Fatalf("replacement was not committed: %+v", record)
+	}
+}
+
+func reservedWithdrawal(noteID uint32) map[string]any {
+	return map[string]any{"phase": "reserved", "note_id": noteID, "destination": withdrawalTestDestination, "final_balance": "100000", "withdrawal_nullifier": "0x123"}
+}
+
+// A withdrawal reservation of the note being replaced that never obtained a
+// plan or a server clearance is released through the companion before the
+// reset; the release names exactly the reserved note and nullifier.
+func TestRebindReleasesAnUnplannedReservationOfTheReplacedNote(t *testing.T) {
+	f, expiry := activatedWithWrongCompanionNote(t)
+	f.mu.Lock()
+	f.withdrawalPhase = reservedWithdrawal(0xA4A4)
+	f.mu.Unlock()
+	wrong := uint64(0xA4A4)
+	status, err := f.h.RebindDeposit(context.Background(), nil, &wrong)
+	if err != nil || status.Phase != "active" || f.resetCalls != 1 || f.activated != 1 {
+		t.Fatalf("an unplanned reservation blocked the named replacement: %+v %v", status, err)
+	}
+	if len(f.releaseBodies) != 1 || len(f.releaseBodies[0]) != 2 || f.releaseBodies[0]["note_id"] != float64(0xA4A4) || f.releaseBodies[0]["withdrawal_nullifier"] != "0x123" {
+		t.Fatalf("release did not name exactly the reserved note and nullifier: %+v", f.releaseBodies)
+	}
+	if steps := strings.Join(f.companionSteps, ","); steps != "release,reset" {
+		t.Fatalf("the reservation was not released before the reset: %s", steps)
 	}
 	if body := f.confirmBodies[0]; body["note_id"] != float64(12) || body["expiry_ts"] != float64(expiry) {
 		t.Fatalf("replacement used the wrong binding: %+v", body)

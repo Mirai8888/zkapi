@@ -1310,9 +1310,11 @@ impl ChallengeService {
                     )
                     .detail("lease cancelled for a corrupt binding; no evidence will be produced")
                 } else {
-                    let late = progress.settle_after.zip(deadline).is_some_and(
-                        |(settle_after, deadline)| {
-                            settle_after
+                    // The write-once settlement deadline bounds when evidence
+                    // exists; rows without one fall back to the next attempt.
+                    let late = progress.evidence_expected_by().zip(deadline).is_some_and(
+                        |(expected_by, deadline)| {
+                            expected_by
                                 >= deadline.saturating_sub(thresholds.critical_remaining_seconds)
                         },
                     );
@@ -3957,6 +3959,64 @@ mod tests {
             .detail
             .unwrap()
             .contains("settlement scheduled after the challenge critical threshold"));
+    }
+
+    #[tokio::test]
+    async fn settlement_deadline_takes_precedence_over_the_next_attempt() {
+        // The write-once deadline bounds when the server finalizes the lease
+        // (at worst case if needed); the next attempt may fail and move.
+        for (settle_after_offset, deadline_offset, critical) in [(50, 5, true), (5, 50, false)] {
+            let (_, request) = finalized_v2_request().await;
+            let store = Arc::new(NullifierStore::in_memory().unwrap());
+            store.reserve_openrouter_lease(&request).unwrap();
+            let fixture = Fixture::with_store(store.clone(), &request).await;
+            let deadline = fixture.chain.lock().unwrap().deadline;
+            store
+                .create_openrouter_lease_bound(&crate::nullifier_store::NewOpenRouterLease {
+                    request: &request,
+                    key_source: "openrouter",
+                    issued_at: deadline - 100,
+                    expires_at: deadline - settle_after_offset,
+                    settle_after: deadline - settle_after_offset,
+                    spending_limit_usd: 1.0,
+                    oa_client_request_id: None,
+                    ttl_seconds: Some(60),
+                    settlement_deadline_at: Some(deadline - deadline_offset),
+                    delivered: Some(true),
+                })
+                .unwrap();
+            store
+                .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
+                .unwrap();
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            let status = obligation(&service.status(), 0);
+            assert_eq!(status.state, ObligationState::AwaitingSettlement);
+            let settlement = status.settlement.as_ref().unwrap();
+            assert_eq!(
+                settlement.settle_after,
+                Some(deadline - settle_after_offset)
+            );
+            assert_eq!(
+                settlement.settlement_deadline_at,
+                Some(deadline - deadline_offset)
+            );
+            assert!(
+                status.seconds_remaining.unwrap() > 10,
+                "not yet in the critical window"
+            );
+            let detail = status.detail.unwrap();
+            if critical {
+                assert_eq!(status.severity, Severity::Critical);
+                assert!(
+                    detail.contains("settlement scheduled after the challenge critical threshold"),
+                    "{detail}"
+                );
+            } else {
+                assert_eq!(status.severity, Severity::Ok);
+                assert_eq!(detail, "awaiting finalized settlement");
+            }
+        }
     }
 
     #[tokio::test]

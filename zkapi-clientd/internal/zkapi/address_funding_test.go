@@ -61,6 +61,11 @@ type addressFixture struct {
 	withdrawalPhase map[string]any
 	confirmBodies   []map[string]any
 	resetCalls      int
+	// Withdrawal release: a non-empty releaseRefusal answers 409 with that
+	// code; companionSteps orders release and reset calls.
+	releaseBodies  []map[string]any
+	releaseRefusal string
+	companionSteps []string
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -337,8 +342,23 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			_, _ = io.WriteString(w, `{}`)
 		case "/wallet/reset":
 			f.resetCalls++
+			f.companionSteps = append(f.companionSteps, "reset")
 			f.active = false
 			_ = json.NewEncoder(w).Encode(map[string]any{"has_note": false, "pending_request": false})
+		case "/oa/v1/withdraw/release":
+			var body map[string]any
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("invalid withdrawal release")
+			}
+			f.releaseBodies = append(f.releaseBodies, body)
+			f.companionSteps = append(f.companionSteps, "release")
+			if f.releaseRefusal != "" {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": f.releaseRefusal, "message": "private reservation detail"}})
+				return
+			}
+			f.withdrawalPhase = nil
+			_ = json.NewEncoder(w).Encode(map[string]any{"phase": "none"})
 		case "/oa/v1/withdraw/status":
 			phase := f.withdrawalPhase
 			if phase == nil {

@@ -16,7 +16,9 @@ import (
 // note ID. Only the note ID and expiry can change: the secret, commitment and
 // amount come from this daemon's own journal. A companion note is replaced
 // only when the caller names it and it is an unspent genesis note of exactly
-// this amount, with no pending request and no withdrawal reservation.
+// this amount, with no pending request. A withdrawal reservation of that note
+// is first released through the companion, which refuses while the
+// withdrawal has a plan or the server knows its nullifier.
 func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteID *uint64) (AddressFundingStatus, error) {
 	if (noteID != nil && *noteID > 0xffffffff) || (replaceNoteID != nil && *replaceNoteID > 0xffffffff) {
 		return AddressFundingStatus{}, errors.New("note IDs must be 32-bit vault note IDs")
@@ -248,20 +250,27 @@ func (h *FundingHandler) rebindCompanion(ctx context.Context, deposit *depositRe
 	if json.Unmarshal(raw, &reservation) != nil {
 		return errors.New("invalid companion withdrawal status")
 	}
+	reserved := fmt.Errorf("the companion holds a withdrawal reservation for note %d; finish or release it before rebinding", reservation.NoteID)
 	switch reservation.Phase {
 	case "none":
 	case "complete":
 		if reservation.NoteID == uint64(candidate) || (*wallet.HasNote && reservation.NoteID == uint64(wallet.Note.NoteID)) {
 			return fmt.Errorf("the companion has a withdrawal record for note %d; finish it before rebinding", reservation.NoteID)
 		}
+	case "reserved":
+		// Only a reservation of the note being replaced is released, below.
+		if !*wallet.HasNote || reservation.NoteID != uint64(wallet.Note.NoteID) || reservation.Nullifier == "" {
+			return reserved
+		}
 	default:
-		// Limitation: a reservation without a signed plan currently blocks
-		// both reset and activation until the companion can release it.
-		return fmt.Errorf("the companion holds a withdrawal reservation for note %d; finish or release it before rebinding", reservation.NoteID)
+		return reserved
 	}
 	if *wallet.HasNote {
 		note := wallet.Note
 		if note.NoteID == candidate && *note.ExpiryTs == expiry && *note.DepositAmount == deposit.Amount {
+			if reservation.Phase == "reserved" {
+				return reserved
+			}
 			return nil
 		}
 		named := replaceNoteID != nil && *replaceNoteID == uint64(note.NoteID)
@@ -271,6 +280,11 @@ func (h *FundingHandler) rebindCompanion(ctx context.Context, deposit *depositRe
 		}
 		if !*note.IsGenesis || *note.CurrentBalance != *note.DepositAmount || *note.DepositAmount != deposit.Amount {
 			return fmt.Errorf("the companion's note %d has been used or holds a different amount; it cannot be replaced", note.NoteID)
+		}
+		if reservation.Phase == "reserved" {
+			if err := h.releaseWithdrawalReservation(ctx, reservation); err != nil {
+				return err
+			}
 		}
 		deposit.Rebind = &depositRebind{FromNoteID: note.NoteID, ToNoteID: candidate, ExpiryTs: expiry}
 		if err := h.save(*deposit); err != nil {
@@ -290,4 +304,30 @@ func (h *FundingHandler) rebindCompanion(ctx context.Context, deposit *depositRe
 	body, _ := json.Marshal(map[string]any{"secret": deposit.Secret, "note_id": candidate, "amount": deposit.Amount, "expiry_ts": expiry})
 	_, err = h.client.request(ctx, http.MethodPost, "/funding/api/deposit/confirm", body)
 	return err
+}
+
+// releaseWithdrawalReservation releases the companion's withdrawal
+// reservation of the note being replaced. The companion releases only a
+// reservation that never obtained a withdrawal plan and whose nullifier the
+// zkAPI server does not know; otherwise that withdrawal must finish first.
+func (h *FundingHandler) releaseWithdrawalReservation(ctx context.Context, reservation withdrawalBridgeStatus) error {
+	body, _ := json.Marshal(map[string]any{"note_id": reservation.NoteID, "withdrawal_nullifier": reservation.Nullifier})
+	raw, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/release", body)
+	var refused *Error
+	if errors.As(err, &refused) {
+		switch refused.Code {
+		case "withdrawal_pending":
+			return fmt.Errorf("the zkAPI server already holds a clearance or request for the withdrawal reserved on note %d, so the note cannot be replaced; finish that withdrawal (run zkapi-clientd config --menu and choose withdraw) instead of rebinding; nothing was changed", reservation.NoteID)
+		case "withdrawal_conflict":
+			return fmt.Errorf("the withdrawal reserved on note %d has a prepared plan or no longer matches the companion's note, so the note cannot be replaced; finish that withdrawal (run zkapi-clientd config --menu and choose withdraw) instead of rebinding; nothing was changed", reservation.NoteID)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	var released withdrawalBridgeStatus
+	if json.Unmarshal(raw, &released) != nil || released.Phase != "none" {
+		return errors.New("the companion did not release the withdrawal reservation; nothing was changed")
+	}
+	return nil
 }

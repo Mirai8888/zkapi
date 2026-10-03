@@ -410,15 +410,16 @@ pub fn deadline_severity(seconds_remaining: Option<u64>, t: RemainingThresholds)
     }
 }
 
-/// A lease whose settlement is not even due before the critical threshold
-/// cannot produce evidence in time without operator action.
+/// A lease whose settlement is not certain to finalize before the critical
+/// threshold (its write-once settlement deadline, or without one its next
+/// scheduled attempt) may not produce evidence in time without operator action.
 pub fn settles_after_critical(o: &ObligationStatus, t: RemainingThresholds) -> bool {
     o.settlement
         .as_ref()
-        .and_then(|settlement| settlement.settle_after)
+        .and_then(SettlementProgress::evidence_expected_by)
         .zip(o.challenge_deadline)
-        .is_some_and(|(settle_after, deadline)| {
-            settle_after >= deadline.saturating_sub(t.critical_remaining_seconds)
+        .is_some_and(|(expected_by, deadline)| {
+            expected_by >= deadline.saturating_sub(t.critical_remaining_seconds)
         })
 }
 
@@ -898,6 +899,19 @@ mod tests {
         awaiting.settlement.as_mut().unwrap().settle_after = Some(NOW + 995);
         assert!(settles_after_critical(&awaiting, t));
         assert_eq!(severity(&awaiting), Severity::Critical);
+        // The write-once settlement deadline, when assigned, takes precedence
+        // over the next scheduled attempt: it bounds when evidence exists.
+        let settlement = awaiting.settlement.as_mut().unwrap();
+        settlement.settle_after = Some(NOW + 100);
+        settlement.settlement_deadline_at = Some(NOW + 995);
+        assert!(settles_after_critical(&awaiting, t));
+        assert_eq!(severity(&awaiting), Severity::Critical);
+        let settlement = awaiting.settlement.as_mut().unwrap();
+        settlement.settle_after = Some(NOW + 995);
+        settlement.settlement_deadline_at = Some(NOW + 100);
+        assert!(!settles_after_critical(&awaiting, t));
+        assert_eq!(severity(&awaiting), Severity::Ok);
+        awaiting.settlement.as_mut().unwrap().settlement_deadline_at = None;
         awaiting.settlement.as_mut().unwrap().settle_after =
             Some(NOW - policy.settlement_overdue_seconds - 1);
         assert_eq!(severity(&awaiting), Severity::Warning, "overdue");

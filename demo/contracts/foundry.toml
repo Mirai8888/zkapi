@@ -1,3 +1,12 @@
+# `forge script script/Deploy.s.sol` cannot link Bn254Poseidon through the
+# relative ../../ remappings below: forge 1.5 records the library artifact under
+# its canonical path but the vault's link reference under the ../../ path
+# ("wasn't able to find artifact for library Bn254Poseidon"). Pass a canonical
+# absolute remapping when running the script, and create the output directory
+# first (fs_permissions does not admit a missing directory):
+#   mkdir -p ../../.demo
+#   FOUNDRY_REMAPPINGS="zkapi-contracts/=$(cd ../../protocol/contracts/src && pwd -P)/" \
+#     OUTPUT_PATH="$PWD/../../.demo/deployment.json" ... forge script script/Deploy.s.sol
 [profile.default]
 src = "src"
 script = "script"

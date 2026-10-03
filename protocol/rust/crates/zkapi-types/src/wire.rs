@@ -74,6 +74,8 @@ pub struct OpenRouterLeaseResponse {
 /// contains the plaintext OpenRouter runtime key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRouterLeaseStatusResponse {
+    /// provisioning, active, retiring, disabled, revoking, finalized, or
+    /// cancelled (a corrupt server record that was never signed).
     pub status: String,
     pub client_request_id: String,
     pub issued_at: u64,
@@ -86,6 +88,14 @@ pub struct OpenRouterLeaseStatusResponse {
     pub charge_applied: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// How a finalized charge was determined: "measured", "clamped",
+    /// "worst_case" or "unissued".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_basis: Option<String>,
+    /// UNIX time by which a pending lease is finalized, at worst at the
+    /// request's solvency bound. Absent once the lease is terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_deadline: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +130,10 @@ pub struct RecoveryResponseV2 {
     pub nullifier_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_response: Option<RequestResponseV2>,
+    /// For a reserved lease request: the UNIX time by which the server
+    /// finalizes it. Wait for that response rather than escaping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_deadline: Option<u64>,
 }
 
 /// A curve point serialized as {x, y} hex fields.
@@ -147,15 +161,70 @@ pub struct ErrorResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
-/// Clearance request for mutual close.
+/// Clearance request for mutual close. Servers that require note ownership
+/// reject a request without `ownership_proof` (`clearance_ownership_required`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClearanceRequest {
     pub withdrawal_nullifier: Felt252,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_proof: Option<ClearanceOwnershipProof>,
+}
+
+/// An escape-form (`has_clearance = false`) withdrawal proof for the same
+/// nullifier, proving knowledge of the note secret. Build it with the real
+/// destination and current balance of the intended mutual close: it is also
+/// a valid escape input for whoever holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearanceOwnershipProof {
+    pub public_inputs: crate::WithdrawalPublicInputsV2,
+    pub proof: Groth16ProofWire,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ErrorResponse;
+    use super::{ClearanceRequest, ErrorResponse};
+    use crate::Felt252;
+
+    #[test]
+    fn clearance_request_ownership_proof_is_optional_and_exact() {
+        let legacy: ClearanceRequest =
+            serde_json::from_str(r#"{"withdrawal_nullifier":"0x7"}"#).unwrap();
+        assert!(legacy.ownership_proof.is_none());
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({"withdrawal_nullifier": Felt252::from_u64(7)})
+        );
+        let destination = [17u8; 20];
+        let inputs = serde_json::json!({
+            "protocol_version":2, "chain_id":11155111, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4",
+            "clearance_signing_key_x":"0x5", "clearance_signing_key_y":"0x6",
+            "note_id":7, "final_balance":1950000, "destination":destination,
+            "withdrawal_nullifier":"0x7", "has_clearance":false, "withdrawal_tag":"0x8"
+        });
+        let proof = serde_json::json!({"backend":"groth16_bn254","proof":"AA=="});
+        let body = serde_json::json!({"withdrawal_nullifier":"0x7",
+            "ownership_proof":{"public_inputs":inputs, "proof":proof}});
+        let parsed: ClearanceRequest = serde_json::from_value(body.clone()).unwrap();
+        let ownership = parsed.ownership_proof.as_ref().unwrap();
+        assert_eq!(ownership.public_inputs.final_balance, 1_950_000);
+        assert!(!ownership.public_inputs.has_clearance);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+        // Unknown ownership fields, and a request proof's statement, are rejected.
+        let mut extra = body.clone();
+        extra["ownership_proof"]["prompt"] = "not allowed".into();
+        assert!(serde_json::from_value::<ClearanceRequest>(extra).is_err());
+        let request_statement = serde_json::json!({
+            "protocol_version":2, "chain_id":1, "contract_address":"0x1", "active_root":"0x2",
+            "state_signing_key_x":"0x3", "state_signing_key_y":"0x4", "request_time":5,
+            "solvency_bound":6, "request_nullifier":"0x7", "authorization_tag":"0x8",
+            "anonymous_commitment_x":"0x9", "anonymous_commitment_y":"0xa"
+        });
+        let mut request_proof = body;
+        request_proof["ownership_proof"]["public_inputs"] = request_statement;
+        assert!(serde_json::from_value::<ClearanceRequest>(request_proof).is_err());
+    }
 
     #[test]
     fn legacy_error_response_without_retry_delay_remains_compatible() {

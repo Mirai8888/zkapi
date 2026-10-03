@@ -14,3 +14,8 @@ serde_json   = { workspace = true }
 uuid         = { workspace = true }
 reqwest      = { workspace = true }
 thiserror       = { workspace = true }
+# Clearance retry backoff; already in the graph through reqwest.
+tokio        = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio        = { version = "1", features = ["rt", "time"] }

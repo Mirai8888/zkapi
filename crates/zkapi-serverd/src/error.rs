@@ -30,6 +30,15 @@ pub enum ServerError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A deterministic settlement failure, such as a corrupt persisted quote.
+    /// Settlement absorbs it by finalizing at the proof-bound worst case.
+    #[error("lease cannot be settled from measured usage: {0}")]
+    Unsettleable(String),
+
+    /// POST /v2/withdraw/clearance without an escape-form withdrawal proof.
+    #[error("clearance requires an escape-form withdrawal proof of note ownership")]
+    ClearanceOwnershipRequired,
+
     #[error("capacity exhausted")]
     CapacityExhausted,
 
@@ -76,6 +85,8 @@ impl ServerError {
             ServerError::Replay => "replay",
             ServerError::NoteExpired => "note_expired",
             ServerError::Internal(_) => "internal_error",
+            ServerError::Unsettleable(_) => "lease_unsettleable",
+            ServerError::ClearanceOwnershipRequired => "clearance_ownership_required",
             ServerError::CapacityExhausted => "capacity_exhausted",
             ServerError::NullifierUsed => "nullifier_used",
             ServerError::Database(_) => "database_error",
@@ -96,10 +107,13 @@ impl ServerError {
             ServerError::StaleRoot { .. } => true,
             ServerError::Internal(_) => true,
             ServerError::Database(_) => true,
+            ServerError::Unsettleable(_) => false,
+            ServerError::ClearanceOwnershipRequired => false,
             ServerError::InvalidProof(_) => false,
             ServerError::Replay => false,
             ServerError::NoteExpired => false,
-            ServerError::CapacityExhausted => false,
+            // Clearance proof verification is bounded; retry after backoff.
+            ServerError::CapacityExhausted => true,
             ServerError::NullifierUsed => false,
             ServerError::InvalidRequest(_) => false,
             ServerError::ProtocolMismatch(_) => false,

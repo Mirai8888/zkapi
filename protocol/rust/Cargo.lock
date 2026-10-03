@@ -2344,6 +2344,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "uuid",
  "zkapi-core",
  "zkapi-proof",

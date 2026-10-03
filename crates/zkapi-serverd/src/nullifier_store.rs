@@ -84,6 +84,101 @@ pub struct OpenRouterLeaseRecord {
     pub usage_usd: Option<f64>,
     pub charge_applied: Option<u128>,
     pub last_error: Option<String>,
+    /// Lease TTL frozen at creation; None for rows from before it was kept.
+    pub ttl_seconds: Option<u64>,
+    /// Write-once settlement deadline; None until first assigned.
+    pub settlement_deadline_at: Option<u64>,
+    /// Failed settlement attempts, never reset.
+    pub settlement_attempts: u64,
+    /// First failed settlement attempt, never reset by phase transitions.
+    pub first_error_at: Option<u64>,
+    /// "measured", "clamped", "worst_case" or "unissued" once finalized.
+    pub charge_basis: Option<String>,
+    /// Key provenance: Some(true) once the runtime key was returned to the
+    /// client; Some(false) while it never was (including issuer-side
+    /// activations); None for rows recorded without provenance.
+    pub delivered: Option<bool>,
+    pub updated_at: u64,
+}
+
+/// A new lease row; see `NullifierStore::create_openrouter_lease_bound`.
+pub struct NewOpenRouterLease<'a> {
+    pub request: &'a ApiRequestV2,
+    pub key_source: &'a str,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub settle_after: u64,
+    pub spending_limit_usd: f64,
+    pub oa_client_request_id: Option<&'a str>,
+    pub ttl_seconds: Option<u64>,
+    /// Written once: never changed by later transitions.
+    pub settlement_deadline_at: Option<u64>,
+    /// Some(false) for issuance rows: delivered only once marked.
+    pub delivered: Option<bool>,
+}
+
+/// An operator-visible record of a settlement that needs review: a clamped
+/// or worst-case charge, a key that could not be deleted first, or a corrupt
+/// binding that was cancelled without signing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementReview {
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub key_source: String,
+    /// One of `SETTLEMENT_REVIEW_REASONS`.
+    pub reason: String,
+    pub charge_basis: Option<String>,
+    /// Truncated to 500 characters when stored.
+    pub detail: String,
+    pub reported_usage_micro_usd: Option<u128>,
+    pub charge_applied: Option<u128>,
+    pub solvency_bound: u128,
+}
+
+/// The closed set of review reasons.
+pub const SETTLEMENT_REVIEW_REASONS: &[&str] = &[
+    "usage_clamped",
+    "deadline_worst_case",
+    "unsettleable_worst_case",
+    "finalized_before_key_deletion",
+    "binding_corrupt",
+];
+
+/// A stored review with its timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSettlementReview {
+    pub review: SettlementReview,
+    pub created_at: u64,
+    pub acknowledged_at: Option<u64>,
+}
+
+/// A provider key of a terminal direct lease still to be disabled and
+/// deleted: by hash when known, otherwise by the lease's request-unique name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeyCleanup<'a> {
+    pub key_source: &'a str,
+    pub key_hash: Option<&'a str>,
+    pub key_name: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingKeyCleanup {
+    pub client_request_id: String,
+    pub key_source: String,
+    pub key_hash: Option<String>,
+    pub key_name: String,
+    pub attempts: u64,
+}
+
+/// How a lease row is finalized; see `finalize_openrouter_lease_with`.
+pub(crate) struct LeaseFinalization<'a> {
+    pub usage_usd: f64,
+    pub charge_applied: u128,
+    pub charge_basis: &'a str,
+    pub review: Option<&'a SettlementReview>,
+    pub key_cleanup: Option<KeyCleanup<'a>>,
+    /// Finalize only a never-issued row: still provisioning with no key.
+    pub only_if_unissued: bool,
 }
 
 /// The deployment a server database serves (table `deployment_binding`, single
@@ -149,6 +244,7 @@ impl NullifierStore {
                 proof_blob BLOB,
                 request_inputs_json TEXT,
                 api_request_binding TEXT,
+                clearance_auth TEXT,
                 created_at INTEGER NOT NULL,
                 finalized_at INTEGER
             );
@@ -168,7 +264,13 @@ impl NullifierStore {
                 usage_usd REAL,
                 charge_applied INTEGER,
                 last_error TEXT,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                ttl_seconds INTEGER,
+                settlement_deadline_at INTEGER,
+                settlement_attempts INTEGER NOT NULL DEFAULT 0,
+                first_error_at INTEGER,
+                charge_basis TEXT,
+                delivered INTEGER
             );
             CREATE TABLE IF NOT EXISTS deployment_binding (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -181,35 +283,75 @@ impl NullifierStore {
                 challenge_period_seconds INTEGER NOT NULL,
                 verified_at INTEGER NOT NULL,
                 verified_block INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS settlement_reviews (
+                client_request_id TEXT PRIMARY KEY,
+                request_nullifier TEXT NOT NULL,
+                key_source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                charge_basis TEXT,
+                detail TEXT NOT NULL,
+                reported_usage_micro_usd TEXT,
+                charge_applied INTEGER,
+                solvency_bound TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                acknowledged_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS provider_key_cleanup (
+                client_request_id TEXT PRIMARY KEY,
+                key_source TEXT NOT NULL,
+                key_hash TEXT,
+                key_name TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL,
+                last_error TEXT,
+                created_at INTEGER NOT NULL
             );",
         )
         .map_err(|e| ServerError::Database(format!("failed to create table: {}", e)))?;
 
-        let _ = conn.execute(
-            "ALTER TABLE nullifiers ADD COLUMN next_state_sig_root TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE nullifiers ADD COLUMN response_payload TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE nullifiers ADD COLUMN reservation_kind TEXT NOT NULL DEFAULT 'proxy'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE nullifiers ADD COLUMN api_request_binding TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE openrouter_leases ADD COLUMN key_source TEXT NOT NULL DEFAULT 'openrouter'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE openrouter_leases ADD COLUMN oa_client_request_id TEXT",
-            [],
-        );
+        // Checked, idempotent column migrations: a column a decoder reads by
+        // name must exist, or opening fails instead of every row being
+        // silently unreadable.
+        for (table, column, definition) in [
+            ("nullifiers", "next_state_sig_root", "TEXT"),
+            ("nullifiers", "response_payload", "TEXT"),
+            (
+                "nullifiers",
+                "reservation_kind",
+                "TEXT NOT NULL DEFAULT 'proxy'",
+            ),
+            ("nullifiers", "api_request_binding", "TEXT"),
+            ("nullifiers", "clearance_auth", "TEXT"),
+            (
+                "openrouter_leases",
+                "key_source",
+                "TEXT NOT NULL DEFAULT 'openrouter'",
+            ),
+            ("openrouter_leases", "oa_client_request_id", "TEXT"),
+            ("openrouter_leases", "ttl_seconds", "INTEGER"),
+            ("openrouter_leases", "settlement_deadline_at", "INTEGER"),
+            (
+                "openrouter_leases",
+                "settlement_attempts",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("openrouter_leases", "first_error_at", "INTEGER"),
+            ("openrouter_leases", "charge_basis", "TEXT"),
+            ("openrouter_leases", "delivered", "INTEGER"),
+        ] {
+            ensure_column(&conn, table, column, definition)?;
+        }
         migrate_oa_provisioning_outcome(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS openrouter_leases_status
+                ON openrouter_leases(status, settle_after);
+             CREATE INDEX IF NOT EXISTS openrouter_leases_deadline
+                ON openrouter_leases(settlement_deadline_at);
+             CREATE INDEX IF NOT EXISTS settlement_reviews_open
+                ON settlement_reviews(acknowledged_at, created_at);",
+        )
+        .map_err(|e| ServerError::Database(format!("failed to create index: {e}")))?;
         backfill_openrouter_request_bindings(&conn)?;
 
         Ok(Self {
@@ -528,8 +670,10 @@ impl NullifierStore {
         .flatten()
     }
 
-    /// Reserve a nullifier for clearance (withdrawal signing).
-    pub fn reserve_clearance(&self, nullifier: &Felt252) -> Result<(), ServerError> {
+    /// Reserve a nullifier for clearance (withdrawal signing). `auth` records
+    /// how the caller proved note ownership: "ownership_proof" or "legacy".
+    /// The reservation is permanent: the clearance signature never expires.
+    pub fn reserve_clearance(&self, nullifier: &Felt252, auth: &str) -> Result<(), ServerError> {
         let conn = self
             .conn
             .lock()
@@ -538,11 +682,12 @@ impl NullifierStore {
         let null_hex = nullifier.to_hex();
 
         conn.execute(
-            "INSERT INTO nullifiers (nullifier, status, created_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO nullifiers (nullifier, status, clearance_auth, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 null_hex,
                 status_to_str(NullifierStatus::ClearanceReserved),
+                auth,
                 now as i64,
             ],
         )
@@ -556,6 +701,23 @@ impl NullifierStore {
         })?;
 
         Ok(())
+    }
+
+    /// How a clearance reservation was authorized (None: before this was
+    /// recorded, or not a clearance reservation).
+    pub fn clearance_auth(&self, nullifier: &Felt252) -> Result<Option<String>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT clearance_auth FROM nullifiers WHERE nullifier = ?1",
+            params![nullifier.to_hex()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| ServerError::Database(format!("clearance lookup failed: {e}")))
     }
 
     /// Get all reserved (not yet finalized) entries, for crash recovery.
@@ -635,6 +797,28 @@ impl NullifierStore {
         spending_limit_usd: f64,
         oa_client_request_id: Option<&str>,
     ) -> Result<(), ServerError> {
+        self.create_openrouter_lease_bound(&NewOpenRouterLease {
+            request,
+            key_source,
+            issued_at,
+            expires_at,
+            settle_after,
+            spending_limit_usd,
+            oa_client_request_id,
+            ttl_seconds: None,
+            settlement_deadline_at: None,
+            delivered: None,
+        })
+    }
+
+    /// Persist a lease with its frozen TTL and write-once settlement
+    /// deadline. A row created without a deadline is assigned one, once, the
+    /// first time the settler sees it.
+    pub fn create_openrouter_lease_bound(
+        &self,
+        lease: &NewOpenRouterLease<'_>,
+    ) -> Result<(), ServerError> {
+        let request = lease.request;
         let request_json = serde_json::to_string(request).map_err(|error| {
             ServerError::Database(format!("lease serialization failed: {error}"))
         })?;
@@ -646,20 +830,23 @@ impl NullifierStore {
             "INSERT INTO openrouter_leases (
                 client_request_id, request_nullifier, api_request_json, key_source, status,
                 issued_at, expires_at, settle_after, spending_limit_usd, updated_at, oa_client_request_id,
-                oa_provisioning_outcome
-             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                oa_provisioning_outcome, ttl_seconds, settlement_deadline_at, delivered
+             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 request.client_request_id,
                 request.public_inputs.request_nullifier.to_hex(),
                 request_json,
-                key_source,
-                issued_at as i64,
-                expires_at as i64,
-                settle_after as i64,
-                spending_limit_usd,
+                lease.key_source,
+                lease.issued_at as i64,
+                lease.expires_at as i64,
+                lease.settle_after as i64,
+                lease.spending_limit_usd,
                 current_timestamp() as i64,
-                oa_client_request_id,
-                if key_source == "oa_org" { "not_started" } else { "may_have_issued" },
+                lease.oa_client_request_id,
+                if lease.key_source == "oa_org" { "not_started" } else { "may_have_issued" },
+                lease.ttl_seconds.map(sql_time),
+                lease.settlement_deadline_at.map(sql_time),
+                lease.delivered,
             ],
         )
         .map_err(|error| ServerError::Database(format!("lease insert failed: {error}")))?;
@@ -804,14 +991,11 @@ impl NullifierStore {
         Ok(())
     }
 
-    /// Recover an existing issuer binding atomically. No plaintext key is
-    /// stored, and a definitive non-issuance outcome can never become issued.
-    pub(crate) fn reconcile_oa_lease(
+    /// Record that the runtime key of an activated lease is being returned to
+    /// the client. Only such a lease can be charged more than zero.
+    pub(crate) fn mark_openrouter_lease_delivered(
         &self,
         client_request_id: &str,
-        key_hash: &str,
-        expires_at: u64,
-        settle_after: u64,
     ) -> Result<(), ServerError> {
         let conn = self
             .conn
@@ -819,29 +1003,74 @@ impl NullifierStore {
             .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
         let rows = conn
             .execute(
-                "UPDATE openrouter_leases SET
-                    status = 'active', key_hash = ?1, expires_at = ?2,
-                    settle_after = ?3, last_error = NULL, updated_at = ?4
-                 WHERE client_request_id = ?5 AND key_source = 'oa_org'
-                    AND status = 'provisioning' AND key_hash IS NULL
-                    AND oa_provisioning_outcome = 'may_have_issued'",
-                params![
-                    key_hash,
-                    expires_at as i64,
-                    settle_after as i64,
-                    current_timestamp() as i64,
-                    client_request_id
-                ],
+                "UPDATE openrouter_leases SET delivered = 1, updated_at = ?1
+                 WHERE client_request_id = ?2 AND status = 'active'",
+                params![current_timestamp() as i64, client_request_id],
             )
             .map_err(|error| {
-                ServerError::Database(format!("OA reconciliation update failed: {error}"))
+                ServerError::Database(format!("lease delivery update failed: {error}"))
             })?;
         if rows != 1 {
             return Err(ServerError::Internal(
-                "OA reconciliation state changed".into(),
+                "lease was not active when its key was returned".to_string(),
             ));
         }
         Ok(())
+    }
+
+    /// Assign the write-once settlement deadline of a lease recorded without
+    /// one (rows from before the upgrade) and return the stored value.
+    pub(crate) fn assign_settlement_deadline(
+        &self,
+        client_request_id: &str,
+        deadline: u64,
+    ) -> Result<u64, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        conn.execute(
+            "UPDATE openrouter_leases SET settlement_deadline_at = ?1
+             WHERE client_request_id = ?2 AND settlement_deadline_at IS NULL",
+            params![sql_time(deadline), client_request_id],
+        )
+        .map_err(|error| ServerError::Database(format!("deadline assignment failed: {error}")))?;
+        conn.query_row(
+            "SELECT settlement_deadline_at FROM openrouter_leases WHERE client_request_id = ?1",
+            params![client_request_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| ServerError::Database(format!("deadline read failed: {error}")))?
+        .map(|value| value.max(0) as u64)
+        .ok_or_else(|| ServerError::Internal("lease deadline was not stored".into()))
+    }
+
+    /// Non-terminal leases still without a settlement deadline:
+    /// (client_request_id, expires_at).
+    pub(crate) fn leases_without_settlement_deadline(
+        &self,
+    ) -> Result<Vec<(String, u64)>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT client_request_id, expires_at FROM openrouter_leases
+                 WHERE settlement_deadline_at IS NULL
+                   AND status NOT IN ('finalized', 'cancelled')",
+            )
+            .map_err(|error| ServerError::Database(format!("deadline scan failed: {error}")))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })
+            .map_err(|error| ServerError::Database(format!("deadline scan failed: {error}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ServerError::Database(format!("deadline scan failed: {error}")))
     }
 
     pub fn remove_failed_openrouter_lease(
@@ -889,29 +1118,57 @@ impl NullifierStore {
         .map_err(|error| ServerError::Database(format!("lease lookup failed: {error}")))
     }
 
+    /// Leases to settle now, least recently attempted first: delivered or
+    /// possibly delivered leases after their drain (or settlement deadline),
+    /// and never-issued provisioning rows of a known source, which finalize
+    /// at zero. Unreadable rows are logged, never silently skipped; they are
+    /// also counted by `settlement_counts`.
     pub fn due_openrouter_leases(&self, now: u64) -> Vec<OpenRouterLeaseRecord> {
         let conn = match self.conn.lock() {
             Ok(conn) => conn,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                tracing::error!("settlement scan failed: database lock poisoned");
+                return Vec::new();
+            }
         };
         let mut statement = match conn.prepare(
             "SELECT * FROM openrouter_leases
-             WHERE (status IN ('active', 'retiring', 'disabled', 'revoking') AND settle_after <= ?1)
-                OR (key_source = 'oa_org' AND status = 'provisioning' AND key_hash IS NULL
-                    AND (oa_provisioning_outcome = 'confirmed_unissued'
-                         OR (oa_provisioning_outcome IN ('not_started', 'may_have_issued') AND settle_after <= ?1)))
-             ORDER BY settle_after ASC",
+             WHERE (status IN ('active', 'retiring', 'disabled', 'revoking')
+                    AND (settle_after <= ?1 OR settlement_deadline_at <= ?1))
+                OR (status = 'provisioning' AND key_hash IS NULL
+                    AND key_source IN ('openrouter', 'oa_org')
+                    AND (settle_after <= ?1 OR settlement_deadline_at <= ?1
+                         OR oa_provisioning_outcome = 'confirmed_unissued'))
+             ORDER BY updated_at ASC, settle_after ASC",
         ) {
             Ok(statement) => statement,
-            Err(_) => return Vec::new(),
+            Err(error) => {
+                tracing::error!(error = %error, "settlement scan failed");
+                return Vec::new();
+            }
         };
-        let rows = match statement.query_map(params![now as i64], row_to_openrouter_lease) {
+        let rows = match statement.query_map(params![sql_time(now)], row_to_openrouter_lease) {
             Ok(rows) => rows,
-            Err(_) => return Vec::new(),
+            Err(error) => {
+                tracing::error!(error = %error, "settlement scan failed");
+                return Vec::new();
+            }
         };
-        rows.filter_map(Result::ok).collect()
+        rows.filter_map(|row| match row {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "unreadable OpenRouter lease row cannot be settled; operator review required"
+                );
+                None
+            }
+        })
+        .collect()
     }
 
+    /// Record a failed settlement attempt. `first_error_at` is set once and
+    /// never reset; `settlement_attempts` only grows.
     pub fn record_openrouter_lease_error(
         &self,
         client_request_id: &str,
@@ -921,10 +1178,13 @@ impl NullifierStore {
             .conn
             .lock()
             .map_err(|cause| ServerError::Database(format!("lock poisoned: {cause}")))?;
+        let now = current_timestamp() as i64;
         conn.execute(
-            "UPDATE openrouter_leases SET last_error = ?1, updated_at = ?2
+            "UPDATE openrouter_leases SET last_error = ?1, updated_at = ?2,
+                settlement_attempts = settlement_attempts + 1,
+                first_error_at = COALESCE(first_error_at, ?2)
              WHERE client_request_id = ?3 AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')",
-            params![error, current_timestamp() as i64, client_request_id],
+            params![error, now, client_request_id],
         )
         .map_err(|cause| ServerError::Database(format!("lease error update failed: {cause}")))?;
         Ok(())
@@ -975,25 +1235,418 @@ impl NullifierStore {
         usage_usd: f64,
         charge_applied: u128,
     ) -> Result<(), ServerError> {
+        self.finalize_openrouter_lease_with(
+            client_request_id,
+            &LeaseFinalization {
+                usage_usd,
+                charge_applied,
+                charge_basis: "measured",
+                review: None,
+                key_cleanup: None,
+                only_if_unissued: false,
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Finalize a lease row after its signed transcript committed, recording
+    /// how the charge was determined, an optional review, and an optional
+    /// provider-key cleanup, in one transaction. Returns false (and changes
+    /// nothing) when the row is cancelled, or is no longer an unissued
+    /// provisioning row for `only_if_unissued`.
+    pub(crate) fn finalize_openrouter_lease_with(
+        &self,
+        client_request_id: &str,
+        finalization: &LeaseFinalization<'_>,
+    ) -> Result<bool, ServerError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
+        let now = current_timestamp() as i64;
+        let condition = if finalization.only_if_unissued {
+            "status = 'provisioning' AND key_hash IS NULL"
+        } else {
+            "status != 'cancelled'"
+        };
+        let rows = transaction
+            .execute(
+                &format!(
+                    "UPDATE openrouter_leases SET
+                        status = 'finalized', usage_usd = ?1, charge_applied = ?2,
+                        charge_basis = ?3, last_error = NULL, updated_at = ?4
+                     WHERE client_request_id = ?5 AND {condition}"
+                ),
+                params![
+                    finalization.usage_usd,
+                    finalization.charge_applied as i64,
+                    finalization.charge_basis,
+                    now,
+                    client_request_id,
+                ],
+            )
+            .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
+        if rows != 1 {
+            return Ok(false);
+        }
+        if let Some(review) = finalization.review {
+            insert_review(&transaction, review, now)?;
+        }
+        if let Some(cleanup) = finalization.key_cleanup {
+            insert_key_cleanup(&transaction, client_request_id, &cleanup, now)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
+        Ok(true)
+    }
+
+    /// Mark a lease whose binding is corrupt as cancelled, with its review.
+    /// Nothing is signed for it; its reservation stays Reserved.
+    pub(crate) fn cancel_openrouter_lease(
+        &self,
+        client_request_id: &str,
+        review: &SettlementReview,
+    ) -> Result<(), ServerError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ServerError::Database(format!("lease cancel failed: {error}")))?;
+        let now = current_timestamp() as i64;
+        let rows = transaction
+            .execute(
+                "UPDATE openrouter_leases SET status = 'cancelled', last_error = ?1, updated_at = ?2
+                 WHERE client_request_id = ?3
+                   AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')",
+                params![truncate_detail(&review.detail), now, client_request_id],
+            )
+            .map_err(|error| ServerError::Database(format!("lease cancel failed: {error}")))?;
+        if rows == 0 {
+            // Already terminal: nothing to cancel or review.
+            return Ok(());
+        }
+        insert_review(&transaction, review, now)?;
+        transaction
+            .commit()
+            .map_err(|error| ServerError::Database(format!("lease cancel failed: {error}")))
+    }
+
+    /// Queue a terminal direct lease's provider key for background cleanup.
+    pub(crate) fn enqueue_key_cleanup(
+        &self,
+        client_request_id: &str,
+        cleanup: &KeyCleanup<'_>,
+    ) -> Result<(), ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        insert_key_cleanup(
+            &conn,
+            client_request_id,
+            cleanup,
+            current_timestamp() as i64,
+        )
+    }
+
+    /// Queued key cleanups whose next attempt is due, oldest first.
+    pub(crate) fn due_key_cleanups(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<PendingKeyCleanup>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT client_request_id, key_source, key_hash, key_name, attempts
+                 FROM provider_key_cleanup WHERE next_attempt_at <= ?1
+                 ORDER BY next_attempt_at ASC LIMIT ?2",
+            )
+            .map_err(|error| ServerError::Database(format!("key cleanup scan failed: {error}")))?;
+        let rows = statement
+            .query_map(params![sql_time(now), limit as i64], |row| {
+                Ok(PendingKeyCleanup {
+                    client_request_id: row.get(0)?,
+                    key_source: row.get(1)?,
+                    key_hash: row.get(2)?,
+                    key_name: row.get(3)?,
+                    attempts: row.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| ServerError::Database(format!("key cleanup scan failed: {error}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ServerError::Database(format!("key cleanup scan failed: {error}")))
+    }
+
+    pub(crate) fn complete_key_cleanup(&self, client_request_id: &str) -> Result<(), ServerError> {
         let conn = self
             .conn
             .lock()
             .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
         conn.execute(
-            "UPDATE openrouter_leases SET
-                status = 'finalized', usage_usd = ?1, charge_applied = ?2,
-                last_error = NULL, updated_at = ?3
-             WHERE client_request_id = ?4",
-            params![
-                usage_usd,
-                charge_applied as i64,
-                current_timestamp() as i64,
-                client_request_id,
-            ],
+            "DELETE FROM provider_key_cleanup WHERE client_request_id = ?1",
+            params![client_request_id],
         )
-        .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
+        .map_err(|error| ServerError::Database(format!("key cleanup update failed: {error}")))?;
         Ok(())
     }
+
+    pub(crate) fn defer_key_cleanup(
+        &self,
+        client_request_id: &str,
+        error: &str,
+        next_attempt_at: u64,
+    ) -> Result<(), ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|cause| ServerError::Database(format!("lock poisoned: {cause}")))?;
+        conn.execute(
+            "UPDATE provider_key_cleanup SET attempts = attempts + 1, last_error = ?1,
+                next_attempt_at = ?2
+             WHERE client_request_id = ?3",
+            params![
+                truncate_detail(error),
+                sql_time(next_attempt_at),
+                client_request_id
+            ],
+        )
+        .map_err(|cause| ServerError::Database(format!("key cleanup update failed: {cause}")))?;
+        Ok(())
+    }
+
+    /// Non-terminal leases, nearest settlement deadline first. Read-only.
+    pub fn pending_openrouter_leases(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OpenRouterLeaseRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT * FROM openrouter_leases
+                 WHERE status NOT IN ('finalized', 'cancelled')
+                 ORDER BY settlement_deadline_at IS NULL, settlement_deadline_at, expires_at
+                 LIMIT ?1",
+            )
+            .map_err(|error| {
+                ServerError::Database(format!("pending lease scan failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![limit as i64], row_to_openrouter_lease)
+            .map_err(|error| {
+                ServerError::Database(format!("pending lease scan failed: {error}"))
+            })?;
+        // A view: unreadable rows are reported by settlement_counts instead.
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Settlement reviews, newest first. Read-only.
+    pub fn settlement_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredSettlementReview>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT client_request_id, request_nullifier, key_source, reason, charge_basis,
+                    detail, reported_usage_micro_usd, charge_applied, solvency_bound, created_at,
+                    acknowledged_at
+                 FROM settlement_reviews ORDER BY created_at DESC, client_request_id LIMIT ?1",
+            )
+            .map_err(|error| ServerError::Database(format!("review scan failed: {error}")))?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                let decimal = |value: Option<String>| value.and_then(|v| v.parse::<u128>().ok());
+                Ok(StoredSettlementReview {
+                    review: SettlementReview {
+                        client_request_id: row.get(0)?,
+                        request_nullifier: Felt252::from_hex(&row.get::<_, String>(1)?)
+                            .unwrap_or(Felt252::ZERO),
+                        key_source: row.get(2)?,
+                        reason: row.get(3)?,
+                        charge_basis: row.get(4)?,
+                        detail: row.get(5)?,
+                        reported_usage_micro_usd: decimal(row.get(6)?),
+                        charge_applied: row.get::<_, Option<i64>>(7)?.map(|value| value as u128),
+                        solvency_bound: decimal(row.get(8)?).unwrap_or_default(),
+                    },
+                    created_at: row.get::<_, i64>(9)?.max(0) as u64,
+                    acknowledged_at: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                })
+            })
+            .map_err(|error| ServerError::Database(format!("review scan failed: {error}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ServerError::Database(format!("review scan failed: {error}")))
+    }
+
+    /// Aggregate settlement state from raw SQL, so rows that cannot be
+    /// decoded are still counted. Read-only.
+    pub fn settlement_counts(
+        &self,
+        now: u64,
+    ) -> Result<crate::dashboard::SettlementCounts, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let count = |sql: &str| -> Result<u64, ServerError> {
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map(|value| value.max(0) as u64)
+                .map_err(|error| ServerError::Database(format!("settlement count failed: {error}")))
+        };
+        let pending = count(
+            "SELECT COUNT(*) FROM openrouter_leases WHERE status NOT IN ('finalized', 'cancelled')",
+        )?;
+        let retrying = count(
+            "SELECT COUNT(*) FROM openrouter_leases
+             WHERE status NOT IN ('finalized', 'cancelled')
+               AND (settlement_attempts > 0 OR last_error IS NOT NULL)",
+        )?;
+        let provisioning =
+            count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'provisioning'")?;
+        let cancelled = count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'cancelled'")?;
+        let unknown_status = count(
+            "SELECT COUNT(*) FROM openrouter_leases WHERE status NOT IN
+                ('provisioning', 'active', 'retiring', 'disabled', 'revoking', 'finalized', 'cancelled')",
+        )?;
+        let open_reviews =
+            count("SELECT COUNT(*) FROM settlement_reviews WHERE acknowledged_at IS NULL")?;
+        let pending_key_cleanups = count("SELECT COUNT(*) FROM provider_key_cleanup")?;
+        let next_deadline: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(settlement_deadline_at) FROM openrouter_leases
+                 WHERE status NOT IN ('finalized', 'cancelled')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| ServerError::Database(format!("settlement count failed: {error}")))?;
+        Ok(crate::dashboard::SettlementCounts {
+            pending,
+            retrying,
+            provisioning,
+            cancelled,
+            unknown_status,
+            open_reviews,
+            pending_key_cleanups,
+            next_deadline_in_seconds: next_deadline
+                .map(|deadline| (deadline.max(0) as u64).saturating_sub(now)),
+        })
+    }
+}
+
+fn insert_review(
+    conn: &Connection,
+    review: &SettlementReview,
+    now: i64,
+) -> Result<(), ServerError> {
+    debug_assert!(SETTLEMENT_REVIEW_REASONS.contains(&review.reason.as_str()));
+    // Keyed by lease: a lease finalizes once, so its first reason is kept.
+    conn.execute(
+        "INSERT OR IGNORE INTO settlement_reviews (
+            client_request_id, request_nullifier, key_source, reason, charge_basis, detail,
+            reported_usage_micro_usd, charge_applied, solvency_bound, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            review.client_request_id,
+            review.request_nullifier.to_hex(),
+            review.key_source,
+            review.reason,
+            review.charge_basis,
+            truncate_detail(&review.detail),
+            review
+                .reported_usage_micro_usd
+                .map(|value| value.to_string()),
+            review
+                .charge_applied
+                .map(|value| value.min(i64::MAX as u128) as i64),
+            review.solvency_bound.to_string(),
+            now,
+        ],
+    )
+    .map_err(|error| ServerError::Database(format!("review insert failed: {error}")))?;
+    Ok(())
+}
+
+fn insert_key_cleanup(
+    conn: &Connection,
+    client_request_id: &str,
+    cleanup: &KeyCleanup<'_>,
+    now: i64,
+) -> Result<(), ServerError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO provider_key_cleanup (
+            client_request_id, key_source, key_hash, key_name, next_attempt_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![
+            client_request_id,
+            cleanup.key_source,
+            cleanup.key_hash,
+            cleanup.key_name,
+            now
+        ],
+    )
+    .map_err(|error| ServerError::Database(format!("key cleanup insert failed: {error}")))?;
+    Ok(())
+}
+
+fn truncate_detail(detail: &str) -> String {
+    detail.chars().take(500).collect()
+}
+
+/// UNIX seconds as a SQLite integer; far-future values saturate.
+fn sql_time(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+/// Add a column a decoder reads by name unless it already exists. Failure is
+/// an error, unless a concurrent opener added the column first.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), ServerError> {
+    let present = |conn: &Connection| -> Result<bool, ServerError> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map(|columns| columns.iter().any(|name| name == column))
+            .map_err(|error| {
+                ServerError::Database(format!("{table}.{column} migration read failed: {error}"))
+            })
+    };
+    if present(conn)? {
+        return Ok(());
+    }
+    if let Err(error) = conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    ) {
+        if !present(conn)? {
+            return Err(ServerError::Database(format!(
+                "{table}.{column} migration failed: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn migrate_oa_provisioning_outcome(conn: &Connection) -> Result<(), ServerError> {
@@ -1200,9 +1853,21 @@ pub(crate) const OPENROUTER_LEASE_RECORD_COLUMNS: &[&str] = &[
     "usage_usd",
     "charge_applied",
     "last_error",
+    "ttl_seconds",
+    "settlement_deadline_at",
+    "settlement_attempts",
+    "first_error_at",
+    "charge_basis",
+    "delivered",
+    "updated_at",
 ];
 
 fn row_to_openrouter_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenRouterLeaseRecord> {
+    let time = |column: &str| -> rusqlite::Result<Option<u64>> {
+        Ok(row
+            .get::<_, Option<i64>>(column)?
+            .map(|value| value.max(0) as u64))
+    };
     let request_json: String = row.get("api_request_json")?;
     let api_request = serde_json::from_str(&request_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1232,6 +1897,15 @@ fn row_to_openrouter_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenRout
             .get::<_, Option<i64>>("charge_applied")?
             .map(|value| value as u128),
         last_error: row.get("last_error")?,
+        ttl_seconds: time("ttl_seconds")?,
+        settlement_deadline_at: time("settlement_deadline_at")?,
+        settlement_attempts: time("settlement_attempts")?.unwrap_or(0),
+        first_error_at: time("first_error_at")?,
+        charge_basis: row.get("charge_basis")?,
+        delivered: row
+            .get::<_, Option<i64>>("delivered")?
+            .map(|value| value != 0),
+        updated_at: time("updated_at")?.unwrap_or(0),
     })
 }
 
@@ -1418,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_oa_outcome_is_ambiguous_until_normalized_for_reconciliation() {
+    fn unknown_oa_outcome_is_ambiguous_and_still_due_for_zero_settlement() {
         let store = NullifierStore::in_memory().unwrap();
         create_oa_lease(&store, "unknown", 1);
         store.conn.lock().unwrap().execute(
@@ -1432,7 +2106,10 @@ mod tests {
                 .oa_provisioning_outcome,
             OaProvisioningOutcome::MayHaveIssued
         );
-        assert!(store.due_openrouter_leases(10_000).is_empty());
+        // Never delivered whatever the issuer did: still settled (at zero),
+        // never silently skipped.
+        assert!(store.due_openrouter_leases(20).is_empty());
+        assert_eq!(store.due_openrouter_leases(10_000).len(), 1);
         assert!(store.confirm_oa_unissued("unknown").is_err());
         assert!(!store.begin_oa_issuance("unknown").unwrap());
         assert_eq!(store.due_openrouter_leases(10_000).len(), 1);
@@ -1596,10 +2273,21 @@ mod tests {
         let store = NullifierStore::in_memory().unwrap();
         let nullifier = Felt252::from_u64(42);
 
-        store.reserve_clearance(&nullifier).unwrap();
+        store
+            .reserve_clearance(&nullifier, "ownership_proof")
+            .unwrap();
 
         let record = store.lookup_by_nullifier(&nullifier).unwrap();
         assert_eq!(record.status, NullifierStatus::ClearanceReserved);
+        assert_eq!(
+            store.clearance_auth(&nullifier).unwrap().as_deref(),
+            Some("ownership_proof")
+        );
+        assert!(matches!(
+            store.reserve_clearance(&nullifier, "legacy"),
+            Err(ServerError::NullifierUsed)
+        ));
+        assert_eq!(store.clearance_auth(&Felt252::from_u64(43)).unwrap(), None);
     }
 
     #[test]
@@ -1764,7 +2452,9 @@ mod tests {
         );
 
         // Every write fails on the reader and leaves the database unchanged.
-        assert!(reader.reserve_clearance(&Felt252::from_u64(43)).is_err());
+        assert!(reader
+            .reserve_clearance(&Felt252::from_u64(43), "ownership_proof")
+            .is_err());
         assert!(reader
             .reserve(&Felt252::from_u64(44), "req-2", &Felt252::from_u64(2))
             .is_err());
@@ -1986,5 +2676,407 @@ mod tests {
             .is_err());
         assert!(reader.lookup_by_nullifier(&Felt252::from_u64(1)).is_none());
         assert!(reader.try_lookup_openrouter_lease("corrupt").is_err());
+    }
+
+    fn review(id: &str, reason: &str) -> SettlementReview {
+        SettlementReview {
+            client_request_id: id.to_string(),
+            request_nullifier: Felt252::from_u64(9),
+            key_source: "openrouter".into(),
+            reason: reason.into(),
+            charge_basis: Some("worst_case".into()),
+            detail: "x".repeat(800),
+            reported_usage_micro_usd: Some(u128::MAX),
+            charge_applied: Some(1_000),
+            solvency_bound: 1_000,
+        }
+    }
+
+    #[test]
+    fn settlement_review_and_cancel_are_atomic_and_listed() {
+        let store = NullifierStore::in_memory().unwrap();
+        store
+            .create_openrouter_lease(&lease_request("worst", 1), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .create_openrouter_lease(&lease_request("corrupt", 2), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store.activate_openrouter_lease("worst", "hash-1").unwrap();
+        let worst = review("worst", "deadline_worst_case");
+        assert!(store
+            .finalize_openrouter_lease_with(
+                "worst",
+                &LeaseFinalization {
+                    usage_usd: 0.0,
+                    charge_applied: 1_000,
+                    charge_basis: "worst_case",
+                    review: Some(&worst),
+                    key_cleanup: Some(KeyCleanup {
+                        key_source: "openrouter",
+                        key_hash: Some("hash-1"),
+                        key_name: "zkapi-worst",
+                    }),
+                    only_if_unissued: false,
+                },
+            )
+            .unwrap());
+        let lease = store.lookup_openrouter_lease("worst").unwrap();
+        assert_eq!(lease.status, "finalized");
+        assert_eq!(lease.charge_applied, Some(1_000));
+        assert_eq!(lease.charge_basis.as_deref(), Some("worst_case"));
+        store
+            .cancel_openrouter_lease("corrupt", &review("corrupt", "binding_corrupt"))
+            .unwrap();
+        let cancelled = store.lookup_openrouter_lease("corrupt").unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.last_error.as_ref().unwrap().len(), 500);
+        // A cancelled row is terminal: neither finalized nor settled later.
+        assert!(!store
+            .finalize_openrouter_lease_with(
+                "corrupt",
+                &LeaseFinalization {
+                    usage_usd: 0.0,
+                    charge_applied: 0,
+                    charge_basis: "measured",
+                    review: None,
+                    key_cleanup: None,
+                    only_if_unissued: false,
+                },
+            )
+            .unwrap());
+        assert!(store.due_openrouter_leases(u64::MAX / 4).is_empty());
+        let reviews = store.settlement_reviews(10).unwrap();
+        assert_eq!(reviews.len(), 2);
+        let stored = reviews
+            .iter()
+            .find(|stored| stored.review.client_request_id == "worst")
+            .unwrap();
+        assert_eq!(stored.review.detail.len(), 500);
+        assert_eq!(stored.review.reported_usage_micro_usd, Some(u128::MAX));
+        assert_eq!(stored.review.charge_applied, Some(1_000));
+        assert_eq!(stored.acknowledged_at, None);
+        // One review per lease: the first reason is kept.
+        store
+            .cancel_openrouter_lease("worst", &review("worst", "binding_corrupt"))
+            .unwrap();
+        assert_eq!(
+            store.lookup_openrouter_lease("worst").unwrap().status,
+            "finalized"
+        );
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 2);
+        let counts = store.settlement_counts(0).unwrap();
+        assert_eq!(
+            (counts.pending, counts.cancelled, counts.open_reviews),
+            (0, 1, 2)
+        );
+        assert_eq!(counts.pending_key_cleanups, 1);
+        let queued = store.due_key_cleanups(u64::MAX / 4, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].key_hash.as_deref(), Some("hash-1"));
+        store
+            .defer_key_cleanup("worst", "provider unavailable", u64::MAX / 8)
+            .unwrap();
+        assert!(store
+            .due_key_cleanups(u64::MAX / 16, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.due_key_cleanups(u64::MAX / 4, 10).unwrap()[0].attempts,
+            1
+        );
+        store.complete_key_cleanup("worst").unwrap();
+        assert!(store.due_key_cleanups(u64::MAX / 4, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unissued_finalization_is_conditional_on_an_unissued_row() {
+        let store = NullifierStore::in_memory().unwrap();
+        store
+            .create_openrouter_lease(&lease_request("raced", 1), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store.activate_openrouter_lease("raced", "issued").unwrap();
+        let zero = LeaseFinalization {
+            usage_usd: 0.0,
+            charge_applied: 0,
+            charge_basis: "unissued",
+            review: None,
+            key_cleanup: None,
+            only_if_unissued: true,
+        };
+        assert!(!store
+            .finalize_openrouter_lease_with("raced", &zero)
+            .unwrap());
+        assert_eq!(
+            store.lookup_openrouter_lease("raced").unwrap().status,
+            "active"
+        );
+        store
+            .create_openrouter_lease(&lease_request("unissued", 2), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        assert!(store
+            .finalize_openrouter_lease_with("unissued", &zero)
+            .unwrap());
+        assert_eq!(
+            store.lookup_openrouter_lease("unissued").unwrap().status,
+            "finalized"
+        );
+    }
+
+    #[test]
+    fn record_error_counts_attempts_and_first_error_survives_transitions() {
+        let store = NullifierStore::in_memory().unwrap();
+        store
+            .create_openrouter_lease(&lease_request("errors", 1), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store.activate_openrouter_lease("errors", "hash").unwrap();
+        let fresh = store.lookup_openrouter_lease("errors").unwrap();
+        assert_eq!((fresh.settlement_attempts, fresh.first_error_at), (0, None));
+        store
+            .record_openrouter_lease_error("errors", "first")
+            .unwrap();
+        let first = store.lookup_openrouter_lease("errors").unwrap();
+        assert_eq!(first.settlement_attempts, 1);
+        let first_error_at = first.first_error_at.unwrap();
+        for (from, to) in [
+            ("active", "retiring"),
+            ("retiring", "disabled"),
+            ("disabled", "retiring"),
+        ] {
+            store
+                .advance_openrouter_retirement("errors", from, to, 0, None)
+                .unwrap();
+            store
+                .record_openrouter_lease_error("errors", "again")
+                .unwrap();
+        }
+        let lease = store.lookup_openrouter_lease("errors").unwrap();
+        assert_eq!(lease.settlement_attempts, 4);
+        assert_eq!(lease.first_error_at, Some(first_error_at));
+        assert_eq!(lease.last_error.as_deref(), Some("again"));
+    }
+
+    #[test]
+    fn settlement_deadline_is_write_once() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = lease_request("deadline", 1);
+        store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request: &request,
+                key_source: "oa_org",
+                issued_at: 10,
+                expires_at: 20,
+                settle_after: 21,
+                spending_limit_usd: 1.0,
+                oa_client_request_id: Some("bound"),
+                ttl_seconds: Some(600),
+                settlement_deadline_at: Some(1_000),
+                delivered: Some(false),
+            })
+            .unwrap();
+        let lease = store.lookup_openrouter_lease("deadline").unwrap();
+        assert_eq!(lease.ttl_seconds, Some(600));
+        assert_eq!(lease.settlement_deadline_at, Some(1_000));
+        assert_eq!(lease.delivered, Some(false));
+        assert_eq!(
+            store.assign_settlement_deadline("deadline", 5).unwrap(),
+            1_000
+        );
+        store
+            .update_openrouter_lease_timing("deadline", 900, 950)
+            .unwrap();
+        store.activate_openrouter_lease("deadline", "hash").unwrap();
+        store.mark_openrouter_lease_delivered("deadline").unwrap();
+        let lease = store.lookup_openrouter_lease("deadline").unwrap();
+        assert_eq!(lease.settlement_deadline_at, Some(1_000));
+        assert_eq!(lease.delivered, Some(true));
+        // Due at the deadline even when settle_after is later.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET settle_after = 5000 WHERE client_request_id = 'deadline'",
+                [],
+            )
+            .unwrap();
+        assert!(store.due_openrouter_leases(999).is_empty());
+        assert_eq!(store.due_openrouter_leases(1_000).len(), 1);
+        // Rows recorded without a deadline are assigned once, then keep it.
+        store
+            .create_openrouter_lease(&lease_request("legacy", 2), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        assert_eq!(
+            store.leases_without_settlement_deadline().unwrap(),
+            vec![("legacy".to_string(), 20)]
+        );
+        assert_eq!(
+            store.assign_settlement_deadline("legacy", 7_000).unwrap(),
+            7_000
+        );
+        assert_eq!(
+            store.assign_settlement_deadline("legacy", 9_000).unwrap(),
+            7_000
+        );
+        assert!(store
+            .leases_without_settlement_deadline()
+            .unwrap()
+            .is_empty());
+        assert!(store.mark_openrouter_lease_delivered("legacy").is_err());
+    }
+
+    #[test]
+    fn due_includes_direct_provisioning_after_settle_after() {
+        let store = NullifierStore::in_memory().unwrap();
+        store
+            .create_openrouter_lease(&lease_request("direct", 1), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .create_openrouter_lease(
+                &lease_request("unknown", 2),
+                "future_source",
+                10,
+                20,
+                21,
+                1.0,
+            )
+            .unwrap();
+        assert!(store.due_openrouter_leases(20).is_empty());
+        let due = store.due_openrouter_leases(21);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].client_request_id, "direct");
+        // Least recently attempted first.
+        store
+            .create_openrouter_lease(&lease_request("second", 3), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .record_openrouter_lease_error("direct", "retry later")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET updated_at = 1 WHERE client_request_id = 'second'",
+                [],
+            )
+            .unwrap();
+        let order: Vec<_> = store
+            .due_openrouter_leases(21)
+            .into_iter()
+            .map(|lease| lease.client_request_id)
+            .collect();
+        assert_eq!(order, ["second", "direct"]);
+    }
+
+    #[test]
+    fn settlement_counts_include_unreadable_rows() {
+        let store = NullifierStore::in_memory().unwrap();
+        store
+            .create_openrouter_lease(&lease_request("ok", 1), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .create_openrouter_lease(&lease_request("broken", 2), "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store.assign_settlement_deadline("ok", 500).unwrap();
+        store.record_openrouter_lease_error("ok", "failed").unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET api_request_json = 'not json' WHERE client_request_id = 'broken'",
+                [],
+            )
+            .unwrap();
+        // The scan cannot decode the broken row...
+        assert_eq!(store.due_openrouter_leases(21).len(), 1);
+        assert_eq!(store.pending_openrouter_leases(10).unwrap().len(), 1);
+        // ...but the operator counts include it.
+        let counts = store.settlement_counts(100).unwrap();
+        assert_eq!(counts.pending, 2);
+        assert_eq!(counts.provisioning, 2);
+        assert_eq!(counts.retrying, 1);
+        assert_eq!(counts.next_deadline_in_seconds, Some(400));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET status = 'mystery' WHERE client_request_id = 'broken'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.settlement_counts(100).unwrap().unknown_status, 1);
+    }
+
+    #[test]
+    fn legacy_db_migrates_settlement_columns_reviews_and_clearance_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nullifiers (
+                    nullifier TEXT PRIMARY KEY, status TEXT NOT NULL,
+                    reservation_kind TEXT NOT NULL DEFAULT 'proxy', client_request_id TEXT,
+                    payload_hash TEXT, charge_applied INTEGER, response_code INTEGER,
+                    response_payload TEXT, response_hash TEXT, next_commitment_x TEXT,
+                    next_commitment_y TEXT, next_anchor TEXT, blind_delta_srv TEXT,
+                    next_state_sig_epoch INTEGER, next_state_sig_root TEXT, next_state_sig_json TEXT,
+                    policy_reason_code INTEGER, policy_evidence_hash TEXT, proof_blob BLOB,
+                    request_inputs_json TEXT, api_request_binding TEXT, created_at INTEGER NOT NULL,
+                    finalized_at INTEGER
+                );
+                CREATE TABLE openrouter_leases (
+                    client_request_id TEXT PRIMARY KEY, request_nullifier TEXT NOT NULL UNIQUE,
+                    api_request_json TEXT NOT NULL, oa_client_request_id TEXT, key_hash TEXT UNIQUE,
+                    key_source TEXT NOT NULL DEFAULT 'openrouter',
+                    oa_provisioning_outcome TEXT NOT NULL DEFAULT 'may_have_issued',
+                    status TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                    settle_after INTEGER NOT NULL, spending_limit_usd REAL NOT NULL, usage_usd REAL,
+                    charge_applied INTEGER, last_error TEXT, updated_at INTEGER NOT NULL
+                );
+                INSERT INTO nullifiers (nullifier, status, created_at)
+                    VALUES ('0x2a', 'ClearanceReserved', 1);",
+            )
+            .unwrap();
+            let request = lease_request("legacy", 1);
+            conn.execute(
+                "INSERT INTO openrouter_leases (client_request_id, request_nullifier, api_request_json,
+                    key_source, key_hash, status, issued_at, expires_at, settle_after, spending_limit_usd,
+                    usage_usd, updated_at)
+                 VALUES ('legacy', ?1, ?2, 'openrouter', 'hash', 'revoking', 10, 20, 21, 6.0, 0.5, 10)",
+                params![
+                    request.public_inputs.request_nullifier.to_hex(),
+                    serde_json::to_string(&request).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let store = NullifierStore::new(&path).unwrap();
+        let lease = store.lookup_openrouter_lease("legacy").unwrap();
+        assert_eq!(lease.ttl_seconds, None);
+        assert_eq!(lease.settlement_deadline_at, None);
+        assert_eq!(lease.settlement_attempts, 0);
+        assert_eq!(lease.first_error_at, None);
+        assert_eq!(lease.charge_basis, None);
+        assert_eq!(lease.delivered, None);
+        assert_eq!(lease.updated_at, 10);
+        assert_eq!(store.due_openrouter_leases(21).len(), 1);
+        assert_eq!(store.clearance_auth(&Felt252::from_u64(42)).unwrap(), None);
+        assert!(store.settlement_reviews(10).unwrap().is_empty());
+        assert_eq!(store.settlement_counts(0).unwrap().pending, 1);
+        drop(store);
+        // Reopening is idempotent, and a read-only reader accepts the schema.
+        NullifierStore::new(&path).unwrap();
+        let reader = NullifierStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reader
+                .try_lookup_openrouter_lease("legacy")
+                .unwrap()
+                .unwrap()
+                .usage_usd,
+            Some(0.5)
+        );
     }
 }

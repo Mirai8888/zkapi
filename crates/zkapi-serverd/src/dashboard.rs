@@ -65,6 +65,70 @@ pub struct DashboardTotals {
     pub total_cost_usd: f64,
 }
 
+/// Durable lease-settlement health, counted with raw SQL so that rows the
+/// settler cannot decode are included. Operator-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SettlementCounts {
+    /// Non-terminal leases.
+    pub pending: u64,
+    /// Non-terminal leases with at least one failed settlement attempt.
+    pub retrying: u64,
+    pub provisioning: u64,
+    /// Corrupt bindings cancelled without a signature.
+    pub cancelled: u64,
+    /// Rows whose status no settler recognizes.
+    pub unknown_status: u64,
+    /// Settlement reviews not yet acknowledged.
+    pub open_reviews: u64,
+    /// Provider keys of terminal leases still queued for deletion.
+    pub pending_key_cleanups: u64,
+    /// Seconds until the nearest pending settlement deadline (0 if past).
+    pub next_deadline_in_seconds: Option<u64>,
+}
+
+/// One non-terminal lease on the operator settlement page.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingLeaseView {
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub key_source: String,
+    pub status: String,
+    pub delivered: Option<bool>,
+    pub expires_at: u64,
+    pub settle_after: u64,
+    pub settlement_deadline: Option<u64>,
+    pub seconds_until_deadline: Option<u64>,
+    pub attempts: u64,
+    pub first_error_at: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+/// A settlement review; gwei and micro-USD amounts are decimal strings.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementReviewView {
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub key_source: String,
+    pub reason: String,
+    pub charge_basis: Option<String>,
+    pub detail: String,
+    pub reported_usage_micro_usd: Option<String>,
+    pub charge_applied: Option<String>,
+    pub solvency_bound: String,
+    pub created_at: u64,
+    pub acknowledged_at: Option<u64>,
+}
+
+/// GET /v1/dashboard/settlement.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementOverview {
+    pub generated_at: u64,
+    pub settlement_deadline_seconds: Option<u64>,
+    pub counts: SettlementCounts,
+    pub pending: Vec<PendingLeaseView>,
+    pub reviews: Vec<SettlementReviewView>,
+}
+
 /// Bounded in-memory feed + broadcast hub.
 pub struct DashboardHub {
     tx: broadcast::Sender<DashboardEvent>,

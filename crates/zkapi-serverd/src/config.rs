@@ -2,6 +2,21 @@
 
 use zkapi_types::Felt252;
 
+/// Default time after a lease's natural settlement start (issuance + TTL +
+/// grace) at which an unsettled, possibly delivered lease is force-finalized.
+pub const DEFAULT_SETTLEMENT_DEADLINE_SECONDS: u64 = 21_600;
+/// Minimum retry window that a settlement deadline must leave after grace.
+pub const MIN_SETTLEMENT_RETRY_WINDOW_SECONDS: u64 = 900;
+/// Bound on the background sweep's own latency (tick budget plus attempt
+/// timeout) used by the startup timing check.
+pub const SETTLEMENT_SWEEP_SLACK_SECONDS: u64 = 600;
+/// How long a root the server observed stays acceptable for clearance.
+pub const DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 3_600;
+pub const MIN_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 60;
+pub const MAX_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 86_400;
+/// In-process cap on new proof-less (legacy) clearance reservations.
+pub const DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE: u32 = 60;
+
 /// Source used to provision prompt-private, short-lived OpenRouter keys.
 #[derive(Clone)]
 pub enum OpenRouterLeaseSourceConfig {
@@ -56,6 +71,50 @@ pub struct OpenRouterLeaseConfig {
     pub settlement_grace_seconds: u64,
     /// Background settlement scan interval.
     pub settlement_poll_seconds: u64,
+    /// Seconds after a lease's issuance + TTL + grace by which an unsettled
+    /// lease is finalized: a lease that may have been delivered at its measured
+    /// (or, failing that, worst-case) charge. Written once per lease row.
+    pub settlement_deadline_seconds: u64,
+}
+
+impl OpenRouterLeaseConfig {
+    /// Every lease that may have been delivered must reach a Finalized
+    /// transcript well inside the vault's escape challenge period:
+    /// ttl + grace + deadline + 2*poll + slack <= challengePeriod / 2.
+    pub fn validate_settlement_timing(&self, challenge_period_seconds: u64) -> anyhow::Result<()> {
+        let minimum = self
+            .settlement_grace_seconds
+            .checked_add(MIN_SETTLEMENT_RETRY_WINDOW_SECONDS)
+            .ok_or_else(|| anyhow::anyhow!("settlement grace overflows"))?;
+        anyhow::ensure!(
+            self.settlement_deadline_seconds >= minimum,
+            "--openrouter-settlement-deadline-seconds ({}) must leave at least {} s of retries after the settlement grace ({} s)",
+            self.settlement_deadline_seconds,
+            MIN_SETTLEMENT_RETRY_WINDOW_SECONDS,
+            self.settlement_grace_seconds
+        );
+        let bound = self
+            .ttl_seconds
+            .checked_add(self.settlement_grace_seconds)
+            .and_then(|value| value.checked_add(self.settlement_deadline_seconds))
+            .and_then(|value| {
+                value.checked_add(self.settlement_poll_seconds.max(1).checked_mul(2)?)
+            })
+            .and_then(|value| value.checked_add(SETTLEMENT_SWEEP_SLACK_SECONDS))
+            .ok_or_else(|| anyhow::anyhow!("lease settlement timing overflows"))?;
+        anyhow::ensure!(
+            bound <= challenge_period_seconds / 2,
+            "refusing to start: lease TTL ({} s) + settlement grace ({} s) + settlement deadline ({} s) + 2 x poll ({} s) + {} s = {} s exceeds half of the vault challengePeriod() ({} s); lower --openrouter-settlement-deadline-seconds or the lease TTL",
+            self.ttl_seconds,
+            self.settlement_grace_seconds,
+            self.settlement_deadline_seconds,
+            self.settlement_poll_seconds.max(1),
+            SETTLEMENT_SWEEP_SLACK_SECONDS,
+            bound,
+            challenge_period_seconds
+        );
+        Ok(())
+    }
 }
 
 /// Configuration for the zkAPI server.
@@ -94,6 +153,14 @@ pub struct ServerConfig {
     pub native_billing: Option<crate::native_billing::NativeBillingConfig>,
     /// Directory containing the v2 Groth16 proving/verifying key files.
     pub proof_setup_dir: String,
+    /// Transitional: let POST /v2/withdraw/clearance reserve a nullifier
+    /// without an ownership proof (older clients). Off by default.
+    pub allow_legacy_clearance: bool,
+    /// In-process cap on new proof-less clearance reservations per minute.
+    pub legacy_clearance_max_per_minute: u32,
+    /// How long after the server last observed a Merkle root a clearance
+    /// ownership proof may still use it.
+    pub clearance_root_window_seconds: u64,
 }
 
 impl ServerConfig {
@@ -122,6 +189,11 @@ impl ServerConfig {
                 && self.request_charge_cap <= crate::native_billing::MAX_SAFE_UNITS,
             "native request cap must fit browser-safe gwei units"
         );
+        anyhow::ensure!(
+            (MIN_CLEARANCE_ROOT_WINDOW_SECONDS..=MAX_CLEARANCE_ROOT_WINDOW_SECONDS)
+                .contains(&self.clearance_root_window_seconds),
+            "--clearance-root-window-seconds must be between {MIN_CLEARANCE_ROOT_WINDOW_SECONDS} and {MAX_CLEARANCE_ROOT_WINDOW_SECONDS}"
+        );
         Ok(())
     }
 }
@@ -146,6 +218,9 @@ impl std::fmt::Debug for ServerConfig {
             openrouter_leases,
             native_billing,
             proof_setup_dir,
+            allow_legacy_clearance,
+            legacy_clearance_max_per_minute,
+            clearance_root_window_seconds,
         } = self;
         formatter
             .debug_struct("ServerConfig")
@@ -165,6 +240,15 @@ impl std::fmt::Debug for ServerConfig {
             // NativeBillingConfig's Debug redacts its RPC URL (provider API keys).
             .field("native_billing", native_billing)
             .field("proof_setup_dir", proof_setup_dir)
+            .field("allow_legacy_clearance", allow_legacy_clearance)
+            .field(
+                "legacy_clearance_max_per_minute",
+                legacy_clearance_max_per_minute,
+            )
+            .field(
+                "clearance_root_window_seconds",
+                clearance_root_window_seconds,
+            )
             .finish()
     }
 }
@@ -188,6 +272,9 @@ impl Default for ServerConfig {
             openrouter_leases: None,
             native_billing: None,
             proof_setup_dir: "protocol/setup/v2".to_string(),
+            allow_legacy_clearance: false,
+            legacy_clearance_max_per_minute: DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE,
+            clearance_root_window_seconds: DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
         }
     }
 }
@@ -237,6 +324,79 @@ mod tests {
             assert!(output.contains("[redacted]"));
             assert!(output.contains("chain_id"));
             assert!(output.contains("0x694aa1769357215de4fac081bf1f309adc325306"));
+        }
+    }
+
+    #[test]
+    fn settlement_timing_validation() {
+        let lease = crate::test_support::lease_config();
+        assert_eq!(
+            lease.settlement_deadline_seconds,
+            DEFAULT_SETTLEMENT_DEADLINE_SECONDS
+        );
+        // Defaults fit a 24 h challenge period: 300 + 0 + 21600 + 2 + 600.
+        lease.validate_settlement_timing(86_400).unwrap();
+        let cli_defaults = OpenRouterLeaseConfig {
+            settlement_grace_seconds: 5,
+            settlement_poll_seconds: 2,
+            ..crate::test_support::lease_config()
+        };
+        cli_defaults.validate_settlement_timing(86_400).unwrap();
+        // Exactly at the bound passes; one second over fails.
+        let at_bound = 43_200 - (300 + 600 + 2);
+        let mut tight = OpenRouterLeaseConfig {
+            settlement_deadline_seconds: at_bound,
+            ..crate::test_support::lease_config()
+        };
+        tight.validate_settlement_timing(86_400).unwrap();
+        tight.settlement_deadline_seconds += 1;
+        let error = tight
+            .validate_settlement_timing(86_400)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("challengePeriod()"), "{error}");
+        let long = OpenRouterLeaseConfig {
+            settlement_deadline_seconds: 43_000,
+            ..crate::test_support::lease_config()
+        };
+        assert!(long.validate_settlement_timing(86_400).is_err());
+        // A short challenge period (e.g. a test vault) needs a short deadline.
+        assert!(lease.validate_settlement_timing(3_600).is_err());
+        // The deadline must leave a retry window after the drain grace.
+        let short = OpenRouterLeaseConfig {
+            settlement_grace_seconds: 120,
+            settlement_deadline_seconds: 120 + MIN_SETTLEMENT_RETRY_WINDOW_SECONDS - 1,
+            ..crate::test_support::lease_config()
+        };
+        let error = short
+            .validate_settlement_timing(86_400)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must leave at least 900 s"), "{error}");
+        let overflow = OpenRouterLeaseConfig {
+            settlement_deadline_seconds: u64::MAX,
+            ..crate::test_support::lease_config()
+        };
+        assert!(overflow.validate_settlement_timing(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn clearance_root_window_is_bounded() {
+        let mut config = ServerConfig {
+            native_billing: Some(crate::test_support::native_config()),
+            openrouter_leases: Some(crate::test_support::lease_config()),
+            ..Default::default()
+        };
+        assert!(!config.allow_legacy_clearance);
+        assert_eq!(config.legacy_clearance_max_per_minute, 60);
+        config.validate_native_mode().unwrap();
+        for window in [0, 59, 86_401] {
+            config.clearance_root_window_seconds = window;
+            assert!(config.validate_native_mode().is_err(), "{window}");
+        }
+        for window in [60, 86_400] {
+            config.clearance_root_window_seconds = window;
+            config.validate_native_mode().unwrap();
         }
     }
 }

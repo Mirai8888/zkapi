@@ -5,9 +5,12 @@
 //! - GET  /v1/attestation           -- published signer metadata for deployments
 //! - POST /v2/openrouter/leases     -- open a prompt-private runtime-key lease
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
-//! - POST /v2/withdraw/clearance    -- request mutual-close clearance
+//! - POST /v2/withdraw/clearance    -- request mutual-close clearance; requires
+//!   an escape-form withdrawal proof of note ownership unless the transitional
+//!   legacy flag is set
 //! - GET  /v2/requests/:id          -- recover by client_request_id
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
+//! - GET  /v1/dashboard/settlement  -- operator-only pending leases and reviews
 
 use std::convert::Infallible;
 use std::future::IntoFuture;
@@ -34,7 +37,9 @@ use zkapi_types::wire::{
 use zkapi_types::Felt252;
 
 use crate::config::ServerConfig;
-use crate::dashboard::{DashboardEvent, DashboardHub, DashboardTotals};
+use crate::dashboard::{
+    DashboardEvent, DashboardHub, DashboardTotals, SettlementCounts, SettlementOverview,
+};
 use crate::error::ServerError;
 use crate::native_billing::{vault_address_hex, NativeBillingOracle, VaultSigningKeys};
 use crate::nullifier_store::{DeploymentBinding, NullifierStore};
@@ -84,7 +89,9 @@ const VAULT_REVERIFY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// clearanceSigningKeyX/Y, read over the native billing RPC (which must serve
 /// `chain_id`), before the database is opened for writes. The verified binding
 /// is recorded in the database; a restart with a matching record starts
-/// without the RPC and re-verifies in the background.
+/// without the RPC and re-verifies in the background. The lease settlement
+/// timing must then fit the vault's challengePeriod() (from that binding):
+/// every possibly delivered lease reaches a signed transcript in time.
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     run_server_with(config, VAULT_BINDING_RETRY).await
 }
@@ -100,6 +107,15 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         )?,
     );
     let (binding, binding_source) = establish_deployment_binding(&config, &signer, retry).await?;
+    if let Some(lease) = config.openrouter_leases.as_ref() {
+        lease.validate_settlement_timing(binding.challenge_period_seconds)?;
+    }
+    if config.allow_legacy_clearance {
+        tracing::warn!(
+            max_per_minute = config.legacy_clearance_max_per_minute,
+            "--allow-legacy-clearance: clearance reserves nullifiers without a note ownership proof; disable after the migration window"
+        );
+    }
     let store = Arc::new(NullifierStore::new(&config.db_path)?);
     let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
         match fetch_indexer_root(indexer_url).await {
@@ -412,6 +428,7 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
         .route("/v1/dashboard/summary", get(handle_dashboard_summary))
         .route("/v1/dashboard/recent", get(handle_dashboard_recent))
         .route("/v1/dashboard/events", get(handle_dashboard_events))
+        .route("/v1/dashboard/settlement", get(handle_dashboard_settlement))
         .layer(CorsLayer::very_permissive());
 
     let router = Router::new()
@@ -480,6 +497,8 @@ struct HealthResponse {
     auth_scheme: &'static str,
     request_modes: Vec<&'static str>,
     testnet_password_required: bool,
+    /// POST /v2/withdraw/clearance requires `ownership_proof`.
+    clearance_ownership_proof_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,6 +527,7 @@ async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse
         auth_scheme: "state-anchor",
         request_modes: vec!["direct_openrouter"],
         testnet_password_required: config.testnet_password.is_some(),
+        clearance_ownership_proof_required: !config.allow_legacy_clearance,
     })
 }
 
@@ -558,13 +578,14 @@ async fn handle_openrouter_lease_retirement(
         .map_err(|error| error_to_response(&error, &client_request_id, &processor))
 }
 
-/// POST /v1/withdraw/clearance -- request a clearance signature.
+/// POST /v2/withdraw/clearance -- request a clearance signature.
 async fn handle_clearance(
     State(processor): State<AppState>,
     Json(clearance_req): Json<ClearanceRequest>,
 ) -> Result<Json<ClearanceResponseV2>, ErrorHttpResponse> {
     processor
         .process_clearance(&clearance_req)
+        .await
         .map(Json)
         .map_err(|e| {
             error_to_response(&e, &clearance_req.withdrawal_nullifier.to_hex(), &processor)
@@ -657,6 +678,8 @@ struct DashboardSummary {
     totals: DashboardTotals,
     started_ms: u64,
     recent_count: usize,
+    /// None when the settlement counts cannot be read.
+    settlement: Option<SettlementCounts>,
 }
 
 /// GET /v1/dashboard/summary -- server identity + running totals.
@@ -696,12 +719,35 @@ async fn handle_dashboard_summary(State(processor): State<AppState>) -> Json<Das
         Some(hub) => (hub.totals(), hub.started_ms, hub.recent().len()),
         None => (DashboardTotals::default(), 0, 0),
     };
+    let settlement = processor
+        .settlement_counts()
+        .map_err(|error| tracing::warn!(error = %error, "settlement counts unavailable"))
+        .ok();
     Json(DashboardSummary {
         server,
         totals,
         started_ms,
         recent_count,
+        settlement,
     })
+}
+
+#[derive(serde::Deserialize)]
+struct SettlementQuery {
+    limit: Option<usize>,
+}
+
+/// GET /v1/dashboard/settlement -- pending leases, deadlines and reviews.
+/// Operator-only: the production gateway does not proxy /v1/dashboard/*.
+async fn handle_dashboard_settlement(
+    State(processor): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SettlementQuery>,
+) -> Result<Json<SettlementOverview>, ErrorHttpResponse> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
+    processor
+        .settlement_overview(limit)
+        .map(Json)
+        .map_err(|error| error_to_response(&error, "settlement", &processor))
 }
 
 /// GET /v1/dashboard/recent -- the recent request feed (newest last).
@@ -741,10 +787,13 @@ fn error_to_response(
     client_request_id: &str,
     processor: &RequestProcessor,
 ) -> ErrorHttpResponse {
-    let latest_root = if matches!(err, ServerError::StaleRoot { .. }) {
-        Some(processor.current_root())
-    } else {
-        None
+    // A clearance StaleRoot carries the vault root it read; report that,
+    // not this server's possibly lagging indexer root.
+    let latest_root = match err {
+        ServerError::StaleRoot { latest_root } => {
+            Some(Felt252::from_hex(latest_root).unwrap_or_else(|_| processor.current_root()))
+        }
+        _ => None,
     };
     ErrorHttpResponse(Box::new(build_error_response(
         err,
@@ -762,6 +811,7 @@ fn build_error_response(
         ServerError::InvalidProof(_)
         | ServerError::InvalidRequest(_)
         | ServerError::OaKeyPolicyRejected
+        | ServerError::ClearanceOwnershipRequired
         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
         ServerError::StaleRoot { .. }
         | ServerError::NativeQuoteExpired
@@ -772,7 +822,9 @@ fn build_error_response(
         }
         ServerError::NoteExpired => StatusCode::GONE,
         ServerError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
-        ServerError::Internal(_) | ServerError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ServerError::Internal(_) | ServerError::Database(_) | ServerError::Unsettleable(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         ServerError::OaRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
     };
 
@@ -925,6 +977,54 @@ mod rate_limit_tests {
     }
 
     #[test]
+    fn new_error_codes_map_to_http() {
+        for (error, status, code, retriable) in [
+            (
+                ServerError::ClearanceOwnershipRequired,
+                StatusCode::BAD_REQUEST,
+                "clearance_ownership_required",
+                false,
+            ),
+            (
+                ServerError::Unsettleable("corrupt quote".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lease_unsettleable",
+                false,
+            ),
+            (
+                ServerError::CapacityExhausted,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity_exhausted",
+                true,
+            ),
+        ] {
+            let (actual, _, Json(body)) = build_error_response(&error, "clearance", None);
+            assert_eq!(actual, status, "{code}");
+            assert_eq!(body.error_code, code);
+            assert_eq!(body.retriable, retriable, "{code}");
+        }
+    }
+
+    #[test]
+    fn stale_root_errors_report_the_root_carried_by_the_error() {
+        let processor = crate::routes::settlement_route_tests::processor(false);
+        processor.update_root(Felt252::from_u64(5));
+        let vault_root = Felt252::from_u64(0x7007);
+        let ErrorHttpResponse(response) = error_to_response(
+            &ServerError::StaleRoot {
+                latest_root: vault_root.to_hex(),
+            },
+            "clearance",
+            &processor,
+        );
+        let (status, _, Json(body)) = *response;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.error_code, "stale_root");
+        assert!(body.retriable);
+        assert_eq!(body.latest_root, Some(vault_root));
+    }
+
+    #[test]
     fn lease_settlement_pending_maps_to_retriable_409_with_retry_metadata() {
         let error = ServerError::LeaseSettlementPending {
             retry_after_seconds: 15,
@@ -992,6 +1092,7 @@ mod startup_tests {
         unavailable: bool,
         /// Holds every response until permits are added.
         gate: Option<Arc<Semaphore>>,
+        challenge_period: u64,
     }
 
     impl VaultRpc {
@@ -1001,6 +1102,7 @@ mod startup_tests {
                 keys: Some(keys),
                 unavailable: false,
                 gate: None,
+                challenge_period: 86_400,
             }
         }
     }
@@ -1045,7 +1147,9 @@ mod startup_tests {
                             STATE_SIGNING_KEY_Y_SELECTOR => word(&keys.state.y),
                             CLEARANCE_SIGNING_KEY_X_SELECTOR => word(&keys.clearance.x),
                             CLEARANCE_SIGNING_KEY_Y_SELECTOR => word(&keys.clearance.y),
-                            CHALLENGE_PERIOD_SELECTOR => format!("0x{:064x}", 86_400),
+                            CHALLENGE_PERIOD_SELECTOR => {
+                                format!("0x{:064x}", vault.challenge_period)
+                            }
                             _ => return Err(StatusCode::BAD_REQUEST),
                         },
                         _ => return Err(StatusCode::BAD_REQUEST),
@@ -1175,6 +1279,42 @@ mod startup_tests {
         assert!(!db_path.exists());
         // A mismatch is definitive: one read of the chain and the vault, no retry.
         assert_eq!(methods(&calls).len(), 1 + KEY_READS.len());
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_settlement_timing_beyond_half_the_challenge_period() {
+        let seeds = strong_test_seeds();
+        let (rpc, _) = vault_rpc(VaultRpc {
+            challenge_period: 3_600,
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("must-not-exist.db");
+        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exceeds half of the vault challengePeriod() (3600 s)"),
+            "{error}"
+        );
+        assert!(!db_path.exists());
+        // A recorded binding is checked the same way, without the RPC.
+        let recorded = tempfile::tempdir().unwrap();
+        let db_path = recorded.path().join("server.db");
+        NullifierStore::new(&db_path)
+            .unwrap()
+            .write_deployment_binding(&DeploymentBinding {
+                challenge_period_seconds: 3_600,
+                ..recorded_binding(seeds)
+            })
+            .unwrap();
+        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("challengePeriod()"), "{error}");
     }
 
     #[tokio::test]
@@ -1479,5 +1619,130 @@ mod startup_tests {
             error.contains("do not match the vault's immutable keys"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod settlement_route_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    pub(crate) fn processor(allow_legacy_clearance: bool) -> RequestProcessor {
+        RequestProcessor::try_new(
+            ServerConfig {
+                contract_address: Felt252::from_u64(123),
+                native_billing: Some(crate::test_support::native_config()),
+                openrouter_leases: Some(crate::test_support::lease_config()),
+                proof_setup_dir: crate::test_support::setup_directory(),
+                allow_legacy_clearance,
+                ..Default::default()
+            },
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            Arc::new(ServerSigner::new(
+                &Felt252::from_u64(7),
+                &Felt252::from_u64(8),
+            )),
+            Felt252::ZERO,
+        )
+        .unwrap()
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn health_reports_clearance_ownership_requirement() {
+        for (legacy, required) in [(false, true), (true, false)] {
+            let app = create_router(Arc::new(processor(legacy)));
+            let (status, body) = get_json(&app, "/health").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["clearance_ownership_proof_required"], required);
+            // No settlement data on the public health endpoint.
+            assert!(body.get("settlement").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn proofless_clearance_is_rejected_over_http() {
+        let processor = Arc::new(processor(false));
+        let app = create_router(processor.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/withdraw/clearance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"withdrawal_nullifier":"0x2a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "clearance_ownership_required");
+        assert_eq!(body["retriable"], false);
+        assert!(processor
+            .store()
+            .lookup_by_nullifier(&Felt252::from_u64(42))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dashboard_settlement_endpoint_lists_pending_leases_and_counts() {
+        let processor = Arc::new(processor(false));
+        let request: ApiRequestV2 = serde_json::from_value(serde_json::json!({
+            "client_request_id": "dashboard-lease",
+            "payload": "{}",
+            "payload_hash": "0x1",
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x7b",
+                "active_root": "0x0", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+                "request_time": 1, "solvency_bound": 10, "request_nullifier": "0x99",
+                "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
+                "anonymous_commitment_y": "0x5"
+            },
+            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+        }))
+        .unwrap();
+        let store = processor.store();
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease(&request, "oa_org", 10, 4_000_000_000, 4_000_000_000, 1.0)
+            .unwrap();
+        store
+            .record_openrouter_lease_error("dashboard-lease", "usage pending")
+            .unwrap();
+        let app = create_router(processor.clone());
+        let (status, overview) = get_json(&app, "/v1/dashboard/settlement?limit=5").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(overview["counts"]["pending"], 1);
+        assert_eq!(overview["counts"]["retrying"], 1);
+        assert_eq!(
+            overview["pending"][0]["client_request_id"],
+            "dashboard-lease"
+        );
+        assert_eq!(overview["pending"][0]["attempts"], 1);
+        assert_eq!(overview["pending"][0]["last_error"], "usage pending");
+        assert_eq!(
+            overview["settlement_deadline_seconds"],
+            crate::config::DEFAULT_SETTLEMENT_DEADLINE_SECONDS
+        );
+        assert!(overview["reviews"].as_array().unwrap().is_empty());
+        let (status, summary) = get_json(&app, "/v1/dashboard/summary").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(summary["settlement"]["pending"], 1);
+        assert_eq!(summary["settlement"]["provisioning"], 1);
     }
 }

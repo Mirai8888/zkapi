@@ -1,7 +1,7 @@
 //! zkAPI v2 wallet: compact Groth16 proofs and proof-friendly state signatures.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
@@ -9,8 +9,8 @@ use zkapi_proof::compact::{
     verify_signature, RequestProver, RequestWitnessData, WithdrawalProver, WithdrawalWitnessData,
 };
 use zkapi_types::wire::{
-    ApiRequestV2, ClearanceRequest, ClearanceResponseV2, CurvePointWire, ErrorResponse,
-    Groth16ProofWire, RecoveryResponseV2, RequestResponseV2,
+    ApiRequestV2, ClearanceOwnershipProof, ClearanceRequest, ClearanceResponseV2, CurvePointWire,
+    ErrorResponse, Groth16ProofWire, RecoveryResponseV2, RequestResponseV2,
 };
 use zkapi_types::{
     canonical_payload_hash, canonical_request_context, canonical_response_hash, Felt252,
@@ -21,6 +21,12 @@ use crate::config::{ClientConfig, ClientProofMode};
 use crate::error::ClientError;
 use crate::journal::PendingRequestJournal;
 use crate::note_state::NoteState;
+
+/// Clearance attempts with the same body on a retriable stale_root (the
+/// server's view of the vault root lags) or capacity_exhausted, before the
+/// caller must refresh its path and prove again.
+const CLEARANCE_ATTEMPTS: u32 = 3;
+const CLEARANCE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub struct Wallet {
     config: ClientConfig,
@@ -333,6 +339,12 @@ impl Wallet {
         Ok(Some(response))
     }
 
+    /// Obtain the server's clearance and prove a mutual close. The server
+    /// requires an escape-form withdrawal proof of note ownership. That proof
+    /// is also a valid escape input, so it is built for the same destination
+    /// and current balance as this close, never a placeholder. Returns
+    /// `ClientError::StaleRoot` if the server still rejects `active_root`
+    /// after retries: refresh the Merkle path and call again.
     pub async fn withdrawal_mutual_close(
         &self,
         destination: [u8; 20],
@@ -341,7 +353,22 @@ impl Wallet {
     ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
-        let clearance = self.request_clearance(&nullifier).await?;
+        let (public_inputs, proof) = self.build_withdrawal(
+            destination,
+            active_root,
+            merkle_siblings.clone(),
+            false,
+            None,
+        )?;
+        let clearance = self
+            .request_clearance(
+                &nullifier,
+                ClearanceOwnershipProof {
+                    public_inputs,
+                    proof,
+                },
+            )
+            .await?;
         let message = core::clearance_message(
             state.protocol_version,
             state.chain_id,
@@ -444,28 +471,54 @@ impl Wallet {
     async fn request_clearance(
         &self,
         nullifier: &Felt252,
+        ownership_proof: ClearanceOwnershipProof,
     ) -> Result<ClearanceResponseV2, ClientError> {
-        let response = self
-            .http
-            .post(format!(
-                "{}/v2/withdraw/clearance",
-                self.config.server_url.trim_end_matches('/')
-            ))
-            .json(&ClearanceRequest {
-                withdrawal_nullifier: *nullifier,
-            })
-            .send()
-            .await
-            .map_err(|error| ClientError::ServerError(error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ClientError::ServerError(error.to_string()))?;
-        if !status.is_success() {
-            return Err(ClientError::ServerError(format!("HTTP {status}: {body}")));
+        let request = ClearanceRequest {
+            withdrawal_nullifier: *nullifier,
+            ownership_proof: Some(ownership_proof),
+        };
+        let mut delay = CLEARANCE_RETRY_DELAY;
+        for attempt in 1..=CLEARANCE_ATTEMPTS {
+            let response = self
+                .http
+                .post(format!(
+                    "{}/v2/withdraw/clearance",
+                    self.config.server_url.trim_end_matches('/')
+                ))
+                .json(&request)
+                .send()
+                .await
+                .map_err(|error| ClientError::ServerError(error.to_string()))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| ClientError::ServerError(error.to_string()))?;
+            if status.is_success() {
+                return serde_json::from_str(&body)
+                    .map_err(|error| ClientError::InvalidResponse(error.to_string()));
+            }
+            let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) else {
+                return Err(ClientError::ServerError(format!("HTTP {status}: {body}")));
+            };
+            let retriable = matches!(
+                error.error_code.as_str(),
+                "stale_root" | "capacity_exhausted"
+            );
+            if retriable && attempt < CLEARANCE_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+                continue;
+            }
+            if error.error_code == "stale_root" {
+                return Err(ClientError::StaleRoot);
+            }
+            return Err(ClientError::ServerError(format!(
+                "{}: {}",
+                error.error_code, error.error_message
+            )));
         }
-        serde_json::from_str(&body).map_err(|error| ClientError::InvalidResponse(error.to_string()))
+        Err(ClientError::StaleRoot)
     }
 
     fn apply_response(
@@ -599,4 +652,245 @@ fn state_note_leaf(state: &NoteState) -> Felt252 {
         state.deposit_amount,
         state.expiry_ts,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    use zkapi_proof::compact::{CompactSigner, WithdrawalVerifier};
+
+    use super::*;
+
+    const DEPOSIT: u128 = 1_950_000;
+    const EXPIRY: u64 = 4_000_000_000;
+
+    fn setup_dir() -> String {
+        format!("{}/../../../setup/v2", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    struct Fixture {
+        wallet: Wallet,
+        clearance_signer: CompactSigner,
+        active_root: Felt252,
+        siblings: Vec<Felt252>,
+        state_dir: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.state_dir);
+        }
+    }
+
+    fn fixture(server_url: String) -> Fixture {
+        let state_signer = CompactSigner::from_seed(&Felt252::from_u64(7));
+        let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(8));
+        let state_dir = std::env::temp_dir().join(format!("zkapi-wallet-{}", uuid::Uuid::new_v4()));
+        let mut wallet = Wallet::new(ClientConfig {
+            protocol_version: 2,
+            chain_id: 11_155_111,
+            contract_address: Felt252::from_u64(0x1234),
+            request_charge_cap: 50_000,
+            policy_charge_cap: 0,
+            policy_enabled: false,
+            server_url,
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            proof_mode: ClientProofMode::Groth16 {
+                setup_dir: setup_dir(),
+            },
+            state_signing_key: state_signer.public_key(),
+            clearance_signing_key: clearance_signer.public_key(),
+        })
+        .unwrap();
+        let (secret, registration) = wallet.generate_deposit_params();
+        wallet.confirm_deposit(secret, 0, DEPOSIT, EXPIRY).unwrap();
+        let siblings: [Felt252; MERKLE_DEPTH] =
+            core::zero_hashes()[..MERKLE_DEPTH].try_into().unwrap();
+        let leaf = core::note_leaf(0, &registration, DEPOSIT, EXPIRY);
+        Fixture {
+            active_root: core::merkle_root(0, &leaf, &siblings),
+            siblings: siblings.to_vec(),
+            wallet,
+            clearance_signer,
+            state_dir,
+        }
+    }
+
+    fn clearance_body(fixture: &Fixture) -> String {
+        let state = fixture.wallet.state().unwrap();
+        let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
+        let message = core::clearance_message(
+            state.protocol_version,
+            state.chain_id,
+            &state.contract_address,
+            &nullifier,
+        );
+        serde_json::to_string(&ClearanceResponseV2 {
+            status: "ok".into(),
+            withdrawal_nullifier: nullifier,
+            signature: fixture.clearance_signer.sign(&message),
+        })
+        .unwrap()
+    }
+
+    fn stale_root_body() -> String {
+        serde_json::json!({"status":"error", "client_request_id":"0x1", "error_code":"stale_root",
+            "error_message":"stale root", "retriable":true, "latest_root":"0x7"})
+        .to_string()
+    }
+
+    type Recorded = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    /// A minimal HTTP/1.1 server: one scripted response per connection.
+    fn serve(responses: Arc<Mutex<Vec<(u16, String)>>>) -> (String, Recorded) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let recorded: Recorded = Arc::default();
+        let bodies = recorded.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert!(request_line.starts_with("POST /v2/withdraw/clearance "));
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                let (status, response) = {
+                    let mut responses = responses.lock().unwrap();
+                    if responses.len() > 1 {
+                        responses.remove(0)
+                    } else {
+                        responses[0].clone()
+                    }
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, recorded)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn mutual_close_proves_ownership_for_the_real_destination_and_balance() {
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let (url, recorded) = serve(responses.clone());
+        let fixture = fixture(url);
+        responses
+            .lock()
+            .unwrap()
+            .push((200, clearance_body(&fixture)));
+        let destination = [0x42u8; 20];
+        let (close, _) = runtime()
+            .block_on(fixture.wallet.withdrawal_mutual_close(
+                destination,
+                fixture.active_root,
+                fixture.siblings.clone(),
+            ))
+            .unwrap();
+        assert!(close.has_clearance);
+        let bodies = recorded.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let request: ClearanceRequest = serde_json::from_value(bodies[0].clone()).unwrap();
+        assert_eq!(request.withdrawal_nullifier, close.withdrawal_nullifier);
+        let ownership = request.ownership_proof.unwrap();
+        let proven = &ownership.public_inputs;
+        assert!(!proven.has_clearance);
+        assert_eq!(proven.destination, destination);
+        assert_eq!(proven.final_balance, close.final_balance);
+        assert_eq!(proven.final_balance, DEPOSIT);
+        assert_eq!(proven.withdrawal_nullifier, close.withdrawal_nullifier);
+        assert_eq!(proven.active_root, fixture.active_root);
+        assert_eq!(
+            proven.clearance_signing_key_x,
+            fixture.clearance_signer.public_key().x
+        );
+        // A genuine escape-form proof the server can verify.
+        assert!(WithdrawalVerifier::load(setup_dir())
+            .unwrap()
+            .verify(proven, &ownership.proof)
+            .unwrap());
+    }
+
+    #[test]
+    fn mutual_close_retries_a_stale_root_then_asks_for_a_fresh_path() {
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let (url, recorded) = serve(responses.clone());
+        let fixture = fixture(url);
+        // The server's view of the vault root lags once, then catches up.
+        responses
+            .lock()
+            .unwrap()
+            .extend([(409, stale_root_body()), (200, clearance_body(&fixture))]);
+        let runtime = runtime();
+        runtime
+            .block_on(fixture.wallet.withdrawal_mutual_close(
+                [0x11; 20],
+                fixture.active_root,
+                fixture.siblings.clone(),
+            ))
+            .unwrap();
+        {
+            let mut bodies = recorded.lock().unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0], bodies[1], "a retry resends the same proof");
+            bodies.clear();
+        }
+        // A root the server keeps rejecting needs a fresh path and proof.
+        *responses.lock().unwrap() = vec![(409, stale_root_body())];
+        let error = runtime
+            .block_on(fixture.wallet.withdrawal_mutual_close(
+                [0x11; 20],
+                fixture.active_root,
+                fixture.siblings.clone(),
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ClientError::StaleRoot), "{error}");
+        assert_eq!(recorded.lock().unwrap().len(), CLEARANCE_ATTEMPTS as usize);
+        // Other refusals are reported, not retried.
+        *responses.lock().unwrap() = vec![(
+            400,
+            serde_json::json!({"status":"error", "client_request_id":"0x1",
+                "error_code":"invalid_proof", "error_message":"bad", "retriable":false})
+            .to_string(),
+        )];
+        recorded.lock().unwrap().clear();
+        let error = runtime
+            .block_on(fixture.wallet.withdrawal_mutual_close(
+                [0x11; 20],
+                fixture.active_root,
+                fixture.siblings.clone(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid_proof"), "{error}");
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+    }
 }

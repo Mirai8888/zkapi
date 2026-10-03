@@ -1,5 +1,7 @@
 //! Native ETH uses integer gwei in the existing proof ledger. The oracle quote
-//! is part of the proof-bound lease payload and is never refreshed at settlement.
+//! is part of the proof-bound lease payload. Admission checks it against the
+//! live deployment configuration; settlement uses only the persisted quote
+//! (intrinsic checks) and never refreshes or re-validates it against config.
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY
 pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
 pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
 pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
+/// Read at runtime only, after a clearance ownership proof verified.
+pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
 
 #[derive(Clone)]
 pub struct NativeBillingConfig {
@@ -87,19 +91,52 @@ fn decimal(value: &str) -> Result<u128, ServerError> {
         .map_err(|_| invalid("native billing quote integer overflow"))
 }
 
+/// A settlement charge clamped to the proof-bound budget before conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CappedCharge {
+    /// Whole gwei; never above the request's solvency bound.
+    pub charge: u128,
+    /// The usage actually billed, in micro-USD (or OA credits).
+    pub charged_micro_usd: u128,
+    /// Reported usage exceeded the frozen budget.
+    pub clamped: bool,
+    /// The conversion overflowed; the charge is the solvency bound.
+    pub conversion_overflow: bool,
+}
+
 impl NativeBillingQuote {
+    /// Checks that depend only on the quote and the chain it was bound to,
+    /// never on mutable deployment configuration. Settlement uses only these.
+    pub fn validate_intrinsic(&self, chain_id: u64) -> Result<(), ServerError> {
+        if self.asset != "native_eth"
+            || self.units_per_eth != UNITS_PER_ETH as u64
+            || self.chain_id != chain_id
+            || !valid_address(&self.feed_address)
+            || self.feed_address != self.feed_address.to_lowercase()
+            || self.decimals > 18
+            || self.updated_at == 0
+            || self.expires_at <= self.updated_at
+        {
+            return Err(invalid("native billing quote is malformed"));
+        }
+        let round = decimal(&self.round_id)?;
+        let price = decimal(&self.answer)?;
+        if round == 0 || round >= (1u128 << 80) || price == 0 || price > 1_000_000_000_000_000_000 {
+            return Err(invalid("native billing quote is outside supported bounds"));
+        }
+        Ok(())
+    }
+
+    /// Admission only: the intrinsic checks plus equality with the live
+    /// deployment's feed, decimals and freshness policy.
     pub fn validate_identity(
         &self,
         config: &NativeBillingConfig,
         chain_id: u64,
     ) -> Result<(), ServerError> {
-        if self.asset != "native_eth"
-            || self.units_per_eth != UNITS_PER_ETH as u64
-            || self.chain_id != chain_id
+        if self.chain_id != chain_id
             || self.feed_address != config.feed_address.to_lowercase()
             || self.decimals != config.decimals
-            || self.decimals > 18
-            || self.updated_at == 0
             || self.expires_at
                 != self
                     .updated_at
@@ -110,12 +147,36 @@ impl NativeBillingQuote {
                 "native billing quote does not match the pinned deployment",
             ));
         }
-        let round = decimal(&self.round_id)?;
-        let price = decimal(&self.answer)?;
-        if round == 0 || round >= (1u128 << 80) || price == 0 || price > 1_000_000_000_000_000_000 {
-            return Err(invalid("native billing quote is outside supported bounds"));
+        self.validate_intrinsic(chain_id)
+    }
+
+    /// Convert measured usage to a charge that can never fail and never
+    /// exceeds `solvency_bound`: usage is clamped to the frozen budget
+    /// `limit_micro_usd(solvency_bound)` before conversion, and a conversion
+    /// overflow charges the bound. Since limit <= U*P*1e6/S, the ceiling
+    /// conversion of the clamped usage is already <= U.
+    pub fn capped_charge_units(&self, usage_micro_usd: u128, solvency_bound: u128) -> CappedCharge {
+        let Ok(limit) = self.limit_micro_usd(solvency_bound) else {
+            // Unreachable for an admitted request: issuance computed the same
+            // limit before reserving.
+            return CappedCharge {
+                charge: solvency_bound,
+                charged_micro_usd: usage_micro_usd,
+                clamped: true,
+                conversion_overflow: true,
+            };
+        };
+        let charged_micro_usd = usage_micro_usd.min(limit);
+        let (charge, conversion_overflow) = match self.charge_units(charged_micro_usd) {
+            Ok(charge) => (charge.min(solvency_bound), false),
+            Err(_) => (solvency_bound, true),
+        };
+        CappedCharge {
+            charge,
+            charged_micro_usd,
+            clamped: usage_micro_usd > limit,
+            conversion_overflow,
         }
-        Ok(())
     }
 
     fn scale(&self) -> Result<u128, ServerError> {
@@ -264,6 +325,16 @@ impl NativeBillingOracle {
             .to_u64()
             .filter(|seconds| *seconds > 0)
             .ok_or_else(|| invalid("vault challenge period is zero or out of range"))
+    }
+
+    /// The vault's live currentRoot() at "latest", after an eth_chainId check.
+    pub async fn vault_current_root(&self) -> Result<Felt252, ServerError> {
+        async {
+            self.assert_chain().await?;
+            self.vault_word(CURRENT_ROOT_SELECTOR).await
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ServerError> {
@@ -536,6 +607,218 @@ mod tests {
         assert!(quote().limit_micro_usd(MAX_SAFE_UNITS + 1).is_err());
         assert!(decode_word(&format!("0x{}", "f".repeat(64)), 0).is_err());
     }
+
+    #[test]
+    fn capped_charge_clamps_before_conversion_and_never_exceeds_bound() {
+        let q = NativeBillingQuote {
+            answer: "250000000000".into(), // $2,500/ETH, 8 decimals
+            ..quote()
+        };
+        let bound = 50_000u128;
+        let limit = q.limit_micro_usd(bound).unwrap();
+        assert_eq!(limit, 125_000);
+        for (usage, clamped) in [
+            (u128::MAX, true),
+            (1_000_000_000_000_000_000, true),
+            (limit + 1, true),
+            (limit, false),
+            (limit - 1, false),
+            (1, false),
+            (0, false),
+        ] {
+            let capped = q.capped_charge_units(usage, bound);
+            assert!(capped.charge <= bound, "{usage}");
+            assert_eq!(capped.clamped, clamped, "{usage}");
+            assert!(!capped.conversion_overflow, "{usage}");
+            assert_eq!(capped.charged_micro_usd, usage.min(limit));
+            assert_eq!(capped.charge, q.charge_units(usage.min(limit)).unwrap());
+        }
+        assert_eq!(q.capped_charge_units(0, bound).charge, 0);
+        assert_eq!(q.capped_charge_units(u128::MAX, bound).charge, bound);
+        // A plain conversion of the same over-limit usage fails outright.
+        assert!(q.charge_units(1_000_000_000_000_000_000).is_err());
+        // An unrepresentable budget charges the bound rather than failing.
+        let capped = q.capped_charge_units(1, MAX_SAFE_UNITS + 1);
+        assert!(capped.conversion_overflow && capped.charge == MAX_SAFE_UNITS + 1);
+    }
+
+    #[test]
+    fn capped_charge_survives_conversion_overflow_at_18_decimals() {
+        let q = NativeBillingQuote {
+            decimals: 18,
+            answer: "1000000000000000000".into(), // $1/ETH at 18 decimals
+            ..quote()
+        };
+        // U * price * 1e6 overflows u128, so neither the budget nor a plain
+        // conversion of a comparable usage can be computed.
+        assert!(q.limit_micro_usd(MAX_SAFE_UNITS).is_err());
+        assert!(q.charge_units(1_000_000_000_000).is_err());
+        for usage in [0, 1, 1_000_000_000_000, u128::MAX] {
+            let capped = q.capped_charge_units(usage, MAX_SAFE_UNITS);
+            assert_eq!(capped.charge, MAX_SAFE_UNITS, "{usage}");
+            assert!(capped.conversion_overflow, "{usage}");
+        }
+        // Below the overflow region the clamp-then-convert result is exact.
+        let bound = 1_000_000_000;
+        let limit = q.limit_micro_usd(bound).unwrap();
+        let capped = q.capped_charge_units(u128::MAX, bound);
+        assert_eq!(capped.charge, q.charge_units(limit).unwrap());
+        assert!(capped.charge <= bound && capped.clamped && !capped.conversion_overflow);
+    }
+
+    #[test]
+    fn intrinsic_validation_is_config_independent() {
+        let q = quote();
+        let config = NativeBillingConfig {
+            rpc_url: "https://example.com".into(),
+            feed_address: q.feed_address.clone(),
+            decimals: 8,
+            max_age_seconds: 3600,
+        };
+        q.validate_identity(&config, 11155111).unwrap();
+        q.validate_intrinsic(11155111).unwrap();
+        for changed in [
+            NativeBillingConfig {
+                max_age_seconds: 7200,
+                ..config.clone()
+            },
+            NativeBillingConfig {
+                decimals: 9,
+                ..config.clone()
+            },
+            NativeBillingConfig {
+                feed_address: "0x0000000000000000000000000000000000000abc".into(),
+                ..config.clone()
+            },
+        ] {
+            assert!(q.validate_identity(&changed, 11155111).is_err());
+            q.validate_intrinsic(11155111).unwrap();
+        }
+        for malformed in [
+            NativeBillingQuote {
+                expires_at: q.updated_at,
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                expires_at: q.updated_at - 1,
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                updated_at: 0,
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                decimals: 19,
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                asset: "erc20".into(),
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                units_per_eth: 1,
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                feed_address: q.feed_address.to_uppercase().replace("0X", "0x"),
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                feed_address: "0x0000000000000000000000000000000000000000".into(),
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                answer: "0".into(),
+                ..q.clone()
+            },
+            NativeBillingQuote {
+                round_id: "0".into(),
+                ..q.clone()
+            },
+        ] {
+            assert!(
+                malformed.validate_intrinsic(11155111).is_err(),
+                "{malformed:?}"
+            );
+            assert!(malformed.validate_identity(&config, 11155111).is_err());
+        }
+        assert!(q.validate_intrinsic(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn vault_word_reads_selectors_at_latest_after_chain_check() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = calls.clone();
+        let root =
+            Felt252::from_hex("0x2a1b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80")
+                .unwrap();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = recorded.clone();
+                async move {
+                    calls.lock().unwrap().push(request.clone());
+                    let result = match request["method"].as_str() {
+                        Some("eth_chainId") => "0xaa36a7".to_string(),
+                        _ if request["params"][0]["data"] == CURRENT_ROOT_SELECTOR => {
+                            format!("0x{}", hex::encode(root.as_bytes()))
+                        }
+                        _ => format!("0x{:064x}", 86_400),
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let vault = "0x0000000000000000000000000000000000000001";
+        let oracle = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            },
+            11155111,
+            vault.into(),
+        )
+        .unwrap();
+        assert_eq!(oracle.vault_current_root().await.unwrap(), root);
+        assert_eq!(oracle.vault_challenge_period().await.unwrap(), 86_400);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0]["method"], "eth_chainId");
+            assert_eq!(
+                calls[1]["params"],
+                json!([{"to":vault, "data":"0xfdab463d"}, "latest"])
+            );
+            assert_eq!(
+                calls[2]["params"],
+                json!([{"to":vault, "data":"0xf3f480d9"}, "latest"])
+            );
+        }
+        // The runtime root read refuses an RPC on another chain.
+        let other_chain = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url: oracle.config.rpc_url.clone(),
+                ..oracle.config.clone()
+            },
+            1,
+            vault.into(),
+        )
+        .unwrap();
+        let before = calls.lock().unwrap().len();
+        assert!(matches!(
+            other_chain.vault_current_root().await,
+            Err(ServerError::Internal(message)) if message.starts_with("vault read failed")
+        ));
+        assert_eq!(calls.lock().unwrap().len(), before + 1);
+        server.abort();
+    }
     #[test]
     fn vault_signing_key_selectors_match_abi() {
         for (signature, selector) in [
@@ -544,10 +827,12 @@ mod tests {
             ("clearanceSigningKeyX()", CLEARANCE_SIGNING_KEY_X_SELECTOR),
             ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
+            ("currentRoot()", CURRENT_ROOT_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
             assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
         }
+        assert_eq!(CURRENT_ROOT_SELECTOR, "0xfdab463d");
         // Independent literals from the ABI, rather than the encoder above.
         assert_eq!(
             [

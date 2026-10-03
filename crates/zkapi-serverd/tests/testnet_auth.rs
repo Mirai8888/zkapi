@@ -29,6 +29,7 @@ fn config(protected: bool) -> ServerConfig {
             ttl_seconds: 300,
             settlement_grace_seconds: 5,
             settlement_poll_seconds: 5,
+            settlement_deadline_seconds: zkapi_serverd::config::DEFAULT_SETTLEMENT_DEADLINE_SECONDS,
         }),
         native_billing: Some(NativeBillingConfig {
             rpc_url: "http://127.0.0.1:9".into(),
@@ -96,6 +97,7 @@ async fn all_service_routes_reject_missing_or_wrong_password_before_body_parsing
         ("GET", "/v1/dashboard/summary"),
         ("GET", "/v1/dashboard/recent"),
         ("GET", "/v1/dashboard/events"),
+        ("GET", "/v1/dashboard/settlement"),
         ("POST", "/health"),
         ("GET", "/unknown-future-service"),
     ] {

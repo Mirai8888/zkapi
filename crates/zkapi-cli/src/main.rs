@@ -79,6 +79,45 @@ enum Commands {
         openrouter_settlement_grace_seconds: u64,
         #[arg(long, default_value_t = 2)]
         openrouter_settlement_poll_seconds: u64,
+        /// Seconds after a lease's issuance + TTL + grace by which an unsettled
+        /// lease is finalized: at its measured usage, or at worst at the
+        /// request's solvency bound. Startup requires TTL + grace + this +
+        /// 2 x poll + 600 <= the vault's challengePeriod() / 2.
+        #[arg(
+            long,
+            env = "ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS",
+            default_value_t = zkapi_serverd::config::DEFAULT_SETTLEMENT_DEADLINE_SECONDS,
+            hide_env_values = true
+        )]
+        openrouter_settlement_deadline_seconds: u64,
+        /// Transitional only: sign mutual-close clearance without a note
+        /// ownership proof, for clients that predate it. Default off.
+        #[arg(
+            long,
+            env = "ZKAPI_ALLOW_LEGACY_CLEARANCE",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new(),
+            hide_env_values = true
+        )]
+        allow_legacy_clearance: bool,
+        /// Cap on new proof-less clearance reservations per minute while
+        /// --allow-legacy-clearance is set.
+        #[arg(
+            long,
+            env = "ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE",
+            default_value_t = zkapi_serverd::config::DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE,
+            hide_env_values = true
+        )]
+        legacy_clearance_max_per_minute: u32,
+        /// How long a Merkle root the server observed stays acceptable for a
+        /// clearance ownership proof (60..=86400).
+        #[arg(
+            long,
+            env = "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
+            default_value_t = zkapi_serverd::config::DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
+            hide_env_values = true
+        )]
+        clearance_root_window_seconds: u64,
         /// Required native ETH oracle RPC for gwei billing and the startup vault
         /// signing-key check; must serve --chain-id. May embed a provider key.
         #[arg(
@@ -185,6 +224,10 @@ async fn main() -> anyhow::Result<()> {
             openrouter_lease_ttl_seconds,
             openrouter_settlement_grace_seconds,
             openrouter_settlement_poll_seconds,
+            openrouter_settlement_deadline_seconds,
+            allow_legacy_clearance,
+            legacy_clearance_max_per_minute,
+            clearance_root_window_seconds,
             native_billing_rpc_url,
             native_price_feed_address,
             native_price_feed_decimals,
@@ -240,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                 ttl_seconds: openrouter_lease_ttl_seconds,
                 settlement_grace_seconds: openrouter_settlement_grace_seconds,
                 settlement_poll_seconds: openrouter_settlement_poll_seconds,
+                settlement_deadline_seconds: openrouter_settlement_deadline_seconds,
             });
             let native_billing = match (native_billing_rpc_url, native_price_feed_address) {
                 (Some(rpc_url), Some(feed_address)) => {
@@ -268,6 +312,9 @@ async fn main() -> anyhow::Result<()> {
                 openrouter_leases,
                 native_billing,
                 proof_setup_dir: cli.proof_setup_dir.clone(),
+                allow_legacy_clearance,
+                legacy_clearance_max_per_minute,
+                clearance_root_window_seconds,
             };
             zkapi_serverd::routes::run_server(config).await?;
         }
@@ -652,6 +699,60 @@ mod tests {
             assert!(help.contains("ZKAPI_STATE_SEED"), "{help}");
             assert!(!help.contains("then 0x1") && !help.contains("then 0x2"));
         }
+    }
+
+    #[test]
+    fn settlement_and_clearance_flags_default_to_the_safe_values() {
+        let base = [
+            "zkapi",
+            "serverd",
+            "--native-billing-rpc-url",
+            "https://rpc.example",
+            "--native-price-feed-address",
+            "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+        ];
+        let parse = |extra: &[&str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Serverd {
+                    openrouter_settlement_deadline_seconds,
+                    allow_legacy_clearance,
+                    legacy_clearance_max_per_minute,
+                    clearance_root_window_seconds,
+                    ..
+                } => (
+                    openrouter_settlement_deadline_seconds,
+                    allow_legacy_clearance,
+                    legacy_clearance_max_per_minute,
+                    clearance_root_window_seconds,
+                ),
+                _ => panic!("expected serverd"),
+            }
+        };
+        let overridden = parse(&[
+            "--openrouter-settlement-deadline-seconds",
+            "7200",
+            "--allow-legacy-clearance",
+            "--legacy-clearance-max-per-minute",
+            "5",
+            "--clearance-root-window-seconds",
+            "600",
+        ]);
+        assert_eq!(overridden, (7200, true, 5, 600));
+        if [
+            "ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS",
+            "ZKAPI_ALLOW_LEGACY_CLEARANCE",
+            "ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE",
+            "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            eprintln!("skipping default checks: a settlement or clearance variable is set");
+            return;
+        }
+        assert_eq!(parse(&[]), (21_600, false, 60, 3_600));
     }
 
     #[test]

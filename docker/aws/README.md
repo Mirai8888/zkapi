@@ -18,11 +18,11 @@ Create these root-owned, mode `0600` files without printing their contents:
 
 | File | Contents |
 | --- | --- |
-| `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline and the indexer's confirmation depth and head-age limit. |
+| `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
 | `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
-| `/etc/zkapi/signer.env` | Copy [`signer.env.example`](signer.env.example): `ZKAPI_CHALLENGE_PRIVATE_KEY`, `ZKAPI_CHALLENGE_CHAIN_ID`, `ZKAPI_CHALLENGE_RPC_URL` (the upstream RPC for the chain), `ZKAPI_CHALLENGE_VAULT` (the configured vault) and the fee cap. Only the signer container receives this file. |
+| `/etc/zkapi/signer.env` | Copy [`signer.env.example`](signer.env.example): `ZKAPI_CHALLENGE_PRIVATE_KEY`, `ZKAPI_CHALLENGE_CHAIN_ID`, `ZKAPI_CHALLENGE_RPC_URL` (the upstream RPC for the chain), `ZKAPI_CHALLENGE_VAULT` (the configured vault), the fee cap and the transaction fee cap (below). Only the signer container receives this file. |
 
 Also create `/etc/zkapi/config.json` with mode `0644`: this is the public client
 manifest containing the contract, signing-key, circuit and proving-key
@@ -134,19 +134,53 @@ every variable, the fee model and its runbooks. In short:
 `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` is the highest `maxFeePerGas` it signs.
 With `ZKAPI_CHALLENGE_CHAIN_ID=1` it refuses to start without one; Sepolia
 defaults to 10 gwei. The tip cap `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI`
-defaults to the lower of the fee cap and 10 gwei. `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI`
-is no longer supported, and the signer refuses to start while it is present,
-even empty. Fund the sender with at least (N + K) x gas limit x fee cap, where N
-is the number of challenges that may be pending at once and K a budget of
-reverted attempts; a real challenge has a gas limit of about 7.53M, so 0.75 ETH
-per challenge at a 100 gwei cap.
+defaults to the lower of the fee cap and 10 times the default tip (10 gwei with
+the 1 gwei default tip). `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` is no longer
+supported, and the signer refuses to start while it is present, even empty.
 
-`challenge.env` holds the daemon's own bounds, which it proposes to the signer:
+The node behind the signer refuses to relay a transaction whose gas limit x
+`maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
+default in geth and reth. `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` (decimal wei, default
+`1000000000000000000`, 1 ETH) caps gas limit x `maxFeePerGas` of every bid. Set
+it to the upstream node's `--rpc.txfeecap`, with the same value in `signer.env`
+for the signer and in `deployment.env` for the daemon (the signer reads only
+`signer.env`). The signer refuses a costlier bid before any upstream call
+(`tx_fee_above_cap`). The daemon bids within the lower of its own value and the
+signer's, which `zkapi_signerStatus` reports, and its `/status` warns when the
+two differ. A real challenge has a gas limit of about 7.53M, so at 1 ETH no bid
+exceeds about 132 gwei, whatever the fee caps:
+
+| Fee cap | Gas limit x fee cap | Highest bid at the default 1 ETH |
+| --- | --- | --- |
+| 10 gwei (Sepolia default) | 0.075 ETH | 10 gwei |
+| 100 gwei | 0.75 ETH | 100 gwei |
+| 300 gwei | 2.26 ETH | about 132 gwei; the daemon warns that its fee cap exceeds the ceiling |
+
+For a higher fee cap, raise the node's `--rpc.txfeecap` and
+`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`,
+for example to at least 2.26 ETH for a 300 gwei fee cap, or keep the fee cap
+within the ceiling. A hosted provider's cap usually cannot be raised. A value
+above the node's cap makes the signer report `upstream_tx_fee_cap`, which the
+daemon treats as critical at once. It then bids within 10/11 of the lowest
+refused fee until it restarts, and its `/status` warns with that fee
+([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
+signer also warns
+`tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap exceeds
+the ceiling; see [Node transaction fee cap](signer/README.md#node-transaction-fee-cap).
+
+Fund the sender with at least (N + K) x gas limit x the highest bid, that is the
+fee cap or, when lower, the ceiling / gas limit. N is the number of challenges
+that may be pending at once and K a budget of reverted attempts. That is 0.75
+ETH per challenge at a 100 gwei cap, and at most the ceiling (1 ETH by default)
+per challenge at any cap.
+
+`challenge.env` holds the daemon's own bounds, which it proposes to the signer
+(its transaction fee cap is in `deployment.env`, above):
 
 | Variable | Requirement |
 | --- | --- |
 | `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | Required. At most the signer's `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`. |
-| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. |
+| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; 5 to 10 times the priority fee leaves several more before it. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
 
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the
@@ -280,9 +314,14 @@ Alert on:
   `alarms`: a missed deadline; an obligation with evidence whose deadline is
   within a quarter of `challengePeriod()`; an obligation blocked by
   `evidence_invalid`, `evidence_db_error`, `indexer_invalid_response`,
-  `indexer_diverged` or `signer_refused`, or by any other reason for 1800
-  seconds; stale polls; a diverged indexer; or an unmined nonce that needs
-  signer intervention;
+  `indexer_diverged`, `signer_refused` or `upstream_tx_fee_cap`, or by any
+  other reason (including `fee_reserve_held`) for 1800 seconds; stale polls; a
+  diverged indexer; or an unmined nonce that needs signer intervention;
+- challenger `/status` warnings naming the transaction fee ceiling (an
+  obligation blocked by `tx_fee_cap_reached`), a signer `tx_fee_cap_wei` that
+  differs from the daemon's, a transaction fee the signer's node refused
+  (`upstream_tx_fee_cap`), a fee cap above the ceiling, or an indexer
+  pending-escapes list that disagrees with the vault;
 - the challenger log lines `MISSED escape challenge deadline`,
   `indexer mirror diverged from vault currentRoot`, and
   `challenge obligation status changed` at error level, and a rising
@@ -298,9 +337,11 @@ Alert on:
 - `settlement required operator review` in the server log, and a nonzero
   `open_reviews` in `/v1/dashboard/settlement`;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
-  `base_fee_near_cap`, `balance_below_required`), signer `/health` failures, and
-  signer audit lines `"event":"challenge_refused"` with reason
-  `base_fee_above_max_fee`, `insufficient_balance` or `broadcast_ambiguous`;
+  `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`),
+  signer `/health` failures, and signer audit lines
+  `"event":"challenge_refused"` with reason `base_fee_above_max_fee`,
+  `insufficient_balance`, `tx_fee_above_cap`, `upstream_tx_fee_cap` or
+  `broadcast_ambiguous`;
 - `clearance_ownership_proof_required: false` after the announced end of the
   legacy clearance window;
 - sustained `gateway_rate_limited` lines in the gateway log, per zone.

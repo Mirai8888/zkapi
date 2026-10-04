@@ -96,8 +96,20 @@ pub enum BlockedReason {
     SignerRefused,
     SendAmbiguous,
     BaseFeeAboveFeeCap,
+    /// The signer saw a base fee above the bid's maxFeePerGas (a stale bid).
+    BaseFeeAboveMaxFee,
     FeeCapReached,
     TipCapReached,
+    /// A pending challenge spent the replacements allowed before the critical
+    /// threshold; the remaining fee headroom is kept for that threshold.
+    FeeReserveHeld,
+    /// The transaction fee ceiling (gas limit x maxFeePerGas) leaves no
+    /// includable bid or valid replacement.
+    TxFeeCapReached,
+    /// The signer refused a bid above its transaction fee cap.
+    TxFeeAboveCap,
+    /// The signer's upstream node refused the transaction fee (its RPC fee cap).
+    UpstreamTxFeeCap,
     InsufficientBalance,
     NonceConflict,
     NonceBlocked,
@@ -113,6 +125,7 @@ impl BlockedReason {
                 | Self::IndexerInvalidResponse
                 | Self::IndexerDiverged
                 | Self::SignerRefused
+                | Self::UpstreamTxFeeCap
         )
     }
 }
@@ -280,6 +293,21 @@ pub struct SenderStatus {
     pub max_priority_fee_per_gas_wei: String,
     pub priority_fee_per_gas_wei: String,
     pub proposed_max_fee_per_gas_wei: Option<String>,
+    /// This daemon's transaction fee ceiling (gas limit x maxFeePerGas).
+    pub tx_fee_cap_wei: String,
+    /// The signer's `tx_fee_cap_wei` from `zkapi_signerStatus` or a refusal.
+    pub signer_tx_fee_cap_wei: Option<String>,
+    pub signer_status_detail: Option<String>,
+    /// A ceiling learned from the signer's node: 10/11 of the lowest
+    /// transaction fee it refused as above its RPC fee cap
+    /// (`upstream_tx_fee_cap`). It stays in force until the daemon restarts.
+    pub node_tx_fee_cap_bound_wei: Option<String>,
+    /// The ceiling in force: the lowest of the three.
+    pub effective_tx_fee_cap_wei: String,
+    /// Gas limit of the latest challenge (its estimate plus 20%).
+    pub challenge_gas_limit: Option<u64>,
+    /// The highest maxFeePerGas the ceiling allows at that gas limit.
+    pub tx_fee_cap_max_fee_per_gas_wei: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +328,10 @@ pub struct IndexerStatus {
     pub pending_escapes_unavailable_since: Option<u64>,
     /// Escapes the event scan had not delivered when the indexer listed them.
     pub escapes_added_from_indexer: u64,
+    /// Listed escapes whose nullifier or deadline differs from the vault's
+    /// `pendingWithdrawals`, in the latest list; the vault's are tracked.
+    pub pending_escapes_disagreement: Option<String>,
+    pub pending_escapes_disagreement_since: Option<u64>,
 }
 
 impl Default for IndexerStatus {
@@ -318,6 +350,8 @@ impl Default for IndexerStatus {
             pending_escapes: "unknown".into(),
             pending_escapes_unavailable_since: None,
             escapes_added_from_indexer: 0,
+            pending_escapes_disagreement: None,
+            pending_escapes_disagreement_since: None,
         }
     }
 }
@@ -354,6 +388,12 @@ pub struct DetachedNonceStatus {
     pub nullifier: Felt252,
     pub transaction_hash: Option<String>,
     pub superseded_hashes: Vec<String>,
+    /// Fees and gas limit of the latest attempt on the nonce, when recorded.
+    /// A gas limit x `maxFeePerGas` above the node's RPC fee cap was refused
+    /// before any pool, even if a signer reported it as possibly broadcast.
+    pub max_fee_per_gas_wei: Option<String>,
+    pub max_priority_fee_per_gas_wei: Option<String>,
+    pub gas_limit: Option<u64>,
     /// Consumed at the latest block (retained until confirmation depth).
     pub mined: bool,
 }
@@ -579,6 +619,31 @@ pub fn evaluate(
         raise(
             Severity::Warning,
             "indexer pending-escapes list unavailable".into(),
+        );
+    }
+    if let Some(detail) = s.indexer.pending_escapes_disagreement.as_ref().filter(|_| {
+        since(s.indexer.pending_escapes_disagreement_since)
+            .is_some_and(|elapsed| elapsed >= policy.blocked_warning_seconds)
+    }) {
+        raise(
+            Severity::Warning,
+            format!("indexer pending-escapes list disagrees with the vault ({detail}); resync the indexer"),
+        );
+    }
+    if s.obligations
+        .iter()
+        .any(|o| o.blocked_reason == Some(BlockedReason::TxFeeCapReached))
+    {
+        let known = |value: &Option<String>| value.as_deref().unwrap_or("unknown").to_owned();
+        raise(
+            Severity::Warning,
+            format!(
+                "transaction fee ceiling {} wei allows a maxFeePerGas of at most {} wei at {} gas; base fee {} wei",
+                s.sender.effective_tx_fee_cap_wei,
+                known(&s.sender.tx_fee_cap_max_fee_per_gas_wei),
+                known(&s.sender.challenge_gas_limit.map(|gas| gas.to_string())),
+                known(&s.chain.base_fee_per_gas_wei),
+            ),
         );
     }
     match s.poll.last_scan_success_at {
@@ -852,6 +917,7 @@ mod tests {
             BlockedReason::IndexerInvalidResponse,
             BlockedReason::IndexerDiverged,
             BlockedReason::SignerRefused,
+            BlockedReason::UpstreamTxFeeCap,
         ] {
             let mut o = obligation(Ready, 1_000);
             o.blocked_reason = Some(reason);
@@ -865,8 +931,12 @@ mod tests {
             BlockedReason::SimulationReverted,
             BlockedReason::SendAmbiguous,
             BlockedReason::BaseFeeAboveFeeCap,
+            BlockedReason::BaseFeeAboveMaxFee,
             BlockedReason::FeeCapReached,
             BlockedReason::TipCapReached,
+            BlockedReason::FeeReserveHeld,
+            BlockedReason::TxFeeCapReached,
+            BlockedReason::TxFeeAboveCap,
             BlockedReason::InsufficientBalance,
             BlockedReason::NonceConflict,
             BlockedReason::NonceBlocked,
@@ -965,6 +1035,9 @@ mod tests {
             nullifier: Felt252::from_u64(1),
             transaction_hash: None,
             superseded_hashes: Vec::new(),
+            max_fee_per_gas_wei: None,
+            max_priority_fee_per_gas_wei: None,
+            gas_limit: None,
             mined: false,
         });
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Critical);
@@ -992,6 +1065,34 @@ mod tests {
         let mut s = healthy_snapshot();
         s.indexer.pending_escapes = "unsupported".into();
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Warning);
+
+        // A listing that disagrees with the vault warns once it persists.
+        let mut s = healthy_snapshot();
+        s.indexer.pending_escapes_disagreement = Some("note 0".into());
+        s.indexer.pending_escapes_disagreement_since = Some(NOW);
+        assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Ok);
+        let later = evaluate(&s, &policy, NOW + policy.blocked_warning_seconds);
+        assert_eq!(later.status, Severity::Warning);
+        assert!(later
+            .alarms
+            .iter()
+            .any(|alarm| alarm.contains("disagrees with the vault (note 0)")));
+
+        // An obligation stopped by the transaction fee ceiling shows the
+        // ceiling and the base fee at once.
+        let mut s = healthy_snapshot();
+        s.chain.base_fee_per_gas_wei = Some("140000000000".into());
+        s.sender.effective_tx_fee_cap_wei = "1000000000000000000".into();
+        s.sender.challenge_gas_limit = Some(7_534_341);
+        s.sender.tx_fee_cap_max_fee_per_gas_wei = Some("132725950546".into());
+        let mut capped = obligation(ObligationState::Ready, 1_000);
+        capped.blocked_reason = Some(BlockedReason::TxFeeCapReached);
+        capped.blocked_since = Some(NOW);
+        s.obligations.push(capped);
+        let current = evaluate(&s, &policy, NOW);
+        assert_eq!(current.status, Severity::Warning);
+        assert!(current.alarms.iter().any(|alarm| alarm
+            == "warning: transaction fee ceiling 1000000000000000000 wei allows a maxFeePerGas of at most 132725950546 wei at 7534341 gas; base fee 140000000000 wei"));
     }
 
     #[test]

@@ -53,6 +53,16 @@ struct Args {
     /// Tip of a first attempt (wei).
     #[arg(long, env = "ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI", default_value_t = FeePolicy::DEFAULT_PRIORITY_FEE_PER_GAS)]
     priority_fee_per_gas_wei: u128,
+    /// Highest gas limit x maxFeePerGas of one challenge (wei); at most the
+    /// upstream node's RPC fee cap (geth --rpc.txfeecap). Bids also stay
+    /// within the signer's tx_fee_cap_wei when it reports a lower one.
+    #[arg(
+        long,
+        env = "ZKAPI_CHALLENGE_TX_FEE_CAP_WEI",
+        default_value_t = FeePolicy::DEFAULT_TX_FEE_CAP_WEI,
+        value_parser = FeePolicy::parse_tx_fee_cap
+    )]
+    tx_fee_cap_wei: u128,
     /// Blocks a challenge may stay pending before a same-nonce replacement.
     #[arg(long, default_value_t = FeePolicy::DEFAULT_BUMP_AFTER_BLOCKS)]
     fee_bump_after_blocks: u64,
@@ -92,7 +102,7 @@ struct Args {
     /// Interval of the sender balance and indexer root observations.
     #[arg(long, default_value_t = 15)]
     observe_interval_seconds: u64,
-    /// Default: 7.6M gas times --max-fee-per-gas-wei.
+    /// Default: 7.6M gas times --max-fee-per-gas-wei, at most --tx-fee-cap-wei.
     #[arg(long)]
     min_sender_balance_wei: Option<u128>,
 }
@@ -150,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
             max_fee_per_gas: args.max_fee_per_gas_wei,
             max_priority_fee_per_gas: args.max_priority_fee_per_gas_wei,
             priority_fee_per_gas: args.priority_fee_per_gas_wei,
+            tx_fee_cap_wei: args.tx_fee_cap_wei,
             bump_after_blocks: args.fee_bump_after_blocks,
             bump_percent: args.fee_bump_percent,
         },

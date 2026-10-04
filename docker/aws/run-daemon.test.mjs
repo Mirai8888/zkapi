@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -20,6 +20,7 @@ const REPORTED_ENV = [
     'ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI',
     'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI',
     'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI',
+    'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI',
 ];
 
 const BASE_ENV = {
@@ -245,6 +246,19 @@ test('challenger serves status on loopback and takes its fees from the environme
     assert.equal(result.received.ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI, '10000000000');
     assert.equal(result.received.ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI, '2000000000');
     assert.equal(result.received.ZKAPI_CHALLENGE_RPC_URL, 'http://signer:8547');
+});
+
+test('challenger receives the shared transaction fee cap from deployment.env through its environment', async () => {
+    // The signer reads its own copy from signer.env; unset means the daemon's 1 ETH default.
+    const example = await readFile(resolve('docker/aws/deployment.env.example'), 'utf8');
+    const cap = /^ZKAPI_CHALLENGE_TX_FEE_CAP_WEI=([1-9][0-9]*)$/m.exec(example)?.[1];
+    assert.equal(cap, '1000000000000000000');
+    for (const value of [undefined, cap, '2300000000000000000']) {
+        const result = await launch('challenger', { set: value === undefined ? {} : { ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: value } });
+        assert.equal(result.status, 0, result.stderr);
+        assert.ok(!result.args.includes('--tx-fee-cap-wei'));
+        assert.equal(result.received.ZKAPI_CHALLENGE_TX_FEE_CAP_WEI, value);
+    }
 });
 
 test('unknown roles print the usage and exit 2', async () => {

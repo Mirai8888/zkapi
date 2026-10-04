@@ -4,9 +4,9 @@
 //! Keys are never loaded by this service; the sender must be dedicated to it.
 //! Only Finalized server transcripts are challenge evidence. Challenges are
 //! EIP-1559 transactions whose fees the daemon proposes and escalates, within
-//! its caps, by same-nonce replacement as deadlines approach. Every
-//! obligation's state, deadline and blocking reason is published on the
-//! operator status endpoint (see `challenge_status`).
+//! its caps and a per-transaction fee ceiling, by same-nonce replacement as
+//! deadlines approach. Every obligation's state, deadline and blocking reason
+//! is published on the operator status endpoint (see `challenge_status`).
 
 use crate::{
     challenge_status::{
@@ -54,19 +54,26 @@ const MAX_ESCAPE_CHECKS_PER_POLL: usize = 64;
 const MAX_ERROR_CHARS: usize = 512;
 
 /// EIP-1559 fee proposals. The signer enforces its own caps, which must be at
-/// least these. Fees on a nonce never decrease; a same-nonce replacement
-/// raises the tip by the minimum valid step and the fee cap by `bump_percent`.
+/// least these. A same-nonce replacement raises the tip by the minimum valid
+/// step and the fee cap by `bump_percent`; two replacements stay reserved for
+/// the critical threshold. Every bid keeps gas limit x maxFeePerGas within
+/// the transaction fee ceiling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeePolicy {
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
     pub priority_fee_per_gas: u128,
+    /// Highest gas limit x maxFeePerGas of one challenge transaction (wei).
+    pub tx_fee_cap_wei: u128,
     pub bump_after_blocks: u64,
     pub bump_percent: u64,
 }
 
 impl FeePolicy {
     pub const DEFAULT_PRIORITY_FEE_PER_GAS: u128 = 2 * GWEI;
+    /// 1 ether, the default `--rpc.txfeecap` of geth and reth: their RPC
+    /// refuses a transaction whose gas limit x maxFeePerGas exceeds it.
+    pub const DEFAULT_TX_FEE_CAP_WEI: u128 = 1_000_000_000_000_000_000;
     pub const DEFAULT_BUMP_AFTER_BLOCKS: u64 = 3;
     pub const DEFAULT_BUMP_PERCENT: u64 = 25;
 
@@ -75,9 +82,25 @@ impl FeePolicy {
             max_fee_per_gas,
             max_priority_fee_per_gas,
             priority_fee_per_gas: Self::DEFAULT_PRIORITY_FEE_PER_GAS,
+            tx_fee_cap_wei: Self::DEFAULT_TX_FEE_CAP_WEI,
             bump_after_blocks: Self::DEFAULT_BUMP_AFTER_BLOCKS,
             bump_percent: Self::DEFAULT_BUMP_PERCENT,
         }
+    }
+
+    /// A transaction fee ceiling as the signer reads it: a positive decimal
+    /// wei amount without sign, leading zeros or spaces; empty means the
+    /// default.
+    pub fn parse_tx_fee_cap(value: &str) -> Result<u128, String> {
+        if value.is_empty() {
+            return Ok(Self::DEFAULT_TX_FEE_CAP_WEI);
+        }
+        if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("must be a positive decimal integer in wei".into());
+        }
+        value
+            .parse()
+            .map_err(|_| "exceeds the largest supported amount".into())
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -90,7 +113,9 @@ impl FeePolicy {
             "max priority fee per gas must not exceed max fee per gas"
         );
         // Nodes accept a same-nonce replacement only when both fees rise by
-        // at least 10%, so the tip needs room above the first bid.
+        // at least 10%, so the tip needs room above the first bid: twice the
+        // first tip allows about five replacements before the critical
+        // threshold and the two reserved for it.
         ensure!(
             self.max_priority_fee_per_gas >= self.priority_fee_per_gas.saturating_mul(2),
             "max priority fee per gas must be at least twice the priority fee per gas, leaving tip headroom for same-nonce replacement"
@@ -98,6 +123,10 @@ impl FeePolicy {
         ensure!(
             self.max_fee_per_gas <= u128::MAX / 1_000,
             "max fee per gas is implausibly large"
+        );
+        ensure!(
+            self.tx_fee_cap_wei > 0,
+            "transaction fee cap must be positive"
         );
         ensure!(
             self.bump_after_blocks >= 1,
@@ -133,15 +162,25 @@ struct NonceAttempts {
     /// Earlier candidate hashes on the nonce, oldest first. Any may still mine.
     #[serde(default)]
     superseded_hashes: Vec<String>,
-    /// Highest fees (0x-hex wei) of any attempt that may have been broadcast.
+    /// Fees (0x-hex wei) of the latest attempt. A send on a nonce that an
+    /// earlier attempt may hold must outbid them, so they are the highest of
+    /// any attempt that may still be in a pool; a re-send of a nonce that no
+    /// attempt holds may lower them to the current caps and ceiling.
     #[serde(default)]
     max_fee_per_gas: Option<String>,
     #[serde(default)]
     max_priority_fee_per_gas: Option<String>,
+    /// Gas limit of the latest attempt.
+    #[serde(default)]
+    gas_limit: Option<u64>,
     #[serde(default)]
     submitted_block: Option<u64>,
     #[serde(default)]
     attempts: u32,
+    /// The nonce was reserved by an older daemon that kept no attempt record,
+    /// so it may hold an attempt this record does not describe.
+    #[serde(default)]
+    unrecorded_attempt: bool,
     /// Digest of (noteId, request inputs, proof) first sent on the nonce;
     /// replacements may change only siblings, gas and fees.
     #[serde(default)]
@@ -350,7 +389,8 @@ impl std::error::Error for DeploymentCheckError {}
 enum SendFailure {
     /// -32602/-32601/-32003: a definitive refusal; nothing was broadcast.
     Refused(Option<String>),
-    /// A signer-reported failure before broadcast (transient).
+    /// A connection never made, or a signer-reported failure before
+    /// broadcast (transient); nothing was broadcast.
     NotBroadcast(BlockedReason),
     /// Possibly broadcast, with the candidate hash when the signer reports it.
     Ambiguous(Option<String>),
@@ -396,6 +436,13 @@ pub struct ChallengeService {
     indexer_logged_at: Option<u64>,
     sender: SenderStatus,
     sender_balance: Option<u128>,
+    /// The signer's transaction fee cap, from `zkapi_signerStatus` or a
+    /// `tx_fee_above_cap` refusal.
+    signer_tx_fee_cap: Option<u128>,
+    /// The lowest transaction fee (gas limit x maxFeePerGas) that the signer's
+    /// node refused as above its RPC fee cap (`upstream_tx_fee_cap`). Kept
+    /// until restart; the node's cap is never reported.
+    node_refused_tx_fee: Option<u128>,
     last_observed_at: Option<u64>,
     last_gas: Option<u128>,
     evaluations: BTreeMap<u32, Evaluation>,
@@ -458,14 +505,20 @@ impl ChallengeService {
         let started_at = unix_now();
         let sender = SenderStatus {
             address: config.sender.to_ascii_lowercase(),
+            // No challenge can lock more than the transaction fee ceiling.
             min_balance_wei: config
                 .alarms
                 .min_sender_balance_wei
-                .unwrap_or(DEFAULT_CHALLENGE_GAS.saturating_mul(config.fee.max_fee_per_gas))
+                .unwrap_or(
+                    DEFAULT_CHALLENGE_GAS
+                        .saturating_mul(config.fee.max_fee_per_gas)
+                        .min(config.fee.tx_fee_cap_wei),
+                )
                 .to_string(),
             max_fee_per_gas_wei: config.fee.max_fee_per_gas.to_string(),
             max_priority_fee_per_gas_wei: config.fee.max_priority_fee_per_gas.to_string(),
             priority_fee_per_gas_wei: config.fee.priority_fee_per_gas.to_string(),
+            tx_fee_cap_wei: config.fee.tx_fee_cap_wei.to_string(),
             ..Default::default()
         };
         let status = Arc::new(RwLock::new(ChallengeStatus::initial(
@@ -496,6 +549,8 @@ impl ChallengeService {
             indexer_logged_at: None,
             sender,
             sender_balance: None,
+            signer_tx_fee_cap: None,
+            node_refused_tx_fee: None,
             last_observed_at: None,
             last_gas: None,
             evaluations: BTreeMap::new(),
@@ -837,10 +892,14 @@ impl ChallengeService {
         true
     }
 
-    /// Completeness against a lagging `eth_getLogs` replica: add every escape
-    /// the indexer lists that the checkpoint lacks, once the vault confirms it
-    /// is pending with that nullifier. Older indexers without the endpoint are
-    /// tolerated with a status warning.
+    /// Completeness against a lagging `eth_getLogs` replica: for every note the
+    /// indexer lists that the checkpoint does not track as listed, track the
+    /// escape the vault's `pendingWithdrawals` holds. Only the note ID is
+    /// taken from the list: the vault can change after the indexer's block,
+    /// and a challenge and re-escape pair leaves the root unchanged, so an
+    /// indexer that checks only its root can list a stale nullifier and
+    /// deadline. Older indexers without the endpoint are tolerated with a
+    /// status warning.
     async fn sync_pending_escapes(&mut self) -> anyhow::Result<()> {
         let now = unix_now();
         let listed = match self
@@ -851,6 +910,8 @@ impl ChallengeService {
             Err(IndexerFailure::Status(404)) => {
                 self.indexer.pending_escapes = "unsupported".into();
                 self.indexer.pending_escapes_unavailable_since = None;
+                self.indexer.pending_escapes_disagreement = None;
+                self.indexer.pending_escapes_disagreement_since = None;
                 return Ok(());
             }
             Err(error) => {
@@ -868,13 +929,36 @@ impl ChallengeService {
         self.indexer.pending_escapes_unavailable_since = None;
         let mut changed = false;
         let mut checked = 0;
+        let mut disagreements = Vec::new();
+        let differs = |escape: &PendingEscape, nullifier: Felt252, deadline: u64| {
+            (nullifier != escape.withdrawal_nullifier
+                || escape
+                    .challenge_deadline
+                    .is_some_and(|listed| listed != deadline))
+            .then(|| {
+                format!(
+                    "note {} listed with nullifier {} and deadline {}, the vault holds {} until {deadline}",
+                    escape.note_id,
+                    escape.withdrawal_nullifier,
+                    escape
+                        .challenge_deadline
+                        .map_or("unknown".into(), |listed| listed.to_string()),
+                    nullifier
+                )
+            })
+        };
         for escape in listed.escapes {
-            if self
+            // A note tracked as listed is compared with the vault on every
+            // reconcile, which also keeps its deadline.
+            if let Some(pending) = self
                 .checkpoint
                 .pending
                 .get(&escape.note_id)
-                .is_some_and(|pending| pending.nullifier == escape.withdrawal_nullifier)
+                .filter(|pending| pending.nullifier == escape.withdrawal_nullifier)
             {
+                if let Some(deadline) = pending.challenge_deadline {
+                    disagreements.extend(differs(&escape, pending.nullifier, deadline));
+                }
                 continue;
             }
             if checked == MAX_ESCAPE_CHECKS_PER_POLL {
@@ -888,8 +972,18 @@ impl ChallengeService {
                     continue;
                 }
             };
-            if !state.exists || state.nullifier != escape.withdrawal_nullifier {
-                continue; // The vault is authoritative; the list may be stale.
+            if !state.exists {
+                continue; // The list may lag the vault.
+            }
+            disagreements.extend(differs(&escape, state.nullifier, state.deadline));
+            // The vault is authoritative, whatever the list says.
+            if self
+                .checkpoint
+                .pending
+                .get(&escape.note_id)
+                .is_some_and(|pending| pending.nullifier == state.nullifier)
+            {
+                continue;
             }
             let initiated = self
                 .challenge_period
@@ -900,23 +994,52 @@ impl ChallengeService {
             {
                 tracing::warn!(
                     note_id = escape.note_id,
-                    nullifier = %escape.withdrawal_nullifier,
+                    nullifier = %state.nullifier,
                     "escape missing from the event scan added from the indexer pending-escapes list; the RPC eth_getLogs may be lagging"
                 );
             } else {
-                tracing::info!(note_id = escape.note_id, nullifier = %escape.withdrawal_nullifier, "escape ahead of the confirmed event scan added from the indexer pending-escapes list");
+                tracing::info!(note_id = escape.note_id, nullifier = %state.nullifier, "escape ahead of the confirmed event scan added from the indexer pending-escapes list");
             }
             self.indexer.escapes_added_from_indexer += 1;
-            changed |= self.track_escape(
-                escape.note_id,
-                escape.withdrawal_nullifier,
-                Some(state.deadline),
+            changed |= self.track_escape(escape.note_id, state.nullifier, Some(state.deadline));
+        }
+        let disagreement = (!disagreements.is_empty()).then(|| bounded(&disagreements.join("; ")));
+        if disagreement.is_some() && self.indexer.pending_escapes_disagreement.is_none() {
+            tracing::warn!(
+                detail = ?disagreement,
+                "indexer pending-escapes list disagrees with the vault; tracking the vault's escapes"
             );
         }
+        let since = self
+            .indexer
+            .pending_escapes_disagreement_since
+            .unwrap_or(now);
+        self.indexer.pending_escapes_disagreement_since = disagreement.as_ref().map(|_| since);
+        self.indexer.pending_escapes_disagreement = disagreement;
         if changed {
             self.persist()?;
         }
         Ok(())
+    }
+
+    /// The vault holds a different escape for a tracked note: the owner
+    /// escaped again after a challenge, or an event replay tracked an older
+    /// escape. Track the vault's; the old reservation stays detached until
+    /// its nonce is consumed or released.
+    fn follow_vault_escape(
+        &mut self,
+        note: u32,
+        tracked: Felt252,
+        state: &WithdrawalState,
+    ) -> anyhow::Result<()> {
+        tracing::warn!(
+            note_id = note,
+            tracked = %tracked,
+            vault = %state.nullifier,
+            "the vault holds a different escape than the one tracked for this note; tracking the vault's"
+        );
+        self.track_escape(note, state.nullifier, Some(state.deadline));
+        self.persist()
     }
 
     fn observation_due(&mut self) -> bool {
@@ -962,6 +1085,37 @@ impl ChallengeService {
             } else {
                 self.sender.nonce_pending = count.or(self.sender.nonce_pending);
             }
+        }
+        // The bundled signer reports its transaction fee cap; bids stay within
+        // the lower of it and this daemon's. Without a report, a cap learned
+        // from a refusal stays in force.
+        match self
+            .rpc("zkapi_signerStatus", json!([]))
+            .await
+            .and_then(|status| {
+                status
+                    .get("tx_fee_cap_wei")
+                    .filter(|value| !value.is_null())
+                    .map(quantity_u128)
+                    .transpose()
+            }) {
+            Ok(Some(cap)) if cap > 0 => {
+                self.signer_tx_fee_cap = Some(cap);
+                self.sender.signer_status_detail = None;
+            }
+            Ok(Some(_)) => {
+                self.sender.signer_status_detail =
+                    Some("the signer reports a zero tx_fee_cap_wei; ignored".into());
+            }
+            Ok(None) => {
+                self.sender.signer_status_detail =
+                    Some("the signer does not report tx_fee_cap_wei".into());
+            }
+            Err(error) if rpc_code(&error) == Some(-32601) => {
+                self.sender.signer_status_detail =
+                    Some("the signer RPC does not provide zkapi_signerStatus".into());
+            }
+            Err(error) => self.sender.signer_status_detail = Some(bounded(&error.to_string())),
         }
     }
 
@@ -1143,7 +1297,12 @@ impl ChallengeService {
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
         let state = self.withdrawal_state(note, None).await?;
-        if !state.exists || state.nullifier != pending.nullifier {
+        if state.exists && state.nullifier != pending.nullifier {
+            // Re-checked every poll, so a tip reorg back to the tracked escape
+            // restores it with its reservation.
+            return self.follow_vault_escape(note, pending.nullifier, &state);
+        }
+        if !state.exists {
             return self.retire_if_confirmed(note, &pending).await;
         }
         self.note_deadline(note, state.deadline)?;
@@ -1151,7 +1310,9 @@ impl ChallengeService {
         if head.timestamp >= state.deadline {
             // Keep the obligation until confirmed vault completion, including
             // the possibility of a reorg back before the deadline.
-            return self.record_expiry(note, &evidence, state.deadline, Some(nonce_state));
+            return self
+                .record_expiry(note, &evidence, state.deadline, Some(nonce_state))
+                .await;
         }
         match evidence {
             Ok(EvidenceStatus::Ready(_)) => match nonce_state {
@@ -1197,6 +1358,8 @@ impl ChallengeService {
             self.record(note, unconfirmed);
             return Ok(());
         }
+        // A nonce no attempt was broadcast on is released rather than kept.
+        self.release_if_never_broadcast(note).await;
         self.detach_nonce(note);
         self.checkpoint.pending.remove(&note);
         self.forget_observations(note);
@@ -1225,7 +1388,10 @@ impl ChallengeService {
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
         let state = self.withdrawal_state(note, None).await?;
-        if !state.exists || state.nullifier != pending.nullifier {
+        if state.exists && state.nullifier != pending.nullifier {
+            return self.follow_vault_escape(note, pending.nullifier, &state);
+        }
+        if !state.exists {
             self.record(
                 note,
                 Evaluation::new(ObligationState::ResolvedUnconfirmed, None).detail(
@@ -1237,7 +1403,9 @@ impl ChallengeService {
         self.note_deadline(note, state.deadline)?;
         let evidence = self.watcher.evidence_status(&pending.nullifier);
         if head.timestamp >= state.deadline {
-            return self.record_expiry(note, &evidence, state.deadline, None);
+            return self
+                .record_expiry(note, &evidence, state.deadline, None)
+                .await;
         }
         match evidence {
             Ok(EvidenceStatus::Ready(_)) => {
@@ -1361,8 +1529,9 @@ impl ChallengeService {
 
     /// The deadline passed: a missed challenge when evidence existed or was
     /// expected, otherwise an expiry without evidence. An unmined reserved
-    /// nonce of an expired obligation still blocks new allocations.
-    fn record_expiry(
+    /// nonce of an expired obligation still blocks new allocations, unless no
+    /// attempt on it was broadcast.
+    async fn record_expiry(
         &mut self,
         note: u32,
         evidence: &Result<EvidenceStatus, ServerError>,
@@ -1414,15 +1583,19 @@ impl ChallengeService {
         };
         evaluation.settlement = settlement;
         if matches!(nonce_state, Some(NonceState::Reserved | NonceState::Held)) {
-            let nonce = self.checkpoint.pending[&note].nonce.unwrap_or_default();
-            self.record(
-                note,
-                evaluation.blocked(
-                    BlockedReason::NonceBlocked,
-                    format!("expired obligation retains unmined reserved nonce {nonce}; resolve it at the signer"),
-                ),
-            );
-            bail!("expired challenge retains an unmined reserved nonce; signer intervention required before allocating another nonce");
+            if self.release_if_never_broadcast(note).await {
+                self.persist()?;
+            } else {
+                let nonce = self.checkpoint.pending[&note].nonce.unwrap_or_default();
+                self.record(
+                    note,
+                    evaluation.blocked(
+                        BlockedReason::NonceBlocked,
+                        format!("expired obligation retains unmined reserved nonce {nonce}, which an attempt may hold; resolve it at the signer"),
+                    ),
+                );
+                bail!("expired challenge retains an unmined reserved nonce; signer intervention required before allocating another nonce");
+            }
         }
         self.record(note, evaluation);
         Ok(())
@@ -1539,14 +1712,25 @@ impl ChallengeService {
             return Ok(());
         };
         let critical = self.queue_severity(note, head) == Severity::Critical;
+        // The ceiling at the gas limit of the latest attempt; the send itself
+        // plans with the exact gas limit.
+        let tx_fee_limit = pending
+            .attempt
+            .gas_limit
+            .map(u128::from)
+            .or(self.last_gas)
+            .map(|gas| self.tx_fee_limit(gas));
         let policy = &self.config.fee;
         let waited = pending
             .attempt
             .submitted_block
             .is_none_or(|block| head.number.saturating_sub(block) >= policy.bump_after_blocks);
         let base_above = head.base_fee.is_some_and(|base| base > old.max_fee);
+        let max_fee_cap = policy
+            .max_fee_per_gas
+            .min(tx_fee_limit.unwrap_or(u128::MAX));
         let below_critical = critical
-            && (old.max_fee < headroom(policy.max_fee_per_gas)
+            && (old.max_fee < headroom(max_fee_cap)
                 || old.tip < headroom(policy.max_priority_fee_per_gas));
         let stale_root = match pending.attempt.submitted_root {
             Some(root) => self.live_root().await.is_ok_and(|live| live != root),
@@ -1556,25 +1740,51 @@ impl ChallengeService {
             self.record(note, hold(submitted, waiting));
             return Ok(());
         }
-        // Skip the path and simulation work while no valid bump exists.
-        if let Err(reason) = plan_fees(
+        // Skip the path and simulation work while no valid bump exists. A
+        // pending attempt that cannot be outbid within the caps and the
+        // transaction fee ceiling is kept, and observed until it mines.
+        match plan_fees(
             &self.config.fee,
             FeePlan::Bump(old),
             head.base_fee,
             critical,
+            tx_fee_limit,
             None,
         ) {
-            self.record(
-                note,
-                submitted.blocked(
-                    reason,
-                    format!(
-                        "{waiting} at max fee {} and tip {} wei; no valid replacement within the caps",
-                        old.max_fee, old.tip
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let detail = format!(
+                    "{waiting}; the remaining fee headroom is reserved for the critical threshold"
+                );
+                // Reported as blocked, so a challenge that stays pending after
+                // its budget is spent escalates with time like an exhausted cap.
+                let evaluation = if visible {
+                    submitted.blocked(BlockedReason::FeeReserveHeld, detail)
+                } else {
+                    hold(submitted, detail)
+                };
+                self.record(note, evaluation);
+                return Ok(());
+            }
+            Err(reason) => {
+                self.record(
+                    note,
+                    submitted.blocked(
+                        reason,
+                        format!(
+                            "{waiting} at max fee {} and tip {} wei; no valid replacement within the caps{}",
+                            old.max_fee,
+                            old.tip,
+                            if reason == BlockedReason::TxFeeCapReached {
+                                format!(" and the transaction fee ceiling of {} wei", self.tx_fee_cap())
+                            } else {
+                                String::new()
+                            }
+                        ),
                     ),
-                ),
-            );
-            return Ok(());
+                );
+                return Ok(());
+            }
         }
         self.submit(note, Some(nonce), head, FeePlan::Bump(old))
             .await
@@ -1774,14 +1984,56 @@ impl ChallengeService {
         let affordable = self
             .sender_balance
             .map(|balance| balance / (gas as u128).max(1));
-        let fees = match plan_fees(&self.config.fee, plan, head.base_fee, critical, affordable) {
-            Ok(fees) => fees,
+        // The signer and its node refuse gas x maxFeePerGas above the ceiling.
+        let tx_fee_limit = self.tx_fee_limit(gas as u128);
+        let fees = match plan_fees(
+            &self.config.fee,
+            plan,
+            head.base_fee,
+            critical,
+            Some(tx_fee_limit),
+            affordable,
+        ) {
+            Ok(Some(fees)) => fees,
+            Ok(None) => {
+                // Only a replacement keeps the reserve, as in maybe_replace.
+                let (reason, waiting) = if pending.transaction_hash.is_some() {
+                    (
+                        BlockedReason::FeeReserveHeld,
+                        format!("pending on nonce {nonce}"),
+                    )
+                } else {
+                    (
+                        BlockedReason::SendAmbiguous,
+                        format!("nonce {nonce} may be held by an attempt without a known hash"),
+                    )
+                };
+                self.record(
+                    note,
+                    Evaluation::new(base_state, Some(EvidenceKind::Finalized)).blocked(
+                        reason,
+                        format!("{waiting}; the remaining fee headroom is reserved for the critical threshold"),
+                    ),
+                );
+                return Ok(());
+            }
             Err(reason) => {
-                // Nothing is sent and nothing is reserved; retried next poll.
+                // Nothing is sent; retried next poll. A reused nonce that no
+                // attempt was broadcast on is released.
                 let detail = match reason {
                     BlockedReason::BaseFeeAboveFeeCap => format!(
                         "base fee {} wei exceeds the usable fee cap",
                         head.base_fee.unwrap_or_default()
+                    ),
+                    BlockedReason::TxFeeCapReached => format!(
+                        "the transaction fee ceiling of {} wei allows a maxFeePerGas of at most {tx_fee_limit} wei at {gas} gas; base fee {} wei{}",
+                        self.tx_fee_cap(),
+                        head.base_fee.unwrap_or_default(),
+                        if matches!(plan, FeePlan::Bump(_)) {
+                            "; no valid replacement"
+                        } else {
+                            ""
+                        }
                     ),
                     BlockedReason::InsufficientBalance => format!(
                         "sender balance {} wei cannot fund a valid bid at {gas} gas",
@@ -1792,6 +2044,9 @@ impl ChallengeService {
                     }
                     _ => "no valid replacement: the fee cap is reached".into(),
                 };
+                if reuse.is_some() && self.release_if_never_broadcast(note).await {
+                    self.persist()?;
+                }
                 self.record(
                     note,
                     Evaluation::new(base_state, Some(EvidenceKind::Finalized))
@@ -1800,8 +2055,24 @@ impl ChallengeService {
                 return Ok(());
             }
         };
+        if let FeePlan::Resend(old) = plan {
+            if fees.max_fee < old.max_fee || fees.tip < old.tip {
+                tracing::warn!(
+                    note_id = note,
+                    nonce,
+                    previous_max_fee_per_gas = old.max_fee,
+                    previous_max_priority_fee_per_gas = old.tip,
+                    max_fee_per_gas = fees.max_fee,
+                    max_priority_fee_per_gas = fees.tip,
+                    "re-sending a nonce no attempt holds below its earlier bid, within the current caps, transaction fee ceiling and balance"
+                );
+            }
+        }
         // Write ahead: a crash or ambiguous result after this point never
         // loses the reservation, the fees that may be in a pool, or the call.
+        // A bid outbids every attempt that may hold the nonce, so its fees
+        // are the highest in any pool; a re-send of a nonce no attempt holds
+        // keeps its earlier fees within the current caps and ceiling.
         let rollback = {
             let entry = self.checkpoint.pending.get_mut(&note).unwrap();
             let rollback = (
@@ -1813,23 +2084,9 @@ impl ChallengeService {
             if let Some(hash) = entry.transaction_hash.take() {
                 push_superseded(&mut entry.attempt, hash);
             }
-            let persisted = rollback.2.clone();
-            let max_fee = fees.max_fee.max(
-                persisted
-                    .max_fee_per_gas
-                    .as_deref()
-                    .and_then(parse_hex_u128)
-                    .unwrap_or_default(),
-            );
-            let tip = fees.tip.max(
-                persisted
-                    .max_priority_fee_per_gas
-                    .as_deref()
-                    .and_then(parse_hex_u128)
-                    .unwrap_or_default(),
-            );
-            entry.attempt.max_fee_per_gas = Some(format!("0x{max_fee:x}"));
-            entry.attempt.max_priority_fee_per_gas = Some(format!("0x{tip:x}"));
+            entry.attempt.max_fee_per_gas = Some(format!("0x{:x}", fees.max_fee));
+            entry.attempt.max_priority_fee_per_gas = Some(format!("0x{:x}", fees.tip));
+            entry.attempt.gas_limit = Some(gas);
             entry.attempt.attempts = entry.attempt.attempts.saturating_add(1);
             entry.attempt.submitted_block = Some(head.number);
             entry.attempt.evidence_digest = Some(digest);
@@ -1876,67 +2133,46 @@ impl ChallengeService {
                 Ok(())
             }
             Err(error) => {
-                self.send_failed(note, nonce, base_state, rollback, error)
-                    .await
+                self.send_failed(
+                    note,
+                    nonce,
+                    (gas, fees.max_fee),
+                    base_state,
+                    rollback,
+                    error,
+                )
+                .await
             }
         }
     }
 
+    /// `sent` is the gas limit and maxFeePerGas of the failed send.
     async fn send_failed(
         &mut self,
         note: u32,
         nonce: u64,
+        sent: (u64, u128),
         base_state: ObligationState,
         rollback: (Option<u64>, Option<String>, NonceAttempts),
         error: anyhow::Error,
     ) -> anyhow::Result<()> {
-        let (previous_nonce, previous_hash, previous_attempt) = rollback;
+        let (gas, max_fee) = sent;
         let reason = match classify_send_error(&error) {
             SendFailure::Refused(reason) => {
-                // Nothing was broadcast: restore the nonce's earlier record.
-                // A nonce that no attempt may occupy is released, so a
-                // refusal lasting until the deadline cannot stall later notes.
-                let never_broadcast = previous_hash.is_none()
-                    && previous_attempt.superseded_hashes.is_empty()
-                    && !previous_attempt.unknown_attempt
-                    && (previous_nonce.is_none() || previous_attempt.attempts > 0);
-                let releasable = never_broadcast
-                    && self
-                        .transaction_count("latest")
-                        .await
-                        .is_ok_and(|count| count <= nonce)
-                    && self
-                        .transaction_count("pending")
-                        .await
-                        .is_ok_and(|count| count <= nonce);
-                let entry = self.checkpoint.pending.get_mut(&note).unwrap();
-                if releasable {
-                    entry.nonce = None;
-                    entry.transaction_hash = None;
-                    entry.attempt = NonceAttempts::default();
-                } else {
-                    let attempts = entry.attempt.attempts;
-                    entry.nonce = previous_nonce.or(Some(nonce));
-                    entry.transaction_hash = previous_hash;
-                    entry.attempt = NonceAttempts {
-                        attempts,
-                        ..previous_attempt
-                    };
+                self.roll_back_unsent(note, nonce, rollback).await;
+                if reason.as_deref() == Some("tx_fee_above_cap") {
+                    // Later bids stay within the signer's cap.
+                    if let Some(cap) = refused_tx_fee_cap(&error, gas) {
+                        self.signer_tx_fee_cap = Some(cap);
+                    }
                 }
-                match reason.as_deref() {
-                    Some("base_fee_above_max_fee") => BlockedReason::BaseFeeAboveFeeCap,
-                    Some("insufficient_balance") => BlockedReason::InsufficientBalance,
-                    _ => BlockedReason::SignerRefused,
+                if reason.as_deref() == Some("upstream_tx_fee_cap") {
+                    self.learn_node_tx_fee_bound(note, refused_tx_fee(&error, gas, max_fee));
                 }
+                refusal_reason(reason.as_deref())
             }
             SendFailure::NotBroadcast(reason) => {
-                let entry = self.checkpoint.pending.get_mut(&note).unwrap();
-                let attempts = entry.attempt.attempts;
-                entry.transaction_hash = previous_hash;
-                entry.attempt = NonceAttempts {
-                    attempts,
-                    ..previous_attempt
-                };
+                self.roll_back_unsent(note, nonce, rollback).await;
                 reason
             }
             SendFailure::Ambiguous(hash) => {
@@ -1957,6 +2193,111 @@ impl ChallengeService {
                 .blocked(reason, error.to_string()),
         );
         Err(error)
+    }
+
+    /// Nothing was broadcast: restore the nonce's earlier record, counting the
+    /// attempt, and release the nonce when no attempt can occupy it, so that a
+    /// failure lasting until the deadline cannot stall later notes. The caller
+    /// persists.
+    async fn roll_back_unsent(
+        &mut self,
+        note: u32,
+        nonce: u64,
+        rollback: (Option<u64>, Option<String>, NonceAttempts),
+    ) {
+        let (previous_nonce, previous_hash, previous_attempt) = rollback;
+        let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+        // A reservation an older daemon made without a record may hold an
+        // attempt the record does not describe.
+        let unrecorded_attempt = previous_attempt.unrecorded_attempt
+            || (previous_nonce.is_some() && previous_attempt.attempts == 0);
+        entry.nonce = previous_nonce.or(Some(nonce));
+        entry.transaction_hash = previous_hash;
+        entry.attempt = NonceAttempts {
+            attempts: entry.attempt.attempts,
+            unrecorded_attempt,
+            ..previous_attempt
+        };
+        self.release_if_never_broadcast(note).await;
+    }
+
+    /// Release the note's reserved nonce when no attempt recorded on it was
+    /// broadcast and neither the latest nor the pending count has passed it.
+    /// The caller persists.
+    async fn release_if_never_broadcast(&mut self, note: u32) -> bool {
+        let Some(nonce) = self
+            .checkpoint
+            .pending
+            .get(&note)
+            .filter(|pending| never_broadcast(pending.transaction_hash.as_ref(), &pending.attempt))
+            .and_then(|pending| pending.nonce)
+        else {
+            return false;
+        };
+        if !self.nonce_unused(nonce).await {
+            return false;
+        }
+        let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+        entry.nonce = None;
+        entry.transaction_hash = None;
+        entry.attempt = NonceAttempts::default();
+        self.observed_fees.remove(&note);
+        tracing::info!(
+            note_id = note,
+            nonce,
+            "released a reserved nonce that no attempt was broadcast on"
+        );
+        true
+    }
+
+    /// Neither the latest nor the pending transaction count has passed `nonce`.
+    async fn nonce_unused(&self, nonce: u64) -> bool {
+        self.transaction_count("latest")
+            .await
+            .is_ok_and(|count| count <= nonce)
+            && self
+                .transaction_count("pending")
+                .await
+                .is_ok_and(|count| count <= nonce)
+    }
+
+    /// The transaction fee ceiling in force: the lowest of this daemon's, the
+    /// signer's and the bound learned from the signer's node.
+    fn tx_fee_cap(&self) -> u128 {
+        self.config
+            .fee
+            .tx_fee_cap_wei
+            .min(self.signer_tx_fee_cap.unwrap_or(u128::MAX))
+            .min(self.node_tx_fee_bound().unwrap_or(u128::MAX))
+    }
+
+    /// The ceiling the node's refusals imply: 10/11 of the lowest transaction
+    /// fee it refused, which exceeded its RPC fee cap. The node refuses before
+    /// its pool and never reports that cap, so each refusal lowers the bids
+    /// that follow by at least 9% until one is accepted; the bound stays above
+    /// 10/11 of the node's cap.
+    fn node_tx_fee_bound(&self) -> Option<u128> {
+        self.node_refused_tx_fee
+            .map(headroom)
+            .filter(|bound| *bound > 0)
+    }
+
+    fn learn_node_tx_fee_bound(&mut self, note: u32, refused: u128) {
+        let lowest = self
+            .node_refused_tx_fee
+            .map_or(refused, |lowest| lowest.min(refused));
+        self.node_refused_tx_fee = Some(lowest);
+        tracing::warn!(
+            note_id = note,
+            refused_tx_fee_wei = refused,
+            node_tx_fee_cap_bound_wei = headroom(lowest),
+            "the signer's node refused the transaction fee as above its RPC fee cap; later bids stay within 10/11 of the lowest refused fee until restart"
+        );
+    }
+
+    /// The highest maxFeePerGas the ceiling allows at `gas`.
+    fn tx_fee_limit(&self, gas: u128) -> u128 {
+        self.tx_fee_cap() / gas.max(1)
     }
 
     fn simulation_failed(
@@ -2103,18 +2444,51 @@ impl ChallengeService {
         self.checkpoint
             .detached_nonces
             .retain(|nonce, _| *nonce >= confirmed);
+        // An unmined nonce that no attempt was broadcast on cannot be pending
+        // anywhere: release it instead of blocking every later allocation.
+        let unsent: Vec<u64> = self
+            .checkpoint
+            .detached_nonces
+            .iter()
+            .filter(|(nonce, entry)| {
+                **nonce >= latest
+                    && never_broadcast(entry.transaction_hash.as_ref(), &entry.attempt)
+            })
+            .map(|(nonce, _)| *nonce)
+            .collect();
+        for nonce in unsent {
+            if self.nonce_unused(nonce).await {
+                let entry = self.checkpoint.detached_nonces.remove(&nonce).unwrap();
+                tracing::info!(
+                    note_id = entry.note_id,
+                    nonce,
+                    "released a detached nonce that no attempt was broadcast on"
+                );
+            }
+        }
         self.persist()?;
         self.detached_status = self
             .checkpoint
             .detached_nonces
             .iter()
-            .map(|(nonce, entry)| DetachedNonceStatus {
-                nonce: *nonce,
-                note_id: entry.note_id,
-                nullifier: entry.nullifier,
-                transaction_hash: entry.transaction_hash.clone(),
-                superseded_hashes: entry.attempt.superseded_hashes.clone(),
-                mined: *nonce < latest,
+            .map(|(nonce, entry)| {
+                let wei = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .and_then(parse_hex_u128)
+                        .map(|wei| wei.to_string())
+                };
+                DetachedNonceStatus {
+                    nonce: *nonce,
+                    note_id: entry.note_id,
+                    nullifier: entry.nullifier,
+                    transaction_hash: entry.transaction_hash.clone(),
+                    superseded_hashes: entry.attempt.superseded_hashes.clone(),
+                    max_fee_per_gas_wei: wei(&entry.attempt.max_fee_per_gas),
+                    max_priority_fee_per_gas_wei: wei(&entry.attempt.max_priority_fee_per_gas),
+                    gas_limit: entry.attempt.gas_limit,
+                    mined: *nonce < latest,
+                }
             })
             .collect();
         if let Some((nonce, entry)) = self
@@ -2259,13 +2633,16 @@ impl ChallengeService {
     fn build_status(&self, now: u64) -> ChallengeStatus {
         let head = self.head.as_ref();
         let fee = &self.config.fee;
+        let gas = self.last_gas.unwrap_or(DEFAULT_CHALLENGE_GAS);
         let proposed = head.map(|head| {
-            head.base_fee.map_or(fee.max_fee_per_gas, |base| {
-                fee.max_fee_per_gas.min(
-                    base.saturating_mul(2)
-                        .saturating_add(fee.priority_fee_per_gas),
-                )
-            })
+            head.base_fee
+                .map_or(fee.max_fee_per_gas, |base| {
+                    fee.max_fee_per_gas.min(
+                        base.saturating_mul(2)
+                            .saturating_add(fee.priority_fee_per_gas),
+                    )
+                })
+                .min(self.tx_fee_limit(gas))
         });
         let mut obligations = Vec::new();
         let mut outstanding = 0u64;
@@ -2317,7 +2694,6 @@ impl ChallengeService {
             }
             obligations.push(obligation);
         }
-        let gas = self.last_gas.unwrap_or(DEFAULT_CHALLENGE_GAS);
         let mut sender = self.sender.clone();
         sender.balance_wei = self.sender_balance.map(|balance| balance.to_string());
         sender.outstanding_obligations = outstanding;
@@ -2328,9 +2704,40 @@ impl ChallengeService {
                 .saturating_mul(fee)
                 .to_string()
         });
+        sender.signer_tx_fee_cap_wei = self.signer_tx_fee_cap.map(|cap| cap.to_string());
+        sender.node_tx_fee_cap_bound_wei = self.node_tx_fee_bound().map(|bound| bound.to_string());
+        sender.effective_tx_fee_cap_wei = self.tx_fee_cap().to_string();
+        sender.challenge_gas_limit = self.last_gas.and_then(|gas| u64::try_from(gas).ok());
+        sender.tx_fee_cap_max_fee_per_gas_wei =
+            self.last_gas.map(|gas| self.tx_fee_limit(gas).to_string());
         let mut config_warnings = self.config_warnings.clone();
         config_warnings.extend(self.startup_warning.clone());
         config_warnings.extend(self.vault_warning.clone());
+        if let Some(signer) = self
+            .signer_tx_fee_cap
+            .filter(|cap| *cap != fee.tx_fee_cap_wei)
+        {
+            config_warnings.push(format!(
+                "the signer's tx_fee_cap_wei {signer} differs from --tx-fee-cap-wei {}; bids stay within the lower",
+                fee.tx_fee_cap_wei
+            ));
+        }
+        if let Some((refused, bound)) = self.node_refused_tx_fee.zip(self.node_tx_fee_bound()) {
+            config_warnings.push(format!(
+                "the signer's node refused a transaction fee of {refused} wei (upstream_tx_fee_cap): its RPC fee cap is below the ceiling, so bids stay within {bound} wei until restart; set ZKAPI_CHALLENGE_TX_FEE_CAP_WEI for the signer and this daemon to the node's --rpc.txfeecap and restart both, or raise the node's cap and restart this daemon"
+            ));
+        }
+        // A real challenge needs about 7.6M gas: a fee cap above the ceiling
+        // per gas is never reached.
+        let challenge_gas = gas.max(DEFAULT_CHALLENGE_GAS);
+        if fee.max_fee_per_gas.saturating_mul(challenge_gas) > self.tx_fee_cap() {
+            config_warnings.push(format!(
+                "--max-fee-per-gas-wei {} x {challenge_gas} gas exceeds the transaction fee ceiling of {} wei; bids stop at {} wei per gas (raise the ceiling with the upstream node's RPC fee cap, or lower the fee cap)",
+                fee.max_fee_per_gas,
+                self.tx_fee_cap(),
+                self.tx_fee_limit(challenge_gas)
+            ));
+        }
         let mut indexer = self.indexer.clone();
         if indexer.root.is_none() && indexer.state == IndexerState::Unknown {
             indexer.detail = Some("not yet observed".into());
@@ -2572,43 +2979,100 @@ impl ChallengeService {
     }
 }
 
-/// Plan the fees of one send. Fees never decrease on a nonce; a bump raises
-/// the tip by the minimum valid replacement step and the fee cap by
-/// `bump_percent`. A critical send bids just under the caps, keeping one
-/// valid bump of headroom (for example a sibling refresh) when possible.
+/// Plan the fees of one send at its exact gas limit. `tx_fee_limit` is the
+/// highest maxFeePerGas the transaction fee ceiling allows at that gas limit
+/// and bounds every bid like a lower fee cap. A bump raises the tip by the
+/// minimum valid replacement step and the fee cap by `bump_percent`.
+///
+/// Two valid replacements stay in reserve for the critical threshold: other
+/// bids stay within 10/11 of 10/11 of the caps, unless the base fee needs
+/// more, or rose above a pending bid that cannot otherwise be outbid. A
+/// critical send bids 10/11 of the caps, then the caps. `Ok(None)` keeps a
+/// pending attempt when only that reserve is left.
 fn plan_fees(
     policy: &FeePolicy,
     plan: FeePlan,
     base_fee: Option<u128>,
     critical: bool,
+    tx_fee_limit: Option<u128>,
     affordable: Option<u128>,
-) -> Result<Fees, BlockedReason> {
+) -> Result<Option<Fees>, BlockedReason> {
     let caps = Fees {
-        max_fee: policy.max_fee_per_gas,
+        max_fee: policy
+            .max_fee_per_gas
+            .min(tx_fee_limit.unwrap_or(u128::MAX)),
         tip: policy.max_priority_fee_per_gas,
     };
-    if base_fee.is_some_and(|base| base > caps.max_fee) {
+    if base_fee.is_some_and(|base| base > policy.max_fee_per_gas) {
         return Err(BlockedReason::BaseFeeAboveFeeCap);
     }
+    if base_fee.is_some_and(|base| base > caps.max_fee) {
+        return Err(BlockedReason::TxFeeCapReached);
+    }
+    let reserve = |steps: u32| {
+        (0..steps).fold(caps, |fees, _| Fees {
+            max_fee: headroom(fees.max_fee),
+            tip: headroom(fees.tip),
+        })
+    };
     // Just under the caps, unless the base fee already exceeds that bid.
     let critical_target = match base_fee {
         Some(base) if base > headroom(caps.max_fee) => caps,
-        _ => Fees {
-            max_fee: headroom(caps.max_fee),
-            tip: headroom(caps.tip),
-        },
+        _ => reserve(1),
+    };
+    // The limits of every other bid, raised only as far as the base fee needs.
+    let limit = match base_fee {
+        Some(base) if base > headroom(caps.max_fee) => caps,
+        Some(base) if base > reserve(2).max_fee => reserve(1),
+        _ => reserve(2),
     };
     let bid = |tip: u128| {
-        base_fee.map_or(headroom(caps.max_fee), |base| {
-            caps.max_fee.min(base.saturating_mul(2).saturating_add(tip))
+        base_fee.map_or(limit.max_fee, |base| {
+            limit
+                .max_fee
+                .min(base.saturating_mul(2).saturating_add(tip))
         })
     };
+    // A max fee the ceiling keeps from rising 10% (or below the raised tip)
+    // is reported first: raising only the tip cap cannot help then.
     let cap_reason = |old: Fees| {
-        if min_bump(old.tip) > caps.tip {
+        let pinned = min_bump(old.max_fee).max(min_bump(old.tip)) > caps.max_fee;
+        if pinned && caps.max_fee < policy.max_fee_per_gas {
+            BlockedReason::TxFeeCapReached
+        } else if min_bump(old.tip) > caps.tip {
             BlockedReason::TipCapReached
         } else {
             BlockedReason::FeeCapReached
         }
+    };
+    let bump = |old: Fees, limit: Fees| {
+        let tip = min_bump(old.tip)
+            .max(policy.priority_fee_per_gas)
+            .min(limit.tip);
+        let mut max_fee = old
+            .max_fee
+            .saturating_mul(100 + policy.bump_percent as u128)
+            .div_ceil(100);
+        if let Some(base) = base_fee {
+            max_fee = max_fee.max(base.saturating_mul(2).saturating_add(tip));
+        }
+        let fees = Fees {
+            max_fee: max_fee.min(limit.max_fee),
+            tip,
+        };
+        is_valid_bump(old, fees).then_some(fees)
+    };
+    // A target's tip never exceeds its max fee, which the ceiling can lower
+    // below the tip cap.
+    let escalate = |old: Fees| {
+        [critical_target, caps]
+            .into_iter()
+            .map(|fees| Fees {
+                tip: fees.tip.min(fees.max_fee),
+                ..fees
+            })
+            .find(|fees| is_valid_bump(old, *fees))
+            .ok_or_else(|| cap_reason(old))
     };
     let mut fees = match plan {
         FeePlan::First if critical => critical_target,
@@ -2631,30 +3095,14 @@ fn plan_fees(
                 fees
             }
         }
-        FeePlan::Bump(old) if critical => [critical_target, caps]
-            .into_iter()
-            .find(|fees| is_valid_bump(old, *fees))
-            .ok_or_else(|| cap_reason(old))?,
-        FeePlan::Bump(old) => {
-            let tip = min_bump(old.tip)
-                .max(policy.priority_fee_per_gas)
-                .min(caps.tip);
-            let mut max_fee = old
-                .max_fee
-                .saturating_mul(100 + policy.bump_percent as u128)
-                .div_ceil(100);
-            if let Some(base) = base_fee {
-                max_fee = max_fee.max(base.saturating_mul(2).saturating_add(tip));
-            }
-            let fees = Fees {
-                max_fee: max_fee.min(caps.max_fee),
-                tip,
-            };
-            if !is_valid_bump(old, fees) {
-                return Err(cap_reason(old));
-            }
-            fees
-        }
+        FeePlan::Bump(old) if critical => escalate(old)?,
+        FeePlan::Bump(old) => match bump(old, limit) {
+            Some(fees) => fees,
+            // The pending bid can no longer be included: spend the reserve.
+            None if base_fee.is_some_and(|base| base > old.max_fee) => escalate(old)?,
+            None if bump(old, caps).is_none() => return Err(cap_reason(old)),
+            None => return Ok(None),
+        },
     };
     fees.tip = fees.tip.min(fees.max_fee);
     let mut clamped = false;
@@ -2674,7 +3122,61 @@ fn plan_fees(
     if !includable {
         return Err(BlockedReason::BaseFeeAboveFeeCap);
     }
-    Ok(fees)
+    Ok(Some(fees))
+}
+
+/// Every attempt recorded on a nonce was a definite non-broadcast: a signer
+/// refusal, a failure the signer reports before broadcasting, or a connection
+/// never made. Any other attempt leaves a candidate hash or an unknown attempt,
+/// and a reservation an older daemon made leaves no record at all.
+fn never_broadcast(transaction_hash: Option<&String>, attempt: &NonceAttempts) -> bool {
+    transaction_hash.is_none()
+        && attempt.superseded_hashes.is_empty()
+        && !attempt.unknown_attempt
+        && !attempt.unrecorded_attempt
+        && attempt.attempts > 0
+}
+
+/// The blocked reason of a definitive signer refusal.
+fn refusal_reason(reason: Option<&str>) -> BlockedReason {
+    match reason {
+        Some("base_fee_above_max_fee") => BlockedReason::BaseFeeAboveMaxFee,
+        Some("insufficient_balance") => BlockedReason::InsufficientBalance,
+        Some("tx_fee_above_cap") => BlockedReason::TxFeeAboveCap,
+        Some("upstream_tx_fee_cap") => BlockedReason::UpstreamTxFeeCap,
+        _ => BlockedReason::SignerRefused,
+    }
+}
+
+/// The signer's transaction fee cap from a `tx_fee_above_cap` refusal: its
+/// `tx_fee_cap_wei`, or else `max_fee_per_gas_allowed` x the gas limit.
+fn refused_tx_fee_cap(error: &anyhow::Error, gas: u64) -> Option<u128> {
+    let data = error.downcast_ref::<RpcError>()?.error.get("data")?;
+    let field = |name: &str| data.get(name).and_then(|value| quantity_u128(value).ok());
+    field("tx_fee_cap_wei")
+        .or_else(|| {
+            Some(
+                field("max_fee_per_gas_allowed")?
+                    .saturating_mul(field("gas_limit").unwrap_or(u128::from(gas))),
+            )
+        })
+        .filter(|cap| *cap > 0)
+}
+
+/// Gas limit x maxFeePerGas of a refused send: the refusal's `gas_limit` and
+/// `max_fee_per_gas` (the bundled signer reports both with
+/// `upstream_tx_fee_cap`), else the send's own.
+fn refused_tx_fee(error: &anyhow::Error, gas: u64, max_fee: u128) -> u128 {
+    let data = error
+        .downcast_ref::<RpcError>()
+        .and_then(|rpc| rpc.error.get("data"));
+    let field = |name: &str| {
+        data.and_then(|data| data.get(name))
+            .and_then(|value| quantity_u128(value).ok())
+    };
+    field("gas_limit")
+        .unwrap_or(u128::from(gas))
+        .saturating_mul(field("max_fee_per_gas").unwrap_or(max_fee))
 }
 
 /// The smallest value nodes accept as a 10% replacement bump.
@@ -2822,10 +3324,13 @@ struct PendingEscapesResponse {
     escapes: Vec<PendingEscape>,
 }
 
+/// Only the note ID is authoritative; the vault supplies the rest.
 #[derive(Deserialize)]
 struct PendingEscape {
     note_id: u32,
     withdrawal_nullifier: Felt252,
+    #[serde(default)]
+    challenge_deadline: Option<u64>,
 }
 
 fn selector(signature: &str) -> Vec<u8> {
@@ -2893,6 +3398,8 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
     use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
 
+    const ONE_ETHER: u128 = 1_000_000_000_000_000_000;
+
     struct MockChain {
         nullifier: Felt252,
         active: bool,
@@ -2930,6 +3437,18 @@ mod tests {
         path_meta: Option<Value>,
         simulation_error: Option<Value>,
         legacy_gas_price: Option<u128>,
+        /// eth_estimateGas answer; the default 10M gas gives a 12M gas limit.
+        estimate: u64,
+        /// Sends whose gas x maxFeePerGas exceeds the cap are refused with
+        /// the reason: `tx_fee_above_cap` (the bundled signer),
+        /// `upstream_tx_fee_cap` (its node), or `broadcast_ambiguous` (an
+        /// earlier signer relaying its node's rejection, with a hash no node
+        /// knows).
+        tx_fee_cap: Option<(u128, &'static str)>,
+        fee_capped_sends: usize,
+        fee_capped_hashes: BTreeSet<String>,
+        /// The zkapi_signerStatus result; None: an RPC without the method.
+        signer_status: Option<Value>,
     }
 
     impl MockChain {
@@ -2973,6 +3492,11 @@ mod tests {
                 path_meta: None,
                 simulation_error: None,
                 legacy_gas_price: None,
+                estimate: 10_000_000,
+                tx_fee_cap: None,
+                fee_capped_sends: 0,
+                fee_capped_hashes: BTreeSet::new(),
+                signer_status: None,
             }
         }
     }
@@ -3101,7 +3625,7 @@ mod tests {
                     json!("0x")
                 }
             }
-            "eth_estimateGas" => json!("0x989680"),
+            "eth_estimateGas" => hex_quantity(state.estimate as u128),
             "eth_getTransactionCount" => hex_quantity(if request["params"][1] == "pending" {
                 state.pending_nonce.unwrap_or(state.mined_nonce)
             } else if request["params"][1] == "latest" {
@@ -3132,6 +3656,41 @@ mod tests {
                         "data": { "reason": "fee_out_of_bounds" } } }))
                     .into_response();
                 }
+                if let Some((cap, reason)) = state.tx_fee_cap {
+                    let gas = quantity_u128(&transaction["gas"]).unwrap();
+                    let max_fee = quantity_u128(&transaction["maxFeePerGas"]).unwrap();
+                    if gas * max_fee > cap {
+                        state.fee_capped_sends += 1;
+                        let (code, data) = match reason {
+                            "tx_fee_above_cap" => (
+                                -32003,
+                                json!({ "reason": reason, "gas_limit": hex_quantity(gas),
+                                    "max_fee_per_gas": hex_quantity(max_fee),
+                                    "tx_fee_cap_wei": hex_quantity(cap),
+                                    "max_fee_per_gas_allowed": hex_quantity(cap / gas) }),
+                            ),
+                            "upstream_tx_fee_cap" => (
+                                -32003,
+                                json!({ "reason": reason, "gas_limit": hex_quantity(gas),
+                                    "max_fee_per_gas": hex_quantity(max_fee) }),
+                            ),
+                            _ => {
+                                let hash = format!(
+                                    "0x{:064x}",
+                                    0xdead_0000_0000u64 + state.sends.len() as u64
+                                );
+                                state.fee_capped_hashes.insert(hash.clone());
+                                (
+                                    -32000,
+                                    json!({ "reason": reason, "transaction_hash": hash }),
+                                )
+                            }
+                        };
+                        return Json(json!({ "jsonrpc": "2.0", "id": 1, "error": {
+                            "code": code, "message": "Transaction fee exceeds the cap", "data": data } }))
+                        .into_response();
+                    }
+                }
                 let nonce = quantity(&transaction["nonce"]).unwrap();
                 state.pending_nonce = Some(
                     state
@@ -3142,7 +3701,11 @@ mod tests {
                 json!(format!("0x{:064x}", state.sends.len()))
             }
             "eth_getTransactionByHash" => {
-                if !state.transaction_known {
+                if !state.transaction_known
+                    || state
+                        .fee_capped_hashes
+                        .contains(request["params"][0].as_str().unwrap())
+                {
                     Value::Null
                 } else {
                     let hash = request["params"][0].as_str().unwrap();
@@ -3160,6 +3723,10 @@ mod tests {
                 }
             }
             "eth_getTransactionReceipt" => Value::Null,
+            "zkapi_signerStatus" => match &state.signer_status {
+                Some(status) => status.clone(),
+                None => return rpc_error(-32601, "RPC method is not allowed"),
+            },
             _ => panic!("unexpected RPC method {method}"),
         };
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result })).into_response()
@@ -3274,7 +3841,12 @@ mod tests {
                 checkpoint: directory.path().join("checkpoint.json"),
                 proof_setup_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("../../protocol/setup/v2"),
-                fee: FeePolicy::new(100 * GWEI, 10 * GWEI),
+                // A transaction fee ceiling the mock's 12M gas limit never
+                // reaches at these caps; the ceiling tests use real figures.
+                fee: FeePolicy {
+                    tx_fee_cap_wei: 10 * ONE_ETHER,
+                    ..FeePolicy::new(100 * GWEI, 10 * GWEI)
+                },
                 // The mock deadline is 100 s away: severity ok unless a test
                 // moves the chain clock.
                 alarms: AlarmPolicy {
@@ -3567,8 +4139,13 @@ mod tests {
         let mut service = fixture.service();
         let original_nullifier = fixture.chain.lock().unwrap().nullifier;
         fixture.reserve(&mut service, 0, false);
-        // An intervening fork presents a different withdrawal for this note.
-        fixture.chain.lock().unwrap().nullifier = Felt252::from_u64(999);
+        // An intervening fork presents a different withdrawal for this note,
+        // in its events and in the vault's state.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.nullifier = Felt252::from_u64(999);
+            chain.withdrawals.get_mut(&0).unwrap().1 = Felt252::from_u64(999);
+        }
         assert!(service
             .poll_once()
             .await
@@ -3579,6 +4156,7 @@ mod tests {
         {
             let mut chain = fixture.chain.lock().unwrap();
             chain.nullifier = original_nullifier;
+            chain.withdrawals.get_mut(&0).unwrap().1 = original_nullifier;
             chain.block_hash = "0xforkB".into();
         }
         drop(service);
@@ -4224,7 +4802,8 @@ mod tests {
             );
         }
 
-        // A signer-reported failure before broadcast needs no bump.
+        // A signer-reported failure before broadcast needs no bump, and its
+        // nonce is released.
         let fixture = Fixture::new().await;
         fixture.chain.lock().unwrap().send_errors.push_back(json!({
             "code": -32000, "message": "Upstream RPC request failed",
@@ -4233,6 +4812,7 @@ mod tests {
         let mut service = fixture.service();
         assert!(service.poll_once().await.is_err());
         assert!(!service.checkpoint.pending[&0].attempt.unknown_attempt);
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
         assert_eq!(
             obligation(&service.status(), 0).blocked_reason,
             Some(BlockedReason::RpcError)
@@ -4264,12 +4844,17 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(fee(&sends[0], "maxFeePerGas"), 62 * GWEI);
         assert_eq!(fee(&sends[0], "maxPriorityFeePerGas"), 2 * GWEI);
-        // A base fee above the pending bid triggers a capped replacement.
+        // A base fee above the pending bid triggers a replacement, within the
+        // non-critical limit that keeps two replacements for the critical
+        // threshold.
         fixture.chain.lock().unwrap().base_fee = Some(70 * GWEI);
         service.poll_once().await.unwrap();
         let sends = fixture.sends();
         assert_eq!(sends.len(), 2);
-        assert_eq!(fee(&sends[1], "maxFeePerGas"), 100 * GWEI);
+        assert_eq!(
+            fee(&sends[1], "maxFeePerGas"),
+            headroom(headroom(100 * GWEI))
+        );
         assert_eq!(fee(&sends[1], "maxPriorityFeePerGas"), 2_200_000_000);
         // Above the cap nothing more can be done but report it.
         fixture.chain.lock().unwrap().base_fee = Some(120 * GWEI);
@@ -4637,11 +5222,16 @@ mod tests {
             chain.drop_logs = true;
             let listed = json!([
                 { "note_id": 0, "withdrawal_nullifier": chain.nullifier, "challenge_deadline": chain.deadline },
-                // Not pending on-chain with this nullifier: never added.
+                // Listed with a stale nullifier and deadline: the vault's
+                // escape of note 7 is tracked instead.
                 { "note_id": 7, "withdrawal_nullifier": Felt252::from_u64(77), "challenge_deadline": chain.deadline },
             ]);
             chain.escapes = Some(listed.as_array().unwrap().clone());
-            chain.deadline
+            let deadline = chain.deadline;
+            chain
+                .withdrawals
+                .insert(7, (true, Felt252::from_u64(78), deadline + 5));
+            deadline
         };
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
@@ -4656,13 +5246,28 @@ mod tests {
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
-            [0]
+            [0, 7]
         );
+        assert_eq!(
+            service.checkpoint.pending[&7].nullifier,
+            Felt252::from_u64(78)
+        );
+        // Note 7's escape has no server request: nothing to send.
         assert_eq!(fixture.sends().len(), 1);
         let status = service.status();
         assert_eq!(status.indexer.pending_escapes, "ok");
-        assert_eq!(status.indexer.escapes_added_from_indexer, 1);
+        assert_eq!(status.indexer.escapes_added_from_indexer, 2);
         assert_eq!(obligation(&status, 0).challenge_deadline, Some(deadline));
+        assert_eq!(
+            obligation(&status, 7).challenge_deadline,
+            Some(deadline + 5)
+        );
+        assert_eq!(obligation(&status, 7).state, ObligationState::NoEvidence);
+        assert!(status
+            .indexer
+            .pending_escapes_disagreement
+            .unwrap()
+            .starts_with("note 7 listed with nullifier"));
 
         // An indexer that predates the endpoint is tolerated with a warning.
         fixture.chain.lock().unwrap().escapes = None;
@@ -4880,40 +5485,59 @@ mod tests {
     #[test]
     fn fee_plans_bid_bump_and_escalate_within_caps() {
         let policy = FeePolicy::new(100 * GWEI, 10 * GWEI);
-        let plan =
-            |plan, base, critical, affordable| plan_fees(&policy, plan, base, critical, affordable);
+        let plan = |plan, base, critical, affordable| {
+            plan_fees(&policy, plan, base, critical, None, affordable)
+        };
         let fees = |max_fee, tip| Fees { max_fee, tip };
         let caps = fees(100 * GWEI, 10 * GWEI);
-        // A first bid is twice the base fee plus the tip, within the cap.
+        let reserve = |fees: Fees| Fees {
+            max_fee: headroom(fees.max_fee),
+            tip: headroom(fees.tip),
+        };
+        // A first bid is twice the base fee plus the tip, within 10/11 of
+        // 10/11 of the cap, or as much more as the base fee needs.
         assert_eq!(
             plan(FeePlan::First, Some(GWEI), false, None),
-            Ok(fees(4 * GWEI, 2 * GWEI))
+            Ok(Some(fees(4 * GWEI, 2 * GWEI)))
         );
         assert_eq!(
             plan(FeePlan::First, Some(60 * GWEI), false, None),
-            Ok(fees(100 * GWEI, 2 * GWEI))
+            Ok(Some(fees(reserve(reserve(caps)).max_fee, 2 * GWEI)))
+        );
+        assert_eq!(
+            plan(FeePlan::First, Some(85 * GWEI), false, None),
+            Ok(Some(fees(reserve(caps).max_fee, 2 * GWEI)))
+        );
+        assert_eq!(
+            plan(FeePlan::First, Some(95 * GWEI), false, None),
+            Ok(Some(fees(100 * GWEI, 2 * GWEI)))
         );
         assert_eq!(
             plan(FeePlan::First, None, false, None),
-            Ok(fees(headroom(100 * GWEI), 2 * GWEI))
+            Ok(Some(fees(reserve(reserve(caps)).max_fee, 2 * GWEI)))
         );
         assert_eq!(
             plan(FeePlan::First, Some(101 * GWEI), false, None),
             Err(BlockedReason::BaseFeeAboveFeeCap)
         );
         // Critical: just under both caps, then the caps, then nothing.
-        let critical = plan(FeePlan::First, Some(GWEI), true, None).unwrap();
+        let critical = plan(FeePlan::First, Some(GWEI), true, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(critical, fees(90_909_090_909, 9_090_909_090));
         assert_eq!(
             plan(FeePlan::Bump(critical), Some(GWEI), true, None),
-            Ok(caps)
+            Ok(Some(caps))
         );
         assert_eq!(
             plan(FeePlan::Bump(caps), Some(GWEI), true, None),
             Err(BlockedReason::TipCapReached)
         );
         // A base fee above the critical bid goes straight to the caps.
-        assert_eq!(plan(FeePlan::First, Some(95 * GWEI), true, None), Ok(caps));
+        assert_eq!(
+            plan(FeePlan::First, Some(95 * GWEI), true, None),
+            Ok(Some(caps))
+        );
         // A normal bump raises the tip minimally and the fee cap by 25%.
         assert_eq!(
             plan(
@@ -4922,17 +5546,41 @@ mod tests {
                 false,
                 None
             ),
-            Ok(fees(5 * GWEI, 2_200_000_000))
+            Ok(Some(fees(5 * GWEI, 2_200_000_000)))
         );
         let mut current = fees(4 * GWEI, 2 * GWEI);
         let mut bumps = 0;
-        while let Ok(next) = plan(FeePlan::Bump(current), Some(GWEI), false, None) {
+        while let Ok(Some(next)) = plan(FeePlan::Bump(current), Some(GWEI), false, None) {
             assert!(is_valid_bump(current, next));
             assert!(next.max_fee <= caps.max_fee && next.tip <= caps.tip);
             current = next;
             bumps += 1;
         }
         assert!(bumps >= 7, "only {bumps} replacements before a cap");
+        // Then the last two replacements wait for the critical threshold.
+        assert!(current.tip <= reserve(reserve(caps)).tip);
+        assert_eq!(
+            plan(FeePlan::Bump(current), Some(GWEI), false, None),
+            Ok(None)
+        );
+        let first = plan(FeePlan::Bump(current), Some(GWEI), true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, reserve(caps));
+        assert_eq!(
+            plan(FeePlan::Bump(first), Some(GWEI), true, None),
+            Ok(Some(caps))
+        );
+        // A pending bid below the base fee spends the reserve for inclusion.
+        assert_eq!(
+            plan(
+                FeePlan::Bump(fees(50 * GWEI, 8 * GWEI)),
+                Some(55 * GWEI),
+                false,
+                None
+            ),
+            Ok(Some(reserve(caps)))
+        );
         // Re-sending a dropped bid needs no bump but follows the base fee.
         assert_eq!(
             plan(
@@ -4941,12 +5589,12 @@ mod tests {
                 false,
                 None
             ),
-            Ok(fees(22 * GWEI, 2 * GWEI))
+            Ok(Some(fees(22 * GWEI, 2 * GWEI)))
         );
         // The balance clamp keeps a valid bid or reports the shortfall.
         assert_eq!(
             plan(FeePlan::First, Some(GWEI), false, Some(3 * GWEI)),
-            Ok(fees(3 * GWEI, 2 * GWEI))
+            Ok(Some(fees(3 * GWEI, 2 * GWEI)))
         );
         assert_eq!(
             plan(FeePlan::First, Some(GWEI), false, Some(GWEI / 2)),
@@ -4960,6 +5608,61 @@ mod tests {
                 Some(4_200_000_000)
             ),
             Err(BlockedReason::InsufficientBalance)
+        );
+
+        // The transaction fee ceiling bounds every bid like a lower fee cap:
+        // 1 ether over a real challenge's 7,534,341 gas is about 132.7 gwei.
+        let policy = FeePolicy::new(300 * GWEI, 10 * GWEI);
+        let limit = ONE_ETHER / 7_534_341;
+        let plan =
+            |plan, base, critical| plan_fees(&policy, plan, base, critical, Some(limit), None);
+        let ceiling = fees(limit, 10 * GWEI);
+        assert_eq!(
+            plan(FeePlan::First, Some(70 * GWEI), false),
+            Ok(Some(fees(reserve(reserve(ceiling)).max_fee, 2 * GWEI)))
+        );
+        let critical = plan(FeePlan::First, Some(10 * GWEI), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(critical, reserve(ceiling));
+        assert_eq!(
+            plan(FeePlan::Bump(critical), Some(10 * GWEI), true),
+            Ok(Some(ceiling))
+        );
+        assert_eq!(
+            plan(FeePlan::Bump(fees(limit, 5 * GWEI)), Some(10 * GWEI), true),
+            Err(BlockedReason::TxFeeCapReached)
+        );
+        // With both fees at their limits the ceiling is named: a higher tip
+        // cap alone cannot make a replacement valid. A tip at its cap below
+        // the ceiling is the tip cap's.
+        assert_eq!(
+            plan(FeePlan::Bump(ceiling), Some(10 * GWEI), true),
+            Err(BlockedReason::TxFeeCapReached)
+        );
+        assert_eq!(
+            plan(
+                FeePlan::Bump(fees(limit / 2, 10 * GWEI)),
+                Some(10 * GWEI),
+                true
+            ),
+            Err(BlockedReason::TipCapReached)
+        );
+        assert_eq!(
+            plan(
+                FeePlan::Resend(fees(142 * GWEI, 2 * GWEI)),
+                Some(10 * GWEI),
+                false
+            ),
+            Ok(Some(fees(limit, 2 * GWEI)))
+        );
+        assert_eq!(
+            plan(FeePlan::First, Some(140 * GWEI), false),
+            Err(BlockedReason::TxFeeCapReached)
+        );
+        assert_eq!(
+            plan(FeePlan::First, Some(301 * GWEI), true),
+            Err(BlockedReason::BaseFeeAboveFeeCap)
         );
         // A legacy transaction bids its gas price as both fees.
         assert_eq!(
@@ -4997,6 +5700,43 @@ mod tests {
             classify(json!({ "code": -32601, "message": "m" })),
             SendFailure::Refused(None)
         ));
+        // The signer's and its node's transaction fee caps refuse before any
+        // pool, each under its own reason.
+        for (reason, blocked) in [
+            ("tx_fee_above_cap", BlockedReason::TxFeeAboveCap),
+            ("upstream_tx_fee_cap", BlockedReason::UpstreamTxFeeCap),
+            ("base_fee_above_max_fee", BlockedReason::BaseFeeAboveMaxFee),
+            ("insufficient_balance", BlockedReason::InsufficientBalance),
+            ("fee_out_of_bounds", BlockedReason::SignerRefused),
+        ] {
+            assert!(matches!(
+                classify(json!({ "code": -32003, "message": "m", "data": { "reason": reason } })),
+                SendFailure::Refused(Some(refused)) if refused == reason
+            ));
+            assert_eq!(refusal_reason(Some(reason)), blocked);
+        }
+        let capped = |data: Value| rpc(json!({ "code": -32003, "message": "m", "data": data }));
+        assert_eq!(
+            refused_tx_fee_cap(
+                &capped(
+                    json!({ "reason": "tx_fee_above_cap", "gas_limit": "0x72f6c5",
+                    "tx_fee_cap_wei": "0xde0b6b3a7640000", "max_fee_per_gas_allowed": "0x1ee6c4df42" })
+                ),
+                1
+            ),
+            Some(ONE_ETHER)
+        );
+        assert_eq!(
+            refused_tx_fee_cap(
+                &capped(json!({ "reason": "tx_fee_above_cap", "max_fee_per_gas_allowed": "0x64" })),
+                7
+            ),
+            Some(700)
+        );
+        assert_eq!(
+            refused_tx_fee_cap(&capped(json!({ "reason": "tx_fee_above_cap" })), 7),
+            None
+        );
         assert!(matches!(
             classify(
                 json!({ "code": -32000, "message": "m", "data": { "reason": "simulation_failed" } })
@@ -5173,5 +5913,1023 @@ mod tests {
             service.verify_deployment_binding().await,
             Err(DeploymentCheckError::Unavailable(_))
         ));
+    }
+
+    /// The gas limit of a measured real Groth16 challenge (estimate + 20%).
+    const REAL_GAS_LIMIT: u128 = 7_534_341;
+
+    /// Every send kept gas limit x maxFeePerGas within `cap`.
+    fn within(sends: &[Value], cap: u128) -> bool {
+        sends
+            .iter()
+            .all(|send| fee(send, "gas") * fee(send, "maxFeePerGas") <= cap)
+    }
+
+    /// Mainnet caps of 300 and 10 gwei with the default 1 ether ceiling.
+    fn mainnet_fees(config: &mut ChallengeServiceConfig) {
+        config.fee = FeePolicy::new(300 * GWEI, 10 * GWEI);
+    }
+
+    #[tokio::test]
+    async fn rpc_fee_cap_bids_stay_within_the_ceiling_and_later_notes_are_challenged() {
+        // A node with the default 1 ether RPC fee cap refuses a costlier bid
+        // before its pool; an earlier signer reported that as possibly
+        // broadcast, which locked the nonce at the refused fee.
+        for refusal in ["broadcast_ambiguous", "tx_fee_above_cap"] {
+            let fixture = Fixture::new().await;
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.tx_fee_cap = Some((ONE_ETHER, refusal));
+                chain.estimate = 6_278_618;
+                // A Mainnet spike, below the daemon's cap.
+                chain.base_fee = Some(70 * GWEI);
+                chain.deadline += 10_000;
+            }
+            let mut service = fixture.service_with(mainnet_fees);
+            service.poll_once().await.unwrap();
+            fixture.chain.lock().unwrap().drop_logs = true;
+            assert!(fee(&fixture.sends()[0], "maxFeePerGas") >= 70 * GWEI);
+            // The spike ends; the challenge stays pending meanwhile.
+            fixture.chain.lock().unwrap().base_fee = Some(10 * GWEI);
+            for _ in 0..20 {
+                fixture.chain.lock().unwrap().head_number += 3;
+                service.poll_once().await.unwrap();
+            }
+            // Kept: the spike bid's max fee is at the non-critical limit, so
+            // the rest of the headroom is held for the critical threshold.
+            let head = obligation(&service.status(), 0);
+            assert_eq!(head.state, ObligationState::Submitted, "{refusal}");
+            assert_eq!(
+                head.blocked_reason,
+                Some(BlockedReason::FeeReserveHeld),
+                "{refusal}"
+            );
+            // A later escape is challenged on the next nonce at once.
+            let later = fixture.chain.lock().unwrap().deadline + 5_000;
+            fixture.track(&mut service, 1, later);
+            fixture.chain.lock().unwrap().head_number += 3;
+            service.poll_once().await.unwrap();
+            let sends = fixture.sends();
+            let queued: Vec<_> = sends
+                .iter()
+                .filter(|send| decode_call(send).0 == Felt252::from_u64(1).as_bytes())
+                .collect();
+            assert_eq!(queued.len(), 1, "{refusal}");
+            assert_eq!(queued[0]["nonce"], "0x4");
+            assert!(within(&sends, ONE_ETHER), "{refusal}");
+            assert_eq!(fixture.chain.lock().unwrap().fee_capped_sends, 0);
+            assert_eq!(service.status().status, Severity::Warning, "{refusal}");
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_escalation_stays_within_the_rpc_fee_cap_at_low_base_fee() {
+        for refusal in ["broadcast_ambiguous", "tx_fee_above_cap"] {
+            let fixture = Fixture::new().await;
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.tx_fee_cap = Some((ONE_ETHER, refusal));
+                chain.estimate = 6_278_618;
+                chain.base_fee = Some(10 * GWEI);
+                // First seen inside the critical threshold.
+                chain.head_timestamp = chain.deadline - 5;
+            }
+            let mut service = fixture.service_with(mainnet_fees);
+            for _ in 0..6 {
+                service.poll_once().await.unwrap();
+                fixture.chain.lock().unwrap().head_number += 3;
+            }
+            let sends = fixture.sends();
+            assert_eq!(
+                fixture.chain.lock().unwrap().fee_capped_sends,
+                0,
+                "{refusal}"
+            );
+            // 10/11 of the ceiling's fee per gas, then the ceiling itself.
+            let limit = ONE_ETHER / REAL_GAS_LIMIT;
+            assert_eq!(sends.len(), 2, "{refusal}");
+            assert_eq!(fee(&sends[0], "maxFeePerGas"), headroom(limit));
+            assert_eq!(fee(&sends[1], "maxFeePerGas"), limit);
+            assert!(within(&sends, ONE_ETHER));
+            // Then the pending bid is kept, and the ceiling is reported.
+            let capped = obligation(&service.status(), 0);
+            assert_eq!(capped.state, ObligationState::Submitted);
+            assert_eq!(capped.blocked_reason, Some(BlockedReason::TxFeeCapReached));
+            assert!(capped
+                .detail
+                .unwrap()
+                .contains("and the transaction fee ceiling of 1000000000000000000 wei"));
+        }
+    }
+
+    #[tokio::test]
+    async fn signer_tx_fee_cap_bounds_bids_and_its_refusals_are_reported() {
+        let half = ONE_ETHER / 2;
+        let critical_at_low_base_fee = |chain: &mut MockChain| {
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(10 * GWEI);
+            chain.head_timestamp = chain.deadline - 5;
+        };
+        // The signer reports a lower cap: bids stay within it, with a warning.
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            critical_at_low_base_fee(&mut chain);
+            chain.tx_fee_cap = Some((half, "tx_fee_above_cap"));
+            chain.signer_status = Some(json!({ "tx_fee_cap_wei": hex_quantity(half) }));
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            fee(&sends[0], "maxFeePerGas"),
+            headroom(half / REAL_GAS_LIMIT)
+        );
+        let status = service.status();
+        assert_eq!(status.sender.tx_fee_cap_wei, ONE_ETHER.to_string());
+        assert_eq!(status.sender.signer_tx_fee_cap_wei, Some(half.to_string()));
+        assert_eq!(status.sender.effective_tx_fee_cap_wei, half.to_string());
+        assert!(status
+            .config_warnings
+            .iter()
+            .any(|warning| warning.contains("differs from --tx-fee-cap-wei")));
+        // A zero report is malformed and leaves the cap in force.
+        fixture.chain.lock().unwrap().signer_status = Some(json!({ "tx_fee_cap_wei": "0x0" }));
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.sender.effective_tx_fee_cap_wei, half.to_string());
+        assert!(status
+            .sender
+            .signer_status_detail
+            .unwrap()
+            .contains("zero tx_fee_cap_wei"));
+
+        // A signer that does not report it refuses the bid with its cap: a
+        // definitive refusal that bounds the next bid.
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            critical_at_low_base_fee(&mut chain);
+            chain.tx_fee_cap = Some((half, "tx_fee_above_cap"));
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        let error = service.poll_once().await.unwrap_err().to_string();
+        assert!(error.contains("tx_fee_above_cap"), "{error}");
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        let refused = obligation(&service.status(), 0);
+        assert_eq!(refused.blocked_reason, Some(BlockedReason::TxFeeAboveCap));
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1]["nonce"], "0x3");
+        assert!(within(&sends[1..], half));
+        assert_eq!(fixture.chain.lock().unwrap().fee_capped_sends, 1);
+        assert_eq!(
+            service.status().sender.signer_tx_fee_cap_wei,
+            Some(half.to_string())
+        );
+
+        // Its node's lower RPC fee cap is a definitive refusal too, and needs
+        // the operator at once.
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            critical_at_low_base_fee(&mut chain);
+            chain.tx_fee_cap = Some((half, "upstream_tx_fee_cap"));
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        assert!(service.poll_once().await.is_err());
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        let refused = obligation(&service.status(), 0);
+        assert_eq!(
+            refused.blocked_reason,
+            Some(BlockedReason::UpstreamTxFeeCap)
+        );
+        assert_eq!(refused.severity, Severity::Critical);
+    }
+
+    #[tokio::test]
+    async fn base_fee_above_the_tx_fee_ceiling_reports_tx_fee_cap_reached() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.tx_fee_cap = Some((ONE_ETHER, "tx_fee_above_cap"));
+            chain.estimate = 6_278_618;
+            // Above the 132.7 gwei the ceiling allows, below the 300 gwei cap.
+            chain.base_fee = Some(140 * GWEI);
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        service.poll_once().await.unwrap();
+        service.poll_once().await.unwrap();
+        assert!(fixture.sends().is_empty());
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        let limit = ONE_ETHER / REAL_GAS_LIMIT;
+        let status = service.status();
+        let blocked = obligation(&status, 0);
+        assert_eq!(blocked.state, ObligationState::Ready);
+        assert_eq!(blocked.blocked_reason, Some(BlockedReason::TxFeeCapReached));
+        assert!(blocked
+            .detail
+            .unwrap()
+            .contains(&format!("allows a maxFeePerGas of at most {limit} wei")));
+        assert!(status.alarms.contains(&format!(
+            "warning: transaction fee ceiling {ONE_ETHER} wei allows a maxFeePerGas of at most {limit} wei at {REAL_GAS_LIMIT} gas; base fee {} wei",
+            140 * GWEI
+        )));
+        // A 300 gwei cap is never reached under a 1 ether ceiling.
+        assert!(status
+            .config_warnings
+            .iter()
+            .any(|warning| warning.contains("exceeds the transaction fee ceiling")));
+        // Once the base fee falls, the challenge is sent within the ceiling.
+        fixture.chain.lock().unwrap().base_fee = Some(100 * GWEI);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert!(within(&sends, ONE_ETHER));
+        assert_eq!(fixture.chain.lock().unwrap().fee_capped_sends, 0);
+    }
+
+    #[tokio::test]
+    async fn bids_above_the_ceiling_are_observed_or_re_planned_never_resent() {
+        // A pending challenge bid above the ceiling, for example under an
+        // earlier daemon: no replacement fits, so it is kept and observed.
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(10 * GWEI);
+            chain.head_timestamp = chain.deadline - 5;
+        }
+        let mut service = fixture.service_with(|config| {
+            config.fee = FeePolicy {
+                tx_fee_cap_wei: 10 * ONE_ETHER,
+                ..FeePolicy::new(300 * GWEI, 10 * GWEI)
+            }
+        });
+        service.poll_once().await.unwrap();
+        let first = fixture.sends()[0].clone();
+        assert!(fee(&first, "gas") * fee(&first, "maxFeePerGas") > ONE_ETHER);
+        drop(service);
+        fixture.chain.lock().unwrap().tx_fee_cap = Some((ONE_ETHER, "tx_fee_above_cap"));
+        let mut service = fixture.service_with(mainnet_fees);
+        for _ in 0..3 {
+            fixture.chain.lock().unwrap().head_number += 3;
+            service.poll_once().await.unwrap();
+        }
+        assert_eq!(fixture.sends().len(), 1, "no refused bid is re-sent");
+        let kept = obligation(&service.status(), 0);
+        assert_eq!(kept.state, ObligationState::Submitted);
+        assert_eq!(kept.blocked_reason, Some(BlockedReason::TxFeeCapReached));
+        assert!(kept.detail.unwrap().contains("transaction fee ceiling"));
+
+        // A nonce an earlier daemon locked at a refused 142 gwei bid, whose
+        // candidate hash no node knows: nothing holds it, so it is re-planned
+        // within the ceiling.
+        let fixture = Fixture::new().await;
+        let refused_hash = format!("0x{:064x}", 0xdead_0000_0000u64);
+        let nullifier = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.tx_fee_cap = Some((ONE_ETHER, "broadcast_ambiguous"));
+            chain.fee_capped_hashes.insert(refused_hash.clone());
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(10 * GWEI);
+            chain.deadline += 10_000;
+            chain.nullifier
+        };
+        let mut service = fixture.service_with(mainnet_fees);
+        service.checkpoint.pending.insert(
+            0,
+            PendingChallenge {
+                nullifier,
+                nonce: Some(3),
+                attempt: NonceAttempts {
+                    superseded_hashes: vec![refused_hash],
+                    max_fee_per_gas: Some(format!("0x{:x}", 142 * GWEI)),
+                    max_priority_fee_per_gas: Some(format!("0x{:x}", 2 * GWEI)),
+                    attempts: 21,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0]["nonce"], "0x3");
+        assert!(within(&sends, ONE_ETHER));
+        assert_eq!(fixture.chain.lock().unwrap().fee_capped_sends, 0);
+        // The record now holds that bid, so replacements are planned from it.
+        assert_eq!(
+            service.persisted_fees(0),
+            Some(Fees {
+                max_fee: ONE_ETHER / REAL_GAS_LIMIT,
+                tip: 2 * GWEI
+            })
+        );
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn not_broadcast_nonce_is_released_and_later_notes_are_challenged() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.base_fee = Some(30 * GWEI);
+            chain.send_errors.push_back(json!({
+                "code": -32000, "message": "Challenge simulation failed",
+                "data": { "reason": "simulation_failed" } }));
+        }
+        let mut service = fixture.service();
+        assert!(service.poll_once().await.is_err());
+        fixture.chain.lock().unwrap().drop_logs = true;
+        // The signer reports the failure before broadcasting: the fresh
+        // nonce is released at once.
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        // The base fee then stays above the 100 gwei cap until the deadline.
+        fixture.chain.lock().unwrap().base_fee = Some(150 * GWEI);
+        service.poll_once().await.unwrap();
+        let later = fixture.chain.lock().unwrap().deadline + 5_000;
+        fixture.track(&mut service, 1, later);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::Missed
+        );
+        // The escaper finalizes, and fees normalise.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.active = false;
+            chain.confirmed_active = false;
+            chain.base_fee = Some(10 * GWEI);
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(decode_call(&sends[1]).0, Felt252::from_u64(1).as_bytes());
+        assert_eq!(sends[1]["nonce"], "0x3");
+        assert!(!service.checkpoint.pending.contains_key(&0));
+        let status = service.status();
+        assert!(status.detached_nonces.is_empty());
+        assert_eq!(obligation(&status, 1).state, ObligationState::Submitted);
+        assert_eq!(status.missed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn never_broadcast_reservations_left_by_an_earlier_daemon_are_released() {
+        // The record an earlier daemon kept after attempts that all failed
+        // before broadcast.
+        let unsent = || NonceAttempts {
+            attempts: 1,
+            ..Default::default()
+        };
+        // An expired obligation releases its nonce instead of blocking.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        let (nullifier, deadline) = {
+            let chain = fixture.chain.lock().unwrap();
+            (chain.nullifier, chain.deadline)
+        };
+        service.checkpoint.pending.insert(
+            0,
+            PendingChallenge {
+                nullifier,
+                nonce: Some(3),
+                challenge_deadline: Some(deadline),
+                attempt: unsent(),
+                ..Default::default()
+            },
+        );
+        fixture.track(&mut service, 1, deadline + 1_000);
+        fixture.chain.lock().unwrap().head_timestamp = deadline;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(decode_call(&sends[0]).0, Felt252::from_u64(1).as_bytes());
+        assert_eq!(sends[0]["nonce"], "0x3");
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::Missed
+        );
+
+        // So does a detached one.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        service.checkpoint.detached_nonces.insert(
+            3,
+            DetachedNonce {
+                note_id: 5,
+                nullifier: Felt252::from_u64(5),
+                transaction_hash: None,
+                attempt: unsent(),
+            },
+        );
+        service.persist().unwrap();
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.detached_nonces.is_empty());
+        assert!(service.status().detached_nonces.is_empty());
+        assert_eq!(fixture.sends().len(), 1);
+        assert_eq!(fixture.sends()[0]["nonce"], "0x3");
+
+        // And one whose withdrawal is resolved, instead of detaching it.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        let nullifier = fixture.chain.lock().unwrap().nullifier;
+        service.checkpoint.pending.insert(
+            0,
+            PendingChallenge {
+                nullifier,
+                nonce: Some(3),
+                attempt: unsent(),
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.active = false;
+            chain.confirmed_active = false;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        assert!(service.checkpoint.detached_nonces.is_empty());
+        let later = fixture.chain.lock().unwrap().deadline + 1_000;
+        fixture.track(&mut service, 1, later);
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1);
+        assert_eq!(fixture.sends()[0]["nonce"], "0x3");
+
+        // A reservation an earlier daemon made without any attempt record is
+        // never released, even after a refusal of this daemon's attempt.
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        fixture.reserve(&mut service, 1, false);
+        fixture.chain.lock().unwrap().refuse_notes.insert(1);
+        assert!(service.poll_once().await.is_err());
+        let held = &service.checkpoint.pending[&1];
+        assert_eq!(held.nonce, Some(3));
+        assert!(held.attempt.unrecorded_attempt);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+        }
+        assert!(service
+            .poll_once()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("signer intervention required"));
+        assert_eq!(service.checkpoint.pending[&1].nonce, Some(3));
+    }
+
+    #[tokio::test]
+    async fn critical_replacements_remain_after_non_critical_bumps_spend_their_budget() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(10 * GWEI);
+            chain.deadline += 10_000;
+        }
+        // The documented minimum tip cap: twice the 2 gwei first tip.
+        let mut service =
+            fixture.service_with(|config| config.fee = FeePolicy::new(130 * GWEI, 4 * GWEI));
+        service.poll_once().await.unwrap();
+        fixture.chain.lock().unwrap().drop_logs = true;
+        for _ in 0..12 {
+            // Not mined for three blocks each time.
+            fixture.chain.lock().unwrap().head_number += 3;
+            service.poll_once().await.unwrap();
+        }
+        let last = fixture.sends().last().unwrap().clone();
+        assert!(fixture.sends().len() > 5);
+        assert!(fee(&last, "maxPriorityFeePerGas") <= headroom(headroom(4 * GWEI)));
+        let waiting = obligation(&service.status(), 0);
+        assert_eq!(waiting.blocked_reason, Some(BlockedReason::FeeReserveHeld));
+        assert!(waiting
+            .detail
+            .unwrap()
+            .contains("reserved for the critical threshold"));
+        // The base fee rises above the pending bid, below the cap, as the
+        // obligation turns critical.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.base_fee = Some(110 * GWEI);
+            chain.head_timestamp = chain.deadline - 5;
+            chain.head_number += 3;
+        }
+        let before = fixture.sends().len();
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), before + 1, "a critical replacement is sent");
+        let critical = &sends[before];
+        assert_eq!(critical["nonce"], last["nonce"]);
+        assert!(fee(critical, "maxFeePerGas") >= 110 * GWEI);
+        for field in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            assert!(
+                fee(critical, field) >= min_bump(fee(&last, field)),
+                "{field}"
+            );
+        }
+        // And one more, at the caps.
+        fixture.chain.lock().unwrap().head_number += 3;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), before + 2);
+        assert_eq!(fee(&sends[before + 1], "maxFeePerGas"), 130 * GWEI);
+        assert_eq!(fee(&sends[before + 1], "maxPriorityFeePerGas"), 4 * GWEI);
+    }
+
+    #[tokio::test]
+    async fn back_run_re_escape_is_challenged_when_the_listing_is_stale() {
+        let (store, first, second) = two_finalized_v2_requests().await;
+        let fixture = Fixture::with_store(store, &first).await;
+        let a = first.public_inputs.request_nullifier;
+        let b = second.public_inputs.request_nullifier;
+        let mut service = fixture.service_with(|config| config.alarms.blocked_warning_seconds = 0);
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1, "escape A challenged");
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            // The challenge of A mined, and in the same block the owner
+            // escaped again with B, another finalized request.
+            chain.mined_nonce = 4;
+            chain.nullifier = b;
+            chain.head_number += 3;
+            // The scan misses B, and the indexer, whose log source dropped
+            // the root-neutral pair, still lists A.
+            chain.drop_logs = true;
+            chain.escapes = Some(vec![json!({
+                "note_id": 0, "withdrawal_nullifier": a, "challenge_deadline": chain.deadline
+            })]);
+        }
+        for _ in 0..3 {
+            service.poll_once().await.unwrap();
+        }
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 2, "B is challenged");
+        assert_eq!(sends[1]["nonce"], "0x4");
+        assert_eq!(decode_call(&sends[1]).1[8 * 32..9 * 32], b.as_bytes()[..]);
+        assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+        let status = service.status();
+        assert!(status
+            .indexer
+            .pending_escapes_disagreement
+            .as_ref()
+            .unwrap()
+            .starts_with("note 0 listed with nullifier"));
+        assert!(status
+            .alarms
+            .iter()
+            .any(|alarm| alarm.contains("pending-escapes list disagrees with the vault")));
+        assert_eq!(status.missed_total, 0);
+    }
+
+    #[tokio::test]
+    async fn indexer_listed_note_with_a_stale_nullifier_tracks_the_vaults_escape() {
+        let fixture = Fixture::new().await;
+        let live = {
+            let mut chain = fixture.chain.lock().unwrap();
+            // The event scan misses the live escape.
+            chain.drop_logs = true;
+            // The indexer lists note 0 with an earlier, challenged escape.
+            chain.escapes = Some(vec![json!({
+                "note_id": 0, "withdrawal_nullifier": Felt252::from_u64(0x384),
+                "challenge_deadline": chain.deadline
+            })]);
+            chain.nullifier
+        };
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(service.checkpoint.pending[&0].nullifier, live);
+        assert_eq!(fixture.sends().len(), 1);
+        let status = service.status();
+        assert_eq!(status.indexer.escapes_added_from_indexer, 1);
+        assert!(status.indexer.pending_escapes_disagreement.is_some());
+        // Past its deadline it would be counted, never silently dropped.
+        assert_eq!(obligation(&status, 0).state, ObligationState::Submitted);
+    }
+
+    #[tokio::test]
+    async fn signer_base_fee_refusal_of_a_stale_bid_has_its_own_reason() {
+        let fixture = Fixture::new().await;
+        fixture.chain.lock().unwrap().send_errors.push_back(json!({
+            "code": -32003, "message": "Base fee exceeds the transaction max fee per gas",
+            "data": { "reason": "base_fee_above_max_fee",
+                "base_fee_per_gas": "0x12a05f200", "max_fee_per_gas": "0xee6b2800" }
+        }));
+        let mut service = fixture.service();
+        assert!(service.poll_once().await.is_err());
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        assert_eq!(
+            obligation(&service.status(), 0).blocked_reason,
+            Some(BlockedReason::BaseFeeAboveMaxFee)
+        );
+        // The next poll bids again from the current base fee.
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 2);
+        assert_eq!(obligation(&service.status(), 0).blocked_reason, None);
+    }
+
+    #[test]
+    fn tx_fee_cap_is_a_strict_positive_decimal() {
+        let parse = FeePolicy::parse_tx_fee_cap;
+        assert_eq!(parse(""), Ok(FeePolicy::DEFAULT_TX_FEE_CAP_WEI));
+        assert_eq!(parse("1"), Ok(1));
+        assert_eq!(parse("1000000000000000000"), Ok(ONE_ETHER));
+        for invalid in [
+            "0",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1e18",
+            "0x10",
+            "1.5",
+            "340282366920938463463374607431768211456",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        let policy = FeePolicy {
+            tx_fee_cap_wei: 0,
+            ..FeePolicy::new(100 * GWEI, 10 * GWEI)
+        };
+        assert!(policy
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("transaction fee cap must be positive"));
+    }
+
+    /// (gas limit x maxFeePerGas, accepted) of every send, in order.
+    fn sent_tx_fees(fixture: &Fixture, cap: u128) -> Vec<(u128, bool)> {
+        fixture
+            .sends()
+            .iter()
+            .map(|send| {
+                let tx_fee = fee(send, "gas") * fee(send, "maxFeePerGas");
+                (tx_fee, tx_fee <= cap)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn node_fee_cap_below_the_ceiling_is_learned_from_its_refusals() {
+        // The node behind the signer caps transaction fees at 0.5 ether,
+        // below the 1 ether ceiling both services were given.
+        let node_cap = ONE_ETHER / 2;
+        for signer_reports_its_cap in [false, true] {
+            // First seen inside the critical threshold at a low base fee,
+            // where a 22 gwei bid (0.17 ether) would be included.
+            let fixture = Fixture::new().await;
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.tx_fee_cap = Some((node_cap, "upstream_tx_fee_cap"));
+                chain.estimate = 6_278_618;
+                chain.base_fee = Some(10 * GWEI);
+                chain.head_timestamp = chain.deadline - 9;
+                if signer_reports_its_cap {
+                    chain.signer_status =
+                        Some(json!({ "tx_fee_cap_wei": hex_quantity(ONE_ETHER) }));
+                }
+            }
+            let mut service = fixture.service_with(mainnet_fees);
+            // A refusal is critical at once, and nothing holds the nonce.
+            assert!(service.poll_once().await.is_err());
+            let refused = obligation(&service.status(), 0);
+            assert_eq!(
+                refused.blocked_reason,
+                Some(BlockedReason::UpstreamTxFeeCap)
+            );
+            assert_eq!(refused.severity, Severity::Critical);
+            assert_eq!(service.checkpoint.pending[&0].nonce, None);
+            for _ in 0..5 {
+                let _ = service.poll_once().await;
+                fixture.chain.lock().unwrap().head_number += 1;
+            }
+            // Each refusal lowers the next bid until the node accepts one.
+            let sent = sent_tx_fees(&fixture, node_cap);
+            let refusals: Vec<u128> = sent
+                .iter()
+                .take_while(|(_, accepted)| !accepted)
+                .map(|(tx_fee, _)| *tx_fee)
+                .collect();
+            assert!(
+                refusals.windows(2).all(|pair| pair[1] <= headroom(pair[0])),
+                "{sent:?}"
+            );
+            assert!(refusals.len() <= 4, "{sent:?}");
+            let (accepted, _) = sent[refusals.len()];
+            assert!(accepted <= node_cap && accepted > node_cap / 2, "{sent:?}");
+            assert_eq!(fixture.sends()[refusals.len()]["nonce"], "0x3");
+            assert_eq!(
+                fixture.chain.lock().unwrap().fee_capped_sends,
+                refusals.len()
+            );
+            let status = service.status();
+            let submitted = obligation(&status, 0);
+            assert_eq!(submitted.state, ObligationState::Submitted);
+            assert_ne!(
+                submitted.blocked_reason,
+                Some(BlockedReason::UpstreamTxFeeCap)
+            );
+            // The bound stays in force and on /status until restart.
+            let bound = headroom(*refusals.last().unwrap());
+            assert_eq!(
+                status.sender.node_tx_fee_cap_bound_wei,
+                Some(bound.to_string())
+            );
+            assert_eq!(status.sender.effective_tx_fee_cap_wei, bound.to_string());
+            assert!(status
+                .config_warnings
+                .iter()
+                .any(|warning| warning.contains(&format!(
+                    "the signer's node refused a transaction fee of {} wei",
+                    refusals.last().unwrap()
+                ))));
+        }
+
+        // A non-critical spike: the reserve-limited bid of 109.7 gwei (0.83
+        // ether) is refused, while about 66 gwei would be included.
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.tx_fee_cap = Some((node_cap, "upstream_tx_fee_cap"));
+            chain.signer_status = Some(json!({ "tx_fee_cap_wei": hex_quantity(ONE_ETHER) }));
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(60 * GWEI);
+            chain.deadline += 10_000;
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        for _ in 0..4 {
+            let _ = service.poll_once().await;
+            fixture.chain.lock().unwrap().head_number += 1;
+        }
+        let sent = sent_tx_fees(&fixture, node_cap);
+        let refused = sent.iter().take_while(|(_, accepted)| !accepted).count();
+        assert!((1..=3).contains(&refused), "{sent:?}");
+        assert!(sent.len() > refused, "{sent:?}");
+        assert!(fee(&fixture.sends()[refused], "maxFeePerGas") > 60 * GWEI);
+        assert!(sent[refused..].iter().all(|(_, accepted)| *accepted));
+        let o = obligation(&service.status(), 0);
+        assert_eq!(o.state, ObligationState::Submitted);
+        assert_eq!(o.blocked_reason, None);
+        assert_eq!(o.severity, Severity::Ok);
+    }
+
+    #[tokio::test]
+    async fn re_escape_without_an_indexer_listing_is_followed_from_the_vault() {
+        // An indexer that predates /v1/escapes/pending (404), or lists nothing:
+        // only the per-poll vault read finds the re-escape.
+        for listing in [None, Some(vec![])] {
+            let (store, first, second) = two_finalized_v2_requests().await;
+            let fixture = Fixture::with_store(store, &first).await;
+            let b = second.public_inputs.request_nullifier;
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            assert_eq!(fixture.sends().len(), 1, "escape A challenged");
+            {
+                // The challenge of A mined, and in the same block the owner
+                // escaped again with B, whose log the scan drops.
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.mined_nonce = 4;
+                chain.nullifier = b;
+                chain.head_number += 3;
+                chain.drop_logs = true;
+                chain.escapes = listing.clone();
+            }
+            for _ in 0..3 {
+                let _ = service.poll_once().await;
+                fixture.chain.lock().unwrap().head_number += 1;
+            }
+            let sends = fixture.sends();
+            assert_eq!(sends.len(), 2, "B is challenged: {listing:?}");
+            assert_eq!(sends[1]["nonce"], "0x4");
+            assert_eq!(decode_call(&sends[1]).1[8 * 32..9 * 32], b.as_bytes()[..]);
+            assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+            assert_eq!(service.status().missed_total, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_only_follows_the_vaults_escape_while_the_queue_is_blocked() {
+        let (store, first, second) = two_finalized_v2_requests().await;
+        let fixture = Fixture::with_store(store, &first).await;
+        let b = second.public_inputs.request_nullifier;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1, "escape A challenged");
+        let deadline_b = {
+            let mut chain = fixture.chain.lock().unwrap();
+            // A's challenge mined and the owner escaped again with B; neither
+            // the scan nor the indexer reports B.
+            chain.mined_nonce = 4;
+            chain.nullifier = b;
+            chain.deadline += 500;
+            chain.head_number += 3;
+            chain.drop_logs = true;
+            chain.escapes = None;
+            // Note 9 holds a nonce reserved without a known hash, so every
+            // poll stops there and only observes note 0.
+            let deadline = chain.deadline;
+            chain
+                .withdrawals
+                .insert(9, (true, Felt252::from_u64(12345), deadline + 50));
+            deadline
+        };
+        service.checkpoint.pending.insert(
+            9,
+            PendingChallenge {
+                nullifier: Felt252::from_u64(12345),
+                nonce: Some(5),
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+        for _ in 0..2 {
+            let _ = service.poll_once().await;
+            fixture.chain.lock().unwrap().head_number += 1;
+        }
+        assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+        let o = obligation(&service.status(), 0);
+        assert_eq!(o.challenge_deadline, Some(deadline_b));
+        assert_eq!(o.state, ObligationState::Ready);
+        assert_eq!(o.blocked_reason, Some(BlockedReason::NonceBlocked));
+    }
+
+    #[tokio::test]
+    async fn plan_refusal_releases_a_never_broadcast_reservation_at_once() {
+        let fixture = Fixture::new().await;
+        let nullifier = {
+            let mut chain = fixture.chain.lock().unwrap();
+            // Above the 100 gwei fee cap: the plan refuses to send.
+            chain.base_fee = Some(150 * GWEI);
+            chain.drop_logs = true;
+            chain.nullifier
+        };
+        let mut service = fixture.service();
+        // An earlier daemon's record of an attempt that failed before
+        // broadcast on nonce 3.
+        service.checkpoint.pending.insert(
+            0,
+            PendingChallenge {
+                nullifier,
+                nonce: Some(3),
+                attempt: NonceAttempts {
+                    attempts: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+        service.poll_once().await.unwrap();
+        assert!(fixture.sends().is_empty());
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        assert_eq!(
+            obligation(&service.status(), 0).blocked_reason,
+            Some(BlockedReason::BaseFeeAboveFeeCap)
+        );
+    }
+
+    #[tokio::test]
+    async fn held_fee_reserve_is_reported_and_escalates_with_blocked_time() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.base_fee = Some(10 * GWEI);
+            chain.deadline += 10_000;
+        }
+        // The documented minimum tip cap, twice the 2 gwei first tip, with
+        // the blocked-time thresholds collapsed.
+        let mut service = fixture.service_with(|config| {
+            config.fee = FeePolicy {
+                tx_fee_cap_wei: 10 * ONE_ETHER,
+                ..FeePolicy::new(130 * GWEI, 4 * GWEI)
+            };
+            config.alarms.blocked_warning_seconds = 0;
+            config.alarms.critical_blocked_seconds = 0;
+        });
+        service.poll_once().await.unwrap();
+        fixture.chain.lock().unwrap().drop_logs = true;
+        for _ in 0..12 {
+            // Not mined for three blocks each time.
+            fixture.chain.lock().unwrap().head_number += 3;
+            service.poll_once().await.unwrap();
+        }
+        // Five replacements, then the rest is held for the critical threshold.
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 6);
+        assert!(sends
+            .iter()
+            .all(|send| fee(send, "maxPriorityFeePerGas") <= headroom(headroom(4 * GWEI))));
+        let status = service.status();
+        let held = obligation(&status, 0);
+        assert_eq!(held.state, ObligationState::Submitted);
+        assert_eq!(held.blocked_reason, Some(BlockedReason::FeeReserveHeld));
+        assert!(held
+            .detail
+            .unwrap()
+            .contains("the remaining fee headroom is reserved for the critical threshold"));
+        // The hold is not re-armed by each poll: its blocked time runs on.
+        assert!(held.consecutive_failures > 1);
+        assert_eq!(held.severity, Severity::Critical);
+        assert!(status
+            .alarms
+            .contains(&"critical: note 0 submitted (fee_reserve_held)".to_string()));
+        // At the critical threshold the reserve is spent at once.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline - 5;
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 7);
+        assert_eq!(obligation(&service.status(), 0).blocked_reason, None);
+    }
+
+    #[test]
+    fn critical_escalation_keeps_a_valid_replacement_under_a_ceiling_below_the_tip_cap() {
+        // A ceiling of 6 gwei per gas, below the 10 gwei tip cap.
+        let policy = FeePolicy::new(100 * GWEI, 10 * GWEI);
+        let plan = |plan| plan_fees(&policy, plan, Some(GWEI), true, Some(6 * GWEI), None);
+        let first = plan(FeePlan::First).unwrap().unwrap();
+        let reserve = headroom(6 * GWEI);
+        assert_eq!(
+            first,
+            Fees {
+                max_fee: reserve,
+                tip: reserve
+            }
+        );
+        let next = plan(FeePlan::Bump(first)).unwrap().unwrap();
+        assert_eq!(
+            next,
+            Fees {
+                max_fee: 6 * GWEI,
+                tip: 6 * GWEI
+            }
+        );
+        assert!(is_valid_bump(first, next));
+        assert_eq!(
+            plan(FeePlan::Bump(next)),
+            Err(BlockedReason::TxFeeCapReached)
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_cap_lock_detached_before_the_upgrade_shows_its_bid_for_the_runbook() {
+        // An earlier daemon locked nonce 3 at a 142 gwei bid its node refused
+        // (an earlier signer reported a candidate hash no node knows), and
+        // the escape was finalized before the upgrade. The nonce cannot be
+        // told apart from a broadcast one, so it needs the manual runbook.
+        let fixture = Fixture::new().await;
+        let refused_hash = format!("0x{:064x}", 0xdead_0000_0000u64);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.fee_capped_hashes.insert(refused_hash.clone());
+            chain.estimate = 6_278_618;
+            chain.deadline += 10_000;
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        service.checkpoint.detached_nonces.insert(
+            3,
+            DetachedNonce {
+                note_id: 5,
+                nullifier: Felt252::from_u64(5),
+                transaction_hash: None,
+                attempt: NonceAttempts {
+                    superseded_hashes: vec![refused_hash.clone()],
+                    max_fee_per_gas: Some(format!("0x{:x}", 142 * GWEI)),
+                    max_priority_fee_per_gas: Some(format!("0x{:x}", 2 * GWEI)),
+                    attempts: 21,
+                    ..Default::default()
+                },
+            },
+        );
+        service.persist().unwrap();
+        let error = service.poll_once().await.unwrap_err().to_string();
+        assert!(error.contains("requires signer intervention"), "{error}");
+        assert!(fixture.sends().is_empty());
+        let status = service.status();
+        assert_eq!(status.status, Severity::Critical);
+        let detached = &status.detached_nonces[0];
+        assert_eq!(detached.nonce, 3);
+        assert!(!detached.mined);
+        assert_eq!(detached.superseded_hashes, vec![refused_hash]);
+        assert_eq!(detached.max_fee_per_gas_wei, Some((142 * GWEI).to_string()));
+        assert_eq!(detached.gas_limit, None);
     }
 }

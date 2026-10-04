@@ -195,9 +195,55 @@ verified next state or records its outcome in the archive. A server error string
 alone never discards it. A `stale_root` reply is first checked against the
 pinned vault RPC (the same request is retried while the vault still has the
 proof's root). Only then is the server's own nullifier record consulted.
-Resolved records are compacted (no proof, payload or rerandomization), bounded
-per note state, and pruned per deployment. No host action is needed. In-flight
-journals from older builds migrate on the first read.
+An archived request keeps its full journal, including the private
+rerandomization, while its note state is current, so a receipt the server
+finalizes later still installs. A record is resolved only when the next state
+is installed or the note closes. Resolved records are compacted (no proof,
+payload or rerandomization) and pruned to the newest 256 per deployment. No
+host action is needed. In-flight journals from older builds migrate on the
+first read.
+
+Each note state is bounded. At most 16 of its unresolved requests count toward
+a per-state cap. Past the cap, the oldest discarded requests whose nullifier
+read `unknown` or `clearance_reserved` at least 20 minutes after their request
+time are evicted. Eviction only takes a record out of the cap: an `evicted`
+record keeps its journal, still marks its state as transmitted for the gates
+below, and still installs a later receipt. A state keeps at most 64 unresolved
+records, evicted ones included. Beyond that, a new chat fails with
+`request_archive_limit` before proving, and nothing is evicted or discarded.
+Chats at that state resume only if the server settles one of its requests: the
+receipt still installs and resolves every record there. A request the server
+never accepted (for example, a quote that expired before acceptance) never
+settles, so waiting does not help and the balance has to be withdrawn: by
+mutual close, which needs the server's clearance, or on a `vault_revision` 2
+vault also by escape. A strict vault never escapes at a transmitted state, so
+there mutual close is the only exit from that note. Reaching the ceiling takes
+at least 64 failed chats at one state, spread over at least an hour.
+
+Each record keeps its newest eight server observations. Of its older ones it
+keeps at most one: the newest that is a receipt claim or a reading that ends
+one (both below). Trimming therefore never changes whether a claim stands.
+`unknown`, `reserved`, `finalized` and `clearance_reserved` are readings of the
+state's nullifier from
+`GET /v2/nullifiers/{nullifier}`; `unavailable` is a failed read. A `finalized`
+reading that carried a receipt is marked `receipt` and names the receipt's
+`client_request_id` when it has one. A receipt that `GET /v2/requests/{id}`
+returns and this browser cannot apply is saved as such a `finalized`
+observation too. A receipt that installs resolves every record at its state,
+so such an observation at the current state is a receipt claim: the server
+says the nullifier was finalized with a receipt this browser could not apply.
+The claim stands until a later reading reports the nullifier `unknown` or
+`clearance_reserved`, also when that reading was saved with another request
+at the same state. A failed read, `reserved`, or `finalized` without a
+receipt leaves it standing. `unaccepted` records that
+`POST /v2/openrouter/leases/{id}/expire` answered `expired_unaccepted` or
+`superseded_unaccepted` for that one request. That
+answer only echoes identifiers the wallet sent, so it is never treated as a
+nullifier reading: it never makes a record evictable and never corroborates a
+discard. The escape and clearance gates decide on a fresh nullifier reading,
+and a saved observation never allows a withdrawal. A standing receipt claim
+only makes the escape override require that claim's own acknowledgement
+(below).
 
 Escape and clearance behavior depends on two optional keys in
 `browser-config.json`'s `trusted_deployment`, read only from that build-pinned
@@ -238,9 +284,27 @@ override for a request the server never settles. It is available once
 since this device sent the request (default 43200, clamped to 3600–604800;
 keep it above the server's settlement deadline), or earlier when the note's
 `effectiveExpiry` is within a challenge period plus a margin. A receipt the
-server finalized installs instead. The override never abandons another tab's
-live key, and the archived journal still installs a later receipt. Show
-`snapshot().config.escape_override.warning` to the user; it is `null` on
+server finalized installs instead, and only a receipt that verifies vetoes the
+override. The override never abandons another tab's live key, and the archived
+journal still installs a later receipt. Before the user overrides, show the
+override's warning, then pass the acknowledgement that goes with it as
+`overrideUnsettledRequest`. Both come from a refusal that offers the override
+(`error.data.escape_override_warning` and
+`error.data.escape_override_acknowledgement`) or from
+`snapshot().config.escape_override` (`warning` and `acknowledgement`). The
+acknowledgement is `true` for the general warning and
+`'receipt_journal_missing'` for that code's own warning (see below), which also
+covers the general case. While the server's claim of a finalized receipt this
+browser cannot apply stands (the fresh reading, or a receipt claim saved
+earlier that the fresh reading does not contradict), the override never
+proceeds with `true`, also after the grace period. It is refused with
+`receipt_journal_missing`, that code's warning and its acknowledgement. When
+that refusal rests on a saved claim, its message says that the server earlier
+reported it, and `error.data.nullifier_status` is the fresh reading (for
+example `unavailable`). The other refusals that offer the override keep the
+code of their fresh reading and carry the same warning and acknowledgement as
+the snapshot. A claim first read during an override can still change the
+warning to show. `snapshot().config.escape_override` is `null` on
 strict vaults, where no override exists. Escape gates contact the server only
 for a transmitted state; on Sepolia that read may prompt for the password.
 
@@ -249,11 +313,20 @@ New 409 codes: `request_settlement_pending`, `transmitted_anchor_unconfirmed`,
 `receipt_journal_missing`, `receipt_response_missing`, `receipt_pending_install`,
 `request_archive_limit` and `withdrawal_submission_pending`. Vault reverts map to
 `unknown_root`, `challenged_nullifier`, `invalid_destination` and
-`vault_paused`. Refusals carry `error.data.escape_override_after` (milliseconds)
-when an override applies. `snapshot().config` adds `vault_revision`,
-`escape_override`, `unresolved_requests` (per request at the selected state:
-`client_request_id`, `kind`, `disposition`, `created_at`, `server_status`,
-`server_status_at`, `escape_override_after`; no proofs) and `last_settlement`
+`vault_paused`. A refusal that offers the override carries
+`error.data.escape_override_after` (milliseconds; no later than now once the
+override is ready and only its acknowledgement was missing),
+`error.data.escape_override_warning` and
+`error.data.escape_override_acknowledgement`: the escape gate's refusals, the
+override's own refusals, and a plain escape's `receipt_journal_missing`.
+`snapshot().config` adds `vault_revision`, `escape_override` (`grace_seconds`,
+`warning`, `acknowledgement`), `unresolved_requests` (per request at the
+selected state: `client_request_id`, `kind`, `disposition` (including
+`evicted`), `created_at`, `server_status` (the newest observation),
+`server_status_at`, `escape_override_after` (when the override opens absent an
+imminent expiry: the grace after the live request's transmission while one
+exists, else after the earliest archived one; `null` on strict vaults and at a
+challenged state); no proofs) and `last_settlement`
 (`charge_applied`, `charge_basis`, `settlement_reason`). Receipts are installed
 against the proof-bound billing quote, never re-validated against changed
 manifest price pins. A worst-case charge equal to the proven bound is valid.
@@ -262,10 +335,33 @@ Challenge evidence is recorded only from a finalized
 `EscapeWithdrawalChallenged` log for the note and nullifier. A server reply such
 as `nullifier_used` is advisory. A challenged state is never escaped again; the
 wallet installs the server-signed successor (from the archived journal) and
-withdraws from that next state. A finalized receipt this browser holds no
-journal for (`receipt_journal_missing`) needs operator intervention. The runtime
-holds one selected note per origin, so exit or set aside a note on an older
-deployment before selecting a newly pinned one.
+withdraws from that next state.
+
+`receipt_journal_missing` means the server reports a finalized request at the
+current state with a receipt this browser cannot apply. Either the browser
+holds no journal for its `client_request_id` (for example, one an older SDK
+build discarded), or the receipt does not verify. A lying server or gateway
+can send the same answer, for example `finalized` for an invented
+`client_request_id` at a state whose nullifier the honest server never
+reserved. Only a receipt that verifies vetoes the escape override, so on a
+revision-2 vault the override is offered for this code on the same schedule as
+for the others, with its own warning and its own acknowledgement,
+`overrideUnsettledRequest: 'receipt_journal_missing'`. A plain escape refused
+with this code offers both wherever the override applies (never at a challenged
+state), also when the receipt surfaced while recovering a live request. If the
+claim is genuine, the server holds the finalized transcript, so the escape will
+be challenged, its gas is lost and the note then needs the operator's help. If
+the claim is false, the escape is the only exit. Mutual close is refused at that
+state on every vault, and strict
+vaults have no override, so there only the operator can help. For a genuine
+claim, the operator can, for example, mark that state's nullifier
+`ClearanceReserved` and sign its mutual-close clearance (forgoing that
+request's charge), after which `withdraw('mutual')` withdraws the current
+balance. On a revision-2 vault this also works after a challenged escape,
+because a challenge does not burn the nullifier.
+
+The runtime holds one selected note per origin, so exit or set aside a note on
+an older deployment before selecting a newly pinned one.
 
 ## Native ETH deployments
 

@@ -1,5 +1,6 @@
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
+    EVICTED_DISPOSITION,
     REQUEST_JOURNAL_TYPE,
     anchorArchiveCapacity,
     buildRequestEvidenceRecord,
@@ -290,7 +291,8 @@ function requestArchiveError(message, code, status = null) {
 /**
  * Merge request-archive updates into an in-memory snapshot of the store.
  * Throws on an identity conflict or when a new unresolved request would exceed
- * its anchor's bound. Returns the ids that must be written.
+ * its anchor's bound. Eviction is non-terminal and keeps every journal intact.
+ * Returns the ids that must be written.
  */
 function mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity = true } = {}) {
     const changed = new Set();
@@ -300,14 +302,14 @@ function mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity = t
             const capacity = anchorArchiveCapacity([...archive.values()], update);
             if (!capacity.available) {
                 throw requestArchiveError(
-                    'Too many unsettled private requests are recorded for this balance. Wait for the server to settle them before starting another chat.',
+                    'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.',
                     'request_archive_limit',
                     409
                 );
             }
             for (const archiveId of capacity.evict) {
                 const evicted = mergeRequestArchiveRecord(archive.get(archiveId),
-                    { archiveId, disposition: 'superseded' }, now);
+                    { archiveId, disposition: EVICTED_DISPOSITION }, now);
                 archive.set(archiveId, evicted);
                 changed.add(archiveId);
             }

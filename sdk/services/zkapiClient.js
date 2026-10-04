@@ -104,10 +104,10 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     anchor_challenged: 'An escape at this balance state was already challenged. Withdraw from the server-signed next state once its receipt is recovered.',
     nullifier_challenged: 'The vault already challenged an escape at this balance state. Withdraw from the server-signed next state once its receipt is recovered.',
     challenged_nullifier: 'The vault already challenged an escape at this balance state, so it cannot escape again. Withdraw from the server-signed next state once its receipt is recovered.',
-    receipt_journal_missing: 'The server finalized a private request for this balance that this browser cannot apply. Withdrawing it needs the operator’s help.',
+    receipt_journal_missing: 'The server reports a finalized private request for this balance that this browser cannot apply. Where the escape override is offered, read its warning before using it; otherwise withdrawing needs the operator’s help.',
     receipt_response_missing: 'The server reports a finalized private request for this balance but returned no receipt. Try again shortly.',
     receipt_pending_install: 'A settled private request must be applied to this balance first. Select the balance and try again.',
-    request_archive_limit: 'Too many unsettled private requests are recorded for this balance. Wait for the server to settle them.',
+    request_archive_limit: 'Too many unsettled private requests are recorded for this balance, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw the balance.',
     withdrawal_submission_pending: 'A withdrawal transaction for this balance is still unresolved. Check its status first.',
     unknown_root: 'The vault no longer accepts this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
     invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
@@ -119,6 +119,13 @@ function withdrawalErrorWithMessage(error) {
     const message = WITHDRAWAL_ERROR_MESSAGES[error?.code];
     if (message && error && typeof error === 'object') error.shortMessage = message;
     return error;
+}
+
+// The escape override is explicit: `true` after its general warning, or
+// 'receipt_journal_missing' after that code's own warning (the value a
+// refusal's error.data.escape_override_acknowledgement carries).
+function escapeOverrideAcknowledgement(mode, value) {
+    return mode === 'escape' && (value === true || value === 'receipt_journal_missing') ? value : null;
 }
 
 function tagTransactionError(error, stage, broadcastPossible, transactionHash = null) {
@@ -1948,13 +1955,14 @@ class ZkapiClient extends EventTarget {
         }
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
         // The escape-only override is an explicit, separately keyed action.
-        const override = overrideUnsettledRequest === true && mode === 'escape';
-        const operationKey = `${mode}:${requestedDestination || ''}${override ? ':override' : ''}`;
+        const acknowledgement = escapeOverrideAcknowledgement(mode, overrideUnsettledRequest);
+        const override = acknowledgement != null;
+        const operationKey = `${mode}:${requestedDestination || ''}${override ? `:override:${acknowledgement}` : ''}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, ...(override ? { overrideUnsettledRequest: true } : {}) };
+        const options = { destination, ...(override ? { overrideUnsettledRequest: acknowledgement } : {}) };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -1997,7 +2005,8 @@ class ZkapiClient extends EventTarget {
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
         await this.assertBalanceNotClaimed(note.note_id);
-        const override = overrideUnsettledRequest === true && mode === 'escape';
+        const acknowledgement = escapeOverrideAcknowledgement(mode, overrideUnsettledRequest);
+        const override = acknowledgement != null;
 
         try {
             await this.settleActiveLease(onStatus);
@@ -2005,7 +2014,8 @@ class ZkapiClient extends EventTarget {
             // The runtime applies the escape override's time gate (and refuses
             // it outright on a vault without non-destructive challenges).
             if (!override || error?.code === 'lease_requests_in_flight' || error?.name === 'AbortError') {
-                throw error;
+                // A receipt this browser cannot apply offers the override.
+                throw mode === 'escape' ? browserWalletRuntime.withEscapeOverrideData(error) : error;
             }
         }
 
@@ -2081,7 +2091,7 @@ class ZkapiClient extends EventTarget {
                 plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
                     expectedActiveRoot,
                     reprove,
-                    ...(override ? { overrideUnsettledRequest: true } : {})
+                    ...(override ? { overrideUnsettledRequest: acknowledgement } : {})
                 });
                 if (Number(plan.public_inputs?.note_id) !== Number(note.note_id)) {
                     throw new Error('The private wallet returned a withdrawal for a different note.');

@@ -13,19 +13,36 @@ export const REQUEST_JOURNAL_TYPE = 'request_journal';
 export const REQUEST_EVIDENCE_TYPE = 'request_evidence';
 export const REQUEST_JOURNAL_PREFIX = 'request-journal:';
 export const REQUEST_EVIDENCE_PREFIX = 'request-evidence:';
+// unresolvedPerAnchor counts the unresolved journals at one note state that
+// are not evicted. retainedPerAnchor is the hard ceiling on all unresolved
+// journals kept there, evicted ones included: about 3 KB each, so at most
+// ~200 KB per note state. Reaching it takes 48 evictions, each needing a
+// corroborated discard read at least 20 minutes after its request, so at
+// least an hour of failed chats at one state. Past it, new requests are
+// refused before proving and nothing is dropped. Chats at that state resume
+// only if the server settles one of its requests; one it never accepted never
+// settles, so the balance then has to be withdrawn. observationsPerRecord is
+// how many of its newest observations a record keeps; older than those, it
+// keeps only its newest receipt claim or contradicting reading.
 export const REQUEST_ARCHIVE_LIMITS = Object.freeze({
     unresolvedPerAnchor: 16,
+    retainedPerAnchor: 64,
     terminalPerDeployment: 256,
     observationsPerRecord: 8
 });
 // The server never newly accepts a request whose proof-bound request_time is
-// older than MAX_REQUEST_AGE_SECONDS (processor_v2.rs). A corroborated discard
-// observed well after that window can no longer become a finalized transcript
-// from an honest server, so it is the only kind of record eviction may retire.
+// older than MAX_REQUEST_AGE_SECONDS (processor_v2.rs). Only a corroborated
+// discard read well after that window may be evicted. The reading is an
+// unauthenticated server answer, so eviction only sets the record aside from
+// the per-state cap and never deletes anything.
 export const REQUEST_ACCEPTANCE_WINDOW_SECONDS = 300;
 export const REQUEST_EVICTION_SKEW_SECONDS = 900;
 
 export const TERMINAL_DISPOSITIONS = new Set(['installed', 'superseded']);
+// Not terminal: an evicted record keeps its full journal, still marks its
+// state as transmitted and still installs a later receipt, until the state
+// advances or the note closes.
+export const EVICTED_DISPOSITION = 'evicted';
 const DISCARDED_DISPOSITIONS = new Set([
     'discarded_stale_root',
     'discarded_expired_unaccepted',
@@ -40,11 +57,20 @@ const EVICTABLE_DISPOSITIONS = new Set([
 const JOURNAL_DISPOSITION_RANK = new Map([
     ['pending', 0],
     ...[...DISCARDED_DISPOSITIONS].map(disposition => [disposition, 1]),
-    ['installed', 2],
-    ['superseded', 2]
+    [EVICTED_DISPOSITION, 2],
+    ['installed', 3],
+    ['superseded', 3]
 ]);
 const EVIDENCE_DISPOSITION_RANK = new Map([['evidence', 0], ['superseded', 2]]);
-const OBSERVATION_STATUSES = new Set(['unknown', 'reserved', 'finalized', 'clearance_reserved', 'unavailable']);
+// GET /v2/nullifiers readings of the state's nullifier. 'unavailable' is a
+// failed read. 'unaccepted' is POST .../expire answering expired_unaccepted
+// or superseded_unaccepted for one request; it only echoes values this wallet
+// sent, so it is never a nullifier reading.
+const NULLIFIER_READINGS = new Set(['unknown', 'reserved', 'finalized', 'clearance_reserved']);
+// The readings that say the nullifier is not finalized, so they contradict an
+// earlier receipt claim.
+const CONTRADICTING_READINGS = new Set(['unknown', 'clearance_reserved']);
+const OBSERVATION_STATUSES = new Set([...NULLIFIER_READINGS, 'unavailable', 'unaccepted']);
 const OBSERVATION_CONTEXTS = new Set(['stale_root', 'recovery', 'escape', 'clearance', 'override']);
 const JOURNAL_SOURCES = new Set(['prepared', 'migrated_runtime_journal']);
 const EVIDENCE_SOURCES = new Set(['escape_challenged']);
@@ -114,30 +140,70 @@ export function lastObservation(record) {
     return observations.length ? observations[observations.length - 1] : null;
 }
 
-/** The newest reading that was not merely an unavailable server. */
+/** The newest nullifier reading: never an unavailable server or an /expire answer. */
 export function lastDefinitiveObservation(record) {
     const observations = Array.isArray(record?.serverObservations) ? record.serverObservations : [];
     for (let index = observations.length - 1; index >= 0; index -= 1) {
-        if (observations[index]?.status !== 'unavailable') return observations[index];
+        if (NULLIFIER_READINGS.has(observations[index]?.status)) return observations[index];
     }
     return null;
 }
 
 /**
- * One server status reading for a transmitted nullifier. A finalized reading
- * may name the response's client request id; it is advisory, never evidence.
+ * A 'finalized' reading that carried a receipt: fresh ({ status, response })
+ * or saved ({ status, receipt, clientRequestId }). A receipt that installs
+ * resolves every record at its state, so on an unresolved record this is the
+ * server's claim of a finalized receipt this wallet could not apply.
  */
-export function requestObservation(status, context, at = Date.now(), { clientRequestId = null } = {}) {
+export function isReceiptClaim(observation) {
+    return observation?.status === 'finalized'
+        && Boolean(observation.response || observation.receipt === true || observation.clientRequestId);
+}
+
+/**
+ * The newest receipt claim or contradicting reading ('unknown',
+ * 'clearance_reserved') among observations, by time, or null. Equal times
+ * keep their order, so the later of two wins.
+ */
+function newestClaimReading(observations) {
+    const relevant = observations
+        .filter(observation => isReceiptClaim(observation) || CONTRADICTING_READINGS.has(observation?.status))
+        // Stable: equal times keep each record's own order.
+        .sort((left, right) => Number(left.at) - Number(right.at));
+    return relevant.length ? relevant[relevant.length - 1] : null;
+}
+
+/**
+ * The newest receipt claim saved at a note state (its unresolved records)
+ * that no later 'unknown' or 'clearance_reserved' reading contradicts, or
+ * null. The contradicting reading may be saved on another record of the
+ * state. A failed read, 'reserved' or 'finalized' without a receipt leaves
+ * the claim standing. Advisory: it never allows anything, it only makes the
+ * escape override ask for that claim's own acknowledgement.
+ */
+export function standingReceiptClaim(records) {
+    const newest = newestClaimReading((records || [])
+        .flatMap(record => Array.isArray(record?.serverObservations) ? record.serverObservations : []));
+    return isReceiptClaim(newest) ? newest : null;
+}
+
+/**
+ * One server status reading for a transmitted nullifier. A finalized reading
+ * that carried a receipt says so (`receipt`) and may name the receipt's client
+ * request id; both are advisory, never evidence.
+ */
+export function requestObservation(status, context, at = Date.now(), { clientRequestId = null, receipt = false } = {}) {
     if (!OBSERVATION_STATUSES.has(status) || !OBSERVATION_CONTEXTS.has(context)
         || !Number.isSafeInteger(Number(at)) || Number(at) <= 0) {
         throw archiveError('A request archive observation is invalid.');
     }
+    const named = status === 'finalized' && typeof clientRequestId === 'string' && clientRequestId;
     return {
         status,
         context,
         at: Number(at),
-        ...(status === 'finalized' && typeof clientRequestId === 'string' && clientRequestId
-            ? { clientRequestId } : {})
+        ...(named ? { clientRequestId } : {}),
+        ...(status === 'finalized' && (named || receipt === true) ? { receipt: true } : {})
     };
 }
 
@@ -257,10 +323,19 @@ function isCompleteRecord(record) {
         || (typeof record.clientRequestId === 'string' && record.clientRequestId && record.journal);
 }
 
+// The newest eight observations, plus the record's newest receipt claim or
+// contradicting reading when it is older than those. The state's standing
+// claim is decided by the newest such observation across its records, which
+// is always the newest on its own record, so trimming any record can neither
+// erase a claim nor revive one that a reading on another record ended. The
+// kept observations stay in order and the newest eight are never displaced.
 function appendObservations(previous, additions) {
-    return [...(Array.isArray(previous) ? previous : []), ...(Array.isArray(additions) ? additions : [])]
-        .map(entry => requestObservation(entry.status, entry.context, entry.at, entry))
-        .slice(-REQUEST_ARCHIVE_LIMITS.observationsPerRecord);
+    const limit = REQUEST_ARCHIVE_LIMITS.observationsPerRecord;
+    const observations = [...(Array.isArray(previous) ? previous : []), ...(Array.isArray(additions) ? additions : [])]
+        .map(entry => requestObservation(entry.status, entry.context, entry.at, entry));
+    const newest = observations.slice(-limit);
+    const decisive = observations.length > limit ? newestClaimReading(observations) : null;
+    return decisive && !newest.includes(decisive) ? [decisive, ...newest] : newest;
 }
 
 /**
@@ -268,8 +343,9 @@ function appendObservations(previous, additions) {
  * serverObservations, ...}) into the stored record. Identity fields are
  * compared only when both sides carry them; a conflict aborts the caller's
  * transaction. The original source and createdAt are kept, evidence sources
- * accumulate as a set, observations append (newest eight retained), and a
- * disposition only moves forward. A partial patch for a missing record is
+ * accumulate as a set, observations append (the newest eight retained, plus
+ * the newest receipt claim or contradicting reading), and a disposition only
+ * moves forward. A partial patch for a missing record is
  * ignored (null), because it cannot establish the record's identity.
  */
 export function mergeRequestArchiveRecord(previous, update, now = Date.now()) {
@@ -371,6 +447,7 @@ function requestTimeMilliseconds(record) {
     return Number(record.journal?.created_at_ms || record.createdAt || 0);
 }
 
+// Only a nullifier reading counts here: an /expire answer never does.
 function evictable(record) {
     if (record.type !== REQUEST_JOURNAL_TYPE || !EVICTABLE_DISPOSITIONS.has(record.disposition)) return false;
     const closedAt = requestTimeMilliseconds(record)
@@ -381,16 +458,20 @@ function evictable(record) {
 
 /**
  * Decide whether one more unresolved request may be archived at an anchor.
- * Unresolved records are never silently dropped; only corroborated discards
- * whose server acceptance window has provably closed may be superseded.
+ * Unresolved records are never dropped. Past the per-state cap, the oldest
+ * corroborated discards whose server acceptance window has provably closed
+ * are evicted: set aside from the cap with their journals intact. At the hard
+ * ceiling of retained records nothing is evicted and the request is refused.
  */
 export function anchorArchiveCapacity(records, key) {
-    const unresolved = unresolvedRequestArchiveAt(records, key)
+    const retained = unresolvedRequestArchiveAt(records, key)
         .filter(record => record.type === REQUEST_JOURNAL_TYPE);
+    if (retained.length >= REQUEST_ARCHIVE_LIMITS.retainedPerAnchor) return { available: false, evict: [] };
+    const counted = retained.filter(record => record.disposition !== EVICTED_DISPOSITION);
     const limit = REQUEST_ARCHIVE_LIMITS.unresolvedPerAnchor;
-    if (unresolved.length < limit) return { available: true, evict: [] };
-    const needed = unresolved.length - limit + 1;
-    const candidates = unresolved.filter(evictable)
+    if (counted.length < limit) return { available: true, evict: [] };
+    const needed = counted.length - limit + 1;
+    const candidates = counted.filter(evictable)
         .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
     if (candidates.length < needed) return { available: false, evict: [] };
     return { available: true, evict: candidates.slice(0, needed).map(record => record.archiveId) };
@@ -410,6 +491,12 @@ export function terminalRequestArchiveToPrune(records, deploymentId) {
  * The escape/clearance policy at an anchor whose request proof left this
  * device. `hardened` is true only for a vault whose challenge is
  * non-destructive (deployment capability vault_revision >= 2).
+ * `journalMissingAcknowledged` is true only when the user overrode after the
+ * receipt_journal_missing warning itself, not the general one.
+ * `journalMissingClaimed` is true when a receipt claim saved earlier at this
+ * state still stands (standingReceiptClaim of the records before `observed`
+ * was saved). Only a contradicting reading, which is corroborated below, or a
+ * receipt that installs ends it.
  */
 export function transmittedAnchorDecision({
     entries,
@@ -418,6 +505,8 @@ export function transmittedAnchorDecision({
     hardened = false,
     override = false,
     overrideReady = false,
+    journalMissingAcknowledged = false,
+    journalMissingClaimed = false,
     selected = true
 }) {
     if (!entries?.length) return { allowed: true, reason: 'untransmitted' };
@@ -446,6 +535,19 @@ export function transmittedAnchorDecision({
         return { allowed: false, code: 'anchor_challenged' };
     }
     if (corroborated) return { allowed: true, reason: 'corroborated' };
-    if (override && overrideReady) return { allowed: true, reason: 'overridden' };
+    // The time-gated override applies to every refusal here, including
+    // receipt_journal_missing. The caller installs any receipt that verifies
+    // before deciding, and only such a receipt may veto the override: a lying
+    // server or gateway can claim 'finalized' with a receipt this wallet
+    // cannot apply. A genuine claim of that kind makes the escape's challenge
+    // certain, so there the override needs that case's own acknowledgement,
+    // also when this reading failed or did not repeat a claim that stands.
+    if (override && overrideReady) {
+        const refused = refusal();
+        if ((refused.code === 'receipt_journal_missing' || journalMissingClaimed) && !journalMissingAcknowledged) {
+            return { allowed: false, code: 'receipt_journal_missing' };
+        }
+        return { allowed: true, reason: 'overridden' };
+    }
     return refusal();
 }

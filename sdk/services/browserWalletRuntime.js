@@ -5,15 +5,18 @@ import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordA
 import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
+    REQUEST_EVIDENCE_TYPE,
     REQUEST_JOURNAL_TYPE,
     anchorArchiveCapacity,
     buildRequestJournalRecord,
     earliestLocalTransmission,
     feltKey,
+    isReceiptClaim,
     journalClientRequestId,
     lastDefinitiveObservation,
     lastObservation,
     requestObservation,
+    standingReceiptClaim,
     transmittedAnchorDecision,
     unresolvedRequestArchiveAt
 } from './zkapiRequestArchive.mjs';
@@ -71,6 +74,20 @@ const UNSETTLED_REQUEST_ESCAPE_AFTER_SECONDS = Object.freeze({
 // expire: a challenged escape still needs a full challenge period plus margin.
 const ESCAPE_OVERRIDE_EXPIRY_MARGIN_SECONDS = 6 * 3_600;
 const ESCAPE_OVERRIDE_WARNING = 'An escape while a private request is unsettled can be challenged if the server later finalizes that request. On this vault a challenge only costs the escape gas and delay: the note becomes active again and the wallet applies the finalized receipt, so the funds stay withdrawable from the next state.';
+// receipt_journal_missing keeps the override: only a receipt that verifies may
+// veto it, because a lying server or gateway can claim 'finalized' with a
+// receipt this wallet cannot apply. A genuine claim makes the challenge
+// certain, so that case has its own warning, and the override proceeds there
+// only with that case's own acknowledgement (overrideUnsettledRequest:
+// 'receipt_journal_missing'), never with the general `true`. A saved claim
+// stands until the server reports the nullifier unknown or clearance_reserved,
+// so a failed or different later read never brings back the general case.
+const RECEIPT_JOURNAL_MISSING_OVERRIDE_WARNING = 'The server claims a finalized receipt for this balance that this wallet cannot apply. If that claim is genuine, the escape will be challenged, its gas is lost and the note then needs the operator’s help. If it is false, the escape is the only exit.';
+const RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT = 'receipt_journal_missing';
+const RECEIPT_JOURNAL_MISSING_MESSAGE = 'The server reports a finalized private request for this balance that this browser cannot apply.';
+// The same refusal when it rests on a claim that an earlier read saved.
+const RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE = 'The server earlier reported a finalized private request for this balance that this browser cannot apply.';
+const REQUEST_ARCHIVE_LIMIT_MESSAGE = 'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.';
 const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
 const CLEARANCE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000]);
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
@@ -86,6 +103,73 @@ const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'request_nullifier', 'authorization_tag', 'anonymous_commitment_x', 'anonymous_commitment_y',
     'solvency_bound', 'request_time'
 ]);
+
+/** The warning that goes with an escape override offered for a refusal code. */
+function escapeOverrideWarning(code) {
+    return code === 'receipt_journal_missing' ? RECEIPT_JOURNAL_MISSING_OVERRIDE_WARNING : ESCAPE_OVERRIDE_WARNING;
+}
+
+/** The overrideUnsettledRequest value that acknowledges that code's warning. */
+function escapeOverrideAcknowledgement(code) {
+    return code === 'receipt_journal_missing' ? RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT : true;
+}
+
+/** The escape override fields of a refusal that offers it. */
+function escapeOverrideData(code, overrideAfter) {
+    return {
+        escape_override_after: overrideAfter,
+        escape_override_warning: escapeOverrideWarning(code),
+        escape_override_acknowledgement: escapeOverrideAcknowledgement(code)
+    };
+}
+
+/**
+ * The override code of a nullifier reading, fresh ({ status, response }) or
+ * saved ({ status, receipt, clientRequestId }), taken after the receipt it
+ * carried was offered for install. 'finalized' with a receipt that did not
+ * install, so the note state is still current, is receipt_journal_missing.
+ */
+function readingOverrideCode(observed) {
+    return isReceiptClaim(observed) ? 'receipt_journal_missing' : null;
+}
+
+/**
+ * Whether the receipt_journal_missing case applies after a fresh reading: the
+ * reading is such a claim, or a claim saved before it stands and the reading
+ * does not contradict it ('unknown' or 'clearance_reserved').
+ */
+function journalMissingAfter(observed, savedClaim) {
+    return readingOverrideCode(observed) === 'receipt_journal_missing'
+        || (Boolean(savedClaim) && !['unknown', 'clearance_reserved'].includes(observed?.status));
+}
+
+/** A saved observation of a nullifier reading, marking and naming the receipt it carried. */
+function readingObservation(observed, context) {
+    return requestObservation(observed.status, context, Date.now(), {
+        clientRequestId: observed.response?.client_request_id
+            ? String(observed.response.client_request_id) : null,
+        receipt: Boolean(observed.response)
+    });
+}
+
+/**
+ * A GET /v2/nullifiers answer as a reading: only 'unknown', 'reserved',
+ * 'finalized' (with its response) and 'clearance_reserved' are readings;
+ * anything else is 'unavailable'.
+ */
+function nullifierReading(recovery) {
+    if (recovery?.status === 'not_found' && recovery.nullifier_status === 'unknown' && !recovery.request_response) {
+        return { status: 'unknown', response: null };
+    }
+    if (recovery?.status === 'ok'
+        && ['reserved', 'finalized', 'clearance_reserved'].includes(recovery.nullifier_status)) {
+        return {
+            status: recovery.nullifier_status,
+            response: recovery.nullifier_status === 'finalized' ? recovery.request_response || null : null
+        };
+    }
+    return { status: 'unavailable', response: null };
+}
 
 function browserConfigUrl() {
     const configured = browserSdkOptions().configUrl;
@@ -791,9 +875,10 @@ class BrowserWalletRuntime extends EventTarget {
         const { vaultRevision, hardenedVault } = this.vaultCapabilities();
         const graceMs = this.unsettledRequestEscapeGraceMs();
         const entries = this.archivedRequestsAt(this.runtime?.state);
-        const overrideAfter = hardenedVault && earliestLocalTransmission(entries) != null
-            ? earliestLocalTransmission(entries) + graceMs
-            : null;
+        const overrideAfter = this.escapeOverrideAfter(this.runtime?.state, entries);
+        // The warning and its acknowledgement follow the state's standing
+        // receipt claim, as every refusal that offers the override does.
+        const claimCode = standingReceiptClaim(entries) ? 'receipt_journal_missing' : null;
         const installed = (this.requestArchive || [])
             .filter(record => record.type === REQUEST_JOURNAL_TYPE && record.disposition === 'installed'
                 && record.deploymentId === this.manifest?.deployment_id
@@ -803,7 +888,11 @@ class BrowserWalletRuntime extends EventTarget {
         return {
             vault_revision: vaultRevision,
             escape_override: hardenedVault
-                ? { grace_seconds: graceMs / 1_000, warning: ESCAPE_OVERRIDE_WARNING }
+                ? {
+                    grace_seconds: graceMs / 1_000,
+                    warning: escapeOverrideWarning(claimCode),
+                    acknowledgement: escapeOverrideAcknowledgement(claimCode)
+                }
                 : null,
             unresolved_requests: entries.map(entry => {
                 const observed = lastObservation(entry);
@@ -839,6 +928,21 @@ class BrowserWalletRuntime extends EventTarget {
         return key ? unresolvedRequestArchiveAt(this.requestArchive, key) : [];
     }
 
+    /**
+     * When the escape override opens at a transmitted state on a hardened
+     * vault, absent an imminent expiry: the grace after the live request's
+     * transmission while one exists (its own time gate binds first), else
+     * after the earliest archived one. Null where no override applies.
+     */
+    escapeOverrideAfter(state = this.runtime?.state, entries = this.archivedRequestsAt(state)) {
+        if (!this.vaultCapabilities().hardenedVault
+            || entries.some(entry => entry.type === REQUEST_EVIDENCE_TYPE)) return null;
+        const earliest = earliestLocalTransmission(entries);
+        if (earliest == null) return null;
+        const live = state && state === this.runtime?.state ? Number(this.runtime?.journal?.created_at_ms) : NaN;
+        return (Number.isSafeInteger(live) && live > earliest ? live : earliest) + this.unsettledRequestEscapeGraceMs();
+    }
+
     /** A complete archive record for a journal at a state, or null when incomplete. */
     tryRequestJournalRecord(journal, state = this.runtime?.state, options = {}) {
         try {
@@ -856,10 +960,7 @@ class BrowserWalletRuntime extends EventTarget {
     async saveRequestObservations(entries, observed, context) {
         if (!entries?.length || !observed?.status) return;
         try {
-            const observation = requestObservation(observed.status, context, Date.now(), {
-                clientRequestId: observed.response?.client_request_id
-                    ? String(observed.response.client_request_id) : null
-            });
+            const observation = readingObservation(observed, context);
             this.requestArchive = await putBrowserRequestArchive(entries.map(entry => ({
                 archiveId: entry.archiveId,
                 type: entry.type,
@@ -1905,7 +2006,7 @@ class BrowserWalletRuntime extends EventTarget {
                 && entry.journal?.user_rerandomization != null && entry.journal?.prepared_request);
             throw new BrowserWalletHttpError(installable
                 ? 'A settled private request receipt must be applied to this balance first. Try again in a moment.'
-                : 'The server finalized a private request for this balance that this browser cannot apply.',
+                : RECEIPT_JOURNAL_MISSING_MESSAGE,
             409, installable ? 'receipt_pending_install' : 'receipt_journal_missing',
             { nullifier_status: 'finalized' });
         }
@@ -1921,11 +2022,7 @@ class BrowserWalletRuntime extends EventTarget {
         }
         const key = this.archiveKey(state);
         if (key && !anchorArchiveCapacity(this.requestArchive, key).available) {
-            throw new BrowserWalletHttpError(
-                'Too many unsettled private requests are recorded for this balance. Wait for the server to settle them before starting another chat.',
-                409,
-                'request_archive_limit'
-            );
+            throw new BrowserWalletHttpError(REQUEST_ARCHIVE_LIMIT_MESSAGE, 409, 'request_archive_limit');
         }
     }
 
@@ -2138,17 +2235,7 @@ class BrowserWalletRuntime extends EventTarget {
             }
             return { status: 'unavailable', response: null };
         }
-        if (recovery?.status === 'not_found' && recovery.nullifier_status === 'unknown' && !recovery.request_response) {
-            return { status: 'unknown', response: null };
-        }
-        if (recovery?.status === 'ok'
-            && ['reserved', 'finalized', 'clearance_reserved'].includes(recovery.nullifier_status)) {
-            return {
-                status: recovery.nullifier_status,
-                response: recovery.nullifier_status === 'finalized' ? recovery.request_response || null : null
-            };
-        }
-        return { status: 'unavailable', response: null };
+        return nullifierReading(recovery);
     }
 
     async issueLease(sessionId, onProgress = () => {}, signal = null, spendingLimitUsd = 1) {
@@ -2599,15 +2686,17 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Install a finalized, signed receipt. The response selects its journal:
      * the live one, or an archived one at this state that still holds its
-     * private rerandomization (a discarded or abandoned request the server
-     * finalized later). completeResponse verifies the commitment algebra, the
-     * charge bound (a worst-case charge equal to the proven solvency bound is
-     * valid) and the state signature before the ONE commit that installs it.
+     * private rerandomization (a discarded, evicted or abandoned request the
+     * server finalized later). completeResponse verifies the commitment
+     * algebra, the charge bound (a worst-case charge equal to the proven
+     * solvency bound is valid) and the state signature before the ONE commit
+     * that installs it.
      */
     async installRecoveredResponse(clientRequestId, onProgress = () => {}, { response = null } = {}) {
         onProgress('applying', 'Updating your private balance…');
         let receipt = response;
-        if (!receipt) {
+        const fetched = !receipt;
+        if (fetched) {
             const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/requests/${encodeURIComponent(clientRequestId)}`);
             if (!recovery.request_response) return false;
             receipt = recovery.request_response;
@@ -2626,11 +2715,15 @@ class BrowserWalletRuntime extends EventTarget {
                 && entry.journal?.prepared_request)?.journal || null;
         }
         if (!journal) {
-            throw new BrowserWalletHttpError(
-                'The server finalized a private request that this browser has no saved journal for, so its receipt cannot be applied.',
-                409,
-                'receipt_journal_missing'
-            );
+            // A caller that passed the receipt saved the nullifier reading it
+            // came with. One fetched by request id is saved here, so the
+            // snapshot's override warning follows this claim too.
+            if (fetched) {
+                await this.saveRequestObservations(this.archivedRequestsAt(state),
+                    { status: 'finalized', response: receipt }, 'recovery');
+            }
+            throw new BrowserWalletHttpError(RECEIPT_JOURNAL_MISSING_MESSAGE, 409, 'receipt_journal_missing',
+                { nullifier_status: 'finalized' });
         }
         // The quote was validated against the pins when the proof was made; a
         // receipt only has to carry exactly that proof-bound quote.
@@ -2734,16 +2827,34 @@ class BrowserWalletRuntime extends EventTarget {
             || !sameFelt(this.runtime.journal.nullifier, request.public_inputs.request_nullifier)) return false;
         // The dedicated endpoint attested non-acceptance under the issuance
         // lock; the archive still remembers that this state was transmitted.
+        // The answer only echoes this request's own identifiers, so it is
+        // saved as 'unaccepted', never as a nullifier reading.
         const record = this.tryRequestJournalRecord(this.runtime.journal, this.runtime.state, {
             disposition: 'discarded_expired_unaccepted',
-            observations: [requestObservation('unknown', 'recovery')]
+            observations: [requestObservation('unaccepted', 'recovery')]
         });
         await this.commit({ ...this.runtime, journal: null, lease: null },
             record ? { requestArchive: [record] } : {});
         return true;
     }
 
-    async recoverPendingLocked({
+    /**
+     * Recover an interrupted request journal. A quiet caller (initialization,
+     * the escape override) never fails here, also when a receipt does not
+     * install: its own gates decide again from a fresh reading, so an
+     * unverifiable 'finalized' claim can neither break initialization nor
+     * veto the override.
+     */
+    async recoverPendingLocked(options = {}) {
+        try {
+            return await this.recoverPendingJournalLocked(options);
+        } catch (error) {
+            if (!options?.quiet || isAbortError(error, options?.signal)) throw error;
+            return false;
+        }
+    }
+
+    async recoverPendingJournalLocked({
         retireLostKey = false,
         quiet = false,
         onProgress = () => {},
@@ -2783,6 +2894,13 @@ class BrowserWalletRuntime extends EventTarget {
         } catch (error) {
             if (error.status === 404) {
                 const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/nullifiers/${encodeURIComponent(this.runtime.journal.nullifier)}`, { signal });
+                const observed = nullifierReading(recovery);
+                // Saved with every request at this state, so the snapshot's
+                // override warning follows any receipt claim it carries. A
+                // clearance reservation is saved below, with its discard.
+                if (observed.status !== 'clearance_reserved') {
+                    await this.saveRequestObservations(this.archivedRequestsAt(this.runtime.state), observed, 'recovery');
+                }
                 if (recovery.request_response) {
                     // A replayed request may have been finalized under an
                     // earlier, archived client request id.
@@ -2915,30 +3033,58 @@ class BrowserWalletRuntime extends EventTarget {
         await this.init();
         // The override exists only where a wrongly challenged escape is
         // non-destructive (hardened vault). Strict mode ignores it entirely.
-        const override = overrideUnsettledRequest === true && mode === 'escape'
-            && this.vaultCapabilities().hardenedVault;
+        // `true` acknowledges the general warning; 'receipt_journal_missing'
+        // acknowledges that case's own warning, and covers the general one.
+        const override = (overrideUnsettledRequest === true
+            || overrideUnsettledRequest === RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT)
+            && mode === 'escape' && this.vaultCapabilities().hardenedVault;
+        const journalMissingAcknowledged = override
+            && overrideUnsettledRequest === RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT;
         try {
-            await this.settleActiveLease();
-        } catch (error) {
-            // An unsettleable lease must not block the escape hatch forever; the
-            // override below archives its journal under the same time gate.
-            if (!override || error?.code === 'lease_requests_in_flight' || isAbortError(error)
-                || error?.code === 'testnet_password_required') throw error;
-        }
-        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
-            // A verified receipt install advances the note to an untransmitted
-            // state, after which preparation restarts from a fresh reload.
-            for (let pass = 0; pass < 3; pass += 1) {
-                const plan = await this.prepareWithdrawalLocked(mode, destination, {
-                    expectedActiveRoot, reprove, override
-                });
-                if (plan !== WITHDRAWAL_RESTART) return plan;
+            try {
+                await this.settleActiveLease();
+            } catch (error) {
+                // An unsettleable lease must not block the escape hatch forever; the
+                // override below archives its journal under the same time gate.
+                if (!override || error?.code === 'lease_requests_in_flight' || isAbortError(error)
+                    || error?.code === 'testnet_password_required') throw error;
             }
-            throw new Error('The private balance changed repeatedly while the withdrawal was being prepared. Try again.');
-        });
+            return await withBrowserWalletLock(this.manifest.deployment_id, async () => {
+                // A verified receipt install advances the note to an untransmitted
+                // state, after which preparation restarts from a fresh reload.
+                for (let pass = 0; pass < 3; pass += 1) {
+                    const plan = await this.prepareWithdrawalLocked(mode, destination, {
+                        expectedActiveRoot, reprove, override, journalMissingAcknowledged
+                    });
+                    if (plan !== WITHDRAWAL_RESTART) return plan;
+                }
+                throw new Error('The private balance changed repeatedly while the withdrawal was being prepared. Try again.');
+            });
+        } catch (error) {
+            throw mode === 'escape' ? this.withEscapeOverrideData(error) : error;
+        }
     }
 
-    async prepareWithdrawalLocked(mode, destination, { expectedActiveRoot, reprove, override }) {
+    /**
+     * A plain escape that recovery refused with receipt_journal_missing (a
+     * finalized receipt for a live request that this browser cannot apply)
+     * offers the override like the escape gate does. Strict vaults and
+     * challenged states offer none.
+     */
+    withEscapeOverrideData(error) {
+        if (error?.code !== 'receipt_journal_missing' || error.data?.escape_override_warning) return error;
+        const overrideAfter = this.escapeOverrideAfter(this.runtime?.state);
+        if (overrideAfter == null) return error;
+        error.data = {
+            ...(error.data || {}),
+            nullifier_status: 'finalized',
+            transmitted: true,
+            ...escapeOverrideData('receipt_journal_missing', overrideAfter)
+        };
+        return error;
+    }
+
+    async prepareWithdrawalLocked(mode, destination, { expectedActiveRoot, reprove, override, journalMissingAcknowledged = false }) {
         await this.reload();
         if (!this.runtime.state) throw new Error('There is no active private note to withdraw.');
         if (unresolvedLateWithdrawalForNote(this.runtime, this.runtime.state.note_id)) {
@@ -2988,7 +3134,9 @@ class BrowserWalletRuntime extends EventTarget {
                     'lease_pending'
                 );
             }
-            if (await this.abandonUnsettledRequestLocked() === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;
+            if (await this.abandonUnsettledRequestLocked({ journalMissingAcknowledged }) === WITHDRAWAL_RESTART) {
+                return WITHDRAWAL_RESTART;
+            }
             existing = this.runtime.preparedWithdrawal;
         }
         const existingHashes = Array.isArray(existing?.transactionHashes)
@@ -3025,7 +3173,7 @@ class BrowserWalletRuntime extends EventTarget {
         const persistedClearance = validClearance(existing, withdrawalNullifier) ? existing.clearance : null;
         if (mode === 'escape') {
             const gate = await this.transmittedAnchorGate({
-                state, nullifier: withdrawalNullifier, purpose: 'escape', override
+                state, nullifier: withdrawalNullifier, purpose: 'escape', override, journalMissingAcknowledged
             });
             if (gate.advanced) return WITHDRAWAL_RESTART;
         }
@@ -3123,9 +3271,12 @@ class BrowserWalletRuntime extends EventTarget {
      * Explicit, time-gated escape override for an unsettled transmitted
      * request (hardened vault only). The journal leaves the runtime only into
      * the archive ('abandoned_for_escape'), so a later-finalized receipt still
-     * installs from its saved rerandomization.
+     * installs from its saved rerandomization. A finalized claim whose receipt
+     * does not install is the receipt_journal_missing case: abandoned only
+     * with that case's own acknowledgement, also when the claim was saved by
+     * an earlier read and this one failed or did not repeat it.
      */
-    async abandonUnsettledRequestLocked({ onProgress = () => {}, signal = null } = {}) {
+    async abandonUnsettledRequestLocked({ onProgress = () => {}, signal = null, journalMissingAcknowledged = false } = {}) {
         if (this.activeLease?.inFlight > 0) {
             throw new BrowserWalletHttpError(
                 'Wait for the active model requests to finish before overriding the private key settlement.',
@@ -3158,6 +3309,9 @@ class BrowserWalletRuntime extends EventTarget {
         }
         const record = this.tryRequestJournalRecord(journal, state);
         if (!record) throw new Error('The unsettled private request journal is incomplete.');
+        // Saved before this read; only a contradicting reading or an installed
+        // receipt ends it.
+        const savedClaim = standingReceiptClaim(this.archivedRequestsAt(state));
         const observed = await this.nullifierServerStatus(journal.nullifier, signal, { propagateAuth: true });
         if (observed.status === 'finalized' && observed.response) {
             try {
@@ -3172,30 +3326,41 @@ class BrowserWalletRuntime extends EventTarget {
             }
         }
         const overrideAfter = Number(record.createdAt) + this.unsettledRequestEscapeGraceMs();
-        if (nowMs < overrideAfter && !(await this.escapeExpiryImminent(state, signal))) {
+        // A finalized receipt that did not install above, or a claim saved
+        // earlier that this reading does not contradict.
+        const freshClaim = readingOverrideCode(observed) === 'receipt_journal_missing';
+        const journalMissing = journalMissingAfter(observed, savedClaim);
+        const ready = nowMs >= overrideAfter || await this.escapeExpiryImminent(state, signal);
+        if (!ready || (journalMissing && !journalMissingAcknowledged)) {
             await putBrowserRequestArchive([{
                 ...record,
-                serverObservations: [requestObservation(observed.status, 'override')]
+                serverObservations: [readingObservation(observed, 'override')]
             }], { deploymentId: this.manifest.deployment_id }).then(records => {
                 this.requestArchive = records;
             }, error => console.warn('Unable to save a private request status observation.', error));
+            // The code follows this reading, except that a ready override
+            // missing only this case's acknowledgement is refused as this case.
+            const code = freshClaim || (journalMissing && ready) ? 'receipt_journal_missing' : 'request_settlement_pending';
             throw new BrowserWalletHttpError(
-                'The server may still settle this private request. The escape override becomes available after its safety window.',
+                code === 'request_settlement_pending'
+                    ? 'The server may still settle this private request. The escape override becomes available after its safety window.'
+                    : freshClaim ? RECEIPT_JOURNAL_MISSING_MESSAGE : RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE,
                 409,
-                'request_settlement_pending',
+                code,
                 {
                     client_request_id: record.clientRequestId,
                     nullifier_status: observed.status,
                     created_at: record.createdAt,
-                    escape_override_after: overrideAfter,
-                    escape_override_warning: ESCAPE_OVERRIDE_WARNING
+                    // Ready but unacknowledged (also near expiry): available now.
+                    ...escapeOverrideData(journalMissing ? 'receipt_journal_missing' : null,
+                        ready ? Math.min(overrideAfter, nowMs) : overrideAfter)
                 }
             );
         }
         await this.commit({ ...this.runtime, journal: null, lease: null }, { requestArchive: [{
             ...record,
             disposition: 'abandoned_for_escape',
-            serverObservations: [requestObservation(observed.status, 'override')]
+            serverObservations: [readingObservation(observed, 'override')]
         }] });
         dropActiveLease();
         return 'abandoned';
@@ -3232,29 +3397,46 @@ class BrowserWalletRuntime extends EventTarget {
      * device. Untransmitted states pass without any server contact, so the
      * escape hatch stays operator-independent in the normal case.
      */
-    async transmittedAnchorGate({ state, nullifier, purpose, override = false, selected = true, signal = null }) {
+    async transmittedAnchorGate({
+        state, nullifier, purpose, override = false, journalMissingAcknowledged = false, selected = true, signal = null
+    }) {
         const entries = this.archivedRequestsAt(state);
         if (!entries.length) return { allowed: true, transmitted: false };
         const { hardenedVault } = this.vaultCapabilities();
         const graceMs = this.unsettledRequestEscapeGraceMs();
         const transmittedAt = earliestLocalTransmission(entries);
-        const refuse = (decision, observed) => {
+        // A receipt claim saved before this gate's own read.
+        const savedClaim = standingReceiptClaim(entries);
+        // `ready`: the override was requested and is available now (by the
+        // grace or an imminent expiry); only its acknowledgement was missing.
+        const refuse = (decision, observed, ready = false) => {
             const messages = {
                 transmitted_anchor_escape_unsafe: 'This balance’s current private state was already sent with a private request. This vault can permanently burn a challenged escape, so the escape hatch stays closed until the server settles that request. Wait for settlement, or withdraw by mutual close.',
                 request_settlement_pending: 'The server is still settling a private request for this balance. Try again after it settles.',
                 transmitted_anchor_unconfirmed: 'This balance’s current state was sent with a private request, and the server’s status could not be confirmed. Try again shortly.',
                 anchor_challenged: 'An escape at this balance state was already challenged on-chain. Withdraw from the server-signed next state instead.',
-                receipt_journal_missing: 'The server finalized a private request for this balance that this browser cannot apply.',
+                receipt_journal_missing: RECEIPT_JOURNAL_MISSING_MESSAGE,
                 receipt_response_missing: 'The server reports this private request as finalized but returned no receipt. Try again shortly.',
                 receipt_pending_install: 'A finalized private request receipt must be applied to this balance before it can be withdrawn.'
             };
             const escapeOverride = purpose === 'escape' && hardenedVault
                 && ['request_settlement_pending', 'transmitted_anchor_unconfirmed', 'receipt_journal_missing', 'receipt_response_missing'].includes(decision.code);
-            return new BrowserWalletHttpError(messages[decision.code] || 'This withdrawal is not safe at the current balance state.', 409, decision.code, {
+            // The override's warning and acknowledgement follow the claim that
+            // stands after this reading, as the snapshot's do.
+            const overrideCode = journalMissingAfter(observed, savedClaim) ? 'receipt_journal_missing' : decision.code;
+            const message = decision.code === 'receipt_journal_missing' && !readingOverrideCode(observed)
+                ? RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE
+                : messages[decision.code] || 'This withdrawal is not safe at the current balance state.';
+            return new BrowserWalletHttpError(message, 409, decision.code, {
                 nullifier_status: observed?.status || null,
                 transmitted: true,
-                escape_override_after: escapeOverride && transmittedAt != null ? transmittedAt + graceMs : null,
-                ...(escapeOverride ? { escape_override_warning: ESCAPE_OVERRIDE_WARNING } : {})
+                escape_override_after: escapeOverride && transmittedAt != null
+                    ? (ready ? Math.min(transmittedAt + graceMs, Date.now()) : transmittedAt + graceMs)
+                    : null,
+                ...(escapeOverride ? {
+                    escape_override_warning: escapeOverrideWarning(overrideCode),
+                    escape_override_acknowledgement: escapeOverrideAcknowledgement(overrideCode)
+                } : {})
             });
         };
         // STRICT (no hardened vault): never escape at a transmitted state, and
@@ -3278,10 +3460,14 @@ class BrowserWalletRuntime extends EventTarget {
             overrideReady = (transmittedAt != null && Date.now() >= transmittedAt + graceMs)
                 || await this.escapeExpiryImminent(state, signal);
         }
+        // Past the grace, a receipt_journal_missing reading, or such a claim
+        // saved earlier that this reading does not contradict, is refused
+        // again without its own acknowledgement, with that code's warning.
         const decision = transmittedAnchorDecision({
-            entries, observed, purpose, hardened: hardenedVault, override, overrideReady, selected
+            entries, observed, purpose, hardened: hardenedVault, override, overrideReady,
+            journalMissingAcknowledged, journalMissingClaimed: Boolean(savedClaim), selected
         });
-        if (!decision.allowed) throw refuse(decision, observed);
+        if (!decision.allowed) throw refuse(decision, observed, overrideReady);
         if (purpose === 'escape' && await this.vaultNullifierChallenged(nullifier, signal)) {
             throw new BrowserWalletHttpError(
                 'The vault already challenged an escape at this balance state, so it cannot escape again. Withdraw from the server-signed next state instead.',

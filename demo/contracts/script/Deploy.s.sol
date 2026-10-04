@@ -17,7 +17,9 @@ import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.
 ///                         unless OWNER is set).
 ///           OWNER       – vault owner (pause/unpause, timelocked treasury changes).
 ///                         Required except on local chains (31337/1337); use a
-///                         multisig or timelock contract.
+///                         multisig or timelock contract. The constructor sets it
+///                         directly; later transfers are two-step (transferOwnership
+///                         nominates, the new owner calls acceptOwnership).
 ///           TREASURY    – operator payout address.
 ///           OUTPUT_PATH – absolute path for the deployment manifest JSON.
 ///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key.

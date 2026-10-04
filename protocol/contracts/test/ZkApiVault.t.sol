@@ -366,6 +366,67 @@ contract ZkApiVaultTest is Test {
         _assertPending();
     }
 
+    // Every root change retires the replaced root, so a withdrawal proven just before an
+    // unrelated deposit, close, escape, challenge or expiry claim only needs fresh siblings.
+    // Each transition below replaces a root the vault has not retired before.
+
+    function test_depositRetiresReplacedRoot() public {
+        _depositFirstNote();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint256 oldRoot = vault.currentRoot();
+        Types.WithdrawalPublicInputs memory withdrawal = _withdrawalInputs(0, 101, false);
+        _depositSecondNote();
+        _assertRetiredRootStillWithdraws(oldRoot, withdrawal);
+    }
+
+    function test_mutualCloseRetiresReplacedRoot() public {
+        _depositFirstNote();
+        _depositSecondNote();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint256 oldRoot = vault.currentRoot();
+        Types.WithdrawalPublicInputs memory withdrawal = _withdrawalInputs(0, 101, false);
+        vault.mutualClose(_withdrawalInputs(1, 202, true), "", _path(1));
+        _assertRetiredRootStillWithdraws(oldRoot, withdrawal);
+    }
+
+    function test_escapeRetiresReplacedRoot() public {
+        _depositFirstNote();
+        _depositSecondNote();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint256 oldRoot = vault.currentRoot();
+        Types.WithdrawalPublicInputs memory withdrawal = _withdrawalInputs(0, 99, true);
+        vault.initiateEscapeWithdrawal(_withdrawalInputs(1, 202, false), "", _path(1));
+        _assertRetiredRootStillWithdraws(oldRoot, withdrawal);
+    }
+
+    function test_challengeRetiresReplacedRoot() public {
+        // With a third note, the escape below leaves a root the tree never had before, so
+        // the challenge does not merely restore a root an earlier deposit retired.
+        _depositFirstNote();
+        _depositSecondNote();
+        _depositThirdNote();
+        Types.RequestPublicInputs memory request = _requestInputs(vault.currentRoot());
+        request.requestNullifier = 202;
+        adapter.acceptRequest(request, hex"cafe");
+        vault.initiateEscapeWithdrawal(_withdrawalInputs(1, 202, false), "", _path(1));
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint256 oldRoot = vault.currentRoot();
+        Types.WithdrawalPublicInputs memory withdrawal = _withdrawalInputs(0, 101, false);
+        vault.challengeEscapeWithdrawal(1, request, hex"cafe", _path(1));
+        _assertRetiredRootStillWithdraws(oldRoot, withdrawal);
+    }
+
+    function test_claimExpiredRetiresReplacedRoot() public {
+        _depositFirstNote();
+        vm.warp(vm.getBlockTimestamp() + 20 days);
+        _depositSecondNote();
+        vm.warp(vault.effectiveExpiry(0));
+        uint256 oldRoot = vault.currentRoot();
+        Types.WithdrawalPublicInputs memory withdrawal = _withdrawalInputs(1, 202, false);
+        vault.claimExpired(0, _path(0));
+        _assertRetiredRootStillWithdraws(oldRoot, withdrawal);
+    }
+
     function test_challengeClearsNullifierThenMutualCloseAtSameAnchor() public {
         _depositFirstNote();
         Types.RequestPublicInputs memory request = _archiveRequest();
@@ -492,10 +553,32 @@ contract ZkApiVaultTest is Test {
         vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(43)), DEPOSIT, siblings);
     }
 
+    function _depositThirdNote() private {
+        vm.deal(user, user.balance + uint256(DEPOSIT) * 1 gwei);
+        uint256[32] memory siblings = _path(2);
+        vm.prank(user);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(44)), DEPOSIT, siblings);
+    }
+
     function _siblingsWithOtherLeaf(uint32 otherNoteId) private view returns (uint256[32] memory siblings) {
         siblings = emptySiblings;
         (bytes32 commitment, uint128 amount, uint64 expiryTs,) = vault.notes(otherNoteId);
         siblings[0] = NoteLeafLib.computeLeaf(otherNoteId, commitment, amount, expiryTs);
+    }
+
+    /// Live-tree siblings for slots 0..3; later slots are empty.
+    function _path(uint32 noteId) private view returns (uint256[32] memory siblings) {
+        require(noteId < 4, "test tree");
+        siblings = emptySiblings;
+        siblings[0] = _liveLeaf(noteId ^ 1);
+        uint32 otherPair = (noteId >> 1) ^ 1;
+        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _liveLeaf(otherPair * 2), _liveLeaf(otherPair * 2 + 1));
+    }
+
+    function _liveLeaf(uint32 noteId) private view returns (uint256) {
+        if (noteId >= vault.nextNoteId()) return 0;
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
+        return status == Types.NoteStatus.Active ? _leafOf(noteId) : 0;
     }
 
     function _requestInputs(uint256 root) private view returns (Types.RequestPublicInputs memory) {
@@ -561,6 +644,25 @@ contract ZkApiVaultTest is Test {
         (bool exists,,,,,) = vault.pendingWithdrawals(0);
         assertTrue(exists);
         assertTrue(vault.usedNullifiers(101));
+    }
+
+    /// The transition just made retired `oldRoot` now, and another note's withdrawal proven at
+    /// it is accepted with fresh siblings.
+    function _assertRetiredRootStillWithdraws(uint256 oldRoot, Types.WithdrawalPublicInputs memory withdrawal) private {
+        assertNotEq(vault.currentRoot(), oldRoot);
+        assertEq(vault.rootRetiredAt(oldRoot), vm.getBlockTimestamp());
+        assertTrue(vault.isKnownRoot(oldRoot));
+        assertEq(withdrawal.activeRoot, oldRoot);
+        uint256[32] memory siblings = _path(withdrawal.noteId);
+        Types.NoteStatus expected = Types.NoteStatus.PendingWithdrawal;
+        if (withdrawal.hasClearance) {
+            vault.mutualClose(withdrawal, "", siblings);
+            expected = Types.NoteStatus.Closed;
+        } else {
+            vault.initiateEscapeWithdrawal(withdrawal, "", siblings);
+        }
+        (,,, Types.NoteStatus status) = vault.notes(withdrawal.noteId);
+        assertEq(uint256(status), uint256(expected));
     }
 
     function _challengeAndAssertRestored(

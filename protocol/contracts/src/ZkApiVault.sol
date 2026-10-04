@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 import {Types} from "./libraries/Types.sol";
 import {Errors} from "./libraries/Errors.sol";
@@ -13,7 +14,11 @@ import {IZkApiProofAdapter} from "./interfaces/IZkApiProofAdapter.sol";
 
 /// @title ZkApiVault
 /// @notice Native ETH settlement in whole gwei with in-protocol BN254 Groth16 verification.
-contract ZkApiVault is ReentrancyGuard, Ownable, Events {
+/// @dev Ownership transfers are two-step and stay open while paused, for incident key rotation:
+///      transferOwnership only nominates pendingOwner, and the current owner keeps every power
+///      (including unpause and replacing the nomination) until the nominee calls acceptOwnership.
+///      A mistyped or unusable nominee therefore cannot leave a paused vault without an owner.
+contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     uint16 public constant PROTOCOL_VERSION = 2;
     uint64 public constant DEFAULT_CHALLENGE_PERIOD = 24 hours;
     uint64 public constant EXPIRY_BUCKET = 1 days;
@@ -319,9 +324,10 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         emit Unpaused(msg.sender);
     }
 
-    /// @dev Prevents making a pause permanent by mistake. It does not bound the owner: pauses are
-    ///      unbounded and transferOwnership stays open while paused (for key rotation), so the
-    ///      owner can freeze funds indefinitely, though nothing can sweep them while paused.
+    /// @dev Prevents making a pause permanent by renouncing; renouncing also clears pendingOwner.
+    ///      Neither this nor the two-step transfer bounds the owner: pauses are unbounded, so the
+    ///      owner (or a key lost after an accepted transfer) can freeze funds indefinitely, though
+    ///      nothing can sweep them while paused.
     function renounceOwnership() public override onlyOwner whenNotPaused {
         super.renounceOwnership();
     }

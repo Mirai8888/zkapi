@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
@@ -42,6 +43,9 @@ contract CostlyTreasury {
 contract ZkApiVaultPauseTest is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint128 constant UNITS = 1_000_000;
+    /// TREASURY_PAYOUT_GAS as the docs state it. Pinned here rather than read from the vault, so
+    /// that raising the cap fails the gas-burning-treasury bounds.
+    uint256 constant DOCUMENTED_PAYOUT_GAS = 100_000;
     address user = address(0x1234);
     address treasury = address(0x5678);
     ZkApiVault vault;
@@ -282,13 +286,17 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(treasury.balance, 300_000 gwei);
     }
 
-    /// Accepted residual: pauses are unbounded, so the owner (or a lost owner key) can freeze
-    /// funds indefinitely, but nothing can sweep them while the vault stays paused.
+    /// Accepted residual: pauses are unbounded, so the owner (or a key lost after an accepted
+    /// transfer) can freeze funds indefinitely, but nothing can sweep them while the vault stays
+    /// paused.
     function test_unboundedPauseFreezesButCannotSeize() public {
         uint32 id = _deposit(42);
         uint256[32] memory path = _path(id);
+        address lost = address(0xdead);
         vault.pause();
-        vault.transferOwnership(address(0xdead));
+        vault.transferOwnership(lost);
+        vm.prank(lost);
+        vault.acceptOwnership();
         vm.warp(block.timestamp + 3650 days);
         vm.expectRevert(Errors.Paused.selector);
         vault.claimExpired(id, path);
@@ -326,18 +334,81 @@ contract ZkApiVaultPauseTest is Test {
         assertEq(vault.owner(), address(0));
     }
 
-    /// The exempt owner action used for incident key rotation still works while paused.
+    function test_renounceOwnershipClearsPendingOwner() public {
+        address rotated = address(0xB0B);
+        vault.transferOwnership(rotated);
+        vault.renounceOwnership();
+        assertEq(vault.owner(), address(0));
+        assertEq(vault.pendingOwner(), address(0));
+        vm.prank(rotated);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rotated));
+        vault.acceptOwnership();
+        assertEq(vault.owner(), address(0));
+    }
+
+    /// The exempt owner actions used for incident key rotation still work while paused. The
+    /// old key stays in charge until the nominee accepts.
     function test_ownerKeyRotationWorksWhilePaused() public {
         address rotated = address(0xB0B);
         vault.pause();
+        vm.expectEmit(address(vault));
+        emit Ownable2Step.OwnershipTransferStarted(address(this), rotated);
         vault.transferOwnership(rotated);
+        assertEq(vault.owner(), address(this));
+        assertEq(vault.pendingOwner(), rotated);
+        vm.prank(rotated);
+        vm.expectEmit(address(vault));
+        emit Ownable.OwnershipTransferred(address(this), rotated);
+        vault.acceptOwnership();
         assertEq(vault.owner(), rotated);
+        assertEq(vault.pendingOwner(), address(0));
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         vault.unpause();
         vm.prank(rotated);
         vault.unpause();
         assertFalse(vault.paused());
         assertEq(vault.lastUnpausedAt(), block.timestamp);
+    }
+
+    /// A mistyped rotation during a pause no longer strands the vault: the old owner can still
+    /// unpause and replace the nomination, after which the mistyped address cannot accept.
+    function test_mistypedTransferWhilePausedLeavesOwnerInControl() public {
+        address mistyped = address(0xdead);
+        address rotated = address(0xB0B);
+        vault.pause();
+        vault.transferOwnership(mistyped);
+        assertEq(vault.owner(), address(this));
+        assertEq(vault.pendingOwner(), mistyped);
+        vault.transferOwnership(rotated);
+        assertEq(vault.pendingOwner(), rotated);
+        vm.prank(mistyped);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, mistyped));
+        vault.acceptOwnership();
+        vault.unpause();
+        assertFalse(vault.paused());
+        assertEq(vault.owner(), address(this));
+        assertEq(vault.pendingOwner(), rotated);
+    }
+
+    function test_onlyPendingOwnerCanAcceptOwnership() public {
+        address rotated = address(0xB0B);
+        vault.pause();
+        vm.prank(rotated);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rotated));
+        vault.acceptOwnership();
+        vault.transferOwnership(rotated);
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, user));
+        vault.acceptOwnership();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        vault.acceptOwnership();
+        // Nominating the zero address cancels the transfer.
+        vault.transferOwnership(address(0));
+        vm.prank(rotated);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rotated));
+        vault.acceptOwnership();
+        assertEq(vault.owner(), address(this));
+        assertEq(vault.pendingOwner(), address(0));
     }
 
     // -------------------------------------------------------------- treasury
@@ -475,15 +546,30 @@ contract ZkApiVaultPauseTest is Test {
         vault.withdrawTreasuryArrears();
     }
 
-    function test_gasBurningTreasuryIsBounded() public {
+    /// A treasury that burns all the gas it is given adds at most the documented cap (plus the
+    /// arrears bookkeeping) to every payout that pushes to it, however much gas the caller sends.
+    function test_gasBurningTreasuryIsBoundedOnMutualClose() public {
         uint32 id = _deposit(42);
-        _switchTreasury(address(new GasBurningTreasury()));
-        Types.WithdrawalPublicInputs memory close = _withdrawal(id, 99, true);
-        uint256[32] memory path = _path(id);
-        uint256 gasBefore = gasleft();
-        vault.mutualClose{gas: 7_000_000}(close, "", path);
-        emit log_named_uint("mutualClose gas with gas-burning treasury", gasBefore - gasleft());
-        assertEq(vault.treasuryArrears(), 300_000);
+        bytes memory close = abi.encodeCall(vault.mutualClose, (_withdrawal(id, 99, true), "", _path(id)));
+        _assertGasBurningTreasuryBounded("mutualClose", close, 300_000);
+    }
+
+    /// The same bound on finalizeEscapeWithdrawal, a user's own exit.
+    function test_gasBurningTreasuryIsBoundedOnEscapeFinalization() public {
+        uint32 id = _deposit(42);
+        vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "", _path(id));
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        vm.warp(deadline);
+        bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
+        _assertGasBurningTreasuryBounded("finalizeEscapeWithdrawal", finalize, 300_000);
+    }
+
+    /// The same bound on claimExpired.
+    function test_gasBurningTreasuryIsBoundedOnExpiryClaim() public {
+        uint32 id = _deposit(42);
+        vm.warp(vault.effectiveExpiry(id));
+        bytes memory claim = abi.encodeCall(vault.claimExpired, (id, _path(id)));
+        _assertGasBurningTreasuryBounded("claimExpired", claim, UNITS);
     }
 
     /// A caller cannot starve a working treasury of gas to push its share into arrears: any
@@ -537,12 +623,13 @@ contract ZkApiVaultPauseTest is Test {
             "renounceOwnership",
             "pause"
         ];
-        string[5] memory exempt = [
+        string[6] memory exempt = [
             "challengeEscapeWithdrawal",
             "finalizeEscapeWithdrawal",
             "unpause",
             "cancelTreasuryChange",
-            "transferOwnership"
+            "transferOwnership",
+            "acceptOwnership"
         ];
         string memory artifact = vm.readFile(string.concat(vm.projectRoot(), "/out/ZkApiVault.sol/ZkApiVault.json"));
         uint256 mutating;
@@ -602,6 +689,37 @@ contract ZkApiVaultPauseTest is Test {
         vault.setTreasury(next);
         vm.warp(block.timestamp + vault.treasuryChangeDelay());
         vault.acceptTreasury();
+    }
+
+    /// Runs `payout` twice from the same state and time: with the funded EOA treasury, which it
+    /// must pay, then with a GasBurningTreasury, whose `share` it must defer to arrears. The second
+    /// run gets 1M gas of headroom, 63/64 of which an uncapped push would burn. It may use at most
+    /// the documented cap plus 30k more than the first: beyond the gas it forwards, a failed push
+    /// only records the arrears (one SSTORE, at most 22,100) and emits TreasuryPaymentDeferred.
+    function _assertGasBurningTreasuryBounded(string memory label, bytes memory payout, uint128 share) private {
+        assertEq(vault.TREASURY_PAYOUT_GAS(), DOCUMENTED_PAYOUT_GAS, "documented cap");
+        // A funded treasury, so the baseline push pays no new-account surcharge.
+        vm.deal(treasury, 1 ether);
+        vault.setTreasury(address(new GasBurningTreasury()));
+        vm.warp(block.timestamp + vault.treasuryChangeDelay());
+        uint256 snapshot = vm.snapshotState();
+        uint256 baseline = _gasUsed(payout, 30_000_000);
+        assertEq(treasury.balance, 1 ether + uint256(share) * 1 gwei, "baseline pays the treasury");
+        vm.revertToState(snapshot);
+
+        vault.acceptTreasury();
+        uint256 used = _gasUsed(payout, baseline + 1_000_000);
+        emit log_named_uint(string.concat(label, " gas with a normal treasury"), baseline);
+        emit log_named_uint(string.concat(label, " gas with a gas-burning treasury"), used);
+        assertEq(vault.treasuryArrears(), share, "share deferred");
+        assertLt(used, baseline + DOCUMENTED_PAYOUT_GAS + 30_000, label);
+    }
+
+    function _gasUsed(bytes memory data, uint256 limit) private returns (uint256 used) {
+        uint256 gasBefore = gasleft();
+        (bool ok,) = address(vault).call{gas: limit}(data);
+        used = gasBefore - gasleft();
+        assertTrue(ok);
     }
 
     function _leafAt(uint32 index) private view returns (uint256) {

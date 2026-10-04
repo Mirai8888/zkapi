@@ -3,6 +3,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Transaction, Wallet } from 'ethers';
 import { GWEI, createSigner, createUpstream, vaultInterface } from './signer.mjs';
@@ -23,7 +25,7 @@ const tx = (nonce, extra = {}) => ({ from: sender, to: vault, data, gas: wei(GAS
 // Port 0 lets the OS choose a free port, which anvil reports on stdout, so
 // parallel runs cannot collide; startup is still retried. Automine is off and
 // every test mines explicitly, so no receipt is read before its block exists.
-async function startAnvil(t) {
+async function launchAnvil(t) {
   assert.ok(haveAnvil, 'ZKAPI_REQUIRE_ANVIL=1 but anvil is not on PATH');
   for (let attempt = 1; attempt <= 3; attempt++) {
     const child = spawn('anvil', ['--port', '0', '--chain-id', String(CHAIN_ID), '--no-mining'], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -44,14 +46,48 @@ async function startAnvil(t) {
       child.on('exit', () => { clearTimeout(timer); resolve(null); });
     });
     if (port) {
-      const rpc = createUpstream(`http://127.0.0.1:${port}`);
+      const url = `http://127.0.0.1:${port}`;
       // A STOP contract: every challenge call simulates successfully.
-      await rpc('anvil_setCode', [vault, '0x00']);
-      return rpc;
+      await createUpstream(url)('anvil_setCode', [vault, '0x00']);
+      return url;
     }
     child.kill();
   }
   assert.fail('anvil did not start');
+}
+const startAnvil = async t => createUpstream(await launchAnvil(t));
+// Anvil does not enforce a node's RPC fee cap. This proxy answers
+// eth_sendRawTransaction above geth's default --rpc.txfeecap (1 ether of gas
+// limit x maxFeePerGas) with geth's exact error and forwards all else to anvil.
+const NODE_TX_FEE_CAP = 10n ** 18n;
+async function feeCapProxy(t, anvilUrl) {
+  const refused = [];
+  const proxy = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    response.setHeader('content-type', 'application/json');
+    try {
+      const { id, method, params } = JSON.parse(body);
+      if (method === 'eth_sendRawTransaction') {
+        const { hash, gasLimit, maxFeePerGas } = Transaction.from(params[0]);
+        const fee = gasLimit * maxFeePerGas;
+        if (fee > NODE_TX_FEE_CAP) {
+          refused.push(hash);
+          const message = `tx fee (${(Number(fee) / 1e18).toFixed(2)} ether) exceeds the configured cap (1.00 ether)`;
+          response.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message } }));
+          return;
+        }
+      }
+      const forwarded = await fetch(anvilUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+      response.end(await forwarded.text());
+    } catch {
+      response.statusCode = 502;
+      response.end();
+    }
+  }).listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); });
+  return { url: `http://127.0.0.1:${proxy.address().port}`, refused };
 }
 const signerFor = (rpc, options) => createSigner({ privateKey: key, vault, rpc, chainId: CHAIN_ID, log: () => {}, ...options });
 const nonceOf = async (rpc, tag) => Number(BigInt(await rpc('eth_getTransactionCount', [sender, tag])));
@@ -167,4 +203,43 @@ test('a balance below gas limit x max fee refuses before broadcast; the check us
   const fits = await signer.handle('eth_sendTransaction', [tx(0, fees(9n * GWEI, GWEI))]);
   await mine(rpc);
   assert.equal((await receipt(rpc, fits)).status, '0x1');
+});
+
+test('bids above a node\'s 1 ETH fee cap are refused as never broadcast; a bid within it then mines on the same nonce', { skip }, async t => {
+  const node = await feeCapProxy(t, await launchAnvil(t));
+  const rpc = createUpstream(node.url);
+  // The measured challenge gas limit: at 1 ETH, about 132.7 gwei per gas.
+  const gas = 7_534_341n;
+  const challenge = extra => tx(0, { gas: wei(gas), ...extra });
+  // At the default transaction fee cap, which matches the node's, the signer
+  // refuses the reviewed 142 gwei bid and the default (fee cap) bid itself.
+  const matched = signerFor(rpc, { maxFeePerGas: 300n * GWEI });
+  const allowed = NODE_TX_FEE_CAP / gas;
+  for (const [request, maxFee] of [[challenge(fees(142n * GWEI, 2n * GWEI)), 142n * GWEI], [challenge(), 300n * GWEI]]) {
+    await assert.rejects(matched.handle('eth_sendTransaction', [request]), {
+      code: -32003, message: 'Gas limit times max fee per gas exceeds the transaction fee cap',
+      data: { reason: 'tx_fee_above_cap', gas_limit: wei(gas), max_fee_per_gas: wei(maxFee), tx_fee_cap_wei: wei(NODE_TX_FEE_CAP), max_fee_per_gas_allowed: wei(allowed) },
+    });
+  }
+  assert.deepEqual(node.refused, [], 'nothing reached the node');
+  // A signer configured above the node's cap passes the bid on; the node
+  // refuses it before its pool, which is a definite refusal, not ambiguous.
+  const unmatched = signerFor(rpc, { maxFeePerGas: 300n * GWEI, txFeeCap: 3n * NODE_TX_FEE_CAP });
+  await assert.rejects(unmatched.handle('eth_sendTransaction', [challenge(fees(142n * GWEI, 2n * GWEI))]), {
+    code: -32003, message: 'Upstream RPC refused the transaction fee',
+    data: { reason: 'upstream_tx_fee_cap', gas_limit: wei(gas), max_fee_per_gas: wei(142n * GWEI) },
+  });
+  assert.equal(node.refused.length, 1);
+  assert.equal(await rpc('eth_getTransactionByHash', [node.refused[0]]), null);
+  assert.equal(await poolSize(rpc), 0, 'nothing was broadcast');
+  assert.equal(await nonceOf(rpc, 'pending'), 0);
+  // The same nonce at the reported ceiling (0.99 ETH) is accepted and mines.
+  const landed = await matched.handle('eth_sendTransaction', [challenge(fees(allowed, 2n * GWEI))]);
+  await mine(rpc);
+  const mined = await receipt(rpc, landed);
+  assert.deepEqual([mined.type, mined.status], ['0x2', '0x1']);
+  const signed = Transaction.from(await rpc('eth_getRawTransactionByHash', [landed]));
+  assert.deepEqual([signed.nonce, signed.gasLimit, signed.maxFeePerGas], [0, gas, allowed]);
+  assert.equal(await nonceOf(rpc, 'latest'), 1);
+  assert.equal(node.refused.length, 1);
 });

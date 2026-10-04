@@ -70,6 +70,8 @@ async function main() {
       fee_model: 'eip1559', fee_cap_source: status.fee_cap_source,
       max_fee_per_gas_wei: decimal(status.max_fee_per_gas), priority_fee_per_gas_wei: decimal(status.priority_fee_per_gas),
       max_priority_fee_per_gas_wei: decimal(status.max_priority_fee_per_gas), fee_ceiling_wei: decimal(status.fee_ceiling),
+      // The highest maxFeePerGas a MAX_GAS transaction can bid within the tx fee cap.
+      tx_fee_cap_wei: decimal(status.tx_fee_cap_wei), max_fee_per_gas_allowed_at_max_gas_wei: decimal(BigInt(status.tx_fee_cap_wei) / BigInt(status.max_gas)),
       max_gas: decimal(status.max_gas), required_balance_wei: decimal(status.required_balance), balance_wei: decimal(status.balance),
       base_fee_per_gas_wei: decimal(status.base_fee_per_gas), warnings: status.warnings,
     }));

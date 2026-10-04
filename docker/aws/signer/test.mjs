@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Transaction, Wallet, keccak256 } from 'ethers';
 import {
-  ABSOLUTE_FEE_CEILING, ConfigError, GWEI, RpcError, UPSTREAM_TIMEOUT_MS, createSigner, createUpstream,
+  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, GWEI, RpcError, UPSTREAM_TIMEOUT_MS, createSigner, createUpstream,
   parseChainId, parseSignerConfig, vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
@@ -133,6 +133,52 @@ test('fee proposals outside 0 < tip <= max fee <= cap and tip <= tip cap are ref
   }
 });
 
+test('gas limit x max fee above the transaction fee cap is refused before any RPC, for default and proposed bids; the cap itself signs', async () => {
+  const gas = 8_000_000n;
+  const message = 'Gas limit times max fee per gas exceeds the transaction fee cap';
+  for (const [transaction, maxFee] of [[validTx, 10n * GWEI], [{ ...validTx, ...fees(3n * GWEI, GWEI) }, 3n * GWEI]]) {
+    const exact = fixture({}, { txFeeCap: gas * maxFee });
+    const hash = await exact.signer.handle('eth_sendTransaction', [transaction]);
+    const [sent] = broadcasts(exact.calls);
+    assert.equal(hash, keccak256(sent.params[0]));
+    assert.equal(Transaction.from(sent.params[0]).maxFeePerGas, maxFee);
+    // One wei above the cap: refused before the chain, simulation or any broadcast.
+    const cap = gas * maxFee - 1n;
+    const above = fixture({}, { txFeeCap: cap });
+    await assert.rejects(above.signer.handle('eth_sendTransaction', [transaction]), {
+      code: -32003, message,
+      data: { reason: 'tx_fee_above_cap', gas_limit: wei(gas), max_fee_per_gas: wei(maxFee), tx_fee_cap_wei: wei(cap), max_fee_per_gas_allowed: wei(maxFee - 1n) },
+    });
+    assert.deepEqual(above.calls, []);
+    assert.deepEqual(above.logs, [{
+      event: 'challenge_refused', nonce: 4, code: -32003, reason: 'tx_fee_above_cap', message, gas_limit: '8000000',
+      max_fee_per_gas_wei: String(maxFee), tx_fee_cap_wei: String(cap), max_fee_per_gas_allowed_wei: String(maxFee - 1n),
+    }]);
+  }
+});
+
+test('the default 1 ETH transaction fee cap bounds a measured 7.53M-gas challenge to about 132.7 gwei', async () => {
+  const gas = 7_534_341n; // 6,278,618 measured, plus the daemon's 20%
+  const challenge = { ...validTx, gas: wei(gas) };
+  const allowed = DEFAULT_TX_FEE_CAP / gas;
+  assert.equal(allowed, 132_725_609_313n);
+  // The default bid (a 300 gwei cap: 2.26 ETH), the reviewed 142 gwei first bid (1.07 ETH) and one wei above the ceiling,
+  // from a sender funded for all of them.
+  for (const [transaction, maxFee] of [[challenge, 300n * GWEI], [{ ...challenge, ...fees(142n * GWEI, 2n * GWEI) }, 142n * GWEI], [{ ...challenge, ...fees(allowed + 1n, 2n * GWEI) }, allowed + 1n]]) {
+    const { signer, calls } = fixture({ eth_getBalance: wei(10n * DEFAULT_TX_FEE_CAP) }, { maxFeePerGas: 300n * GWEI });
+    await assert.rejects(signer.handle('eth_sendTransaction', [transaction]), {
+      code: -32003,
+      data: { reason: 'tx_fee_above_cap', gas_limit: wei(gas), max_fee_per_gas: wei(maxFee), tx_fee_cap_wei: ONE_ETH, max_fee_per_gas_allowed: wei(allowed) },
+    });
+    assert.equal(broadcasts(calls).length, 0);
+  }
+  const { signer, calls } = fixture({}, { maxFeePerGas: 300n * GWEI });
+  await signer.handle('eth_sendTransaction', [{ ...challenge, ...fees(allowed, 2n * GWEI) }]);
+  const signed = Transaction.from(broadcasts(calls)[0].params[0]);
+  assert.deepEqual([signed.gasLimit, signed.maxFeePerGas], [gas, allowed]);
+  assert.ok(signed.gasLimit * signed.maxFeePerGas <= DEFAULT_TX_FEE_CAP);
+});
+
 test('upstream wrong chain, failed simulation, base fee above the max fee, missing base fee, low balance and changed estimate never broadcast', async () => {
   const proposed = { ...validTx, ...fees(3n * GWEI, GWEI) };
   for (const [overrides, transaction, expected] of [
@@ -165,19 +211,28 @@ test('every failure is either a definite non-broadcast or broadcast_ambiguous ca
     new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_rejected'),
     new Error('unexpected failure'), 'malformed', null, {}, `0x${'cd'.repeat(32)}`,
   ];
+  // What createUpstream raises for a node's own fee-cap refusal of a broadcast.
+  const feeCapRefusal = new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_tx_fee_cap');
   for (const method of methods) {
-    for (const fault of faults) {
+    for (const fault of method === 'eth_sendRawTransaction' ? [...faults, feeCapRefusal] : faults) {
       const overrides = { [method]: fault };
       if (method === 'eth_getTransactionByHash') overrides.eth_sendRawTransaction = new RpcError(-32000, 'already known', 'upstream_rejected');
       const { signer, calls } = fixture(overrides);
       const outcome = await signer.handle('eth_sendTransaction', [validTx]).then(hash => ({ hash }), error => ({ error }));
       const sent = broadcasts(calls);
-      const label = `${method} -> ${fault instanceof Error ? fault.message : JSON.stringify(fault)}`;
+      const label = `${method} -> ${fault instanceof Error ? `${fault.message}${fault.data ? ` (${fault.data.reason})` : ''}` : JSON.stringify(fault)}`;
+      if (fault === feeCapRefusal) assert.equal(outcome.error?.data?.reason, 'upstream_tx_fee_cap', label);
       if (outcome.error?.data?.reason === 'broadcast_ambiguous') {
         assert.equal(outcome.error.code, -32000, label);
         assert.equal(sent.length, 1, label);
         assert.equal(outcome.error.data.transaction_hash, keccak256(sent[0].params[0]), label);
         assert.equal(calls.at(-1).method === 'eth_sendRawTransaction' || calls.at(-1).method === 'eth_getTransactionByHash', true, label);
+      } else if (outcome.error?.data?.reason === 'upstream_tx_fee_cap') {
+        // The node refused the broadcast before its pool: definite, and no hash to track.
+        assert.equal(fault, feeCapRefusal, label);
+        assert.equal(outcome.error.code, -32003, label);
+        assert.equal(sent.length, 1, label);
+        assert.equal(outcome.error.data.transaction_hash, undefined, label);
       } else if (outcome.error) {
         assert.equal(sent.length, 0, label);
       } else {
@@ -257,6 +312,78 @@ test('an invalid or mismatched upstream transaction hash remains an ambiguous se
   }
 });
 
+test('a node fee-cap refusal of the broadcast is a definite refusal without a hash; other send failures stay ambiguous', async t => {
+  const geth = 'tx fee (1.07 ether) exceeds the configured cap (1.00 ether)';
+  const reads = {
+    eth_chainId: wei(CHAIN_ID), eth_call: '0x', eth_estimateGas: '0x6acfc0', eth_getBlockByNumber: { number: '0x10', baseFeePerGas: '0x3b9aca00' },
+    eth_getBalance: ONE_ETH, eth_getTransactionByHash: null,
+  };
+  let answer;
+  const upstream = createServer(async (request, response) => {
+    try {
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      const { id, method } = JSON.parse(body);
+      const reply = payload => response.end(JSON.stringify({ jsonrpc: '2.0', id, ...payload }));
+      if (method !== 'eth_sendRawTransaction') return reply({ result: reads[method] });
+      return answer(reply, response);
+    } catch { response.destroy(); } // a request its client abandoned part-way
+  }).listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  const url = `http://127.0.0.1:${upstream.address().port}`;
+  let raw;
+  // Every call keeps the default timeout, so a slow answer on a loaded host is never
+  // mistaken for another outcome; only a broadcast the node never answers gets a short one.
+  const send = async (respond, { broadcastTimeoutMs = UPSTREAM_TIMEOUT_MS } = {}) => {
+    answer = respond;
+    raw = undefined;
+    const logs = [];
+    const read = createUpstream(url);
+    const broadcast = createUpstream(url, { timeoutMs: broadcastTimeoutMs });
+    const rpc = (method, params) => {
+      if (method !== 'eth_sendRawTransaction') return read(method, params);
+      [raw] = params;
+      return broadcast(method, params);
+    };
+    const signer = createSigner({ privateKey: key, vault, rpc, chainId: CHAIN_ID, log: line => logs.push(line) });
+    const error = await signer.handle('eth_sendTransaction', [validTx]).then(() => assert.fail('the send cannot succeed'), failure => failure);
+    assert.ok(raw, 'the broadcast was attempted');
+    return { error, logs };
+  };
+  // geth's JSON-RPC error answer, whatever its code, amounts or letter case.
+  for (const error of [{ code: -32000, message: geth }, { code: -32000, message: 'tx fee (2.05 ether) exceeds the configured cap (1.00 ether)' }, { code: 3, message: geth.toUpperCase() }]) {
+    const { error: refused, logs } = await send(reply => reply({ error }));
+    assert.ok(refused instanceof RpcError);
+    assert.deepEqual([refused.code, refused.message, refused.data], [-32003, 'Upstream RPC refused the transaction fee',
+      { reason: 'upstream_tx_fee_cap', gas_limit: wei(8_000_000n), max_fee_per_gas: wei(10n * GWEI) }]);
+    assert.deepEqual(logs, [{ event: 'challenge_refused', nonce: 4, code: -32003, reason: 'upstream_tx_fee_cap', message: 'Upstream RPC refused the transaction fee', gas_limit: '8000000', max_fee_per_gas_wei: '10000000000' }]);
+  }
+  // Any other answer may follow a broadcast: transport errors, timeouts, malformed
+  // replies and every other rejection stay ambiguous with the candidate hash.
+  const never = () => {};
+  for (const respond of [
+    reply => reply({ error: { code: -32000, message: 'nonce too low' } }),
+    reply => reply({ error: { code: -32000, message: 'replacement transaction underpriced' } }),
+    reply => reply({ error: { code: -32000, message: 'insufficient funds for gas * price + value' } }),
+    reply => reply({ error: { code: -32000, message: 'execution reverted', data: geth } }),
+    reply => reply({ error: { code: -32000, message: `${geth} ${'x'.repeat(256)}` } }),
+    reply => reply({ error: geth }),
+    (reply, response) => { response.statusCode = 500; reply({ error: { code: -32000, message: geth } }); },
+    (_reply, response) => response.end(geth),
+    never,
+  ]) {
+    const { error } = await send(respond, respond === never ? { broadcastTimeoutMs: 300 } : undefined);
+    assert.deepEqual([error.code, error.data], [-32000, { reason: 'broadcast_ambiguous', transaction_hash: keccak256(raw) }], respond.toString());
+  }
+  // A node that lowered its cap after accepting the identical transaction still has it pending.
+  const known = fixture({
+    eth_sendRawTransaction: new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_tx_fee_cap'),
+    eth_getTransactionByHash: hash => ({ hash }),
+  });
+  assert.equal(await known.signer.handle('eth_sendTransaction', [validTx]), keccak256(broadcasts(known.calls)[0].params[0]));
+});
+
 test('audit logging can never change the RPC outcome', async () => {
   const unhandled = [];
   const onUnhandled = reason => unhandled.push(reason);
@@ -296,7 +423,7 @@ test('signer status reports policy, base fee, balance coverage and warnings', as
   assert.deepEqual(healthy, {
     chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
-    fee_ceiling: '0x9184e72a000', max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
+    fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
     block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
   const warnings = async (baseFee, balance = ONE_ETH) => (await fixture({
@@ -313,6 +440,50 @@ test('signer status reports policy, base fee, balance coverage and warnings', as
   await assert.rejects(fixture().signer.handle('zkapi_signerStatus', [1]), { code: -32602, message: 'Expected no parameters' });
   await assert.rejects(fixture({ eth_chainId: '0x1' }).signer.handle('zkapi_signerStatus', []), { code: -32000, message: 'Upstream RPC does not match the configured chain', data: { reason: 'upstream_chain_mismatch' } });
   await assert.rejects(fixture({ eth_getBlockByNumber: { number: '0x11' } }).signer.handle('zkapi_signerStatus', []), { code: -32000, message: 'Upstream block lacks a base fee', data: { reason: 'base_fee_unavailable' } });
+});
+
+test('status reports the transaction fee cap and warns once MAX_GAS x fee cap exceeds it', async () => {
+  const status = options => fixture({ eth_getBalance: wei(10n ** 20n) }, options).signer.handle('zkapi_signerStatus', []);
+  const maxGas = 12_000_000n;
+  // At the defaults, 12M gas x 10 gwei is 0.12 ETH, well within 1 ETH.
+  assert.deepEqual([(await status()).tx_fee_cap_wei, (await status()).warnings], [ONE_ETH, []]);
+  assert.deepEqual((await status({ txFeeCap: maxGas * 10n * GWEI })).warnings, []);
+  const below = await status({ txFeeCap: maxGas * 10n * GWEI - 1n });
+  assert.deepEqual([below.tx_fee_cap_wei, below.warnings], [wei(maxGas * 10n * GWEI - 1n), ['tx_fee_cap_below_fee_cap']]);
+  // A 100 gwei cap at the default 12M gas and 1 ETH: only about 83.3 gwei per gas fits.
+  assert.deepEqual((await status({ maxFeePerGas: 100n * GWEI })).warnings, ['tx_fee_cap_below_fee_cap']);
+  assert.deepEqual((await status({ maxFeePerGas: 100n * GWEI, maxGas: 8_000_000n })).warnings, []);
+  assert.deepEqual((await status({ maxFeePerGas: 300n * GWEI, txFeeCap: maxGas * 300n * GWEI })).warnings, []);
+});
+
+test('between the MAX_GAS warning and the real gas limit, status warns but a challenge without fee proposals still signs', async () => {
+  // At the default 12M MAX_GAS and 1 ETH the warning starts above about 83.3 gwei, while a
+  // 7.53M-gas challenge bid at the fee cap (an earlier daemon proposes no fees) fits up to about 132.7 gwei.
+  const gas = 7_534_341n;
+  const challenge = { ...validTx, gas: wei(gas) };
+  const allowed = DEFAULT_TX_FEE_CAP / gas;
+  const funded = { eth_getBalance: wei(10n * DEFAULT_TX_FEE_CAP) };
+  for (const maxFeePerGas of [DEFAULT_TX_FEE_CAP / 12_000_000n + 1n, 100n * GWEI, allowed]) {
+    const { signer, calls } = fixture(funded, { maxFeePerGas });
+    assert.deepEqual((await signer.handle('zkapi_signerStatus', [])).warnings, ['tx_fee_cap_below_fee_cap'], String(maxFeePerGas));
+    const hash = await signer.handle('eth_sendTransaction', [challenge]);
+    const [sent] = broadcasts(calls);
+    const signed = Transaction.from(sent.params[0]);
+    assert.equal(hash, keccak256(sent.params[0]));
+    assert.deepEqual([signed.gasLimit, signed.maxFeePerGas, signed.maxPriorityFeePerGas], [gas, maxFeePerGas, GWEI]);
+  }
+  // One wei above the ceiling, the same default bid is refused before any upstream call.
+  const { signer, calls } = fixture(funded, { maxFeePerGas: allowed + 1n });
+  await assert.rejects(signer.handle('eth_sendTransaction', [challenge]), {
+    code: -32003,
+    data: { reason: 'tx_fee_above_cap', gas_limit: wei(gas), max_fee_per_gas: wei(allowed + 1n), tx_fee_cap_wei: ONE_ETH, max_fee_per_gas_allowed: wei(allowed) },
+  });
+  assert.deepEqual(calls, []);
+  // Lowering MAX_GAS toward the gas limit clears the warning; the same challenge still signs.
+  const lowered = fixture(funded, { maxFeePerGas: 100n * GWEI, maxGas: 7_600_000n });
+  assert.deepEqual((await lowered.signer.handle('zkapi_signerStatus', [])).warnings, []);
+  await lowered.signer.handle('eth_sendTransaction', [challenge]);
+  assert.equal(broadcasts(lowered.calls).length, 1);
 });
 
 test('base-fee and balance reads run in parallel when signing and in status', async () => {
@@ -346,7 +517,7 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
   assert.deepEqual(health, {
     status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
-    fee_ceiling: '0x9184e72a000', max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
+    fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
   });
   const failed = await post({ jsonrpc: '2.0', id: 8, method: 'eth_blockNumber', params: [] });
   assert.deepEqual(failed, { jsonrpc: '2.0', id: 8, error: { code: -32603, message: 'Signer request failed' } });
@@ -360,6 +531,13 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
   t.after(() => spiking.close());
   const refused = await fetch(`http://127.0.0.1:${spiking.address().port}`, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'eth_sendTransaction', params: [validTx] }) }).then(r => r.json());
   assert.deepEqual(refused, { jsonrpc: '2.0', id: 2, error: { code: -32003, message: 'Base fee exceeds the transaction max fee per gas', data: { reason: 'base_fee_above_max_fee', base_fee_per_gas: '0x2540be401', max_fee_per_gas: '0x2540be400' } } });
+  const capped = createHttpServer(fixture({}, { txFeeCap: 8_000_000n * 10n * GWEI - 1n }).signer).listen(0, '127.0.0.1');
+  await once(capped, 'listening');
+  t.after(() => capped.close());
+  const overCap = await fetch(`http://127.0.0.1:${capped.address().port}`, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'eth_sendTransaction', params: [validTx] }) }).then(r => r.json());
+  assert.deepEqual(overCap, { jsonrpc: '2.0', id: 4, error: { code: -32003, message: 'Gas limit times max fee per gas exceeds the transaction fee cap', data: {
+    reason: 'tx_fee_above_cap', gas_limit: '0x7a1200', max_fee_per_gas: '0x2540be400', tx_fee_cap_wei: wei(8_000_000n * 10n * GWEI - 1n), max_fee_per_gas_allowed: wei(10n * GWEI - 1n),
+  } } });
   const wrong = createHttpServer(fixture({ eth_chainId: '0x1' }).signer).listen(0, '127.0.0.1');
   await once(wrong, 'listening');
   t.after(() => wrong.close());
@@ -380,6 +558,7 @@ test('upstream enforces encrypted remote transport, bounds every call by a timeo
     const route = {
       '/ok': () => response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0xaa36a7' })),
       '/rejected': () => response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: 3, message: 'execution reverted: private-api-key', data: '0xdead' } })),
+      '/fee-cap': () => response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'tx fee (1.07 ether) exceeds the configured cap (1.00 ether)' } })),
       '/http-error': () => { response.statusCode = 500; response.end('private-api-key'); },
       '/no-result': () => response.end(JSON.stringify({ jsonrpc: '2.0', id: 1 })),
       '/not-json': () => response.end('private-api-key'),
@@ -395,6 +574,10 @@ test('upstream enforces encrypted remote transport, bounds every call by a timeo
   for (const path of ['/http-error', '/no-result', '/not-json']) await assert.rejects(at(path)('eth_chainId', []), unavailable, path);
   const rejected = await at('/rejected')('eth_call', []).catch(error => error);
   assert.deepEqual({ code: rejected.code, message: rejected.message, data: rejected.data }, { code: -32000, message: 'Upstream RPC rejected the request', data: { reason: 'upstream_rejected' } });
+  // A node's fee-cap refusal is told apart only for a raw broadcast, and its text is still dropped.
+  const feeCap = await at('/fee-cap')('eth_sendRawTransaction', ['0x02']).catch(error => error);
+  assert.deepEqual({ code: feeCap.code, message: feeCap.message, data: feeCap.data }, { code: -32000, message: 'Upstream RPC rejected the request', data: { reason: 'upstream_tx_fee_cap' } });
+  assert.deepEqual((await at('/fee-cap')('eth_call', []).catch(error => error)).data, { reason: 'upstream_rejected' });
   const started = Date.now();
   await assert.rejects(at('/hang', { timeoutMs: 200 })('eth_chainId', []), unavailable);
   assert.ok(Date.now() - started < 5_000, 'a hung upstream call is abandoned at its timeout');
@@ -425,16 +608,18 @@ test('Mainnet refuses to start without an explicit fee cap; Sepolia uses a repor
     ...env, ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '300000000000', ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: '2000000000',
     ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI: '20000000000', ZKAPI_CHALLENGE_FEE_CEILING_WEI: '1000000000000',
     ZKAPI_CHALLENGE_MAX_GAS: '9000000', ZKAPI_CHALLENGE_PORT: '65535', ZKAPI_CHALLENGE_LISTEN_HOST: '',
+    ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2700000000000000000',
   });
   assert.deepEqual(configured, {
     chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
     maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI,
+    txFeeCap: 2_700_000_000_000_000_000n,
   });
   for (const legacy of ['50000000000', '']) {
     assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '50000000000', ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI: legacy }),
       configError('ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI is no longer supported; remove it and set ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI (the EIP-1559 fee cap in wei)'));
   }
-  for (const name of ['ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_FEE_CEILING_WEI', 'ZKAPI_CHALLENGE_MAX_GAS', 'ZKAPI_CHALLENGE_PORT']) {
+  for (const name of ['ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI', 'ZKAPI_CHALLENGE_FEE_CEILING_WEI', 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI', 'ZKAPI_CHALLENGE_MAX_GAS', 'ZKAPI_CHALLENGE_PORT']) {
     for (const bad of ['0', '0x10', '1e9', ' 5', '5 ', '-1', '10.5', '+5', '05', '1_000', 'REPLACE_WITH_FEE_CAP_WEI', '9'.repeat(32)]) {
       assert.throws(() => parseSignerConfig({ ...env, [name]: bad }), configError(`${name} must be a positive decimal integer`), `${name}=${bad}`);
     }
@@ -467,6 +652,27 @@ test('fee cap, priority fees and the configurable ceiling are mutually bounded',
     assert.throws(() => policy({ maxFeePerGas: 10n * GWEI, ...options }), { message: 'Default priority fee is invalid or exceeds the priority fee cap' });
   }
   assert.throws(() => fixture({}, { privateKey: '0x1234' }), { message: 'Signer private key is invalid' });
+});
+
+test('ZKAPI_CHALLENGE_TX_FEE_CAP_WEI defaults to 1 ETH and must be a positive decimal', () => {
+  const env = { ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault, ZKAPI_CHALLENGE_RPC_URL: 'https://rpc.invalid' };
+  const policyFor = extra => {
+    const { rpcUrl, listenHost, port, ...options } = parseSignerConfig({ ...env, ...extra });
+    return createSigner({ ...options, rpc: async () => assert.fail('no RPC expected') }).policy;
+  };
+  assert.equal(DEFAULT_TX_FEE_CAP, 1_000_000_000_000_000_000n);
+  for (const unset of [{}, { ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '' }]) {
+    assert.equal(parseSignerConfig({ ...env, ...unset }).txFeeCap, undefined);
+    assert.equal(policyFor(unset).tx_fee_cap_wei, ONE_ETH);
+  }
+  assert.equal(policyFor({ ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2260302300000000000' }).tx_fee_cap_wei, wei(2_260_302_300_000_000_000n));
+  assert.equal(policyFor({ ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '1' }).tx_fee_cap_wei, '0x1');
+  for (const bad of ['0', '00', '0x0de0b6b3a7640000', '1e18', '1000000000000000000 ', '-1', '1.5', '+1', '01', '1_000', 'REPLACE_WITH_TX_FEE_CAP_WEI', '9'.repeat(32)]) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: bad }), configError('ZKAPI_CHALLENGE_TX_FEE_CAP_WEI must be a positive decimal integer'), bad);
+  }
+  for (const txFeeCap of [0n, -1n, 1_000_000, '1000000000000000000', null]) {
+    assert.throws(() => fixture({}, { txFeeCap }), { message: 'Transaction fee cap is invalid' }, String(txFeeCap));
+  }
 });
 
 test('Mainnet and Sepolia preserve chain-specific signatures, proof bindings and fee bounds', async () => {
@@ -513,6 +719,7 @@ test('server process refuses unsafe fee configuration and prints only the safe r
     [{ ZKAPI_CHALLENGE_CHAIN_ID: '1' }, 'Mainnet requires an explicit ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI'],
     [{ ZKAPI_CHALLENGE_CHAIN_ID: '1', ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: 'REPLACE_WITH_FEE_CAP_WEI' }, 'ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI must be a positive decimal integer'],
     [{ ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI: '50000000000' }, 'ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI is no longer supported'],
+    [{ ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '0' }, 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI must be a positive decimal integer'],
     [{ ZKAPI_CHALLENGE_CHAIN_ID: '11155111' }, 'Upstream RPC request failed (upstream_unavailable)'],
   ]) {
     const result = spawnSync(process.execPath, ['server.mjs'], { cwd: here, encoding: 'utf8', timeout: 30_000, env: { ...base, ...env } });
@@ -543,6 +750,7 @@ test('server process starts from strict configuration and prints its fee policy 
       PATH: process.env.PATH, ZKAPI_CHALLENGE_CHAIN_ID: '11155111', ZKAPI_CHALLENGE_PRIVATE_KEY: key, ZKAPI_CHALLENGE_VAULT: vault,
       ZKAPI_CHALLENGE_RPC_URL: `http://127.0.0.1:${upstream.address().port}/private-api-key`, ZKAPI_CHALLENGE_PORT: String(port),
       ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '10000000000', ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: '',
+      ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '100000000000000000',
     },
   });
   t.after(() => child.kill());
@@ -556,12 +764,15 @@ test('server process starts from strict configuration and prints its fee policy 
   assert.deepEqual(line, {
     status: 'listening', chain_id: 11155111, sender: sender.toLowerCase(), vault, fee_model: 'eip1559', fee_cap_source: 'explicit',
     max_fee_per_gas_wei: '10000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
-    fee_ceiling_wei: '10000000000000', max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1',
-    base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required'],
+    // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
+    fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
+    max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1',
+    base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required', 'tx_fee_cap_below_fee_cap'],
   });
   const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());
   assert.equal(health.status, 'ok');
   assert.equal(health.max_fee_per_gas, wei(10n * GWEI));
+  assert.equal(health.tx_fee_cap_wei, wei(10n ** 17n));
   for (const secret of [key.slice(2), 'private-api-key']) assert.ok(!stdout.includes(secret) && !stderr.includes(secret));
 });
 

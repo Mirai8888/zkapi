@@ -14,6 +14,8 @@ export const DEFAULT_SEPOLIA_MAX_FEE_PER_GAS = 10n * GWEI;
 export const DEFAULT_PRIORITY_FEE_PER_GAS = 1n * GWEI;
 export const DEFAULT_FEE_CEILING = 10_000n * GWEI;
 export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
+// geth's and reth's default --rpc.txfeecap: 1 ether of gas limit x maxFeePerGas.
+export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
@@ -23,7 +25,12 @@ const readMethods = new Set([
 // Callers may propose both EIP-1559 fee fields (or neither). Every other fee
 // or envelope field (gasPrice, type, accessList, input, blob fields) is refused.
 const transactionFields = new Set(['from', 'to', 'data', 'gas', 'nonce', 'value', 'chainId', 'maxFeePerGas', 'maxPriorityFeePerGas']);
-const weiDetails = new Set(['base_fee_per_gas', 'max_fee_per_gas', 'max_priority_fee_per_gas', 'balance', 'required_balance']);
+const weiDetails = new Set(['base_fee_per_gas', 'max_fee_per_gas', 'max_priority_fee_per_gas', 'max_fee_per_gas_allowed', 'balance', 'required_balance']);
+// geth refuses eth_sendRawTransaction before its pool when gas limit x
+// maxFeePerGas exceeds --rpc.txfeecap: "tx fee (1.07 ether) exceeds the
+// configured cap (1.00 ether)". Only a short message of that form counts.
+const UPSTREAM_TX_FEE_CAP = /tx fee .* exceeds the configured cap/i;
+const txFeeCapRefusal = error => typeof error?.message === 'string' && error.message.length <= 256 && UPSTREAM_TX_FEE_CAP.test(error.message);
 
 export class RpcError extends Error {
   constructor(code, message, reason, details) {
@@ -77,6 +84,7 @@ export function parseSignerConfig(env) {
     priorityFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI'),
     maxPriorityFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI'),
     feeCeiling: envInteger(env, 'ZKAPI_CHALLENGE_FEE_CEILING_WEI'),
+    txFeeCap: envInteger(env, 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI'),
   };
 }
 
@@ -100,13 +108,16 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
       if (!response.ok) throw new Error();
       body = await response.json();
     } catch { throw new RpcError(-32000, 'Upstream RPC request failed', 'upstream_unavailable'); }
-    if (body && typeof body === 'object' && body.error) throw new RpcError(-32000, 'Upstream RPC rejected the request', 'upstream_rejected');
+    if (body && typeof body === 'object' && body.error) {
+      const reason = method === 'eth_sendRawTransaction' && txFeeCapRefusal(body.error) ? 'upstream_tx_fee_cap' : 'upstream_rejected';
+      throw new RpcError(-32000, 'Upstream RPC rejected the request', reason);
+    }
     if (!body || typeof body !== 'object' || !Object.hasOwn(body, 'result')) throw new RpcError(-32000, 'Upstream RPC request failed', 'upstream_unavailable');
     return body.result;
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, log = line => console.log(JSON.stringify(line)), ...unsupported }) {
+export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, log = line => console.log(JSON.stringify(line)), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
   requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
   // Mainnet never inherits the testnet default; null counts as unset.
@@ -121,6 +132,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   requireValid(typeof maxGas === 'bigint' && maxGas > 0n && maxGas <= 16_777_216n, 'Gas limit cap is invalid');
   const positive = value => typeof value === 'bigint' && value > 0n;
   requireValid(positive(feeCeiling) && feeCeiling <= ABSOLUTE_FEE_CEILING, 'Fee ceiling is invalid');
+  requireValid(positive(txFeeCap), 'Transaction fee cap is invalid');
   requireValid(positive(maxFeePerGas) && maxFeePerGas <= feeCeiling, 'Fee cap is invalid or exceeds the fee ceiling');
   requireValid(maxPriorityFeePerGas == null || (positive(maxPriorityFeePerGas) && maxPriorityFeePerGas <= maxFeePerGas), 'Priority fee cap is invalid or exceeds the fee cap');
   priorityFeePerGas ??= min(DEFAULT_PRIORITY_FEE_PER_GAS, maxPriorityFeePerGas ?? maxFeePerGas);
@@ -135,7 +147,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   const policy = Object.freeze({
     sender, vault: destination, transaction_type: '0x2', fee_cap_source: feeCapSource,
     max_fee_per_gas: hex(maxFeePerGas), priority_fee_per_gas: hex(priorityFeePerGas),
-    max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling),
+    max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling), tx_fee_cap_wei: hex(txFeeCap),
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
   });
 
@@ -204,6 +216,8 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     // The next base fee may be 12.5% higher; the cap must still leave the default tip.
     if (baseFee * 9n + priorityFeePerGas * 8n > maxFeePerGas * 8n) warnings.push('base_fee_near_cap');
     if (balance < maxGas * maxFeePerGas) warnings.push('balance_below_required');
+    // Bids near the fee cap at a gas limit near MAX_GAS would be refused.
+    if (maxGas * maxFeePerGas > txFeeCap) warnings.push('tx_fee_cap_below_fee_cap');
     return { chain_id: hex(chainId), ...policy, block_number: hex(number), base_fee_per_gas: hex(baseFee), balance: hex(balance), warnings };
   }
 
@@ -259,9 +273,18 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   }
 
   // Every failure before eth_sendRawTransaction is a definite non-broadcast.
-  // From the broadcast on, the only failure is broadcast_ambiguous with the hash.
+  // From the broadcast on, the only failures are broadcast_ambiguous with the
+  // hash and upstream_tx_fee_cap, which the node answers before its pool.
   async function signAndSend(tx) {
     const transaction = validateTransaction(tx);
+    // Nodes refuse a gas limit x maxFeePerGas above their RPC fee cap, so
+    // neither a proposed nor the default bid above it is ever offered.
+    if (transaction.gasLimit * transaction.maxFeePerGas > txFeeCap) {
+      throw new RpcError(-32003, 'Gas limit times max fee per gas exceeds the transaction fee cap', 'tx_fee_above_cap', {
+        gas_limit: hex(transaction.gasLimit), max_fee_per_gas: hex(transaction.maxFeePerGas),
+        tx_fee_cap_wei: hex(txFeeCap), max_fee_per_gas_allowed: hex(txFeeCap / transaction.gasLimit),
+      });
+    }
     await checkChain();
     const simulation = { from: sender, to: destination, data: transaction.data, value: '0x0' };
     await simulate(() => rpc('eth_call', [simulation, 'latest']));
@@ -292,9 +315,13 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const ambiguous = () => new RpcError(-32000, 'Transaction broadcast outcome is unknown', 'broadcast_ambiguous', { transaction_hash: hash });
     let returned;
     try { returned = await rpc('eth_sendRawTransaction', [raw]); }
-    catch {
+    catch (error) {
       // Signing is deterministic, so an identical rebroadcast ("already known") is idempotent.
       if (await knownTransaction(hash)) return { hash, transaction };
+      // The node's own fee-cap refusal: definitely not broadcast, so no hash.
+      if (error instanceof RpcError && error.data?.reason === 'upstream_tx_fee_cap') {
+        throw new RpcError(-32003, 'Upstream RPC refused the transaction fee', 'upstream_tx_fee_cap', { gas_limit: hex(transaction.gasLimit), max_fee_per_gas: hex(transaction.maxFeePerGas) });
+      }
       throw ambiguous();
     }
     if (typeof returned !== 'string' || returned.toLowerCase() !== hash) throw ambiguous();

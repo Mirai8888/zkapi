@@ -7,18 +7,20 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
 
 // RebindDeposit repairs a saved deposit's note binding from finalized vault
 // state and the indexer snapshot, for example after an RPC reported the wrong
-// note ID. Only the note ID and expiry can change: the secret, commitment and
-// amount come from this daemon's own journal. A companion note is replaced
-// only when the caller names it and it is an unspent genesis note of exactly
-// this amount, with no pending request. A withdrawal reservation of that note
-// is first released through the companion, which refuses while the
-// withdrawal has a plan or the server knows its nullifier.
+// note ID, or a revert for a deposit that landed. Only the note ID and expiry
+// can change: the secret, commitment and amount come from this daemon's own
+// journal. A companion note is replaced only when the caller names it and it
+// is an unspent genesis note of exactly this amount, with no pending request.
+// A withdrawal reservation of that note is first released through the
+// companion, which refuses while the withdrawal has a plan or the server
+// knows its nullifier.
 func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteID *uint64) (AddressFundingStatus, error) {
 	if (noteID != nil && *noteID > 0xffffffff) || (replaceNoteID != nil && *replaceNoteID > 0xffffffff) {
 		return AddressFundingStatus{}, errors.New("note IDs must be 32-bit vault note IDs")
@@ -65,14 +67,22 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 	}
 
 	// Every saved deposit transaction must be final: an unmined one could
-	// still create a second note with this secret after the rebind.
+	// still create a second note with this secret after the rebind. That
+	// includes earlier deposits of this note retired after a reported revert,
+	// which a withholding RPC can still relay.
 	type savedDeposit struct {
 		hash    string
 		receipt *addressReceipt
 	}
 	var saved []savedDeposit
-	for _, hash := range []string{pendingDepositHash(record), deposit.TransactionHash} {
-		if hash == "" || (len(saved) > 0 && strings.EqualFold(saved[0].hash, hash)) {
+	hashes := []string{pendingDepositHash(record), deposit.TransactionHash}
+	for _, entry := range noteDepositTransactions(record, deposit) {
+		if entry.FinalizedRevert {
+			hashes = append(hashes, entry.Hash)
+		}
+	}
+	for _, hash := range hashes {
+		if hash == "" || slices.ContainsFunc(saved, func(entry savedDeposit) bool { return strings.EqualFold(entry.hash, hash) }) {
 			continue
 		}
 		receipt, final, err := h.addressFinalReceipt(ctx, config, hash, true)
@@ -113,14 +123,15 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 			}
 		}
 		if !found && deposit.Slot != nil {
-			// Without a usable receipt, only our exact leaf at the slot the
-			// signed calldata targeted can identify the note.
+			// Without a usable receipt, only our exact leaf from a slot this
+			// note's deposits were built for, earliest first, identifies it.
 			ttl, err := h.noteTTL()
 			if err != nil {
 				return AddressFundingStatus{}, err
 			}
+			slots := append(signedDepositSlots(deposit, record), *deposit.Slot)
 			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil {
-				candidate, found = findDepositLeaf(snapshot, deposit.Slot, commitment, deposit.Amount, ttl, time.Now().Unix())
+				candidate, found = findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, time.Now().Unix())
 			}
 		}
 		if !found {

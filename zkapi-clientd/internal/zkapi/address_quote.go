@@ -125,7 +125,7 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 		if err != nil {
 			return quote, err
 		}
-		if err := h.checkDepositRevert(ctx, config, deposit, record.Pending, receipt); err != nil {
+		if err := h.checkDepositRevert(ctx, config, record, deposit, receipt); err != nil {
 			return quote, err
 		}
 		retryHash = record.Pending.Hash
@@ -136,6 +136,26 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	deposit, err := h.readAddressDeposit(config)
 	if err != nil || deposit == nil || deposit.Amount != amount || deposit.Active || deposit.TransactionHash != "" {
 		return quote, errors.New("the prepared deposit cannot be quoted; preserve its recovery data")
+	}
+	if retryHash == "" {
+		// An earlier deposit of this note, already retired, may have landed
+		// since. Approval searches the tree it signs from again; a retry that
+		// would be refused is not quoted for funding. A quote saves phase
+		// waiting_funds, so a saved conflict is only cleared by a search that
+		// completes.
+		search := h.advisePriorDeposits
+		if record.Phase == "verification_conflict" {
+			search = h.checkPriorDeposits
+		}
+		if err := search(ctx, config, record, deposit); err != nil {
+			if errors.Is(err, errDepositVerificationConflict) && record.Phase != "verification_conflict" {
+				record.Phase = "verification_conflict"
+				if saveErr := h.saveAddress(record); saveErr != nil {
+					return quote, saveErr
+				}
+			}
+			return quote, err
+		}
 	}
 	record.Amount, record.Commitment, record.Phase = amount, deposit.Commitment, "waiting_funds"
 	if retryHash != "" {

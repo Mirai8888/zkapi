@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -144,6 +146,71 @@ func TestGuidedFundingReverifiesSavedConflict(t *testing.T) {
 		if f.resumeCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 {
 			t.Fatal("a saved conflict was not re-verified exactly once without a new deposit")
 		}
+	}
+}
+
+// When a retry's quote or approval finds an earlier deposit of the note in
+// the zkAPI indexer's tree, nothing is signed and setup points to repair.
+func TestGuidedDepositPointsToRepairWhenEarlierDepositLanded(t *testing.T) {
+	for _, step := range []string{"quote", "approval"} {
+		t.Run(step, func(t *testing.T) {
+			f := newWizardFixture()
+			conflict := false
+			f.address = func() zkapi.AddressFundingStatus {
+				state := wizardState("waiting_funds")
+				if conflict {
+					state.Phase = "verification_conflict"
+				}
+				state.TransactionHash = ""
+				return state
+			}
+			f.quote = func(call int, _, _ uint64) (zkapi.AddressPaymentQuote, error) {
+				if step == "quote" && call == 2 {
+					conflict = true
+					return zkapi.AddressPaymentQuote{}, errors.New("the zkAPI indexer records this private note's deposit at note 12")
+				}
+				q := wizardQuote()
+				q.ID = fmt.Sprintf("%064x", call)
+				return q, nil
+			}
+			f.approve = func(string) (zkapi.AddressFundingStatus, error) {
+				conflict = true
+				return f.address(), nil
+			}
+			f.ready = func(int) zkapi.WalletReadiness { return zkapi.WalletReadiness{} }
+			err := guidedFunding(context.Background(), f, "", &fundingWizardUI{confirmations: []bool{true}}, immediateWizardPoll)
+			if err == nil || !strings.Contains(err.Error(), "config --menu, then choose repair") {
+				t.Fatalf("setup did not point to repair: %v", err)
+			}
+			if f.resumeCalls != 0 || f.approveCalls != map[string]int{"quote": 0, "approval": 1}[step] {
+				t.Fatalf("unexpected flow after the conflict: resumes %d, approvals %d", f.resumeCalls, f.approveCalls)
+			}
+		})
+	}
+}
+
+// A conflict about an earlier, retired deposit has no saved transaction. When
+// the re-check clears it, setup says so instead of resuming a deposit that
+// does not exist, and neither quotes nor approves in that run.
+func TestGuidedFundingReportsClearedConflictWithoutSavedDeposit(t *testing.T) {
+	f := newWizardFixture()
+	f.address = func() zkapi.AddressFundingStatus {
+		state := wizardState("verification_conflict")
+		state.TransactionHash = ""
+		return state
+	}
+	f.resume = func(uint64) (zkapi.AddressFundingStatus, error) {
+		state := wizardState("waiting_funds")
+		state.TransactionHash = ""
+		return state, nil
+	}
+	f.ready = func(int) zkapi.WalletReadiness { return zkapi.WalletReadiness{} }
+	err := guidedFunding(context.Background(), f, "", &fundingWizardUI{}, immediateWizardPoll)
+	if err == nil || !strings.Contains(err.Error(), "no longer shows the earlier deposit") || strings.Contains(err.Error(), "preserve recovery files") {
+		t.Fatalf("a cleared conflict was not reported plainly: %v", err)
+	}
+	if f.resumeCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 {
+		t.Fatal("a cleared conflict quoted, approved, or resumed again")
 	}
 }
 

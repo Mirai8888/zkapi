@@ -49,7 +49,7 @@ type addressFixture struct {
 	indexerHash                string
 	indexerStatus              int // >0: HTTP error, <0: inconsistent snapshot
 	indexerWithoutBlock        bool
-	snapshotReads              int
+	snapshotReads, rootReads   int
 	cachedRoot                 *big.Int
 	cachedPath                 []*big.Int
 	cachedVersion, leafVersion int
@@ -118,20 +118,28 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 			t.Error("identity reached the indexer")
 		}
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/tree/snapshot" {
+		if r.Method != http.MethodGet || (r.URL.Path != "/v1/tree/snapshot" && r.URL.Path != "/v1/tree/root") {
 			t.Errorf("unexpected indexer request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		f.snapshotReads++
+		snapshot := r.URL.Path == "/v1/tree/snapshot"
+		if snapshot {
+			f.snapshotReads++
+		} else {
+			f.rootReads++
+		}
 		if f.indexerStatus > 0 {
 			w.WriteHeader(f.indexerStatus)
 			_, _ = io.WriteString(w, `{"status":"unavailable","error_code":"indexer_unavailable"}`)
 			return
 		}
 		root, _ := f.tree()
-		body := map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(f.leaves), "leaves": fieldHexes(f.leaves)}
-		if f.indexerStatus < 0 { // An internally inconsistent snapshot.
+		body := map[string]any{"root": fmt.Sprintf("0x%x", root), "next_note_id": len(f.leaves)}
+		if snapshot {
+			body["leaves"] = fieldHexes(f.leaves)
+		}
+		if f.indexerStatus < 0 && snapshot { // An internally inconsistent snapshot.
 			body["next_note_id"] = len(f.leaves) + 1
 		}
 		if !f.indexerWithoutBlock {

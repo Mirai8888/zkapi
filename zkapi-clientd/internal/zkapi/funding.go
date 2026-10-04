@@ -24,6 +24,9 @@ type FundingHandler struct {
 	client    *Client
 	statePath string
 	mu        sync.Mutex
+	// priorAdvice, guarded by mu, spares repeated quotes a download of an
+	// indexer tree that was already searched; see advisePriorDeposits.
+	priorAdvice *priorDepositAdvice
 }
 
 type fundingConfig struct {
@@ -55,6 +58,10 @@ type depositRecord struct {
 	Binding *depositBinding `json:"binding,omitempty"`
 	Rebind  *depositRebind  `json:"rebind,omitempty"`
 	Slot    *depositSlot    `json:"slot,omitempty"`
+	// SignedSlots keeps the slot of every earlier signed deposit of this note
+	// when Slot is replaced for another attempt: a deposit reported as
+	// reverted can still land there later.
+	SignedSlots []depositSlot `json:"signed_slots,omitempty"`
 }
 
 // depositBinding is the note identity both the vault and the indexer agreed

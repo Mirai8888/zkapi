@@ -68,6 +68,10 @@ func runGuidedFunding(ctx context.Context, c config.Config, usdText, _ string, u
 // A fixed label: the daemon's detailed status stays out of the guided output.
 var errGuidedDepositConflict = errors.New("deposit needs attention: the payment RPC, the vault state, and the zkAPI indexer disagree about this mined deposit, so its private note was not activated; the funds stay on chain. Run zkapi-clientd config again to re-check. If this persists, compare the transaction on a block explorer and run zkapi-clientd config --menu, then choose repair")
 
+// A conflict about an earlier, retired deposit can clear on re-check; no
+// deposit is saved then, so there is nothing to resume.
+var errGuidedDepositRechecked = errors.New("the zkAPI indexer no longer shows the earlier deposit and no deposit is saved; run zkapi-clientd config again to review a new deposit quote")
+
 // runGuidedRepair binds the saved deposit to the vault note that finalized
 // vault state and the zkAPI indexer agree holds it, through the
 // owner-authenticated rebind endpoint. The daemon verifies everything itself
@@ -169,6 +173,9 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		}
 		if next.Phase == "verification_conflict" {
 			return errGuidedDepositConflict
+		}
+		if next.TransactionHash == "" && (next.Phase == "ready" || next.Phase == "waiting_funds") {
+			return errGuidedDepositRechecked
 		}
 		if err := finishGuidedDeposit(ctx, service, next, ui, wait); err != nil {
 			return err
@@ -331,6 +338,9 @@ func waitAndDeposit(ctx context.Context, service guidedFundingService, initial z
 					if state.TransactionHash != "" {
 						return errors.New("saved funding has inconsistent transaction state; preserve recovery files")
 					}
+				case "verification_conflict":
+					// An earlier deposit of this note shows on chain after all.
+					return errGuidedDepositConflict
 				default:
 					return errors.New("saved funding needs attention; run zkapi-clientd config before continuing")
 				}
@@ -430,6 +440,8 @@ func waitAndDeposit(ctx context.Context, service guidedFundingService, initial z
 					return err
 				}
 				continue
+			case "verification_conflict":
+				return errGuidedDepositConflict
 			default:
 				return errors.New("saved funding needs attention; run zkapi-clientd config before continuing (a reverted transaction is never retried automatically)")
 			}

@@ -11,6 +11,8 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,11 +20,12 @@ import (
 )
 
 // The packaged payment RPC is a third party. Before a note secret leaves this
-// process, a failed deposit is retired, or a withdrawal closes local state,
-// its claims are checked against the operator indexer's tree snapshot. The
-// snapshot is the same payload for every caller, so the indexer never learns
-// which note is ours; Go recomputes the expected leaf with zkAPI Poseidon.
-// Lag or missing data is pending; disagreement is a non-terminal conflict.
+// process, a failed deposit is retired or retried, or a withdrawal closes
+// local state, its claims are checked against the operator indexer's tree
+// snapshot. The snapshot is the same payload for every caller, so the
+// indexer never learns which note is ours; Go recomputes the expected leaf
+// with zkAPI Poseidon. Lag or missing data is pending; disagreement is a
+// non-terminal conflict.
 
 const notesSelector = "0x9f18e4ed" // notes(uint32)
 
@@ -39,10 +42,12 @@ const (
 	indexerSnapshotLimit = 32 << 20
 	// The vault rounds expiry up to whole days: ceil((t + noteTtl) / 1 day).
 	vaultExpiryBucket = 24 * 60 * 60
-	// A deposit's calldata can only match an empty slot at or shortly after
-	// the one it was built for (after closes restored identical siblings).
+	// The search for our leaf is bounded (see findDepositLeaf): it compares
+	// this many occupied slots from a signed slot, over this many expiry days.
 	depositRevertScanSlots  = 64
 	depositRevertMaxBuckets = 64
+	// A tree root response is a few hundred bytes.
+	indexerRootLimit = 4 << 10
 )
 
 var (
@@ -153,30 +158,61 @@ func (s *treeSnapshot) leaf(id uint32) (value *big.Int, present bool, err error)
 	return value, true, nil
 }
 
-// indexerSnapshot reads the packaged indexer's whole-tree snapshot through the
-// configured transport, with no credentials and no redirects. Bodies are
-// never reflected. A snapshot without block metadata (an older indexer) can
-// never be evidence: its applied block is unknown.
-func (h *FundingHandler) indexerSnapshot(ctx context.Context, config fundingConfig) (*treeSnapshot, error) {
-	unavailable := errors.New("the zkAPI indexer snapshot is unavailable")
+// indexerGet reads a public, parameterless route of the packaged indexer
+// through the configured transport, with no credentials and no redirects.
+// Every caller gets the same response, so the indexer never learns which
+// note is ours. Bodies are never reflected.
+func (h *FundingHandler) indexerGet(ctx context.Context, config fundingConfig, route string, limit int, timeout time.Duration) ([]byte, bool) {
 	if config.Indexer == "" {
-		return nil, unavailable
+		return nil, false
 	}
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(config.Indexer, "/")+"/v1/tree/snapshot", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(config.Indexer, "/")+route, nil)
 	if err != nil {
-		return nil, unavailable
+		return nil, false
 	}
 	req.Header.Set("Accept", "application/json")
 	response, err := h.client.inference.Do(req)
 	if err != nil {
-		return nil, unavailable
+		return nil, false
 	}
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, indexerSnapshotLimit+1))
-	if err != nil || len(raw) > indexerSnapshotLimit || response.StatusCode != http.StatusOK {
-		return nil, unavailable
+	raw, err := io.ReadAll(io.LimitReader(response.Body, int64(limit)+1))
+	if err != nil || len(raw) > limit || response.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	return raw, true
+}
+
+// indexerRoot reads the identity of the indexer's current tree, its root and
+// next_note_id, without the leaves. The root commits to every leaf.
+func (h *FundingHandler) indexerRoot(ctx context.Context, config fundingConfig) (*big.Int, uint32, error) {
+	raw, ok := h.indexerGet(ctx, config, "/v1/tree/root", indexerRootLimit, 5*time.Second)
+	if !ok {
+		return nil, 0, errors.New("the zkAPI indexer root is unavailable")
+	}
+	var wire struct {
+		Root       string  `json:"root"`
+		NextNoteID *uint32 `json:"next_note_id"`
+	}
+	if json.Unmarshal(raw, &wire) != nil || wire.NextNoteID == nil {
+		return nil, 0, errors.New("invalid zkAPI indexer root")
+	}
+	root, valid := parseFieldElement(wire.Root)
+	if !valid {
+		return nil, 0, errors.New("invalid zkAPI indexer root")
+	}
+	return root, *wire.NextNoteID, nil
+}
+
+// indexerSnapshot reads the packaged indexer's whole-tree snapshot. A
+// snapshot without block metadata (an older indexer) can never be evidence:
+// its applied block is unknown.
+func (h *FundingHandler) indexerSnapshot(ctx context.Context, config fundingConfig) (*treeSnapshot, error) {
+	raw, ok := h.indexerGet(ctx, config, "/v1/tree/snapshot", indexerSnapshotLimit, 20*time.Second)
+	if !ok {
+		return nil, errors.New("the zkAPI indexer snapshot is unavailable")
 	}
 	var wire struct {
 		Root        string   `json:"root"`
@@ -278,7 +314,19 @@ func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingC
 // an empty leaf at the snapshot's next_note_id to the snapshot root. The slot
 // is saved with the note record before the transaction exists, so a later
 // reported revert can be checked against what actually happened there.
-func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConfig, deposit *depositRecord) (string, error) {
+//
+// A deposit reported as reverted may have been withheld and still land, and
+// a second deposit of this note would share its nullifier. So the same
+// snapshot is searched for our leaf from the slot of every deposit of this
+// note signed before, and nothing is signed when it is found. The new path
+// and that search come from one tree. An earlier deposit missing from it
+// cannot land beside the new one: the vault accepts each only against a
+// tree without the other's leaf. An earlier deposit in it is found unless it
+// lies outside findDepositLeaf's bounds. That happens only in two cases.
+// After it landed, challengeEscapeWithdrawal restored 64 or more leaves
+// between the slot it was built for and the slot it landed in. Or it landed
+// about 63 or more days ago.
+func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord) (string, error) {
 	path, err := h.depositPath(ctx)
 	if err != nil {
 		return "", err
@@ -305,6 +353,10 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	if merkleRoot(snapshot.NextNoteID, new(big.Int), siblings).Cmp(snapshot.Root) != 0 {
 		return "", errors.New("the deposit witness does not match the zkAPI indexer's current tree; no deposit was signed, retry")
 	}
+	signed := signedDepositSlots(deposit, record)
+	if err := h.priorDepositConflict(snapshot, deposit, signed); err != nil {
+		return "", err
+	}
 	data := "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", deposit.Amount)
 	for _, sibling := range refreshed.ZeroPath {
 		data += addressABIWord(sibling)
@@ -314,6 +366,7 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 		return "", errors.New("invalid deposit call data")
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
+	deposit.SignedSlots = signed
 	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix()}
 	if err := h.save(*deposit); err != nil {
 		return "", err
@@ -346,13 +399,40 @@ func signedDepositSlot(deposit *depositRecord, saved *addressTransaction) (*depo
 // checkDepositRevert decides whether a finalized failed deposit may be retired.
 // A hostile RPC can report a revert for a deposit that actually created our
 // note; retiring it would reuse the note secret in a second deposit. The
-// indexer must show that this note did not land where the signed calldata
-// could apply. Foreign deposits reusing the public commitment with another
-// amount never match our leaf, so they cannot block a genuine retry. Deposits
-// signed before slots were recorded keep the previous behaviour.
-func (h *FundingHandler) checkDepositRevert(ctx context.Context, config fundingConfig, deposit *depositRecord, saved *addressTransaction, receipt *addressReceipt) error {
-	slot, ok := signedDepositSlot(deposit, saved)
-	if !ok {
+// indexer must show that this note did not land where the signed calldata of
+// this or any earlier deposit of it could apply. Foreign deposits reusing the
+// public commitment with another amount never match our leaf, so they cannot
+// block a genuine retry. Deposits signed before slots were recorded keep the
+// previous behaviour.
+func (h *FundingHandler) checkDepositRevert(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord, receipt *addressReceipt) error {
+	if _, ok := signedDepositSlot(deposit, record.Pending); !ok {
+		return nil
+	}
+	block, err := addressHexUint(receipt.BlockNumber)
+	if err != nil || !block.IsUint64() {
+		return errRevertVerificationPending
+	}
+	snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64())
+	if err != nil {
+		return fmt.Errorf("%w (%v)", errRevertVerificationPending, err)
+	}
+	// Otherwise another leaf holds the slot, it was emptied, or it is still
+	// free. The deposit may still land later, so a retry is searched for it
+	// again, in the tree the retry is built from, before it is signed.
+	return h.priorDepositConflict(snapshot, deposit, signedDepositSlots(deposit, record))
+}
+
+// landedDepositConflict reports this note's deposit found in the indexer's
+// tree. Another deposit of the note would share its nullifier, so nothing
+// more is signed; repair binds the note that landed.
+func landedDepositConflict(id uint32) error {
+	return fmt.Errorf("%w: the zkAPI indexer records this private note's deposit at note %d; no replacement will be signed; run zkapi-clientd config --menu, then choose repair", errDepositVerificationConflict, id)
+}
+
+// priorDepositConflict searches snapshot for our leaf from every slot a
+// deposit of this note was signed for.
+func (h *FundingHandler) priorDepositConflict(snapshot *treeSnapshot, deposit *depositRecord, slots []depositSlot) error {
+	if len(slots) == 0 {
 		return nil
 	}
 	commitment, ok := parseFieldElement(deposit.Commitment)
@@ -363,38 +443,182 @@ func (h *FundingHandler) checkDepositRevert(ctx context.Context, config fundingC
 	if err != nil {
 		return err
 	}
-	block, err := addressHexUint(receipt.BlockNumber)
-	if err != nil || !block.IsUint64() {
-		return errRevertVerificationPending
+	if id, found := findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, time.Now().Unix()); found {
+		return landedDepositConflict(id)
 	}
-	snapshot, err := h.confirmedSnapshot(ctx, config, block.Uint64())
-	if err != nil {
-		return fmt.Errorf("%w (%v)", errRevertVerificationPending, err)
-	}
-	if id, found := findDepositLeaf(snapshot, slot, commitment, deposit.Amount, ttl, time.Now().Unix()); found {
-		return fmt.Errorf("%w: the zkAPI indexer records this private note's deposit at note %d; no replacement will be signed; run zkapi-clientd config --menu, then choose repair", errDepositVerificationConflict, id)
-	}
-	// Another leaf holds the slot, it was emptied, or it is still free. A
-	// retry is rebuilt from the then-current tree: while the slot is free it
-	// targets the same slot, so at most one of the two transactions can land,
-	// and a late landing of this one is found by the next check or a rebind.
 	return nil
 }
 
+// checkPriorDeposits searches the indexer's current tree the same way and
+// fails closed: an unavailable indexer is an error. It decides whether a
+// saved conflict about an earlier deposit is cleared. With no deposit of this
+// note signed yet, it makes no request.
+func (h *FundingHandler) checkPriorDeposits(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord) error {
+	slots := signedDepositSlots(deposit, record)
+	if len(slots) == 0 {
+		return nil
+	}
+	snapshot, err := h.indexerSnapshot(ctx, config)
+	if err != nil {
+		return err
+	}
+	return h.priorDepositConflict(snapshot, deposit, slots)
+}
+
+// priorDepositAdvice is the indexer tree that the last quote-time search ran
+// on without finding any of the searched deposits.
+type priorDepositAdvice struct {
+	key  string
+	root *big.Int
+	next uint32
+}
+
+// advisePriorDeposits is the quote-time search, so that a user is not asked
+// to fund a retry that approval would refuse. Approval searches the tree it
+// signs from again and fails closed. So here only a deposit that is found
+// refuses the quote, and an unavailable or older indexer does not. A tree
+// that was already searched is not downloaded again: while a client polls
+// quotes and waits for funds, each quote costs one small root read until
+// the tree changes.
+func (h *FundingHandler) advisePriorDeposits(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord) error {
+	slots := signedDepositSlots(deposit, record)
+	if len(slots) == 0 {
+		return nil
+	}
+	ttl, err := h.noteTTL()
+	if err != nil {
+		return err
+	}
+	key := priorDepositKey(config, deposit, slots, ttl)
+	if advice := h.priorAdvice; advice != nil && advice.key == key {
+		root, next, err := h.indexerRoot(ctx, config)
+		if err != nil || (root.Cmp(advice.root) == 0 && next == advice.next) {
+			return nil
+		}
+	}
+	snapshot, err := h.indexerSnapshot(ctx, config)
+	if err != nil {
+		return nil
+	}
+	if err := h.priorDepositConflict(snapshot, deposit, slots); err != nil {
+		h.priorAdvice = nil
+		return err
+	}
+	h.priorAdvice = &priorDepositAdvice{key: key, root: snapshot.Root, next: snapshot.NextNoteID}
+	return nil
+}
+
+// priorDepositKey names what a search verdict depends on besides the tree and
+// the time. Over time the expiry window only gains days after the search,
+// when no leaf of an unchanged tree can have landed, and drops older ones.
+// So a verdict that found nothing still holds while the root is the same.
+func priorDepositKey(config fundingConfig, deposit *depositRecord, slots []depositSlot, ttl uint64) string {
+	ordered := append([]depositSlot{}, slots...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].NoteID != ordered[j].NoteID {
+			return ordered[i].NoteID < ordered[j].NoteID
+		}
+		if ordered[i].PreparedAt != ordered[j].PreparedAt {
+			return ordered[i].PreparedAt < ordered[j].PreparedAt
+		}
+		return strings.ToLower(ordered[i].PathSHA256) < strings.ToLower(ordered[j].PathSHA256)
+	})
+	var key strings.Builder
+	fmt.Fprintf(&key, "%s|%s|%d|%d", config.Indexer, strings.ToLower(deposit.Commitment), deposit.Amount, ttl)
+	for _, slot := range ordered {
+		fmt.Fprintf(&key, "|%d:%d:%s", slot.NoteID, slot.PreparedAt, strings.ToLower(slot.PathSHA256))
+	}
+	return key.String()
+}
+
+// signedDepositSlots lists the slot of every deposit of this note that was
+// signed: those kept from earlier attempts and, when a saved deposit
+// transaction of this note carries exactly its zero path, the current one.
+// A path already kept is not added again, so its earliest preparation stays.
+func signedDepositSlots(deposit *depositRecord, record *addressFundingRecord) []depositSlot {
+	if deposit == nil {
+		return nil
+	}
+	slots := append([]depositSlot{}, deposit.SignedSlots...)
+	current := deposit.Slot
+	if current == nil || slices.ContainsFunc(slots, func(slot depositSlot) bool {
+		return slot.NoteID == current.NoteID && strings.EqualFold(slot.PathSHA256, current.PathSHA256)
+	}) {
+		return slots
+	}
+	for _, entry := range noteDepositTransactions(record, deposit) {
+		if _, ok := signedDepositSlot(deposit, &entry); ok {
+			return append(slots, *current)
+		}
+	}
+	return slots
+}
+
+// noteDepositTransactions returns the saved deposit transactions whose signed
+// calldata deposits exactly this note's commitment and amount.
+func noteDepositTransactions(record *addressFundingRecord, deposit *depositRecord) []addressTransaction {
+	if record == nil || deposit == nil {
+		return nil
+	}
+	var deposits []addressTransaction
+	for _, entry := range append(append([]addressTransaction{}, record.History...), pendingAddressTransaction(record.Pending)...) {
+		if entry.Kind != "deposit" {
+			continue
+		}
+		raw, err := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))
+		var tx types.Transaction
+		if err != nil || tx.UnmarshalBinary(raw) != nil {
+			continue
+		}
+		data := tx.Data()
+		if len(data) != 4+34*32 || hex.EncodeToString(data[:4]) != "c588341c" || !strings.EqualFold(hex.EncodeToString(data[4:36]), addressABIWord(deposit.Commitment)) || hex.EncodeToString(data[36:68]) != fmt.Sprintf("%064x", deposit.Amount) {
+			continue
+		}
+		deposits = append(deposits, entry)
+	}
+	return deposits
+}
+
+// findSignedDepositLeaf searches from each signed slot, earliest first. Slots
+// with the same note ID are searched once, from the earliest preparation.
+func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
+	ordered := append([]depositSlot{}, slots...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].NoteID != ordered[j].NoteID {
+			return ordered[i].NoteID < ordered[j].NoteID
+		}
+		return ordered[i].PreparedAt < ordered[j].PreparedAt
+	})
+	for i := range ordered {
+		if i > 0 && ordered[i].NoteID == ordered[i-1].NoteID {
+			continue
+		}
+		if id, found := findDepositLeaf(snapshot, &ordered[i], commitment, amount, ttl, now); found {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
 // findDepositLeaf looks for exactly our leaf (commitment, amount and a
-// day-bucketed expiry the vault could have assigned since the deposit was
-// prepared) at the prepared slot and the few slots after it.
+// day-bucketed expiry from plausibleExpiries) at the prepared slot and the
+// occupied slots after it. Every comparison costs a Poseidon hash per expiry
+// day, so it compares at most depositRevertScanSlots occupied slots. Empty
+// slots are skipped without counting. Calldata built for one slot lands at a
+// later one only while every slot in between is empty, because the vault
+// checks the path against its live root. So when it lands, its slot is the
+// first occupied one. Afterwards challengeEscapeWithdrawal can restore leaves
+// that escapes removed in between, and a landing behind
+// depositRevertScanSlots restored leaves is not found.
 func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
 	expiries := plausibleExpiries(slot.PreparedAt, now, ttl)
-	end := uint64(slot.NoteID) + depositRevertScanSlots
-	if end > uint64(snapshot.NextNoteID) {
-		end = uint64(snapshot.NextNoteID)
-	}
-	for id := uint64(slot.NoteID); id < end; id++ {
+	compared := 0
+	for id := uint64(slot.NoteID); id < uint64(snapshot.NextNoteID) && compared < depositRevertScanSlots; id++ {
 		leaf, ok := parseFieldElement(snapshot.Leaves[id])
 		if !ok || leaf.Sign() == 0 {
 			continue
 		}
+		compared++
 		for _, expiry := range expiries {
 			if leaf.Cmp(noteLeaf(uint32(id), commitment, amount, expiry)) == 0 {
 				return uint32(id), true
@@ -405,7 +629,11 @@ func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.
 }
 
 // plausibleExpiries lists every bucketed expiry for a deposit mined between
-// preparation and now, with one day of clock tolerance on each side.
+// preparation and now, with one day of clock tolerance on each side, limited
+// to the depositRevertMaxBuckets days that end one day after now. A deposit
+// mined about 63 or more days before the search is not covered. The 30-day
+// note TTL of the pinned deployments has passed by then, unless vault pauses
+// extended it by more than 33 days.
 func plausibleExpiries(preparedAt, now int64, ttl uint64) []uint64 {
 	to := now + vaultExpiryBucket
 	from := preparedAt - vaultExpiryBucket

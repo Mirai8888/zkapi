@@ -121,10 +121,17 @@ leaves the deposit in `verification_conflict`; nothing is activated, retired or
 replaced until a later check agrees. Success does not wait for Ethereum
 finality. Failed receipts retain the finality gate before explicit retry; a
 deposit signed by this release is also retired only after the indexer shows
-its note did not land. Missing or ambiguous receipts preserve the exact signed
-transaction without authorizing a replacement. Withdrawals and public ETH
-returns require their own finality checks, and a withdrawal completes locally
-only after the vault and the indexer both show the note closed.
+its note did not land. Because the RPC can withhold a deposit and relay it
+after that check, a retry is signed only when a bounded search of the
+indexer tree it is built from finds none of the note's earlier deposits
+(CLI_ZKAPI.md describes the bound). That search uses the same whole-tree
+snapshot. A quote repeated while the tree is unchanged reads only the tree's
+root, which is also the same response for every client. So the indexer
+still cannot tell which note is yours. Missing or ambiguous receipts preserve
+the exact signed transaction without authorizing a replacement. Withdrawals
+and public ETH returns require their own finality checks, and a withdrawal
+completes locally only after the vault and the indexer both show the note
+closed.
 
 Pre-finality activation exposes the same reorganization risk as the web wallet:
 a block can be replaced after a private note or inference credit becomes usable.

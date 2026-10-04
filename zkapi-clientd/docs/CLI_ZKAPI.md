@@ -145,9 +145,25 @@ private state:
 - **Reverted deposits.** Before a finalized failed deposit is retired or
   requoted, the indexer must show that this note did not land at the empty
   slot the signed transaction was built for. The slot is checked against the
-  indexer's tree and saved with the note just before signing. If the note is
-  there, the revert is reported as a `verification_conflict` and no
-  replacement is signed. Deposits that reuse your public commitment with a
+  indexer's tree and saved with the note just before signing. A reported
+  revert can also be a deposit the RPC withheld and relays later, so the
+  slot of every deposit signed for the note is kept. Another deposit of the
+  same note is signed only when a search of the indexer tree it is built
+  from, starting at each of those slots, does not find the note. An earlier
+  deposit missing from that tree cannot land beside the new one. Quotes run
+  the same search only to refuse early. While the indexer is unavailable, a
+  quote is still given, but approval signs nothing. The search is bounded:
+  it compares the first 64 occupied slots after each kept slot, for expiry
+  days back to about 63 days before the search. A deposit lands after its
+  slot only when every slot in between is empty. So a landed deposit is
+  missed only in two cases. After it lands, challenges restore 64 or more
+  escaped notes between the slot it was built for and the slot it landed
+  in. Or it landed about 63 or more days earlier, past its note's 30-day
+  term on the packaged deployments unless vault pauses extended it by more
+  than 33 days. If the note is found, the deposit is reported as a
+  `verification_conflict` and no replacement is signed. Running
+  `zkapi-clientd config` again checks once more; **repair** (below) binds
+  the note that landed. Deposits that reuse your public commitment with a
   different amount are ignored, so they cannot block a genuine retry.
 - **Withdrawals.** Before the wallet companion deletes its note state, the
   vault (at the payout receipt's block) must show the note closed and the
@@ -170,11 +186,15 @@ balance is active again.
 
 Rebind never changes the note secret, commitment or amount; it accepts a note
 only when the finalized vault state and the indexer both hold exactly this
-deposit there. It refuses while a withdrawal, public return or unconfirmed
-deposit transaction is saved, or while the wallet has an unsettled request,
-and it replaces an existing wallet note only when you name it and it is an
-unspent genesis note of the same amount. A withdrawal reservation of that note
-is released first through the companion's `POST /oa/v1/withdraw/release`,
+deposit there. Left blank, the note ID comes from a saved deposit's receipt
+or, failing that, from this deposit's leaf in the indexer's tree, searched
+with the bound above from every slot any of its deposits was signed for,
+earliest first. It refuses while a withdrawal, public return or unconfirmed
+deposit transaction is saved (including an earlier deposit of the note
+retired after a reported revert), or while the wallet has an unsettled
+request, and it replaces an existing wallet note only when you name it and it
+is an unspent genesis note of the same amount. A withdrawal reservation of
+that note is released first through the companion's `POST /oa/v1/withdraw/release`,
 which refuses when the withdrawal has a prepared plan or the protocol server
 knows its nullifier; any other reservation blocks the rebind. The replacement
 is saved before the wallet is reset, so an interrupted rebind resumes when

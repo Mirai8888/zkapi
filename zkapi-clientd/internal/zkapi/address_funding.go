@@ -199,6 +199,16 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		next.Message = err.Error() + "." + conflictGuidance
 		return next
 	}
+	// The indexer showing this note's deposit is a durable conflict.
+	landed := func(err error) (AddressFundingStatus, error) {
+		if record.Phase != "verification_conflict" {
+			record.Phase = "verification_conflict"
+			if saveErr := h.saveAddress(record); saveErr != nil {
+				return update(), saveErr
+			}
+		}
+		return conflicted(err), nil
+	}
 	// A finalized deposit revert is retired, or reported as retryable, only
 	// after the indexer shows the note did not land where it could have.
 	revertUnconfirmed := func(receipt *addressReceipt) (AddressFundingStatus, bool, error) {
@@ -206,18 +216,13 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		if err != nil {
 			return update(), true, err
 		}
-		err = h.checkDepositRevert(ctx, config, deposit, record.Pending, receipt)
+		err = h.checkDepositRevert(ctx, config, record, deposit, receipt)
 		switch {
 		case err == nil:
 			return AddressFundingStatus{}, false, nil
 		case errors.Is(err, errDepositVerificationConflict):
-			if record.Phase != "verification_conflict" {
-				record.Phase = "verification_conflict"
-				if saveErr := h.saveAddress(record); saveErr != nil {
-					return update(), true, saveErr
-				}
-			}
-			return conflicted(err), true, nil
+			next, saveErr := landed(err)
+			return next, true, saveErr
 		case errors.Is(err, errRevertVerificationPending):
 			next := update()
 			next.Message = "The saved deposit reported a revert; " + errRevertVerificationPending.Error() + " before any retry is allowed."
@@ -246,6 +251,26 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	}
 	if record.Amount != 0 && record.Amount != amount {
 		return update(), errors.New("a different deposit amount is already saved; resume the saved amount")
+	}
+	if record.Pending == nil && record.Phase == "verification_conflict" {
+		// An earlier, retired deposit of this note showed in the indexer's
+		// tree. Re-check it on every resume, whatever the balance. Once it is
+		// gone this call signs nothing; a fresh quote or resume continues.
+		deposit, err := h.readAddressDeposit(config)
+		if err != nil {
+			return update(), err
+		}
+		if err := h.checkPriorDeposits(ctx, config, record, deposit); err != nil {
+			if errors.Is(err, errDepositVerificationConflict) {
+				return landed(err)
+			}
+			return update(), err
+		}
+		record.Phase = "waiting_funds"
+		if err := h.saveAddress(record); err != nil {
+			return update(), err
+		}
+		return update(), nil
 	}
 	if record.Phase == "reverted" {
 		if record.Pending == nil {
@@ -491,7 +516,10 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	} else {
 		// Approval may take minutes. Obtain the current empty-leaf witness,
 		// bound to its indexer slot, immediately before simulating/signing.
-		bound, bindErr := h.bindDepositPath(ctx, config, deposit)
+		bound, bindErr := h.bindDepositPath(ctx, config, record, deposit)
+		if errors.Is(bindErr, errDepositVerificationConflict) {
+			return landed(bindErr)
+		}
 		if bindErr != nil {
 			return update(), bindErr
 		}
@@ -571,6 +599,11 @@ func validDepositRecovery(record depositRecord) bool {
 	}
 	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0) {
 		return false
+	}
+	for _, s := range record.SignedSlots {
+		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 {
+			return false
+		}
 	}
 	return true
 }

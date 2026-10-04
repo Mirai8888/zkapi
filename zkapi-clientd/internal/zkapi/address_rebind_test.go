@@ -2,6 +2,7 @@ package zkapi
 
 import (
 	"context"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"testing"
@@ -198,6 +199,70 @@ func TestRebindResumesAfterCrashBetweenResetAndConfirm(t *testing.T) {
 				t.Fatal("a completed rebind accepted an unverified note")
 			}
 		})
+	}
+}
+
+// The automatic repair searches from the earliest slot a deposit of this
+// note was signed for. Here an indexer view that was later reorganized moved
+// the latest prepared slot past the one where the withheld deposit landed.
+func TestRebindSearchesFromTheEarliestSignedSlot(t *testing.T) {
+	f := newAddressFixture(t, true)
+	first, err := f.fundNative(t, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mine(t, first.TransactionHash, true) // forged revert; deposit withheld
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("revert not recorded: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	f.setLeaf(12, noteLeaf(12, fieldValue("0x5678"), 7, bucketedExpiry())) // A deposit on a short-lived fork.
+	f.mu.Unlock()
+	_, _ = f.h.FundAddress(context.Background(), 100000) // Retires the revert; prepares slot 13 unsigned.
+	if slot := f.savedDeposit(t).Slot; slot == nil || slot.NoteID != 13 {
+		t.Fatalf("fixture did not move the prepared slot past the signed one: %+v", slot)
+	}
+	f.mu.Lock()
+	f.leaves = f.leaves[:12] // The fork is reorganized away ...
+	f.leafVersion++
+	commitment := "0x" + hex.EncodeToString(f.accepted[first.TransactionHash].Data())[8:72]
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry()) // ... and the withheld deposit lands.
+	f.mu.Unlock()
+	status, err := f.h.RebindDeposit(context.Background(), nil, nil)
+	if err != nil || status.Phase != "active" || f.activated != 1 || f.confirmBodies[0]["note_id"] != float64(12) {
+		t.Fatalf("repair did not find the deposit from its signed slot: %+v %v", status, err)
+	}
+	if len(f.accepted) != 1 {
+		t.Fatal("repair signed a deposit")
+	}
+}
+
+// Repair waits while an earlier deposit of this note, retired after a
+// reported revert, has no final receipt: the RPC can still relay it and
+// create a second note. Its final receipt then identifies the note.
+func TestRebindWaitsForRetiredDepositToBeFinal(t *testing.T) {
+	f, hash, commitment := retiredWithheldDeposit(t)
+	f.mu.Lock()
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+	expiry := f.vaultNotes[12].expiry
+	delete(f.receipts, hash) // The RPC now reports the retired deposit as unmined.
+	f.mu.Unlock()
+	note := uint64(12)
+	if _, err := f.h.RebindDeposit(context.Background(), &note, nil); err == nil || !strings.Contains(err.Error(), "second note") {
+		t.Fatalf("rebind ignored a retired deposit without a final receipt: %v", err)
+	}
+	if f.activated != 0 || f.resetCalls != 0 || f.savedDeposit(t).Active {
+		t.Fatal("refused rebind changed the companion or deposit")
+	}
+	f.mu.Lock()
+	f.receipts[hash] = map[string]any{"transactionHash": hash, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestVault, "logs": depositEventReceipt(addressTestVault, 12, commitment, 100000, expiry).Logs}
+	f.mu.Unlock()
+	status, err := f.h.RebindDeposit(context.Background(), nil, nil)
+	if err != nil || status.Phase != "active" || f.activated != 1 || f.confirmBodies[0]["note_id"] != float64(12) {
+		t.Fatalf("the retired deposit's final receipt did not identify its note: %+v %v", status, err)
+	}
+	if record := f.savedDeposit(t); record.TransactionHash != hash || record.Binding == nil || record.Binding.NoteID != 12 {
+		t.Fatalf("rebind did not record the deposit that created the note: %+v", record)
 	}
 }
 

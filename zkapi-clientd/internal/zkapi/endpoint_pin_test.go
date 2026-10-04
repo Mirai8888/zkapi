@@ -170,7 +170,7 @@ func TestFundingConfigRejectsCompanionEndpointMismatchBeforeRPC(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "chain endpoints do not match") {
 					t.Fatalf("mismatched %s accepted: %v", c.field, err)
 				}
-				if len(f.rpcCalls) != 0 || f.snapshotReads != 0 {
+				if len(f.rpcCalls) != 0 || f.snapshotReads != 0 || f.rootReads != 0 {
 					t.Fatal("an RPC or indexer read happened before the endpoint check")
 				}
 				if _, err := os.Stat(f.h.addressStatePath()); !os.IsNotExist(err) {

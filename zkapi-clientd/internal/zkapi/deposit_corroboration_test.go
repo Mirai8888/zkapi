@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -341,6 +342,102 @@ func TestDepositPathMustMatchIndexerTree(t *testing.T) {
 	}
 }
 
+// Only signed deposits keep their slot: a path prepared but never signed adds
+// none, so repeated attempts cannot grow the record. A record saved before
+// signed slots were kept still counts its current slot when a saved deposit
+// transaction carries exactly that path.
+func TestSignedSlotsKeepOnlySignedDeposits(t *testing.T) {
+	t.Run("unsigned paths", func(t *testing.T) {
+		f, _, _ := retiredWithheldDeposit(t)
+		signed := f.savedDeposit(t).SignedSlots
+		for id := uint32(12); id < 15; id++ {
+			// Another deposit takes the next slot; a resume prepares a path
+			// for the one after it and signs nothing without a quote.
+			f.mu.Lock()
+			f.setLeaf(id, noteLeaf(id, fieldValue("0x5678"), 7, bucketedExpiry()))
+			f.mu.Unlock()
+			_, _ = f.h.FundAddress(context.Background(), 100000)
+		}
+		record := f.savedDeposit(t)
+		if len(signed) != 1 || len(record.SignedSlots) != 1 || record.SignedSlots[0] != signed[0] || signed[0].NoteID != 12 || record.Slot == nil || record.Slot.NoteID != 15 || len(f.accepted) != 1 {
+			t.Fatalf("unsigned paths changed the signed slots: %+v", record)
+		}
+	})
+	t.Run("record without signed slots", func(t *testing.T) {
+		f, _, commitment := retiredWithheldDeposit(t)
+		record := f.savedDeposit(t)
+		record.SignedSlots = nil
+		if err := f.h.save(record); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+		f.mu.Unlock()
+		if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "at note 12") {
+			t.Fatalf("the slot of the saved deposit was not searched: %v", err)
+		}
+		if len(f.accepted) != 1 {
+			t.Fatal("a second deposit was signed for the same note")
+		}
+	})
+}
+
+// Signed slots are written only by this daemon. A malformed one means the
+// record was damaged; it is preserved rather than acted on.
+func TestMalformedSignedSlotIsPreserved(t *testing.T) {
+	for name, slot := range map[string]depositSlot{
+		"path":        {NoteID: 12, PathSHA256: "0x12", PreparedAt: 1},
+		"preparation": {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newAddressFixture(t, true)
+			if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err != nil {
+				t.Fatal(err)
+			}
+			record := f.savedDeposit(t)
+			record.SignedSlots = []depositSlot{slot}
+			if err := f.h.save(record); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "preserve") {
+				t.Fatalf("a malformed signed slot was accepted: %v", err)
+			}
+			if len(f.accepted) != 0 {
+				t.Fatal("a damaged record was used to sign")
+			}
+		})
+	}
+}
+
+// Calldata built for a slot can land later only where every slot in between
+// is empty. The search skips emptied slots without counting them and
+// compares at most depositRevertScanSlots occupied ones.
+func TestDepositLeafSearchSkipsEmptiedSlots(t *testing.T) {
+	commitment, expiry := fieldValue("0x1234"), bucketedExpiry()
+	slot := &depositSlot{NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: time.Now().Unix()}
+	search := func(fill string, between int) (uint32, bool) {
+		leaves := make([]string, 0, 12+between+1)
+		for i := range 12 {
+			leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
+		}
+		for range between {
+			leaves = append(leaves, fill)
+		}
+		id := uint32(len(leaves))
+		leaves = append(leaves, fmt.Sprintf("0x%x", noteLeaf(id, commitment, 100000, expiry)))
+		return findDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slot, commitment, 100000, 2592000, time.Now().Unix())
+	}
+	if id, found := search("0x0", 200); !found || id != 212 {
+		t.Fatalf("our leaf after emptied slots was not found: %d %v", id, found)
+	}
+	if id, found := search("0x5", depositRevertScanSlots-1); !found || id != 12+depositRevertScanSlots-1 {
+		t.Fatalf("our leaf within the occupied-slot bound was not found: %d %v", id, found)
+	}
+	if _, found := search("0x5", depositRevertScanSlots); found {
+		t.Fatal("the search compared more occupied slots than its bound")
+	}
+}
+
 // A finalized revert is retired or requoted only after the indexer shows
 // this note did not land at the slot its calldata targeted.
 func TestRevertedDepositRetryRequiresIndexerToShowNoDeposit(t *testing.T) {
@@ -472,30 +569,354 @@ func TestForgedRevertWithAdvancedNonceSignsNoSecondDeposit(t *testing.T) {
 		}
 	})
 	t.Run("deposit withheld", func(t *testing.T) {
+		// Retired while withheld, the deposit is relayed and lands at its
+		// slot before the retry is quoted.
+		f, hash, commitment := retiredWithheldDeposit(t)
+		f.mu.Lock()
+		f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+		f.mu.Unlock()
+		if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "at note 12") || !strings.Contains(err.Error(), "config --menu, then choose repair") {
+			t.Fatalf("a retry was quoted after the withheld deposit landed: %v", err)
+		}
+		if record := f.savedAddress(t); record.Quote != nil || record.Phase != "verification_conflict" {
+			t.Fatalf("the refused retry left an approvable quote or no conflict: %+v", record)
+		}
+		for range 2 {
+			status, err := f.h.FundAddress(context.Background(), 100000)
+			if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "note 12") {
+				t.Fatalf("resuming did not re-check the landed deposit: %+v %v", status, err)
+			}
+		}
+		if read, err := f.h.Address(context.Background()); err != nil || read.Phase != "verification_conflict" {
+			t.Fatalf("conflict is not durable: %+v %v", read, err)
+		}
+		if len(f.accepted) != 1 || f.prepared != 1 {
+			t.Fatal("a second deposit was signed for the same note")
+		}
+		f.repairBindsNote(t, 12, hash)
+		if len(f.accepted) != 1 {
+			t.Fatal("repair signed a deposit")
+		}
+	})
+	t.Run("deposit lands between quote and approval", func(t *testing.T) {
+		f, hash, commitment := retiredWithheldDeposit(t)
+		quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+		f.mu.Unlock()
+		// The approval builds the retry for slot 13 from a tree that shows
+		// the earlier deposit at 12.
+		status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID)
+		if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "at note 12") || !strings.Contains(status.Message, "config --menu, then choose repair") {
+			t.Fatalf("the approval did not stop at the landed deposit: %+v %v", status, err)
+		}
+		if len(f.accepted) != 1 || f.savedDeposit(t).Slot.NoteID != 12 {
+			t.Fatal("a second deposit was signed or its slot recorded")
+		}
+		f.repairBindsNote(t, 12, hash)
+		if len(f.accepted) != 1 {
+			t.Fatal("repair signed a deposit")
+		}
+	})
+	t.Run("deposit lands during the approval", func(t *testing.T) {
 		f := newAddressFixture(t, true)
 		first, err := f.fundNative(t, 100000)
 		if err != nil {
 			t.Fatal(err)
 		}
-		f.mine(t, first.TransactionHash, true) // withheld: indexer has nothing
-		_, _ = f.h.FundAddress(context.Background(), 100000)
+		f.mine(t, first.TransactionHash, true) // forged revert; deposit withheld
+		if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+			t.Fatalf("revert not recorded: %+v %v", status, err)
+		}
 		quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err != nil {
-			t.Fatal(err)
+		f.mu.Lock()
+		commitment := "0x" + hex.EncodeToString(f.accepted[first.TransactionHash].Data())[8:72]
+		f.mu.Unlock()
+		// The approval's revert check reads an indexer view without the
+		// deposit. The RPC stalls the canonical lookup of that view's block
+		// while the deposit lands, so the stale view retires it.
+		relayed := false
+		upstream := f.h.client.inference.Transport
+		f.h.client.inference.Transport = withdrawalRoundTripper(func(r *http.Request) (*http.Response, error) {
+			raw, _ := ioReadAndRestore(r)
+			var request struct {
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.Unmarshal(raw, &request)
+			if !relayed && request.Method == "eth_getBlockByNumber" && len(request.Params) > 0 && string(request.Params[0]) == `"0x20"` && f.savedAddress(t).Pending != nil {
+				relayed = true
+				f.mu.Lock()
+				f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+				f.mu.Unlock()
+			}
+			return upstream.RoundTrip(r)
+		})
+		status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID)
+		if !relayed {
+			t.Fatal("the fixture did not land the deposit during the revert check")
 		}
-		// The retry targets the same still-empty slot, so at most one of
-		// the two signed deposits can ever land.
-		var paths []string
-		for _, tx := range f.accepted {
-			paths = append(paths, depositPathDigest(tx.Data()))
+		if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "at note 12") {
+			t.Fatalf("the retry was not stopped by the tree it is built from: %+v %v", status, err)
 		}
-		if len(paths) != 2 || paths[0] != paths[1] {
-			t.Fatal("retry of a withheld deposit targeted a different slot")
+		if len(f.accepted) != 1 {
+			t.Fatal("a second deposit was signed for the same note")
+		}
+		f.h.client.inference.Transport = upstream
+		f.repairBindsNote(t, 12, first.TransactionHash)
+		if len(f.accepted) != 1 {
+			t.Fatal("repair signed a deposit")
 		}
 	})
+}
+
+// retiredWithheldDeposit signs a native deposit whose payment RPC withholds
+// it, forges its finalized revert and advances the nonce. A plain resume
+// retires it, because the indexer shows nothing yet, and signs nothing
+// without an approved quote.
+func retiredWithheldDeposit(t *testing.T) (*addressFixture, string, string) {
+	t.Helper()
+	f := newAddressFixture(t, true)
+	first, err := f.fundNative(t, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mine(t, first.TransactionHash, true)
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("revert not recorded: %+v %v", status, err)
+	}
+	_, _ = f.h.FundAddress(context.Background(), 100000)
+	if record := f.savedAddress(t); record.Pending != nil || len(record.History) != 1 || !record.History[0].FinalizedRevert || len(f.accepted) != 1 {
+		t.Fatalf("the withheld deposit was not retired: %+v", record)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f, first.TransactionHash, "0x" + hex.EncodeToString(f.accepted[first.TransactionHash].Data())[8:72]
+}
+
+// repairBindsNote runs the menu's repair, a rebind without IDs, and requires
+// it to activate noteID once and keep the retired deposit in history.
+func (f *addressFixture) repairBindsNote(t *testing.T, noteID uint32, retired string) {
+	t.Helper()
+	status, err := f.h.RebindDeposit(context.Background(), nil, nil)
+	if err != nil || status.Phase != "active" || f.activated != 1 || f.confirmBodies[0]["note_id"] != float64(noteID) {
+		t.Fatalf("repair did not bind the landed note: %+v %v", status, err)
+	}
+	record := f.savedAddress(t)
+	if record.Pending != nil || record.Phase != "active" || len(record.History) == 0 || record.History[0].Hash != retired || !record.History[0].FinalizedRevert {
+		t.Fatalf("repair did not keep the retired deposit journal: %+v", record)
+	}
+	if binding := f.savedDeposit(t).Binding; binding == nil || binding.NoteID != noteID {
+		t.Fatalf("repair saved another binding: %+v", binding)
+	}
+	if again, err := f.h.FundAddress(context.Background(), 100000); err != nil || again.Phase != "active" || f.activated != 1 {
+		t.Fatalf("the repaired note was activated again or replaced: %+v %v", again, err)
+	}
+}
+
+// The conflict is re-checked on every resume. If the indexer no longer shows
+// the earlier deposit (its block was reorganized away), funding continues
+// only through a fresh quote, whose retry again targets its still-empty slot.
+func TestLandedDepositConflictClearsWhenIndexerNoLongerShowsIt(t *testing.T) {
+	f, _, commitment := retiredWithheldDeposit(t)
+	f.mu.Lock()
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+	f.mu.Unlock()
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "verification_conflict" {
+		t.Fatalf("the landed deposit was not a conflict: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	f.indexerStatus = http.StatusServiceUnavailable
+	f.mu.Unlock()
+	if status, err := f.h.FundAddress(context.Background(), 100000); err == nil || status.Phase != "verification_conflict" {
+		t.Fatalf("an unavailable indexer cleared the conflict: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	f.indexerStatus = 0
+	f.leaves = f.leaves[:12]
+	f.leafVersion++
+	delete(f.vaultNotes, 12)
+	f.mu.Unlock()
+	status, err := f.h.FundAddress(context.Background(), 100000)
+	if err != nil || status.Phase != "waiting_funds" || len(f.accepted) != 1 {
+		t.Fatalf("the cleared conflict did not wait for a fresh quote: %+v %v", status, err)
+	}
+	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, err = f.h.ApproveAddressDeposit(context.Background(), quote.ID); err != nil || status.Phase != "deposit_pending" {
+		t.Fatalf("the retry was not signed: %+v %v", status, err)
+	}
+	var paths []string
+	for _, tx := range f.accepted {
+		paths = append(paths, depositPathDigest(tx.Data()))
+	}
+	if len(paths) != 2 || paths[0] != paths[1] {
+		t.Fatal("the retry did not target the earlier deposit's empty slot")
+	}
+}
+
+// While a withheld deposit has not landed, a retry is built for its still
+// empty slot. If the withheld deposit lands first, the retry cannot also
+// land, and its revert is a conflict that signs nothing more.
+func TestRetryOfWithheldDepositTargetsItsEmptySlot(t *testing.T) {
+	f := newAddressFixture(t, true)
+	first, err := f.fundNative(t, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mine(t, first.TransactionHash, true) // forged revert; deposit withheld
+	_, _ = f.h.FundAddress(context.Background(), 100000)
+	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID)
+	if err != nil || retry.Phase != "deposit_pending" {
+		t.Fatalf("the retry was not signed: %+v %v", retry, err)
+	}
+	var paths []string
+	for _, tx := range f.accepted {
+		paths = append(paths, depositPathDigest(tx.Data()))
+	}
+	if len(paths) != 2 || paths[0] != paths[1] {
+		t.Fatal("retry of a withheld deposit targeted a different slot")
+	}
+	f.mu.Lock()
+	commitment := "0x" + hex.EncodeToString(f.accepted[first.TransactionHash].Data())[8:72]
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+	f.mu.Unlock()
+	f.mine(t, retry.TransactionHash, true) // Its slot is taken: the retry reverts.
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("the retry's revert was not recorded: %+v %v", status, err)
+	}
+	for range 2 {
+		status, err := f.h.FundAddress(context.Background(), 100000)
+		if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "note 12") {
+			t.Fatalf("the landed deposit was not a conflict: %+v %v", status, err)
+		}
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil {
+		t.Fatal("a third deposit was quoted")
+	}
+	f.repairBindsNote(t, 12, first.TransactionHash)
+	notes := 0
+	for _, note := range f.vaultNotes {
+		if strings.EqualFold(note.commitment, commitment) {
+			notes++
+		}
+	}
+	if len(f.accepted) != 2 || notes != 1 {
+		t.Fatalf("signed %d deposits, %d of them on chain", len(f.accepted), notes)
+	}
+}
+
+// Guided setup quotes again every five seconds while it waits for funds. A
+// retry quote searches the indexer's tree for the note's earlier deposits,
+// but downloads a tree it already searched only once; later quotes read its
+// root. A deposit that lands changes the root, so the next quote searches
+// the new tree and refuses.
+func TestRetryQuotesDownloadAnUnchangedTreeOnce(t *testing.T) {
+	f, hash, commitment := retiredWithheldDeposit(t)
+	reads := func() (int, int) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.snapshotReads, f.rootReads
+	}
+	snapshots, roots := reads()
+	for i := range 12 {
+		if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err != nil {
+			t.Fatalf("retry quote %d: %v", i, err)
+		}
+	}
+	if s, r := reads(); s-snapshots != 1 || r-roots != 11 {
+		t.Fatalf("12 quotes of one tree downloaded it %d times and read its root %d times", s-snapshots, r-roots)
+	}
+	f.mu.Lock()
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry()) // The withheld deposit lands.
+	f.mu.Unlock()
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "at note 12") {
+		t.Fatalf("the quote after the landing did not search the changed tree: %v", err)
+	}
+	if s, _ := reads(); s-snapshots != 2 {
+		t.Fatalf("the changed tree was downloaded %d times in all", s-snapshots)
+	}
+	if record := f.savedAddress(t); record.Phase != "verification_conflict" || len(f.accepted) != 1 {
+		t.Fatalf("the landed deposit is not a durable conflict: %+v", record)
+	}
+	f.repairBindsNote(t, 12, hash)
+}
+
+// The quote-time search is advisory: approval searches the tree it signs
+// from and fails closed. So an indexer outage does not refuse a retry quote,
+// which would end guided setup at its first quote, and approval signs
+// nothing until the indexer answers again.
+func TestRetryQuoteIsNotRefusedWhileIndexerIsUnavailable(t *testing.T) {
+	f := newAddressFixture(t, true)
+	first, err := f.fundNative(t, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.setLeaf(12, noteLeaf(12, fieldValue("0x5678"), 7, bucketedExpiry())) // Another deposit takes slot 12.
+	f.mu.Unlock()
+	f.mine(t, first.TransactionHash, true)
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("revert not recorded: %+v %v", status, err)
+	}
+	// Retiring signs nothing: a native deposit needs an approved quote.
+	_, _ = f.h.FundAddress(context.Background(), 100000)
+	if record := f.savedAddress(t); record.Pending != nil || record.Phase != "waiting_funds" || len(record.History) != 1 || !record.History[0].FinalizedRevert {
+		t.Fatalf("the revert was not retired: %+v", record)
+	}
+	f.mu.Lock()
+	f.indexerStatus = http.StatusServiceUnavailable
+	f.mu.Unlock()
+	quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+	if err != nil || quote.ID == "" {
+		t.Fatalf("an indexer outage refused the retry quote: %v", err)
+	}
+	if status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "no deposit was signed") || len(f.accepted) != 1 {
+		t.Fatalf("approval signed without searching the indexer's tree: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	f.indexerStatus = 0
+	f.mu.Unlock()
+	if quote, err = f.h.QuoteAddressDeposit(context.Background(), 100000); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err != nil || status.Phase != "deposit_pending" || len(f.accepted) != 2 {
+		t.Fatalf("the retry was not signed once the indexer answered: %+v %v", status, err)
+	}
+}
+
+// A quote saves phase waiting_funds, so it clears a saved conflict about an
+// earlier deposit only after a completed search, as a resume does. An
+// indexer outage keeps the conflict.
+func TestQuoteKeepsSavedConflictWhileIndexerIsUnavailable(t *testing.T) {
+	f, _, commitment := retiredWithheldDeposit(t)
+	f.mu.Lock()
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+	f.mu.Unlock()
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "verification_conflict" {
+		t.Fatalf("the landed deposit was not a conflict: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	f.indexerStatus = http.StatusServiceUnavailable
+	f.mu.Unlock()
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil {
+		t.Fatal("a quote cleared the saved conflict without searching the indexer's tree")
+	}
+	if record := f.savedAddress(t); record.Phase != "verification_conflict" || record.Quote != nil || len(f.accepted) != 1 {
+		t.Fatalf("the saved conflict was not kept: %+v", record)
+	}
 }
 
 func TestPrepareIgnoresCompanionActivationFields(t *testing.T) {
@@ -512,16 +933,17 @@ func TestPrepareIgnoresCompanionActivationFields(t *testing.T) {
 		return withdrawalJSONResponse(r, 200, map[string]any{
 			"amount": 100000, "secret": "0xabcdef", "commitment": "0x1234", "zero_path": path, "next_note_id": 12, "active_root": "0x1",
 			"active": true, "transaction_hash": "0x" + strings.Repeat("d", 64), "deployment_id": "other",
-			"binding": map[string]any{"note_id": 7, "expiry_ts": 1, "block_hash": "0x" + strings.Repeat("e", 64)},
-			"rebind":  map[string]any{"from_note_id": 1, "to_note_id": 7, "expiry_ts": 1},
-			"slot":    map[string]any{"note_id": 7, "path_sha256": "0x" + strings.Repeat("f", 64), "prepared_at": 1},
+			"binding":      map[string]any{"note_id": 7, "expiry_ts": 1, "block_hash": "0x" + strings.Repeat("e", 64)},
+			"rebind":       map[string]any{"from_note_id": 1, "to_note_id": 7, "expiry_ts": 1},
+			"slot":         map[string]any{"note_id": 7, "path_sha256": "0x" + strings.Repeat("f", 64), "prepared_at": 1},
+			"signed_slots": []map[string]any{{"note_id": 7, "path_sha256": "0x" + strings.Repeat("f", 64), "prepared_at": 1}},
 		}), nil
 	})
 	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err != nil {
 		t.Fatal(err)
 	}
 	record := f.savedDeposit(t)
-	if record.Active || record.TransactionHash != "" || record.Binding != nil || record.Rebind != nil || record.Slot != nil || record.Secret != "0xabcdef" || record.DeploymentID == "other" {
+	if record.Active || record.TransactionHash != "" || record.Binding != nil || record.Rebind != nil || record.Slot != nil || record.SignedSlots != nil || record.Secret != "0xabcdef" || record.DeploymentID == "other" {
 		t.Fatalf("companion seeded Go-owned deposit fields: %+v", record)
 	}
 }

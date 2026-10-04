@@ -23,7 +23,7 @@ export const REQUEST_EVIDENCE_PREFIX = 'request-evidence:';
 // only if the server settles one of its requests; one it never accepted never
 // settles, so the balance then has to be withdrawn. observationsPerRecord is
 // how many of its newest observations a record keeps; older than those, it
-// keeps only its newest receipt claim or contradicting reading.
+// keeps only its newest receipt claim or contradicting reading in save order.
 export const REQUEST_ARCHIVE_LIMITS = Object.freeze({
     unresolvedPerAnchor: 16,
     retainedPerAnchor: 64,
@@ -160,26 +160,76 @@ export function isReceiptClaim(observation) {
         && Boolean(observation.response || observation.receipt === true || observation.clientRequestId);
 }
 
+/** An observation's save-order stamp, or null when an older build saved it. */
+function observationSeq(observation) {
+    const seq = Number(observation?.seq);
+    return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+}
+
+/**
+ * Save order, never the device clock: stamped observations by `seq`, which
+ * the store assigns inside its write transaction (sequenceObservationUpdates).
+ * Observations an older build saved carry no `seq`; they come before every
+ * stamped one, by time among themselves. `at` is only the local time of the
+ * save, and a clock that ran fast or stepped back would misorder it.
+ */
+function saveOrder(left, right) {
+    const leftSeq = observationSeq(left);
+    const rightSeq = observationSeq(right);
+    if (leftSeq != null && rightSeq != null) return leftSeq - rightSeq;
+    if (leftSeq != null || rightSeq != null) return leftSeq != null ? 1 : -1;
+    return Number(left.at) - Number(right.at);
+}
+
 /**
  * The newest receipt claim or contradicting reading ('unknown',
- * 'clearance_reserved') among observations, by time, or null. Equal times
- * keep their order, so the later of two wins.
+ * 'clearance_reserved') among observations, in save order, or null. Equal
+ * unstamped times keep their order, so the later of two wins.
  */
 function newestClaimReading(observations) {
     const relevant = observations
         .filter(observation => isReceiptClaim(observation) || CONTRADICTING_READINGS.has(observation?.status))
-        // Stable: equal times keep each record's own order.
-        .sort((left, right) => Number(left.at) - Number(right.at));
+        // Stable: equal unstamped times keep each record's own order.
+        .sort(saveOrder);
     return relevant.length ? relevant[relevant.length - 1] : null;
+}
+
+/** The highest save-order stamp among the records' observations, or 0. */
+export function highestObservationSeq(records) {
+    let highest = 0;
+    for (const record of records || []) {
+        for (const observation of Array.isArray(record?.serverObservations) ? record.serverObservations : []) {
+            const seq = observationSeq(observation);
+            if (seq != null && seq > highest) highest = seq;
+        }
+    }
+    return highest;
+}
+
+/**
+ * Stamp every observation the updates append with its save order: the next
+ * `seq` above every one saved in `records`, in update and array order. The
+ * store calls this inside its write transaction with every record it holds,
+ * so a later save always orders after an earlier one, also across the records
+ * of a state and whatever the device clock says. A `seq` an update already
+ * carries is replaced; `at` is kept.
+ */
+export function sequenceObservationUpdates(records, updates) {
+    let seq = highestObservationSeq(records);
+    return (Array.isArray(updates) ? updates : []).map(update =>
+        Array.isArray(update?.serverObservations) && update.serverObservations.length
+            ? { ...update, serverObservations: update.serverObservations.map(observation => ({ ...observation, seq: ++seq })) }
+            : update);
 }
 
 /**
  * The newest receipt claim saved at a note state (its unresolved records)
- * that no later 'unknown' or 'clearance_reserved' reading contradicts, or
- * null. The contradicting reading may be saved on another record of the
- * state. A failed read, 'reserved' or 'finalized' without a receipt leaves
- * the claim standing. Advisory: it never allows anything, it only makes the
- * escape override ask for that claim's own acknowledgement.
+ * that no 'unknown' or 'clearance_reserved' reading saved after it
+ * contradicts, or null. "After" is save order, not the device clock. The
+ * contradicting reading may be saved on another record of the state. A failed
+ * read, 'reserved' or 'finalized' without a receipt leaves the claim
+ * standing. Advisory: it never allows anything, it only makes the escape
+ * override ask for that claim's own acknowledgement.
  */
 export function standingReceiptClaim(records) {
     const newest = newestClaimReading((records || [])
@@ -190,20 +240,28 @@ export function standingReceiptClaim(records) {
 /**
  * One server status reading for a transmitted nullifier. A finalized reading
  * that carried a receipt says so (`receipt`) and may name the receipt's client
- * request id; both are advisory, never evidence.
+ * request id; both are advisory, never evidence. `at` is the local time; a
+ * saved observation also carries `seq`, its save order, which only the store
+ * assigns (an invalid one is dropped).
  */
-export function requestObservation(status, context, at = Date.now(), { clientRequestId = null, receipt = false } = {}) {
+export function requestObservation(status, context, at = Date.now(), {
+    clientRequestId = null,
+    receipt = false,
+    seq = null
+} = {}) {
     if (!OBSERVATION_STATUSES.has(status) || !OBSERVATION_CONTEXTS.has(context)
         || !Number.isSafeInteger(Number(at)) || Number(at) <= 0) {
         throw archiveError('A request archive observation is invalid.');
     }
     const named = status === 'finalized' && typeof clientRequestId === 'string' && clientRequestId;
+    const stamp = observationSeq({ seq });
     return {
         status,
         context,
         at: Number(at),
         ...(named ? { clientRequestId } : {}),
-        ...(status === 'finalized' && (named || receipt === true) ? { receipt: true } : {})
+        ...(status === 'finalized' && (named || receipt === true) ? { receipt: true } : {}),
+        ...(stamp != null ? { seq: stamp } : {})
     };
 }
 
@@ -324,11 +382,13 @@ function isCompleteRecord(record) {
 }
 
 // The newest eight observations, plus the record's newest receipt claim or
-// contradicting reading when it is older than those. The state's standing
-// claim is decided by the newest such observation across its records, which
-// is always the newest on its own record, so trimming any record can neither
-// erase a claim nor revive one that a reading on another record ended. The
-// kept observations stay in order and the newest eight are never displaced.
+// contradicting reading in save order when it is older than those. The
+// state's standing claim is decided by the newest such observation across its
+// records, which is always the newest on its own record, so trimming any
+// record can neither erase a claim nor revive one that a reading on another
+// record ended. The kept observations stay in order and the newest eight are
+// never displaced. Saved stamps (`seq`) are kept; additions are stamped by the
+// store before they get here.
 function appendObservations(previous, additions) {
     const limit = REQUEST_ARCHIVE_LIMITS.observationsPerRecord;
     const observations = [...(Array.isArray(previous) ? previous : []), ...(Array.isArray(additions) ? additions : [])]
@@ -344,9 +404,10 @@ function appendObservations(previous, additions) {
  * compared only when both sides carry them; a conflict aborts the caller's
  * transaction. The original source and createdAt are kept, evidence sources
  * accumulate as a set, observations append (the newest eight retained, plus
- * the newest receipt claim or contradicting reading), and a disposition only
- * moves forward. A partial patch for a missing record is
- * ignored (null), because it cannot establish the record's identity.
+ * the newest receipt claim or contradicting reading in save order), and a
+ * disposition only moves forward. A partial patch for a missing record is
+ * ignored (null), because it cannot establish the record's identity. The
+ * store stamps appended observations first (sequenceObservationUpdates).
  */
 export function mergeRequestArchiveRecord(previous, update, now = Date.now()) {
     if (!update?.archiveId || (previous && previous.archiveId !== update.archiveId)) {

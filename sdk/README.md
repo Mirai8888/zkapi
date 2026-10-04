@@ -223,6 +223,14 @@ at least 64 failed chats at one state, spread over at least an hour.
 Each record keeps its newest eight server observations. Of its older ones it
 keeps at most one: the newest that is a receipt claim or a reading that ends
 one (both below). Trimming therefore never changes whether a claim stands.
+"Newest" and "after" mean save order, never the device clock. The store stamps
+every observation it saves with a sequence number (`seq`) inside its write
+transaction, above every one already saved. A clock that ran fast or stepped
+back therefore cannot make an older reading outrank one saved after it. Each
+observation's `at` is the device time of its save; it only decides eviction
+(above). Observations saved by an older build have no `seq`. They order before
+every stamped one, by `at` among themselves. An older build open in another tab
+drops the stamps of each record it writes.
 `unknown`, `reserved`, `finalized` and `clearance_reserved` are readings of the
 state's nullifier from
 `GET /v2/nullifiers/{nullifier}`; `unavailable` is a failed read. A `finalized`
@@ -232,8 +240,8 @@ returns and this browser cannot apply is saved as such a `finalized`
 observation too. A receipt that installs resolves every record at its state,
 so such an observation at the current state is a receipt claim: the server
 says the nullifier was finalized with a receipt this browser could not apply.
-The claim stands until a later reading reports the nullifier `unknown` or
-`clearance_reserved`, also when that reading was saved with another request
+The claim stands until a reading saved after it reports the nullifier `unknown`
+or `clearance_reserved`, also when that reading was saved with another request
 at the same state. A failed read, `reserved`, or `finalized` without a
 receipt leaves it standing. `unaccepted` records that
 `POST /v2/openrouter/leases/{id}/expire` answered `expired_unaccepted` or

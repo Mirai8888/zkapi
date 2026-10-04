@@ -1170,7 +1170,8 @@ test('a receipt claim stands until a later unknown or clearance_reserved reading
         assert.equal(standing(recordWith([claim(1), reading(status, 2)])), null, `${status} contradicts the claim`);
         assert.deepEqual(standing(recordWith([reading(status, 1), claim(2)])), claim(2));
     }
-    // Across the records of one state, by time.
+    // Across the records of one state. These observations carry no save-order
+    // stamp (as an older build saved them), so their times order them.
     assert.equal(standing(recordWith([claim(1)], 'a'), recordWith([reading('unknown', 2)], 'b')), null);
     assert.deepEqual(standing(recordWith([reading('unknown', 1)], 'a'), recordWith([claim(2)], 'b')), claim(2));
 
@@ -1223,50 +1224,166 @@ test('a reading that ends a receipt claim on one record keeps it ended when both
     }
 });
 
-test('trimming never changes the standing claim, the newest eight observations or the newest reading in them', () => {
+// mulberry32: a 32-bit integer generator that draws from its high bits, so
+// every bound is reached evenly.
+function mulberry32(seed) {
+    let state = seed | 0;
+    return bound => {
+        state = (state + 0x6d2b79f5) | 0;
+        let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+        mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+        return Math.floor((((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296) * bound);
+    };
+}
+
+// Saves observations on records[targets] as the store does in one write: each
+// appended observation is stamped in save order over every record held, then
+// merged. Returns the stamped observations, one list per target.
+function saveObservations(records, targets, observations, now = 1_000) {
+    const stamped = archive.sequenceObservationUpdates(records,
+        targets.map(index => ({ archiveId: records[index].archiveId, serverObservations: observations })));
+    targets.forEach((index, position) => {
+        records[index] = archive.mergeRequestArchiveRecord(records[index], stamped[position], now);
+    });
+    return stamped.map(update => update.serverObservations);
+}
+
+test('the last save decides the standing claim, and trimming never changes it, the newest eight observations or the newest reading in them', () => {
     const state = noteState();
     const limit = archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord;
-    // Deterministic pseudo-random sequences (a linear congruential generator).
-    let seed = 0x5eed;
-    const random = bound => {
-        seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
-        return seed % bound;
-    };
+    const random = mulberry32(0x5eed);
     const kinds = [
-        ['unavailable'], ['unavailable'], ['unavailable'], ['unaccepted'], ['reserved'],
-        ['finalized'], ['finalized', { receipt: true }], ['finalized', { clientRequestId: 'foreign' }],
+        ['unavailable'], ['unaccepted'], ['reserved'], ['finalized'],
+        ['finalized', { receipt: true }], ['finalized', { clientRequestId: 'foreign' }],
         ['unknown'], ['clearance_reserved']
     ];
-    const sameReading = (left, right) => assert.deepEqual(left ?? null, right ?? null);
+    // The kinds that neither make nor end a receipt claim.
+    const quiet = [0, 1, 2, 3];
+    const contexts = ['escape', 'override', 'recovery', 'stale_root', 'clearance'];
+    const decisive = observation => archive.isReceiptClaim(observation)
+        || ['unknown', 'clearance_reserved'].includes(observation.status);
+    const key = observation => [observation.status, observation.context, observation.at, observation.seq,
+        observation.receipt, observation.clientRequestId].join('|');
+    const sameReading = (left, right, message) => assert.deepEqual(left ?? null, right ?? null, message);
+    const seen = { all: 0, one: 0, subset: 0, multiple: 0, joined: 0, legacy: 0, earlier: 0, multiRecord: 0,
+        standing: 0, ended: 0, endedElsewhere: 0, clockDisagrees: 0, pinned: 0 };
+    const drawn = kinds.map(() => 0);
     for (let sequence = 0; sequence < 300; sequence += 1) {
-        const ids = ['a', 'b', 'c'].slice(0, 1 + random(3));
-        const trimmed = ids.map(id => pendingRecord(state, id));
-        const full = ids.map(() => []);
+        const maxRecords = 1 + random(4);
+        const trimmed = [];      // what the store keeps
+        const full = [];         // every observation each record was given
+        const saves = [];        // every stamped save, in save order
+        // A quarter of the sequences begin with observations an older build
+        // saved without a stamp; they order before every stamped one.
+        let legacySteps = random(4) === 0 ? 1 + random(20) : 0;
+        // During an outage most reads fail or decide nothing, which pushes the
+        // deciding reading out of a record's newest eight.
+        let outage = false;
         let at = 1_000;
-        for (let step = 0; step < 40; step += 1) {
-            // Mostly later, sometimes the same millisecond, rarely an earlier clock.
-            at = Math.max(1, at + [1, 1, 1, 0, -3][random(5)] * (1 + random(50)));
-            const [status, extra = {}] = kinds[random(kinds.length)];
-            const observation = archive.requestObservation(status, 'escape', at, extra);
-            // Saved on every record (a sweep or a gate) or on one (a refusal or a discard).
-            const targets = random(2) ? ids.map((_, index) => index) : [random(ids.length)];
-            for (const index of targets) {
-                trimmed[index] = archive.mergeRequestArchiveRecord(trimmed[index],
-                    { archiveId: trimmed[index].archiveId, serverObservations: [observation] }, at);
-                full[index].push(observation);
+        const make = () => {
+            const kind = outage && random(8) ? quiet[random(quiet.length)] : random(kinds.length);
+            drawn[kind] += 1;
+            const [status, extra = {}] = kinds[kind];
+            return archive.requestObservation(status, contexts[random(contexts.length)], at, extra);
+        };
+        const apply = (targets, observations) => {
+            if (legacySteps > 0) {
+                for (const index of targets) {
+                    trimmed[index] = archive.mergeRequestArchiveRecord(trimmed[index],
+                        { archiveId: trimmed[index].archiveId, serverObservations: observations }, at);
+                    full[index].push(...observations);
+                    seen.legacy += observations.length;
+                }
+                return;
             }
-            sameReading(archive.standingReceiptClaim(trimmed),
-                archive.standingReceiptClaim(full.map(serverObservations => ({ serverObservations }))));
+            saveObservations(trimmed, targets, observations, at).forEach((stamped, position) => {
+                full[targets[position]].push(...stamped);
+                saves.push(...stamped.map(observation => ({ index: targets[position], observation })));
+            });
+        };
+        const join = initial => {
+            trimmed.push(pendingRecord(state, `r${trimmed.length}`));
+            full.push([]);
+            if (initial.length) apply([trimmed.length - 1], initial);
+        };
+        join([]);
+        for (let step = 0; step < 60; step += 1) {
+            // The clock: mostly later, sometimes the same millisecond, often
+            // earlier, and now and then far back (a fast clock corrected).
+            const move = random(10);
+            const before = at;
+            at = Math.max(1, move < 5 ? at + 1 + random(40) : move < 6 ? at
+                : move < 9 ? at - 1 - random(40) : at - 1 - random(5_000));
+            if (at < before) seen.earlier += 1;
+            if (random(6) === 0) outage = !outage;
+            if (trimmed.length < maxRecords && random(8) === 0) {
+                // A record that joins the state late, sometimes with its own first observation.
+                seen.joined += 1;
+                join(random(3) === 0 ? [make()] : []);
+            } else {
+                const observations = Array.from({ length: random(6) === 0 ? 2 + random(3) : 1 }, make);
+                if (observations.length > 1) seen.multiple += 1;
+                // Saved on every record (a sweep or a gate), on one (a refusal or
+                // a discard) or on some.
+                const mode = random(3);
+                const targets = mode === 0 ? trimmed.map((_, index) => index)
+                    : mode === 1 ? [random(trimmed.length)]
+                        : trimmed.map((_, index) => index).filter(() => random(2));
+                seen[['all', 'one', 'subset'][mode]] += 1;
+                apply(targets, observations);
+            }
+            if (legacySteps > 0) legacySteps -= 1;
+
+            // Any record order: the store returns key order, memory may differ.
+            const order = trimmed.map((_, index) => index);
+            for (let index = order.length - 1; index > 0; index -= 1) {
+                const other = random(index + 1);
+                [order[index], order[other]] = [order[other], order[index]];
+            }
+            const standing = archive.standingReceiptClaim(order.map(index => trimmed[index]));
+            sameReading(standing, archive.standingReceiptClaim(order.map(index => ({ serverObservations: full[index] }))),
+                'trimming never changes the standing claim');
+            // Save order decides, never the clock: the last claim or
+            // contradicting reading saved with a stamp, on any record.
+            const last = saves.findLast(save => decisive(save.observation));
+            if (last) {
+                const expected = archive.isReceiptClaim(last.observation) ? last.observation : null;
+                sameReading(standing, expected, 'the reading saved last decides');
+                const byClock = order.flatMap(index => full[index]).filter(decisive)
+                    .sort((left, right) => left.at - right.at).at(-1);
+                if (archive.isReceiptClaim(byClock) !== Boolean(expected)) seen.clockDisagrees += 1;
+                if (!expected) {
+                    seen.ended += 1;
+                    // A claim still newest on another record than the one that ended it.
+                    if (full.some((all, index) => index !== last.index && archive.isReceiptClaim(all.findLast(decisive)))) {
+                        seen.endedElsewhere += 1;
+                    }
+                }
+            }
+            if (standing) seen.standing += 1;
+            if (trimmed.length > 1) seen.multiRecord += 1;
+
             trimmed.forEach((record, index) => {
                 const kept = record.serverObservations;
                 const all = full[index];
-                assert.ok(kept.length <= limit + 1);
+                assert.ok(kept.length <= limit + 1, 'at most nine observations');
                 assert.deepEqual(kept.slice(-limit), all.slice(-limit), 'the newest eight are never displaced');
                 let cursor = 0;
                 for (const observation of kept) {
-                    while (cursor < all.length && JSON.stringify(all[cursor]) !== JSON.stringify(observation)) cursor += 1;
+                    while (cursor < all.length && key(all[cursor]) !== key(observation)) cursor += 1;
                     assert.ok(cursor < all.length, 'kept observations stay in order');
                     cursor += 1;
+                }
+                // Ahead of the newest eight: exactly the record's newest claim
+                // or contradicting reading in save order, when it is older.
+                if (all.every(observation => observation.seq)) {
+                    const newest = all.findLast(decisive);
+                    const inWindow = newest && all.slice(-limit).includes(newest);
+                    assert.equal(kept.length, all.length > limit && newest && !inWindow ? limit + 1 : Math.min(all.length, limit));
+                    if (kept.length > limit) {
+                        assert.deepEqual(kept[0], newest, 'the kept older observation is the newest claim or contradiction');
+                        seen.pinned += 1;
+                    }
                 }
                 // The newest nullifier reading among the newest eight, else
                 // only the kept claim or contradicting reading.
@@ -1277,7 +1394,219 @@ test('trimming never changes the standing claim, the newest eight observations o
             });
         }
     }
+    // The generator reaches every case this test claims to cover (about half
+    // of what this seed gives), so a degenerate generator fails here.
+    const minimums = { all: 3_000, one: 3_000, subset: 3_000, multiple: 1_500, joined: 200, legacy: 600,
+        earlier: 3_000, multiRecord: 6_000, standing: 4_000, ended: 4_000, endedElsewhere: 900,
+        clockDisagrees: 3_000, pinned: 1_500 };
+    for (const [name, minimum] of Object.entries(minimums)) {
+        assert.ok(seen[name] >= minimum, `${name}: ${seen[name]} < ${minimum}`);
+    }
+    drawn.forEach((count, kind) => assert.ok(count >= 800, `${JSON.stringify(kinds[kind])} drawn ${count} times`));
 });
+
+// Round-4 review: only a receipt claim or a reading that ends one is kept
+// ahead of the newest eight, never a later receipt-less 'finalized' or
+// 'reserved' reading.
+test('a receipt-less finalized or a reserved reading after a contradiction never takes its place', () => {
+    const state = noteState();
+    const claim = at => archive.requestObservation('finalized', 'escape', at,
+        { receipt: true, clientRequestId: 'not-held-by-this-browser' });
+    const reading = (status, at) => archive.requestObservation(status, 'override', at);
+    for (const contradiction of ['unknown', 'clearance_reserved']) {
+        for (const later of ['finalized', 'reserved']) {
+            const records = [pendingRecord(state, 'archived'), pendingRecord(state, 'live')];
+            saveObservations(records, [0, 1], [claim(2_000)]);
+            // The claim is ended on the live record alone, which then reads a
+            // receipt-less 'finalized' or 'reserved' before eight failed reads.
+            const [[ended]] = saveObservations(records, [1], [reading(contradiction, 3_000)]);
+            saveObservations(records, [1], [reading(later, 3_001)]);
+            for (let index = 0; index < 8; index += 1) {
+                saveObservations(records, [0, 1], [reading('unavailable', 4_000 + index)]);
+            }
+            const [archived, live] = records;
+            assert.ok(archive.isReceiptClaim(archived.serverObservations[0]), 'the claim stays on its own record');
+            assert.equal(live.serverObservations.length, archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord + 1);
+            assert.deepEqual(live.serverObservations[0], ended, `the ${contradiction} reading is kept, not ${later}`);
+            assert.ok(live.serverObservations.slice(1).every(observation => observation.status === 'unavailable'));
+            assert.equal(archive.standingReceiptClaim(records), null, `${contradiction} still ends the claim`);
+            assert.equal(archive.standingReceiptClaim([live, archived]), null, 'in either record order');
+        }
+    }
+});
+
+// Round-4 review: a clock that ran fast or stepped back must not reorder a
+// claim and the reading that ends it.
+test('save order, not the device clock, decides whether a receipt claim stands', () => {
+    const state = noteState();
+    const NOW = 1_700_000_000_000;
+    const FAST = NOW + 3 * 86_400_000;
+    const limit = archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord;
+    const claim = at => archive.requestObservation('finalized', 'escape', at,
+        { receipt: true, clientRequestId: 'not-held-by-this-browser' });
+    const reading = (status, at) => archive.requestObservation(status, 'stale_root', at);
+
+    // The stamp is one above every saved one, in update and array order. A
+    // stamp an update carries is replaced, `at` is kept, and a patch without
+    // observations is left alone. Only a positive integer is a stamp.
+    const held = [{ serverObservations: [{ ...reading('unknown', NOW), seq: 41 }, reading('unavailable', NOW)] }, {}];
+    assert.equal(archive.highestObservationSeq(held), 41);
+    assert.equal(archive.highestObservationSeq([]), 0);
+    const patch = { archiveId: 'patch', disposition: 'superseded' };
+    const stamped = archive.sequenceObservationUpdates(held, [
+        { archiveId: 'a', serverObservations: [reading('unknown', FAST), { ...claim(NOW), seq: 7 }] },
+        patch,
+        { archiveId: 'b', serverObservations: [reading('unavailable', 1)] }
+    ]);
+    assert.deepEqual(stamped[0].serverObservations.map(observation => [observation.seq, observation.at]),
+        [[42, FAST], [43, NOW]]);
+    assert.equal(stamped[1], patch);
+    assert.deepEqual(stamped[2].serverObservations.map(observation => observation.seq), [44]);
+    for (const seq of [0, -1, 1.5, '2x', null]) {
+        assert.equal(archive.requestObservation('unknown', 'escape', NOW, { seq }).seq, undefined);
+    }
+    assert.equal(archive.requestObservation('unknown', 'escape', NOW, { seq: 3 }).seq, 3);
+
+    // 'unknown' saved while the clock ran fast, then a claim saved after the
+    // clock was corrected: the claim stands at once, across two records ...
+    const pair = [pendingRecord(state, 'archived'), pendingRecord(state, 'live')];
+    saveObservations(pair, [1], [reading('unknown', FAST)]);
+    const [[across]] = saveObservations(pair, [0], [claim(NOW)]);
+    assert.deepEqual(archive.standingReceiptClaim(pair), across);
+    // ... and on one record, where it is kept ahead of the newest eight
+    // instead of the fast-dated reading.
+    const single = [pendingRecord(state, 'single')];
+    saveObservations(single, [0], [reading('unknown', FAST)]);
+    const [[own]] = saveObservations(single, [0], [claim(NOW)]);
+    assert.deepEqual(archive.standingReceiptClaim(single), own);
+    for (let index = 0; index < limit; index += 1) saveObservations(single, [0], [reading('unavailable', NOW + index)]);
+    assert.equal(single[0].serverObservations.length, limit + 1);
+    assert.deepEqual(single[0].serverObservations[0], own);
+    assert.deepEqual(archive.standingReceiptClaim(single), own);
+    // A reading saved after the claim ends it, although its clock is behind.
+    saveObservations(single, [0], [reading('clearance_reserved', NOW - 86_400_000)]);
+    assert.equal(archive.standingReceiptClaim(single), null);
+    saveObservations(pair, [1], [reading('unknown', NOW - 86_400_000)]);
+    assert.equal(archive.standingReceiptClaim(pair), null);
+
+    // An older build saved no stamp: its observations come before every
+    // stamped one, by time among themselves.
+    const legacy = observations => ({ ...pendingRecord(state, 'legacy'), serverObservations: observations });
+    const later = observation => ({ ...pendingRecord(state, 'stamped'), serverObservations: [{ ...observation, seq: 1 }] });
+    assert.equal(archive.standingReceiptClaim([legacy([claim(FAST)]), later(reading('unknown', NOW))]), null);
+    assert.deepEqual(archive.standingReceiptClaim([legacy([reading('unknown', FAST)]), later(claim(NOW))]),
+        { ...claim(NOW), seq: 1 });
+    assert.deepEqual(archive.standingReceiptClaim([legacy([reading('unknown', NOW), claim(NOW + 1)])]), claim(NOW + 1));
+    assert.equal(archive.standingReceiptClaim([legacy([claim(NOW), reading('unknown', NOW + 1)])]), null);
+    const otherLegacy = observations => ({ ...pendingRecord(state, 'other-legacy'), serverObservations: observations });
+    assert.deepEqual(archive.standingReceiptClaim([legacy([claim(NOW + 1)]), otherLegacy([reading('unknown', NOW)])]),
+        claim(NOW + 1), 'by time across records, whatever their order');
+    assert.equal(archive.standingReceiptClaim([otherLegacy([reading('unknown', NOW + 1)]), legacy([claim(NOW)])]), null);
+    // Stamped observations appended to such a record keep its claim ahead of
+    // the newest eight, not the older build's fast-dated reading.
+    const upgraded = [legacy([reading('unknown', FAST)])];
+    const [[upgradedClaim]] = saveObservations(upgraded, [0], [claim(NOW)]);
+    for (let index = 0; index < limit; index += 1) saveObservations(upgraded, [0], [reading('unavailable', NOW + index)]);
+    assert.deepEqual(upgraded[0].serverObservations[0], upgradedClaim);
+    assert.deepEqual(archive.standingReceiptClaim(upgraded), upgradedClaim);
+});
+
+test('the store stamps every saved observation in save order, across records and writes', async t => {
+    indexedDB.clear();
+    const state = noteState();
+    const [archived, live] = ['archived', 'live'].map(id => pendingRecord(state, id));
+    await store.putBrowserRequestArchive([archived, live]);
+    const realNow = Date.now();
+    const fast = realNow + 3 * 86_400_000;
+    let clock = fast;
+    t.mock.method(Date, 'now', () => clock);
+    const save = (record, observation) => store.putBrowserRequestArchive([{
+        archiveId: record.archiveId, serverObservations: [observation]
+    }]);
+    // The live record reads three failures and then 'unknown' while the clock
+    // runs fast; the last update carries a stamp of its own.
+    for (let index = 0; index < 3; index += 1) {
+        await save(live, archive.requestObservation('unavailable', 'escape', fast + index));
+    }
+    await save(live, { ...archive.requestObservation('unknown', 'stale_root', fast + 3), seq: 1_000_000 });
+    // The clock is corrected, and the archived record saves a receipt claim.
+    clock = realNow;
+    await save(archived, archive.requestObservation('finalized', 'escape', realNow,
+        { receipt: true, clientRequestId: 'not-held-by-this-browser' }));
+    let saved = await records();
+    const byId = id => saved.find(record => record.clientRequestId === id);
+    assert.deepEqual(byId('live').serverObservations.map(observation => [observation.seq, observation.at]),
+        [[1, fast], [2, fast + 1], [3, fast + 2], [4, fast + 3]], 'a carried stamp is replaced and `at` is kept');
+    assert.deepEqual(byId('archived').serverObservations.map(observation => observation.seq), [5]);
+    assert.equal(archive.standingReceiptClaim(saved)?.seq, 5, 'the claim saved last stands although its clock is behind');
+    // One write that saves a reading on both records stamps each copy in
+    // turn. Saved after the claim, it ends it, although its clock is behind.
+    clock = realNow - 60_000;
+    await store.putBrowserRequestArchive([archived, live].map(record => ({
+        archiveId: record.archiveId, serverObservations: [archive.requestObservation('unknown', 'escape', clock)]
+    })));
+    saved = await records();
+    assert.deepEqual([byId('archived'), byId('live')].map(record => record.serverObservations.at(-1).seq), [6, 7]);
+    assert.equal(archive.standingReceiptClaim(saved), null);
+});
+
+// Round-3 and round-4 reviews: a contradicting reading saved while the device
+// clock ran fast must neither hide a later claim nor outlast it in trimming.
+for (const [label, skew] of [['10 minutes', 10 * 60_000], ['3 days', 3 * 86_400_000]]) {
+    test(`a receipt claim saved after the clock stepped back ${label} stands at once and through later failed reads`, async t => {
+        const realNow = Date.now();
+        let clock = realNow + skew;
+        t.mock.method(Date, 'now', () => clock);
+        // The clock runs fast while a chat is discarded on a corroborated 'unknown'.
+        const h = await freshWallet({ vaultRevision: 2 });
+        await discardFirstRequest(h);
+        // The clock is corrected. The server then claims a finalized receipt
+        // this browser cannot apply.
+        clock = realNow;
+        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
+            request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
+        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' });
+        const [record] = await records();
+        const claim = record.serverObservations.findLast(archive.isReceiptClaim);
+        assert.equal(record.serverObservations[0].status, 'unknown');
+        assert.ok(claim.at < record.serverObservations[0].at, 'the claim carries the earlier clock');
+        assert.ok(claim.seq > record.serverObservations[0].seq, 'and the later save');
+        // The claim stands at once.
+        assert.deepEqual(archive.standingReceiptClaim(await records()), claim);
+        let shown = h.runtime.snapshot().config.escape_override;
+        assertJournalMissingWarning(shown.warning);
+        assert.equal(shown.acknowledgement, 'receipt_journal_missing');
+
+        // Real time passes the grace and the fast clock's reading; the server
+        // is unreachable. Each attempt saves two failed reads.
+        clock = realNow + skew + 13 * 3_600_000;
+        h.server.nullifier = () => { throw new HttpError('Service unavailable', 503, 'service_unavailable'); };
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
+                assert.equal(error.code, 'transmitted_anchor_unconfirmed');
+                assertJournalMissingWarning(error.data.escape_override_warning);
+                assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
+                return true;
+            });
+        }
+        const [kept] = await records();
+        assert.equal(kept.serverObservations.length, archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord + 1);
+        assert.deepEqual(kept.serverObservations[0], claim, 'the claim, not the fast-dated reading, is kept');
+        assert.ok(kept.serverObservations.slice(1).every(observation => observation.status === 'unavailable'));
+        shown = h.runtime.snapshot().config.escape_override;
+        assertJournalMissingWarning(shown.warning);
+        assert.equal(shown.acknowledgement, 'receipt_journal_missing');
+        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
+            assertSavedClaimRefusal(error, 'unavailable');
+            return true;
+        });
+        assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
+        // A false claim still cannot veto the override: its own acknowledgement escapes.
+        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
+        assert.equal(plan.mode, 'escape');
+        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
+    });
+}
 
 test('an unknown reading saved on the live journal alone keeps a receipt claim ended through later failed reads', async t => {
     const h = await freshWallet({ vaultRevision: 2 });

@@ -11,6 +11,7 @@ import {
     journalClientRequestId,
     mergeRequestArchiveRecord,
     requestJournalArchiveId,
+    sequenceObservationUpdates,
     terminalRequestArchiveToPrune
 } from './zkapiRequestArchive.mjs';
 
@@ -292,11 +293,13 @@ function requestArchiveError(message, code, status = null) {
  * Merge request-archive updates into an in-memory snapshot of the store.
  * Throws on an identity conflict or when a new unresolved request would exceed
  * its anchor's bound. Eviction is non-terminal and keeps every journal intact.
- * Returns the ids that must be written.
+ * Every appended observation is stamped with its save order here, inside the
+ * write transaction that holds every record. Returns the ids that must be
+ * written.
  */
 function mergeRequestArchiveUpdates(archive, updates, now, { enforceCapacity = true } = {}) {
     const changed = new Set();
-    for (const update of updates) {
+    for (const update of sequenceObservationUpdates([...archive.values()], updates)) {
         const previous = archive.get(update?.archiveId) || null;
         if (!previous && enforceCapacity && update?.type === REQUEST_JOURNAL_TYPE && isUnresolved(update)) {
             const capacity = anchorArchiveCapacity([...archive.values()], update);

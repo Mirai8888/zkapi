@@ -11,6 +11,14 @@
 //! absorbed or trigger a rebuild, and any unresolved mismatch fails closed
 //! (HTTP 503) rather than serving a root the vault never had.
 //!
+//! That check covers the open-escape list only through the notes' leaves.
+//! An open escape zeroes its note's leaf, so no open escape is left out
+//! (barring the cases `PendingEscape` lists), but each entry is the last one
+//! applied from the logs: a missed challenge followed by a re-escape, close
+//! or claim of the same note leaves the root unchanged, so an entry can carry
+//! a challenged escape's nullifier and deadline, or outlive the note's
+//! escape. Consumers read `pendingWithdrawals(note)` from the vault.
+//!
 //! The indexer is NOT trusted. Incorrect paths only cause proof or tx failure.
 
 pub mod events;
@@ -27,4 +35,4 @@ pub use service::{
     HealthResponse, IndexerService, NextNoteIdResponse, PendingEscapesResponse, ServiceSettings,
     SyncStatus, TreePathResponse, TreeRootResponse, TreeSnapshotResponse, TreeView,
 };
-pub use tree_mirror::{MirrorError, PendingEscape, TreeMirror};
+pub use tree_mirror::{EscapeClose, MirrorError, MissedReEscape, PendingEscape, TreeMirror};

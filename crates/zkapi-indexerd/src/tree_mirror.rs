@@ -10,13 +10,72 @@ use zkapi_types::{Felt252, MERKLE_DEPTH};
 use crate::events::VaultEvent;
 
 /// An escape withdrawal the vault holds open until it is challenged or
-/// finalized. The challenger uses this list as a completeness check for its
-/// own escape-event scan.
+/// finalized, as last applied from the vault's logs. The challenger uses the
+/// note ids as a completeness check for its own escape-event scan.
+///
+/// The root check covers leaves only. An open escape zeroes its note's leaf,
+/// so a mirror with the vault's root lists every open escape, unless a
+/// reorganization below the checkpoint or a stale log backend made it apply a
+/// closing event the canonical chain lacks. The entries themselves are hints.
+/// A challenge restores the leaf, so if the logs miss a challenge followed by
+/// a re-escape, mutual close or expiry claim of the same note, the root is
+/// unchanged: the entry keeps the challenged escape's `withdrawal_nullifier`
+/// and `challenge_deadline`, or stays listed after the vault closed the note.
+/// Consumers read `pendingWithdrawals(note)` from the vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingEscape {
     pub note_id: u32,
     pub withdrawal_nullifier: Felt252,
     pub challenge_deadline: u64,
+}
+
+/// The vault event that closed an escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EscapeClose {
+    /// `EscapeWithdrawalChallenged`: the note's leaf was restored.
+    Challenged,
+    /// `EscapeWithdrawalFinalized`: the vault paid the escape out.
+    Finalized,
+}
+
+impl EscapeClose {
+    pub const ALL: [EscapeClose; 2] = [EscapeClose::Challenged, EscapeClose::Finalized];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EscapeClose::Challenged => "challenged",
+            EscapeClose::Finalized => "finalized",
+        }
+    }
+}
+
+/// A challenge or finalization of an escape other than the one listed for
+/// its note. The vault holds at most one escape per note, so the mirror never
+/// applied this escape's initiation: the logs missed a challenge of the
+/// listed escape and a re-escape of the note, or a reorganization below the
+/// checkpoint replaced the note's escape, which re-anchoring on the root and
+/// next note id cannot see. Either leaves the root unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissedReEscape {
+    pub note_id: u32,
+    /// The listed escape, which the mirror never saw closed.
+    pub listed_nullifier: Felt252,
+    /// The escape the event closed, which the mirror never saw initiated.
+    pub nullifier: Felt252,
+    pub closed_by: EscapeClose,
+}
+
+impl std::fmt::Display for MissedReEscape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "note {} escape {} was {} while escape {} was listed",
+            self.note_id,
+            self.nullifier,
+            self.closed_by.as_str(),
+            self.listed_nullifier
+        )
+    }
 }
 
 /// Serializable state paired atomically with the indexer's block cursor.
@@ -43,8 +102,6 @@ pub enum MirrorError {
     NoteNotActive { note_id: u32 },
     #[error("note {note_id} has no pending escape withdrawal")]
     NoteNotPending { note_id: u32 },
-    #[error("note {note_id} pending escape has a different withdrawal nullifier")]
-    PendingNullifierMismatch { note_id: u32 },
     #[error("event root {event} does not match mirror root {mirror}")]
     RootMismatch { event: Felt252, mirror: Felt252 },
     #[error("note id space is exhausted")]
@@ -58,7 +115,8 @@ pub struct TreeMirror {
     next_note_id: u32,
     /// Original leaf values for each note (needed for challenge restores).
     original_leaves: HashMap<u32, Felt252>,
-    /// Escape withdrawals that are neither challenged nor finalized.
+    /// Escape withdrawals the logs showed initiated and not yet challenged or
+    /// finalized (see `PendingEscape`).
     pending_escapes: BTreeMap<u32, PendingEscape>,
 }
 
@@ -105,7 +163,8 @@ impl TreeMirror {
             .collect()
     }
 
-    /// Open escape withdrawals in note-id order.
+    /// Open escape withdrawals in note-id order. The entries are hints (see
+    /// `PendingEscape`).
     pub fn pending_escapes(&self) -> Vec<PendingEscape> {
         self.pending_escapes.values().copied().collect()
     }
@@ -210,8 +269,15 @@ impl TreeMirror {
     /// Apply a contract event after checking that it can follow the mirrored
     /// vault state, including the root the vault emitted with it.
     ///
+    /// Returns the missed re-escape that a challenge or finalization of an
+    /// unlisted nullifier implies; the caller's batch-end check of the root
+    /// and next note id remains the safety check.
+    ///
     /// On error the mirror may be partially updated and must be discarded.
-    pub fn apply_event(&mut self, event: &VaultEvent) -> Result<(), MirrorError> {
+    pub fn apply_event(
+        &mut self,
+        event: &VaultEvent,
+    ) -> Result<Option<MissedReEscape>, MirrorError> {
         match event {
             VaultEvent::NoteDeposited {
                 note_id,
@@ -233,13 +299,14 @@ impl TreeMirror {
                 self.tree.set_leaf(*note_id, leaf);
                 self.original_leaves.insert(*note_id, leaf);
                 self.next_note_id = next_note_id;
-                self.require_root(new_root)
+                self.require_root(new_root)?;
+                Ok(None)
             }
             VaultEvent::MutualClose { note_id, .. } => {
                 // The event carries no root; the batch-end state check covers it.
                 self.require_active(*note_id)?;
                 self.tree.set_leaf(*note_id, Felt252::ZERO);
-                Ok(())
+                Ok(None)
             }
             VaultEvent::EscapeWithdrawalInitiated {
                 note_id,
@@ -258,32 +325,37 @@ impl TreeMirror {
                         challenge_deadline: *challenge_deadline,
                     },
                 );
-                self.require_root(new_root)
+                self.require_root(new_root)?;
+                Ok(None)
             }
             VaultEvent::EscapeWithdrawalChallenged {
                 note_id,
                 nullifier,
                 restored_root,
             } => {
-                let original = self.require_pending(*note_id, nullifier)?;
+                let (original, missed) =
+                    self.require_pending(*note_id, nullifier, EscapeClose::Challenged)?;
                 self.tree.set_leaf(*note_id, original);
                 self.pending_escapes.remove(note_id);
-                self.require_root(restored_root)
+                self.require_root(restored_root)?;
+                Ok(missed)
             }
             VaultEvent::EscapeWithdrawalFinalized {
                 note_id, nullifier, ..
             } => {
                 // The leaf was zeroed on initiation; only the escape closes.
-                self.require_pending(*note_id, nullifier)?;
+                let (_, missed) =
+                    self.require_pending(*note_id, nullifier, EscapeClose::Finalized)?;
                 self.pending_escapes.remove(note_id);
-                Ok(())
+                Ok(missed)
             }
             VaultEvent::ExpiredClaimed {
                 note_id, new_root, ..
             } => {
                 self.require_active(*note_id)?;
                 self.tree.set_leaf(*note_id, Felt252::ZERO);
-                self.require_root(new_root)
+                self.require_root(new_root)?;
+                Ok(None)
             }
         }
     }
@@ -306,19 +378,35 @@ impl TreeMirror {
         Ok(())
     }
 
-    fn require_pending(&self, note_id: u32, nullifier: &Felt252) -> Result<Felt252, MirrorError> {
+    /// Check that the note has a listed escape and a zero leaf, and return its
+    /// original leaf. An event for another nullifier closes a re-escape the
+    /// mirror missed: the listed record takes the event's nullifier, and the
+    /// missed re-escape is returned.
+    fn require_pending(
+        &mut self,
+        note_id: u32,
+        nullifier: &Felt252,
+        closed_by: EscapeClose,
+    ) -> Result<(Felt252, Option<MissedReEscape>), MirrorError> {
         let original = self.original_leaf(note_id)?;
-        let escape = self
-            .pending_escapes
-            .get(&note_id)
-            .ok_or(MirrorError::NoteNotPending { note_id })?;
         if !self.tree.get_leaf(note_id).is_zero() {
             return Err(MirrorError::NoteNotPending { note_id });
         }
-        if escape.withdrawal_nullifier != *nullifier {
-            return Err(MirrorError::PendingNullifierMismatch { note_id });
+        let escape = self
+            .pending_escapes
+            .get_mut(&note_id)
+            .ok_or(MirrorError::NoteNotPending { note_id })?;
+        if escape.withdrawal_nullifier == *nullifier {
+            return Ok((original, None));
         }
-        Ok(original)
+        let missed = MissedReEscape {
+            note_id,
+            listed_nullifier: escape.withdrawal_nullifier,
+            nullifier: *nullifier,
+            closed_by,
+        };
+        escape.withdrawal_nullifier = *nullifier;
+        Ok((original, Some(missed)))
     }
 
     fn require_root(&self, event_root: &Felt252) -> Result<(), MirrorError> {
@@ -603,9 +691,10 @@ mod tests {
         }
     }
 
+    /// Apply complete logs, which never imply a missed re-escape.
     fn apply_all(mirror: &mut TreeMirror, events: &[VaultEvent]) {
         for event in events {
-            mirror.apply_event(event).unwrap();
+            assert_eq!(mirror.apply_event(event), Ok(None));
         }
     }
 
@@ -626,7 +715,7 @@ mod tests {
         ];
         let mut mirror = TreeMirror::new();
         for (index, event) in events.iter().enumerate() {
-            mirror.apply_event(event).unwrap();
+            assert_eq!(mirror.apply_event(event), Ok(None));
             if index == 3 {
                 assert_eq!(
                     mirror.pending_escapes(),
@@ -793,20 +882,6 @@ mod tests {
             Err(MirrorError::UnknownNote { note_id: 4 })
         );
 
-        // The vault emits the pending escape's own nullifier.
-        let escape = reference.escape(0, 900);
-        mirror.apply_event(&escape).unwrap();
-        assert_eq!(
-            mirror
-                .clone()
-                .apply_event(&VaultEvent::EscapeWithdrawalFinalized {
-                    note_id: 0,
-                    nullifier: Felt252::from_u64(901),
-                    final_balance: 1,
-                }),
-            Err(MirrorError::PendingNullifierMismatch { note_id: 0 })
-        );
-
         // A closed note (zero leaf, no pending escape) cannot be finalized.
         let mut reference = Reference::new();
         let deposit = reference.deposit(100);
@@ -817,6 +892,109 @@ mod tests {
             closed.apply_event(&finalize),
             Err(MirrorError::NoteNotPending { note_id: 0 })
         );
+    }
+
+    #[test]
+    fn apply_event_takes_another_nullifier_as_a_missed_re_escape() {
+        let mut reference = Reference::new();
+        let deposit = reference.deposit(100);
+        let escape = reference.escape(0, 900);
+        let mut mirror = TreeMirror::new();
+        apply_all(&mut mirror, &[deposit, escape]);
+        // The logs miss a challenge of 900 and a re-escape 901 of the note.
+        // The pair leaves the root unchanged, so only the listing is stale.
+        reference.challenge(0, 900);
+        reference.escape(0, 901);
+        assert_eq!(mirror.root(), reference.0.root());
+        assert_eq!(
+            mirror.pending_escapes()[0].withdrawal_nullifier,
+            Felt252::from_u64(900)
+        );
+        let missed = |closed_by| MissedReEscape {
+            note_id: 0,
+            listed_nullifier: Felt252::from_u64(900),
+            nullifier: Felt252::from_u64(901),
+            closed_by,
+        };
+
+        // The vault later finalizes 901: the listed escape closes.
+        let mut finalized = mirror.clone();
+        let finalize = VaultEvent::EscapeWithdrawalFinalized {
+            note_id: 0,
+            nullifier: Felt252::from_u64(901),
+            final_balance: 1,
+        };
+        let closed = finalized.apply_event(&finalize);
+        assert_eq!(closed, Ok(Some(missed(EscapeClose::Finalized))));
+        assert_eq!(
+            closed.unwrap().unwrap().to_string(),
+            "note 0 escape 0x385 was finalized while escape 0x384 was listed"
+        );
+        assert!(finalized.pending_escapes().is_empty());
+        assert!(finalized.get_leaf(0).is_zero());
+        assert_eq!(finalized.root(), reference.0.root());
+
+        // Or challenges 901: the leaf is restored under the event's root.
+        let challenge = reference.challenge(0, 901);
+        let mut challenged = mirror.clone();
+        assert_eq!(
+            challenged.apply_event(&challenge),
+            Ok(Some(missed(EscapeClose::Challenged)))
+        );
+        assert!(challenged.pending_escapes().is_empty());
+        assert!(!challenged.get_leaf(0).is_zero());
+        assert_eq!(challenged.root(), reference.0.root());
+
+        // The event's root is still checked.
+        assert!(matches!(
+            mirror.apply_event(&VaultEvent::EscapeWithdrawalChallenged {
+                note_id: 0,
+                nullifier: Felt252::from_u64(901),
+                restored_root: Felt252::from_u64(5),
+            }),
+            Err(MirrorError::RootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_event_rejects_unknown_nullifier_for_note_without_listed_escape() {
+        let mut reference = Reference::new();
+        let events = [
+            reference.deposit(100),
+            reference.deposit(101),
+            reference.escape(1, 900),
+            reference.challenge(1, 900),
+            reference.close(0),
+        ];
+        let mut mirror = TreeMirror::new();
+        apply_all(&mut mirror, &events);
+        assert!(mirror.pending_escapes().is_empty());
+
+        // Note 0 is closed (zero leaf) and note 1 is active again; neither
+        // lists an escape, so no event can close one.
+        let unknown = Felt252::from_u64(0xbad);
+        for note_id in [0, 1] {
+            assert_eq!(
+                mirror
+                    .clone()
+                    .apply_event(&VaultEvent::EscapeWithdrawalFinalized {
+                        note_id,
+                        nullifier: unknown,
+                        final_balance: 1,
+                    }),
+                Err(MirrorError::NoteNotPending { note_id })
+            );
+            assert_eq!(
+                mirror
+                    .clone()
+                    .apply_event(&VaultEvent::EscapeWithdrawalChallenged {
+                        note_id,
+                        nullifier: unknown,
+                        restored_root: mirror.root(),
+                    }),
+                Err(MirrorError::NoteNotPending { note_id })
+            );
+        }
     }
 
     #[test]

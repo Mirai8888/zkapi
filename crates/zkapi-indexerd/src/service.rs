@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
-use crate::tree_mirror::{PendingEscape, TreeMirror};
+use crate::tree_mirror::{EscapeClose, PendingEscape, TreeMirror};
 
 /// Indexer status as reported on `/health` and `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +45,9 @@ impl SyncStatus {
 }
 
 /// A mirror state the vault had at a recorded block hash, as verified by
-/// `currentRoot()` and `nextNoteId()` read at that block.
+/// `currentRoot()` and `nextNoteId()` read at that block. That check covers
+/// the open-escape entries only through their notes' leaves (see
+/// `PendingEscape`).
 #[derive(Clone)]
 pub struct TreeView {
     pub mirror: Arc<TreeMirror>,
@@ -126,6 +128,8 @@ struct State {
     last_error: Option<String>,
     divergence_count: u64,
     rebuild_count: u64,
+    missed_re_escapes_challenged: u64,
+    missed_re_escapes_finalized: u64,
     stale_reported: bool,
     head_stale_reported: bool,
 }
@@ -163,6 +167,8 @@ impl IndexerService {
                 last_error: None,
                 divergence_count: 0,
                 rebuild_count: 0,
+                missed_re_escapes_challenged: 0,
+                missed_re_escapes_finalized: 0,
                 stale_reported: false,
                 head_stale_reported: false,
             }),
@@ -245,6 +251,10 @@ impl IndexerService {
             last_error: state.last_error.clone(),
             divergence_count: state.divergence_count,
             rebuild_count: state.rebuild_count,
+            missed_re_escape_count: state
+                .missed_re_escapes_challenged
+                .saturating_add(state.missed_re_escapes_finalized),
+            missed_re_escape_finalized_count: state.missed_re_escapes_finalized,
         }
     }
 
@@ -374,6 +384,17 @@ impl IndexerService {
         state.divergence_count = state.divergence_count.saturating_add(1);
     }
 
+    /// A committed event closed an escape the mirror never saw initiated
+    /// (see `MissedReEscape`).
+    pub(crate) fn bump_missed_re_escapes(&self, closed_by: EscapeClose) {
+        let mut state = self.state.write().unwrap();
+        let count = match closed_by {
+            EscapeClose::Challenged => &mut state.missed_re_escapes_challenged,
+            EscapeClose::Finalized => &mut state.missed_re_escapes_finalized,
+        };
+        *count = count.saturating_add(1);
+    }
+
     /// Stop serving and report a rebuild from the deployment block.
     pub(crate) fn begin_rebuild(&self, reason: String) {
         let mut state = self.state.write().unwrap();
@@ -487,6 +508,22 @@ impl IndexerService {
                 "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
             ));
         }
+        let name = "zkapi_indexer_missed_re_escapes_total";
+        out.push_str(&format!(
+            "# HELP {name} Committed challenges or finalizations of an escape the indexer never saw initiated, once per escape, by closing event.\n# TYPE {name} counter\n"
+        ));
+        for closed_by in EscapeClose::ALL {
+            let value = match closed_by {
+                EscapeClose::Challenged => health
+                    .missed_re_escape_count
+                    .saturating_sub(health.missed_re_escape_finalized_count),
+                EscapeClose::Finalized => health.missed_re_escape_finalized_count,
+            };
+            out.push_str(&format!(
+                "{name}{{event=\"{}\"}} {value}\n",
+                closed_by.as_str()
+            ));
+        }
         out
     }
 }
@@ -534,6 +571,16 @@ pub struct HealthResponse {
     pub last_error: Option<String>,
     pub divergence_count: u64,
     pub rebuild_count: u64,
+    /// Committed challenges or finalizations of an escape the indexer never
+    /// saw initiated, once per escape and closing event in this process: its
+    /// logs missed a challenge and re-escape of the note, or a reorganization
+    /// below the checkpoint replaced the note's escape (see `MissedReEscape`).
+    #[serde(default)]
+    pub missed_re_escape_count: u64,
+    /// Of those, finalizations: the vault paid out an escape the indexer's
+    /// pending list never showed.
+    #[serde(default)]
+    pub missed_re_escape_finalized_count: u64,
 }
 
 /// Response type for tree endpoints.
@@ -587,8 +634,16 @@ pub struct TreeSnapshotResponse {
     pub block_hash: String,
 }
 
-/// Escape withdrawals open in the verified view (internal; the challenger's
-/// completeness check for its own event scan).
+/// Escape withdrawals open in the verified view (internal). The view's root
+/// check covers them only through their notes' leaves: an open escape zeroes
+/// its note's leaf, so the list leaves none out (barring the cases in
+/// `PendingEscape`), and the challenger uses it as a completeness check for
+/// its own event scan. Each entry is the last one applied from the logs, a
+/// hint: a missed challenge followed by a re-escape, mutual close or expiry
+/// claim of the note leaves the root unchanged, so an entry can carry a
+/// challenged escape's `withdrawal_nullifier` and `challenge_deadline`, or
+/// outlive the note's escape. Consumers read `pendingWithdrawals(note)` from
+/// the vault.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingEscapesResponse {
     pub block_number: u64,

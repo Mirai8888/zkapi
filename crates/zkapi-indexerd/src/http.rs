@@ -263,8 +263,15 @@ async fn handle_zero_path(
     }))
 }
 
-/// Internal: escape withdrawals open in the verified view. The challenger
-/// reconciles its own escape-event scan against this list.
+/// Internal: escape withdrawals open in the verified view. The view's root
+/// check covers them only through their notes' leaves, so no open escape is
+/// left out (barring the cases in `PendingEscape`), and the challenger
+/// reconciles its own escape-event scan against the note ids. Each entry is
+/// the last one applied from the logs, a hint: after a missed challenge
+/// followed by a re-escape, close or claim of the note, which leaves the root
+/// unchanged, it carries a challenged escape's `withdrawal_nullifier` and
+/// `challenge_deadline` or outlives the note's escape. Consumers read
+/// `pendingWithdrawals(note)` from the vault.
 async fn handle_pending_escapes(
     State(service): State<AppState>,
 ) -> Result<Json<PendingEscapesResponse>, IndexerUnavailable> {
@@ -285,7 +292,7 @@ mod tests {
     use zkapi_types::MERKLE_DEPTH;
 
     use crate::events::VaultEvent;
-    use crate::tree_mirror::TreeMirror;
+    use crate::tree_mirror::{EscapeClose, TreeMirror};
 
     fn mirror_with_deposits(count: u32) -> TreeMirror {
         let mut mirror = TreeMirror::new();
@@ -541,6 +548,8 @@ mod tests {
         assert_eq!(health["last_error"], serde_json::Value::Null);
         assert_eq!(health["divergence_count"], 0);
         assert_eq!(health["rebuild_count"], 0);
+        assert_eq!(health["missed_re_escape_count"], 0);
+        assert_eq!(health["missed_re_escape_finalized_count"], 0);
         assert!(serde_json::from_value::<crate::service::HealthResponse>(health).is_ok());
 
         // A head older than max_head_age makes the view stale.
@@ -681,6 +690,12 @@ mod tests {
         ));
         service.record_success();
         service.bump_divergences();
+        service.bump_missed_re_escapes(EscapeClose::Challenged);
+        service.bump_missed_re_escapes(EscapeClose::Finalized);
+        service.bump_missed_re_escapes(EscapeClose::Challenged);
+        let health = service.health();
+        assert_eq!(health.missed_re_escape_count, 3);
+        assert_eq!(health.missed_re_escape_finalized_count, 1);
         let base = serve(service).await;
 
         let response = reqwest::get(format!("{base}/metrics")).await.unwrap();
@@ -704,7 +719,10 @@ mod tests {
             "zkapi_indexer_consecutive_failures 0",
             "zkapi_indexer_divergences_total 1",
             "zkapi_indexer_rebuilds_total 0",
+            "zkapi_indexer_missed_re_escapes_total{event=\"challenged\"} 2",
+            "zkapi_indexer_missed_re_escapes_total{event=\"finalized\"} 1",
             "# TYPE zkapi_indexer_rebuilds_total counter",
+            "# TYPE zkapi_indexer_missed_re_escapes_total counter",
             "# TYPE zkapi_indexer_served_block gauge",
         ] {
             assert!(
@@ -712,6 +730,15 @@ mod tests {
                 "missing {line:?} in\n{text}"
             );
         }
+        // One HELP and TYPE pair, and only labelled samples.
+        assert_eq!(
+            text.matches("# TYPE zkapi_indexer_missed_re_escapes_total ")
+                .count(),
+            1
+        );
+        assert!(!text
+            .lines()
+            .any(|line| line.starts_with("zkapi_indexer_missed_re_escapes_total ")));
         assert!(text.contains("zkapi_indexer_head_age_seconds "));
         assert!(text.contains("zkapi_indexer_last_success_timestamp_seconds "));
     }

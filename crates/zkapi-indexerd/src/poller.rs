@@ -35,7 +35,7 @@ use zkapi_types::Felt252;
 
 use crate::events::VaultEvent;
 use crate::service::{unix_ms, IndexerService, SyncStatus, TreeView};
-use crate::tree_mirror::{TreeMirror, TreeMirrorSnapshot};
+use crate::tree_mirror::{EscapeClose, MissedReEscape, TreeMirror, TreeMirrorSnapshot};
 
 const CHECKPOINT_VERSION: u32 = 2;
 /// `currentRoot()`
@@ -161,6 +161,15 @@ struct AnchorCandidate {
     sightings: u32,
 }
 
+/// Catch-up progress above the anchor whose state could not be verified
+/// (pruned history). Never served or persisted.
+struct Provisional {
+    mirror: Arc<TreeMirror>,
+    /// Missed re-escapes in the held chunks, reported only when a later
+    /// chunk verifies and commits them.
+    missed_re_escapes: Vec<MissedReEscapeAt>,
+}
+
 pub struct JsonRpcLogPoller {
     client: Client,
     rpc_url: String,
@@ -168,9 +177,7 @@ pub struct JsonRpcLogPoller {
     cfg: PollerConfig,
     /// Verified, persisted state at `committed.anchor`.
     committed: Committed,
-    /// Catch-up progress above the anchor whose state could not be verified
-    /// (pruned history). Never served or persisted.
-    provisional: Option<Arc<TreeMirror>>,
+    provisional: Option<Provisional>,
     /// First block not yet applied to the working (committed or provisional)
     /// mirror.
     next_block: u64,
@@ -178,6 +185,8 @@ pub struct JsonRpcLogPoller {
     chain_verified: bool,
     chain_mismatch_reported: bool,
     published: Option<BlockRef>,
+    /// The committed state is a restored checkpoint not yet verified in this
+    /// process.
     startup_check_pending: bool,
     anchor_checked_at: Option<BlockRef>,
     anchor_candidate: Option<AnchorCandidate>,
@@ -190,6 +199,10 @@ pub struct JsonRpcLogPoller {
     rebuild_started: Option<Instant>,
     pending_rebuild: Option<String>,
     eip1898_reported: bool,
+    /// Missed re-escapes already reported, by note id, nullifier and closing
+    /// event. A rebuild replays the same history and must not report them
+    /// again.
+    reported_missed_re_escapes: HashSet<(u32, Felt252, EscapeClose)>,
     cursor_path: Option<PathBuf>,
     _lock: Option<File>,
 }
@@ -231,6 +244,7 @@ impl JsonRpcLogPoller {
             rebuild_started: None,
             pending_rebuild: None,
             eip1898_reported: false,
+            reported_missed_re_escapes: HashSet::new(),
             cursor_path: cursor_path.clone(),
             _lock: None,
             cfg: config,
@@ -465,13 +479,14 @@ impl JsonRpcLogPoller {
                         format!("checkpoint does not match vault state: {detail}"),
                     )));
                 }
-                Verdict::Match => {}
+                Verdict::Match => self.startup_check_pending = false,
+                // Retried on the next poll. Until it passes, the restored
+                // state is published only through a view verified on its own.
                 Verdict::Unavailable(err) => tracing::debug!(
                     error = %format!("{err:#}"),
-                    "checkpoint state unavailable at startup; the next verified commit checks it"
+                    "checkpoint state unavailable at startup; retrying on the next poll"
                 ),
             }
-            self.startup_check_pending = false;
         }
         Ok(None)
     }
@@ -618,10 +633,10 @@ impl JsonRpcLogPoller {
         let logs = self.fetch_logs(from, to, &to_header.hash).await?;
         let base = self
             .provisional
-            .clone()
-            .unwrap_or_else(|| self.committed.mirror.clone());
-        let staged = match apply_logs(&base, &logs) {
-            Ok((staged, _)) => staged,
+            .as_ref()
+            .map_or_else(|| self.committed.mirror.clone(), |held| held.mirror.clone());
+        let (staged, chunk_missed) = match apply_logs(&base, &logs) {
+            Ok(applied) => (applied.mirror, applied.missed_re_escapes),
             Err(detail) => {
                 self.on_mismatch(service, detail).await;
                 return Ok(Some(PollOutcome::Idle));
@@ -630,9 +645,12 @@ impl JsonRpcLogPoller {
         let to_ref = to_header.block_ref();
         match self.verify_state(&staged, &to_ref, false).await {
             Verdict::Match => {
+                let mut missed = self.take_provisional_missed();
+                missed.extend(chunk_missed);
                 self.commit(service, staged, to_ref);
                 // Read by number under this head and verified as canonical.
                 self.anchor_checked_at = Some(head.clone());
+                self.report_missed_re_escapes(service, &missed);
             }
             Verdict::Mismatch(detail) => {
                 self.on_mismatch(service, detail).await;
@@ -641,14 +659,19 @@ impl JsonRpcLogPoller {
             Verdict::Unavailable(err) if to < target => {
                 // Historical state is pruned on non-archive nodes. Hold the
                 // chunk in memory; the final chunk must verify before
-                // anything is persisted or served.
+                // anything is persisted, served or reported.
                 tracing::debug!(
                     from,
                     to,
                     error = %format!("{err:#}"),
                     "historical vault state unavailable; holding catch-up chunk in memory"
                 );
-                self.provisional = Some(staged);
+                let mut missed = self.take_provisional_missed();
+                missed.extend(chunk_missed);
+                self.provisional = Some(Provisional {
+                    mirror: staged,
+                    missed_re_escapes: missed,
+                });
                 self.next_block = to + 1;
             }
             Verdict::Unavailable(err) => {
@@ -678,6 +701,44 @@ impl JsonRpcLogPoller {
         self.persist_committed();
     }
 
+    /// Missed re-escapes of the held catch-up chunks, if any; the held
+    /// chunks themselves are dropped.
+    fn take_provisional_missed(&mut self) -> Vec<MissedReEscapeAt> {
+        self.provisional
+            .take()
+            .map(|held| held.missed_re_escapes)
+            .unwrap_or_default()
+    }
+
+    /// Log and count each missed re-escape a verified commit took, once per
+    /// escape and closing event in this process: a rebuild replays the same
+    /// history.
+    fn report_missed_re_escapes(&mut self, service: &IndexerService, missed: &[MissedReEscapeAt]) {
+        for at in missed {
+            let event = &at.event;
+            if !self.reported_missed_re_escapes.insert((
+                event.note_id,
+                event.nullifier,
+                event.closed_by,
+            )) {
+                tracing::debug!(detail = %at, "missed re-escape already reported");
+                continue;
+            }
+            match event.closed_by {
+                EscapeClose::Challenged => tracing::warn!(
+                    detail = %at,
+                    "escape challenged that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list showed a stale nullifier and deadline until now"
+                ),
+                // The vault paid out an escape the pending list never showed.
+                EscapeClose::Finalized => tracing::error!(
+                    detail = %at,
+                    "escape finalized that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list showed a stale nullifier and deadline until now, so check that the challenge service tracked this escape"
+                ),
+            }
+            service.bump_missed_re_escapes(event.closed_by);
+        }
+    }
+
     async fn publish_head_view(
         &mut self,
         service: &IndexerService,
@@ -698,14 +759,24 @@ impl JsonRpcLogPoller {
             Vec::new()
         };
         let (overlay, last_event_block) = match apply_logs(&self.committed.mirror, &logs) {
-            Ok(applied) => applied,
+            Ok(applied) => {
+                // Re-derived on every head; reported once committed.
+                for at in &applied.missed_re_escapes {
+                    tracing::debug!(
+                        detail = %at,
+                        "escape closed above the checkpoint that the indexer never saw initiated"
+                    );
+                }
+                (applied.mirror, applied.last_event_block)
+            }
             Err(detail) => {
                 self.on_mismatch(service, detail).await;
                 return Ok(());
             }
         };
-        if self.committed.anchor.as_ref() == Some(&head_ref) {
-            // Committed at the head (zero confirmations): already verified.
+        if self.committed.anchor.as_ref() == Some(&head_ref) && !self.startup_check_pending {
+            // Committed at the head (zero confirmations) and verified there by
+            // this process. A restored checkpoint is verified like any view.
             self.publish(service, overlay, head_ref);
             return Ok(());
         }
@@ -1317,30 +1388,63 @@ fn validate_logs(
     Ok(logs)
 }
 
-/// Apply logs to a copy of `base`. Returns the staged mirror (sharing `base`
-/// when no log decodes to a vault event) and the block of the last event.
-fn apply_logs(
-    base: &Arc<TreeMirror>,
-    logs: &[ChainLog],
-) -> Result<(Arc<TreeMirror>, Option<u64>), String> {
+/// A missed re-escape and the log that revealed it.
+#[derive(Debug, Clone)]
+struct MissedReEscapeAt {
+    block: u64,
+    log_index: u64,
+    event: MissedReEscape,
+}
+
+impl std::fmt::Display for MissedReEscapeAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block {} log {}: {}",
+            self.block, self.log_index, self.event
+        )
+    }
+}
+
+/// Logs applied to a copy of a mirror.
+struct Applied {
+    /// The staged mirror; the base itself when no log decodes to a vault event.
+    mirror: Arc<TreeMirror>,
+    /// Block of the last vault event.
+    last_event_block: Option<u64>,
+    /// Events that closed an escape the mirror never saw initiated.
+    missed_re_escapes: Vec<MissedReEscapeAt>,
+}
+
+/// Apply logs to a copy of `base`.
+fn apply_logs(base: &Arc<TreeMirror>, logs: &[ChainLog]) -> Result<Applied, String> {
     let mut staged: Option<TreeMirror> = None;
     let mut last_event_block = None;
+    let mut missed_re_escapes = Vec::new();
     for log in logs {
         let event = decode_log(&log.log)
             .map_err(|err| format!("block {} log {}: {err}", log.block, log.index))?;
         let Some(event) = event else {
             continue;
         };
-        staged
+        let missed = staged
             .get_or_insert_with(|| (**base).clone())
             .apply_event(&event)
             .map_err(|err| format!("block {} log {}: {err}", log.block, log.index))?;
+        if let Some(event) = missed {
+            missed_re_escapes.push(MissedReEscapeAt {
+                block: log.block,
+                log_index: log.index,
+                event,
+            });
+        }
         last_event_block = Some(log.block);
     }
-    Ok((
-        staged.map(Arc::new).unwrap_or_else(|| base.clone()),
+    Ok(Applied {
+        mirror: staged.map(Arc::new).unwrap_or_else(|| base.clone()),
         last_event_block,
-    ))
+        missed_re_escapes,
+    })
 }
 
 fn lock_checkpoint(path: &Path) -> anyhow::Result<File> {

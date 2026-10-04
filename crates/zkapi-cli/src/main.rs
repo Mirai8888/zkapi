@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use zkapi_serverd::config::{OpenRouterLeaseConfig, OpenRouterLeaseSourceConfig, ServerConfig};
+use zkapi_serverd::nullifier_store::{ReopenOptions, ReopenRefusal, GROTH16_UNVERIFIED};
 use zkapi_serverd::signer::ServerSigner;
 use zkapi_types::Felt252;
 
@@ -199,6 +200,58 @@ enum Commands {
         #[arg(long, default_value_t = 180)]
         max_head_age_secs: u64,
     },
+    /// Offline settlement remediation on a stopped API server's database.
+    #[command(subcommand)]
+    Settlement(SettlementCommand),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SettlementCommand {
+    /// Return a lease cancelled with a `binding_corrupt` review to settlement
+    /// after its binding was repaired.
+    ///
+    /// Stop the API server first: this takes the server's database writer
+    /// lock and refuses while a server holds it. It verifies the lease's saved
+    /// request against its Groth16 proof with the server's proof setup
+    /// (--proof-setup-dir, as for serverd) and refuses one its owner's proof
+    /// does not authorize: supply the authentic request with --saved-request.
+    /// It refuses while the lease row still disagrees with its nullifier
+    /// reservation, naming the field and its repair (--rebind), and for a
+    /// clearance-reserved nullifier (its owner exits by mutual close). The
+    /// restarted server verifies the request and checks the binding,
+    /// deployment and signing key again before signing: a lease never
+    /// delivered settles at zero; one that may have been delivered settles at
+    /// the usage captured before its direct key was deleted, or from measured
+    /// usage until its unchanged settlement deadline, and at its solvency
+    /// bound when no usage can be measured (the output then warns).
+    Reopen {
+        /// The server's SQLite database (the --db-path of serverd).
+        #[arg(long)]
+        db_path: String,
+        /// The lease's id as its binding_corrupt review names it.
+        #[arg(long)]
+        client_request_id: String,
+        /// Finalize at zero instead (charge_basis "operator_conceded"): the
+        /// operator concedes the request's charge. Also concedes a lease
+        /// reopened earlier that is not settled yet.
+        #[arg(long)]
+        zero_charge: bool,
+        /// Once the saved request verifies, repair the other side from it:
+        /// the lease row's client_request_id and request_nullifier (its
+        /// reviews follow a changed id), and the nullifier reservation's
+        /// payload hash, request binding, request id and kind, or a missing
+        /// reservation row.
+        #[arg(long)]
+        rebind: bool,
+        /// A JSON file (`-` for standard input) holding the authentic
+        /// request, restoring a saved request that does not verify or cannot
+        /// be read: from a backup of the server database, or its owner's
+        /// copy. Accepted only if it verifies, its binding is the one its
+        /// nullifier reservation recorded at admission, and it shares the
+        /// lease row's client_request_id or request_nullifier.
+        #[arg(long, value_name = "FILE")]
+        saved_request: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -366,8 +419,96 @@ async fn main() -> anyhow::Result<()> {
             };
             zkapi_indexerd::run_indexer(config).await?;
         }
+        Commands::Settlement(SettlementCommand::Reopen {
+            db_path,
+            client_request_id,
+            zero_charge,
+            rebind,
+            saved_request,
+        }) => {
+            let saved_request = saved_request
+                .as_deref()
+                .map(|path| read_saved_request(path, std::io::stdin()))
+                .transpose()?;
+            print_json(&reopen_cancelled_lease(
+                &db_path,
+                &client_request_id,
+                ReopenOptions {
+                    zero_charge,
+                    rebind,
+                    saved_request: saved_request.as_ref(),
+                },
+                &cli.proof_setup_dir,
+            )?)?;
+        }
     }
     Ok(())
+}
+
+/// The request of `--saved-request`: a JSON file, or `-` for `stdin`.
+fn read_saved_request(
+    path: &str,
+    mut stdin: impl std::io::Read,
+) -> anyhow::Result<zkapi_types::wire::ApiRequestV2> {
+    let text = if path == "-" {
+        let mut text = String::new();
+        stdin.read_to_string(&mut text).context(
+            "refusing to reopen the lease: cannot read --saved-request from standard input",
+        )?;
+        text
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("refusing to reopen the lease: cannot read {path}"))?
+    };
+    serde_json::from_str(&text).with_context(|| {
+        format!("refusing to reopen the lease: --saved-request {path} does not hold a request")
+    })
+}
+
+/// `zkapi settlement reopen`: holds the server writer lock for its whole run.
+/// The request verifier is loaded first, so that a wrong setup directory
+/// refuses before the database is touched.
+fn reopen_cancelled_lease(
+    db_path: &str,
+    client_request_id: &str,
+    options: ReopenOptions,
+    proof_setup_dir: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let verifier =
+        zkapi_proof::compact::RequestVerifier::load(proof_setup_dir).with_context(|| {
+            format!(
+                "refusing to reopen the lease: cannot load the request verifying key from \
+             {proof_setup_dir} (pass the server's --proof-setup-dir or ZKAPI_PROOF_SETUP_DIR)"
+            )
+        })?;
+    let store = zkapi_serverd::nullifier_store::OfflineStore::open(db_path)
+        .context("refusing to reopen the lease")?;
+    let reopened = store
+        .reopen_cancelled_lease(client_request_id, options, &verifier)
+        .map_err(|refusal| anyhow::anyhow!("{}", refusal_message(&refusal, proof_setup_dir)))?;
+    let mut report = serde_json::to_value(reopened)?;
+    report["result"] = "reopened".into();
+    Ok(report)
+}
+
+/// Why `zkapi settlement reopen` refused. A Groth16 failure, the only check
+/// that depends on the proof setup, also names the setup it was checked with:
+/// a wrong --proof-setup-dir must not pass for a corrupt saved request.
+fn refusal_message(refusal: &ReopenRefusal, proof_setup_dir: &str) -> String {
+    let groth16 = match refusal {
+        ReopenRefusal::BindingCorrupt(mismatch) => mismatch.detail == GROTH16_UNVERIFIED,
+        ReopenRefusal::SuppliedRequestUnverified(detail) => *detail == GROTH16_UNVERIFIED,
+        _ => false,
+    };
+    if groth16 {
+        format!(
+            "refusing to reopen the lease: {refusal} (checked with the request verifying key in \
+             {proof_setup_dir}; if the server runs with another --proof-setup-dir, run this \
+             command with that one first)"
+        )
+    } else {
+        format!("refusing to reopen the lease: {refusal}")
+    }
 }
 
 fn log_filter() -> tracing_subscriber::EnvFilter {
@@ -841,6 +982,253 @@ mod tests {
             ]),
             (3600, 18)
         );
+    }
+
+    #[test]
+    fn settlement_reopen_takes_the_server_database_and_an_opt_in_concession() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["zkapi", "settlement", "reopen"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Commands::Settlement(SettlementCommand::Reopen {
+                    db_path,
+                    client_request_id,
+                    zero_charge,
+                    rebind,
+                    saved_request,
+                }) => (
+                    db_path,
+                    client_request_id,
+                    zero_charge,
+                    rebind,
+                    saved_request,
+                ),
+                _ => panic!("expected settlement reopen"),
+            })
+        };
+        let base = [
+            "--db-path",
+            "/var/lib/zkapi/server.db",
+            "--client-request-id",
+            "lease-1",
+        ];
+        assert_eq!(
+            parse(&base).unwrap(),
+            (
+                "/var/lib/zkapi/server.db".into(),
+                "lease-1".into(),
+                false,
+                false,
+                None
+            )
+        );
+        let mut conceded = base.to_vec();
+        conceded.push("--zero-charge");
+        assert!(parse(&conceded).unwrap().2);
+        let mut rebound = base.to_vec();
+        rebound.push("--rebind");
+        assert!(parse(&rebound).unwrap().3);
+        let mut restored = base.to_vec();
+        restored.extend(["--saved-request", "-"]);
+        assert_eq!(parse(&restored).unwrap().4.as_deref(), Some("-"));
+        // No default database and no default lease.
+        assert!(parse(&base[..2]).is_err());
+        assert!(parse(&base[2..]).is_err());
+        assert!(Cli::try_parse_from(["zkapi", "settlement"]).is_err());
+    }
+
+    /// A unique scratch directory; the CLI crate has no tempfile dependency.
+    fn scratch_directory(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zkapi-cli-{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    /// The repository's proof setup, as serverd's --proof-setup-dir.
+    fn setup_directory() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/setup/v2")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Review regression (reopen authenticity): the command verifies saved
+    /// requests with the server's proof setup. A setup it cannot load refuses
+    /// before the database is opened, so nothing is locked or changed.
+    #[test]
+    fn settlement_reopen_requires_the_server_proof_setup() {
+        let cli = Cli::try_parse_from([
+            "zkapi",
+            "--proof-setup-dir",
+            "/srv/zkapi/protocol/setup/v2",
+            "settlement",
+            "reopen",
+            "--db-path",
+            "/data/server.db",
+            "--client-request-id",
+            "lease-1",
+        ])
+        .unwrap();
+        assert_eq!(cli.proof_setup_dir, "/srv/zkapi/protocol/setup/v2");
+        let directory = scratch_directory("reopen-setup");
+        let missing_setup = directory.join("no-setup");
+        let missing_database = directory.join("server.db");
+        let error = reopen_cancelled_lease(
+            missing_database.to_str().unwrap(),
+            "lease-1",
+            ReopenOptions::default(),
+            missing_setup.to_str().unwrap(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("request verifying key"), "{message}");
+        assert!(message.contains("--proof-setup-dir"), "{message}");
+        // Refused before the database: not even a missing one is reported.
+        assert!(!message.contains("no server database"), "{message}");
+        assert!(!missing_database.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Review regression (reopen authenticity): a Groth16 refusal, the only
+    /// one that depends on the proof setup, names the setup it was checked
+    /// with, so that a wrong --proof-setup-dir is not taken for a corrupt
+    /// saved request; other refusals are unchanged.
+    #[test]
+    fn groth16_refusal_names_the_proof_setup_it_used() {
+        use zkapi_serverd::nullifier_store::{BindingMismatch, SAVED_REQUEST_FIELD};
+        let setup = "/srv/zkapi/protocol/setup/v2";
+        let groth16 = ReopenRefusal::BindingCorrupt(BindingMismatch {
+            field: SAVED_REQUEST_FIELD,
+            detail: GROTH16_UNVERIFIED,
+        });
+        let message = refusal_message(&groth16, setup);
+        assert!(message.contains("from a backup"), "{message}");
+        assert!(message.contains(setup), "{message}");
+        let tag = ReopenRefusal::BindingCorrupt(BindingMismatch {
+            field: SAVED_REQUEST_FIELD,
+            detail: "is not the request its proof authorized: the authorization tag does not \
+                     bind its client_request_id and payload",
+        });
+        assert!(!refusal_message(&tag, setup).contains(setup));
+        // So does one of a request supplied with --saved-request.
+        let supplied = ReopenRefusal::SuppliedRequestUnverified(GROTH16_UNVERIFIED);
+        let message = refusal_message(&supplied, setup);
+        assert!(message.contains("--saved-request"), "{message}");
+        assert!(message.contains(setup), "{message}");
+        assert_eq!(
+            refusal_message(&ReopenRefusal::NotBindingCorrupt, setup),
+            format!(
+                "refusing to reopen the lease: {}",
+                ReopenRefusal::NotBindingCorrupt
+            )
+        );
+    }
+
+    /// A lease request as serverd stores it (a fixture: its proof does not
+    /// verify).
+    fn lease_request_json() -> serde_json::Value {
+        serde_json::json!({
+            "client_request_id": "lease-1", "payload": "{}", "payload_hash": "0x1",
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x7b",
+                "active_root": "0x0", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+                "request_time": 1, "solvency_bound": 10, "request_nullifier": "0x99",
+                "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
+                "anonymous_commitment_y": "0x5"
+            },
+            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+        })
+    }
+
+    /// Review regression (corrupt saved request): --saved-request reads the
+    /// authentic request from a file (a database backup's
+    /// api_request_json, or its owner's copy) or from standard input, and
+    /// refuses anything that is not a request before the database is opened.
+    #[test]
+    fn saved_request_is_read_from_a_file_or_standard_input() {
+        let text = lease_request_json().to_string();
+        let directory = scratch_directory("saved-request");
+        let file = directory.join("request.json");
+        std::fs::write(&file, format!("{text}\n")).unwrap();
+        let from_file = read_saved_request(file.to_str().unwrap(), std::io::empty()).unwrap();
+        let from_stdin = read_saved_request("-", text.as_bytes()).unwrap();
+        assert_eq!(from_file.client_request_id, "lease-1");
+        assert_eq!(
+            serde_json::to_value(&from_file).unwrap(),
+            serde_json::to_value(&from_stdin).unwrap()
+        );
+        let error = read_saved_request("-", r#"{"prepared_request": {}}"#.as_bytes()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not hold a request"),
+            "{error:#}"
+        );
+        let missing = directory.join("missing.json");
+        let error = read_saved_request(missing.to_str().unwrap(), std::io::empty()).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settlement_reopen_refuses_without_changing_the_database() {
+        use zkapi_serverd::nullifier_store::{NullifierStore, OfflineStore};
+        let directory = scratch_directory("reopen");
+        let setup = setup_directory();
+        let conceded = ReopenOptions {
+            zero_charge: true,
+            rebind: false,
+            saved_request: None,
+        };
+        let missing = directory.join("missing.db");
+        let error = reopen_cancelled_lease(
+            missing.to_str().unwrap(),
+            "lease-1",
+            ReopenOptions::default(),
+            &setup,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no server database"),
+            "{error:#}"
+        );
+        assert!(!missing.exists());
+
+        let path = directory.join("server.db");
+        let request: zkapi_types::wire::ApiRequestV2 =
+            serde_json::from_value(lease_request_json()).unwrap();
+        {
+            let store = NullifierStore::new(&path).unwrap();
+            store.reserve_openrouter_lease(&request).unwrap();
+            store
+                .create_openrouter_lease(&request, "oa_org", 10, 20, 21, 1.0)
+                .unwrap();
+        }
+        let db_path = path.to_str().unwrap();
+        // A lease that was never cancelled is not reopened.
+        let error = reopen_cancelled_lease(db_path, "lease-1", ReopenOptions::default(), &setup)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not cancelled"), "{error:#}");
+        let error = reopen_cancelled_lease(db_path, "lease-2", conceded, &setup).unwrap_err();
+        assert!(format!("{error:#}").contains("no lease"), "{error:#}");
+        // Nothing runs while another holder (a server) has the writer lock.
+        let held = OfflineStore::open(&path).unwrap();
+        let error = reopen_cancelled_lease(db_path, "lease-1", ReopenOptions::default(), &setup)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("writer lock"), "{error:#}");
+        drop(held);
+        assert_eq!(
+            NullifierStore::new(&path)
+                .unwrap()
+                .lookup_openrouter_lease("lease-1")
+                .unwrap()
+                .status,
+            "provisioning"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -9,8 +9,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zkapi_core::v2 as core;
+use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
-use zkapi_types::{Felt252, NullifierStatus, SchnorrSignature};
+use zkapi_types::{
+    canonical_payload_hash, canonical_request_context, Felt252, NullifierStatus, SchnorrSignature,
+};
 
 use crate::error::ServerError;
 
@@ -92,7 +96,11 @@ pub struct OpenRouterLeaseRecord {
     pub settlement_attempts: u64,
     /// First failed settlement attempt, never reset by phase transitions.
     pub first_error_at: Option<u64>,
-    /// "measured", "clamped", "worst_case" or "unissued" once finalized.
+    /// "measured", "clamped", "worst_case", "unissued" or "operator_conceded"
+    /// once finalized. Set earlier only on a lease committed to a zero
+    /// settlement ("unissued", see `fence_unissued_settlement`) or whose
+    /// charge the operator conceded when or after reopening it
+    /// ("operator_conceded"): its key is never delivered from then on.
     pub charge_basis: Option<String>,
     /// Key provenance: Some(true) once the runtime key was returned to the
     /// client; Some(false) while it never was (including issuer-side
@@ -118,8 +126,9 @@ pub struct NewOpenRouterLease<'a> {
 }
 
 /// An operator-visible record of a settlement that needs review: a clamped
-/// or worst-case charge, a key that could not be deleted first, or a corrupt
-/// binding that was cancelled without signing.
+/// or worst-case charge, a key that could not be deleted first, a corrupt
+/// binding that was cancelled without signing, or such a lease reopened by
+/// the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementReview {
     pub client_request_id: String,
@@ -142,6 +151,7 @@ pub const SETTLEMENT_REVIEW_REASONS: &[&str] = &[
     "unsettleable_worst_case",
     "finalized_before_key_deletion",
     "binding_corrupt",
+    "binding_reopened",
 ];
 
 /// A stored review with its timestamps.
@@ -177,8 +187,19 @@ pub(crate) struct LeaseFinalization<'a> {
     pub charge_basis: &'a str,
     pub review: Option<&'a SettlementReview>,
     pub key_cleanup: Option<KeyCleanup<'a>>,
-    /// Finalize only a never-issued row: still provisioning with no key.
-    pub only_if_unissued: bool,
+    pub guard: FinalizeGuard,
+}
+
+/// The lease rows a finalization may still update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizeGuard {
+    /// Any row that is not cancelled.
+    NotCancelled,
+    /// A zero settlement fenced by `fence_unissued_settlement`: still fenced,
+    /// never delivered and, while provisioning, without a key.
+    Unissued,
+    /// A lease reopened with a concession: still marked `operator_conceded`.
+    Conceded,
 }
 
 /// The deployment a server database serves (table `deployment_binding`, single
@@ -213,6 +234,155 @@ pub(crate) fn api_request_binding(request: &ApiRequestV2) -> Result<String, Serv
     digest.update(b"zkapi:v2:api-request-binding\0");
     digest.update(request);
     Ok(hex::encode(digest.finalize()))
+}
+
+/// Where a lease row disagrees with its nullifier reservation, named as the
+/// operator finds it in the database. Such a lease is never signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingMismatch {
+    /// `table.column` of the first disagreeing field.
+    pub field: &'static str,
+    pub detail: &'static str,
+}
+
+impl std::fmt::Display for BindingMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.field, self.detail)
+    }
+}
+
+impl BindingMismatch {
+    /// The operator's repair. The saved request in
+    /// `openrouter_leases.api_request_json` is verified first: the request its
+    /// owner's proof authorized decides which side is corrupt.
+    pub fn remedy(&self) -> &'static str {
+        if self.field == SAVED_REQUEST_FIELD {
+            "the saved request is the corrupt side: run this command again with --saved-request \
+             and the authentic request (from a backup of the server database, or its owner's \
+             copy), which is accepted only if it verifies and its binding is \
+             nullifiers.api_request_binding; never re-derive the reservation from the saved \
+             request"
+        } else if self.field.starts_with("nullifiers.") {
+            "the saved request verifies, so the reservation is the corrupt side: run this \
+             command again with --rebind to rewrite it from that request"
+        } else {
+            "the saved request verifies, so the lease row is the corrupt side: run this command \
+             again with --rebind to rewrite it from that request"
+        }
+    }
+}
+
+/// The lease column holding the saved request.
+pub const SAVED_REQUEST_FIELD: &str = "openrouter_leases.api_request_json";
+
+/// The detail of a saved request whose Groth16 proof does not verify. Of the
+/// saved-request checks, only this one depends on the proof setup the
+/// verifier was loaded from.
+pub const GROTH16_UNVERIFIED: &str =
+    "is not the request its proof authorized: its Groth16 proof does not verify";
+
+/// Checks a lease's saved request as admission did; None when it is the
+/// request its owner's proof authorized. Production passes
+/// `saved_request_mismatch` with the server's verifier.
+pub(crate) type SavedRequestCheck<'a> = &'a dyn Fn(&ApiRequestV2) -> Option<BindingMismatch>;
+
+/// Verify a lease's saved request as admission verified it: its payload
+/// hashes to its payload_hash, its proof's authorization tag binds its
+/// client_request_id and payload, and its Groth16 proof verifies against its
+/// public inputs. Together these cover every field of the request, so a
+/// request that passes is one its owner authorized, and the reservation's
+/// authenticators may be derived from it. A request that fails is corrupt
+/// (or tampered with); nothing may be signed or derived from it.
+pub(crate) fn saved_request_mismatch(
+    verifier: &RequestVerifier,
+    request: &ApiRequestV2,
+) -> Option<BindingMismatch> {
+    let unverified = |detail| {
+        Some(BindingMismatch {
+            field: SAVED_REQUEST_FIELD,
+            detail,
+        })
+    };
+    let payload_hash = canonical_payload_hash(request.payload.as_bytes());
+    if payload_hash != request.payload_hash {
+        return unverified("holds a payload that does not hash to its payload_hash");
+    }
+    let public = &request.public_inputs;
+    let context = canonical_request_context(&request.client_request_id, &payload_hash);
+    if core::authorization_tag(&public.request_nullifier, &context) != public.authorization_tag {
+        return unverified(
+            "is not the request its proof authorized: the authorization tag does not bind its \
+             client_request_id and payload",
+        );
+    }
+    match verifier.verify(public, &request.proof) {
+        Ok(true) => None,
+        _ => unverified(GROTH16_UNVERIFIED),
+    }
+}
+
+/// The store-level binding checks of a lease row against its nullifier
+/// reservation (`record`, None when the nullifier has no row). The signer
+/// additionally checks the request's deployment and signing key, and, for a
+/// reopened lease, verifies the saved request (`saved_request_mismatch`).
+pub(crate) fn lease_binding_mismatch(
+    lease: &OpenRouterLeaseRecord,
+    record: Option<&TranscriptRecord>,
+) -> Result<Option<BindingMismatch>, ServerError> {
+    let request = &lease.api_request;
+    let mismatch = |field, detail| Ok(Some(BindingMismatch { field, detail }));
+    if lease.client_request_id != request.client_request_id {
+        return mismatch(
+            "openrouter_leases.client_request_id",
+            "differs from the client_request_id in api_request_json",
+        );
+    }
+    if lease.request_nullifier != request.public_inputs.request_nullifier {
+        return mismatch(
+            "openrouter_leases.request_nullifier",
+            "differs from the request_nullifier in api_request_json",
+        );
+    }
+    if canonical_payload_hash(request.payload.as_bytes()) != request.payload_hash {
+        return mismatch(
+            "openrouter_leases.api_request_json",
+            "holds a payload that does not hash to its payload_hash",
+        );
+    }
+    let Some(record) = record else {
+        return mismatch(
+            "nullifiers.nullifier",
+            "has no reservation row for the lease's request_nullifier",
+        );
+    };
+    if record.status == NullifierStatus::ClearanceReserved {
+        return mismatch(
+            "nullifiers.status",
+            "is ClearanceReserved: the nullifier is reserved for a withdrawal clearance",
+        );
+    }
+    if record.reservation_kind != "openrouter_lease" {
+        return mismatch("nullifiers.reservation_kind", "is not openrouter_lease");
+    }
+    if record.client_request_id.as_deref() != Some(request.client_request_id.as_str()) {
+        return mismatch(
+            "nullifiers.client_request_id",
+            "differs from the lease request's client_request_id",
+        );
+    }
+    if record.payload_hash != Some(request.payload_hash) {
+        return mismatch(
+            "nullifiers.payload_hash",
+            "differs from the lease request's payload_hash",
+        );
+    }
+    if record.api_request_binding.as_deref() != Some(api_request_binding(request)?.as_str()) {
+        return mismatch(
+            "nullifiers.api_request_binding",
+            "differs from the binding of the lease request in api_request_json",
+        );
+    }
+    Ok(None)
 }
 
 impl NullifierStore {
@@ -285,7 +455,8 @@ impl NullifierStore {
                 verified_block INTEGER
             );
             CREATE TABLE IF NOT EXISTS settlement_reviews (
-                client_request_id TEXT PRIMARY KEY,
+                review_id INTEGER PRIMARY KEY,
+                client_request_id TEXT NOT NULL,
                 request_nullifier TEXT NOT NULL,
                 key_source TEXT NOT NULL,
                 reason TEXT NOT NULL,
@@ -343,13 +514,16 @@ impl NullifierStore {
             ensure_column(&conn, table, column, definition)?;
         }
         migrate_oa_provisioning_outcome(&conn)?;
+        migrate_settlement_review_log(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS openrouter_leases_status
                 ON openrouter_leases(status, settle_after);
              CREATE INDEX IF NOT EXISTS openrouter_leases_deadline
                 ON openrouter_leases(settlement_deadline_at);
              CREATE INDEX IF NOT EXISTS settlement_reviews_open
-                ON settlement_reviews(acknowledged_at, created_at);",
+                ON settlement_reviews(acknowledged_at, created_at);
+             CREATE INDEX IF NOT EXISTS settlement_reviews_lease
+                ON settlement_reviews(client_request_id);",
         )
         .map_err(|e| ServerError::Database(format!("failed to create index: {e}")))?;
         backfill_openrouter_request_bindings(&conn)?;
@@ -497,6 +671,12 @@ impl NullifierStore {
         payload_hash: &Felt252,
     ) -> Result<(), ServerError> {
         self.reserve_with_kind(nullifier, client_request_id, payload_hash, "proxy", None)
+    }
+
+    /// Raw SQL for tests that simulate database faults and operator repairs.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str, params: impl rusqlite::Params) -> usize {
+        self.conn.lock().unwrap().execute(sql, params).unwrap()
     }
 
     pub fn reserve_openrouter_lease(&self, request: &ApiRequestV2) -> Result<(), ServerError> {
@@ -975,11 +1155,13 @@ impl NullifierStore {
             .conn
             .lock()
             .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        // A lease committed to a zero settlement never activates a key.
         let rows = conn
             .execute(
                 "UPDATE openrouter_leases
                  SET status = 'active', key_hash = ?1, updated_at = ?2
-                 WHERE client_request_id = ?3 AND status = 'provisioning'",
+                 WHERE client_request_id = ?3 AND status = 'provisioning'
+                   AND charge_basis IS NULL",
                 params![key_hash, current_timestamp() as i64, client_request_id],
             )
             .map_err(|error| ServerError::Database(format!("lease activation failed: {error}")))?;
@@ -992,7 +1174,9 @@ impl NullifierStore {
     }
 
     /// Record that the runtime key of an activated lease is being returned to
-    /// the client. Only such a lease can be charged more than zero.
+    /// the client. Only such a lease can be charged more than zero. Refused
+    /// once the lease is committed to a zero settlement (or conceded): its key
+    /// must then never be returned.
     pub(crate) fn mark_openrouter_lease_delivered(
         &self,
         client_request_id: &str,
@@ -1004,7 +1188,7 @@ impl NullifierStore {
         let rows = conn
             .execute(
                 "UPDATE openrouter_leases SET delivered = 1, updated_at = ?1
-                 WHERE client_request_id = ?2 AND status = 'active'",
+                 WHERE client_request_id = ?2 AND status = 'active' AND charge_basis IS NULL",
                 params![current_timestamp() as i64, client_request_id],
             )
             .map_err(|error| {
@@ -1012,10 +1196,38 @@ impl NullifierStore {
             })?;
         if rows != 1 {
             return Err(ServerError::Internal(
-                "lease was not active when its key was returned".to_string(),
+                "lease was not active, or was settling, when its key was returned".to_string(),
             ));
         }
         Ok(())
+    }
+
+    /// Commit a never-delivered lease to its zero settlement before the
+    /// successor is signed (`charge_basis = 'unissued'`). From then on its key
+    /// can neither be activated nor marked delivered, so it is never returned.
+    /// Returns false, changing nothing, when the key was delivered (or the
+    /// row changed) first. Idempotent for a row already fenced.
+    pub(crate) fn fence_unissued_settlement(
+        &self,
+        client_request_id: &str,
+    ) -> Result<bool, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let rows = conn
+            .execute(
+                "UPDATE openrouter_leases SET charge_basis = 'unissued', updated_at = ?1
+                 WHERE client_request_id = ?2
+                   AND (charge_basis IS NULL OR charge_basis = 'unissued')
+                   AND ((status = 'provisioning' AND key_hash IS NULL
+                         AND COALESCE(delivered, 0) = 0)
+                        OR (status IN ('active', 'retiring', 'disabled', 'revoking')
+                            AND delivered = 0))",
+                params![current_timestamp() as i64, client_request_id],
+            )
+            .map_err(|error| ServerError::Database(format!("lease fence failed: {error}")))?;
+        Ok(rows == 1)
     }
 
     /// Assign the write-once settlement deadline of a lease recorded without
@@ -1120,9 +1332,10 @@ impl NullifierStore {
 
     /// Leases to settle now, least recently attempted first: delivered or
     /// possibly delivered leases after their drain (or settlement deadline),
-    /// and never-issued provisioning rows of a known source, which finalize
-    /// at zero. Unreadable rows are logged, never silently skipped; they are
-    /// also counted by `settlement_counts`.
+    /// never-issued provisioning rows of a known source, which finalize at
+    /// zero, and leases already committed to a zero (or conceded) charge.
+    /// Unreadable rows are logged, never silently skipped; they are also
+    /// counted by `settlement_counts`.
     pub fn due_openrouter_leases(&self, now: u64) -> Vec<OpenRouterLeaseRecord> {
         let conn = match self.conn.lock() {
             Ok(conn) => conn,
@@ -1139,6 +1352,8 @@ impl NullifierStore {
                     AND key_source IN ('openrouter', 'oa_org')
                     AND (settle_after <= ?1 OR settlement_deadline_at <= ?1
                          OR oa_provisioning_outcome = 'confirmed_unissued'))
+                OR (status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')
+                    AND charge_basis IS NOT NULL AND key_source IN ('openrouter', 'oa_org'))
              ORDER BY updated_at ASC, settle_after ASC",
         ) {
             Ok(statement) => statement,
@@ -1243,7 +1458,7 @@ impl NullifierStore {
                 charge_basis: "measured",
                 review: None,
                 key_cleanup: None,
-                only_if_unissued: false,
+                guard: FinalizeGuard::NotCancelled,
             },
         )
         .map(|_| ())
@@ -1252,8 +1467,7 @@ impl NullifierStore {
     /// Finalize a lease row after its signed transcript committed, recording
     /// how the charge was determined, an optional review, and an optional
     /// provider-key cleanup, in one transaction. Returns false (and changes
-    /// nothing) when the row is cancelled, or is no longer an unissued
-    /// provisioning row for `only_if_unissued`.
+    /// nothing) when the row no longer satisfies `finalization.guard`.
     pub(crate) fn finalize_openrouter_lease_with(
         &self,
         client_request_id: &str,
@@ -1267,10 +1481,18 @@ impl NullifierStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
         let now = current_timestamp() as i64;
-        let condition = if finalization.only_if_unissued {
-            "status = 'provisioning' AND key_hash IS NULL"
-        } else {
-            "status != 'cancelled'"
+        let condition = match finalization.guard {
+            FinalizeGuard::NotCancelled => "status != 'cancelled'",
+            // Never a delivered key: the fence refused delivery from signing on.
+            FinalizeGuard::Unissued => {
+                "charge_basis = 'unissued' AND COALESCE(delivered, 0) = 0
+                 AND ((status = 'provisioning' AND key_hash IS NULL)
+                      OR status IN ('active', 'retiring', 'disabled', 'revoking'))"
+            }
+            FinalizeGuard::Conceded => {
+                "charge_basis = 'operator_conceded'
+                 AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')"
+            }
         };
         let rows = transaction
             .execute(
@@ -1304,12 +1526,51 @@ impl NullifierStore {
         Ok(true)
     }
 
-    /// Mark a lease whose binding is corrupt as cancelled, with its review.
-    /// Nothing is signed for it; its reservation stays Reserved.
+    #[cfg(test)]
     pub(crate) fn cancel_openrouter_lease(
         &self,
         client_request_id: &str,
         review: &SettlementReview,
+    ) -> Result<(), ServerError> {
+        self.cancel_corrupt_openrouter_lease(client_request_id, review, None)
+    }
+
+    /// Record the `binding_corrupt` review of a pending lease as soon as its
+    /// corrupt binding is found, while its cancellation waits for the usage
+    /// capture of its direct key: once, unless the lease has such a review
+    /// since its last reopening. The cancellation records its own. Returns
+    /// whether it was recorded.
+    pub(crate) fn review_corrupt_binding(
+        &self,
+        review: &SettlementReview,
+    ) -> Result<bool, ServerError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ServerError::Database(format!("review insert failed: {error}")))?;
+        if binding_corrupt_reviewed(&transaction, &review.client_request_id)? {
+            return Ok(false);
+        }
+        insert_review(&transaction, review, current_timestamp() as i64)?;
+        transaction
+            .commit()
+            .map_err(|error| ServerError::Database(format!("review insert failed: {error}")))?;
+        Ok(true)
+    }
+
+    /// Mark a lease whose binding is corrupt as cancelled, with its review
+    /// and, for a direct key, its queued cleanup, in one transaction: once
+    /// that cleanup row is gone, the key is deleted. Nothing is signed for
+    /// the lease; its reservation stays Reserved until the operator repairs
+    /// the binding and reopens it (`reopen_cancelled_lease`).
+    pub(crate) fn cancel_corrupt_openrouter_lease(
+        &self,
+        client_request_id: &str,
+        review: &SettlementReview,
+        key_cleanup: Option<KeyCleanup<'_>>,
     ) -> Result<(), ServerError> {
         let mut conn = self
             .conn
@@ -1319,9 +1580,12 @@ impl NullifierStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ServerError::Database(format!("lease cancel failed: {error}")))?;
         let now = current_timestamp() as i64;
+        // A charge basis committed before the cancellation no longer applies;
+        // a reopening decides afresh.
         let rows = transaction
             .execute(
-                "UPDATE openrouter_leases SET status = 'cancelled', last_error = ?1, updated_at = ?2
+                "UPDATE openrouter_leases SET status = 'cancelled', charge_basis = NULL,
+                    last_error = ?1, updated_at = ?2
                  WHERE client_request_id = ?3
                    AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')",
                 params![truncate_detail(&review.detail), now, client_request_id],
@@ -1332,9 +1596,377 @@ impl NullifierStore {
             return Ok(());
         }
         insert_review(&transaction, review, now)?;
+        if let Some(cleanup) = key_cleanup {
+            insert_key_cleanup(&transaction, client_request_id, &cleanup, now)?;
+        }
         transaction
             .commit()
             .map_err(|error| ServerError::Database(format!("lease cancel failed: {error}")))
+    }
+
+    /// Whether the operator reopened this lease (`binding_reopened` review):
+    /// the server then verifies its saved request again before signing.
+    pub(crate) fn lease_reopened(&self, client_request_id: &str) -> Result<bool, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM settlement_reviews
+                            WHERE client_request_id = ?1 AND reason = 'binding_reopened')",
+            params![client_request_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| ServerError::Database(format!("review lookup failed: {error}")))
+    }
+
+    /// Operator remediation of a lease cancelled with a `binding_corrupt`
+    /// review: return it to the settlement state machine, keeping its
+    /// write-once deadline. Refuses, changing nothing, unless the lease is
+    /// cancelled with such a review, its nullifier is not reserved for a
+    /// clearance, its saved request is the one its owner's proof authorized
+    /// (`verify`, as admission verified it), and its row agrees with its
+    /// reservation. A review left under an id the lease row no longer has (an
+    /// id repaired by hand) is found by the row's nullifier, and joins it.
+    ///
+    /// `options.saved_request` restores a saved request that does not verify
+    /// or cannot be read, from a copy whose authenticity the database proves
+    /// (`restore_saved_request`). The request verifying, a disagreement on the
+    /// other side is repaired from it with `options.rebind`: the lease row's
+    /// client_request_id and request_nullifier are rewritten (its reviews
+    /// move with its id), a Reserved row's authenticators are rewritten, or a
+    /// missing row is re-created.
+    ///
+    /// A lease without a key resumes provisioning, a direct lease whose usage
+    /// was captured resumes revoking, and any other resumes active. A lease
+    /// never delivered is committed to its zero settlement (`unissued`), so
+    /// its key is never returned. Any other settles at its captured usage, or
+    /// from measured usage until its deadline; at its solvency bound when no
+    /// usage can be measured (its deadline passed, or its direct key was
+    /// deleted before its usage was captured). A key deletion queued by the
+    /// cancellation is withdrawn: settlement reads the key's usage first.
+    /// `options.zero_charge` commits it to a zero charge instead
+    /// (`operator_conceded`), also for a lease reopened earlier and not yet
+    /// signed. Records a `binding_reopened` review and acknowledges the
+    /// lease's open `binding_corrupt` reviews. The server verifies a reopened
+    /// lease's request, binding, deployment and signing key again before it
+    /// signs anything.
+    pub(crate) fn reopen_cancelled_lease(
+        &self,
+        client_request_id: &str,
+        options: ReopenOptions<'_>,
+        verify: SavedRequestCheck<'_>,
+        now: u64,
+    ) -> Result<ReopenedLease, ReopenRefusal> {
+        let failed =
+            |error: rusqlite::Error| ServerError::Database(format!("lease reopen failed: {error}"));
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let (status, row_nullifier): (String, String) = transaction
+            .query_row(
+                "SELECT status, request_nullifier FROM openrouter_leases
+                 WHERE client_request_id = ?1",
+                params![client_request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(failed)?
+            .ok_or_else(|| ReopenRefusal::UnknownLease(client_request_id.to_string()))?;
+        // Reviews record the nullifier in canonical hex.
+        let row_nullifier = Felt252::from_hex(&row_nullifier)
+            .map(|nullifier| nullifier.to_hex())
+            .unwrap_or(row_nullifier);
+        let reviewed = |reason: &str| -> Result<bool, ServerError> {
+            transaction
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM settlement_reviews
+                                    WHERE reason = ?3
+                                      AND (client_request_id = ?1
+                                           OR (request_nullifier = ?2 AND client_request_id
+                                               NOT IN (SELECT client_request_id
+                                                       FROM openrouter_leases))))",
+                    params![client_request_id, row_nullifier, reason],
+                    |row| row.get(0),
+                )
+                .map_err(failed)
+        };
+        // A lease reopened earlier can still be conceded until it is signed.
+        let conceding = status != "cancelled";
+        if conceding {
+            let pending = PENDING_LEASE_STATUSES.contains(&status.as_str());
+            if !(options.zero_charge && pending && reviewed("binding_reopened")?) {
+                // A possibly delivered direct lease is reviewed when its
+                // binding is found corrupt, and cancelled once its key's usage
+                // is captured.
+                if pending && binding_corrupt_reviewed(&transaction, client_request_id)? {
+                    return Err(ReopenRefusal::CapturePending(status));
+                }
+                return Err(ReopenRefusal::NotCancelled(status));
+            }
+        } else if !reviewed("binding_corrupt")? {
+            return Err(ReopenRefusal::NotBindingCorrupt);
+        }
+        let saved_request = match options.saved_request {
+            Some(supplied) => restore_saved_request(
+                &transaction,
+                client_request_id,
+                &row_nullifier,
+                supplied,
+                verify,
+            )?,
+            None => "unchanged",
+        };
+        let read_lease = |id: &str| {
+            transaction.query_row(
+                "SELECT * FROM openrouter_leases WHERE client_request_id = ?1",
+                params![id],
+                row_to_openrouter_lease,
+            )
+        };
+        let mut lease = match read_lease(client_request_id) {
+            Ok(lease) => lease,
+            Err(rusqlite::Error::FromSqlConversionFailure(..)) if saved_request == "unchanged" => {
+                return Err(ReopenRefusal::BindingCorrupt(BindingMismatch {
+                    field: SAVED_REQUEST_FIELD,
+                    detail: "is not a readable request",
+                }))
+            }
+            Err(error) => return Err(failed(error).into()),
+        };
+        if !matches!(lease.key_source.as_str(), "openrouter" | "oa_org") {
+            return Err(ReopenRefusal::UnsupportedKeySource(lease.key_source));
+        }
+        let reservation_of = |lease: &OpenRouterLeaseRecord| {
+            transaction
+                .query_row(
+                    "SELECT * FROM nullifiers WHERE nullifier = ?1",
+                    params![lease.request_nullifier.to_hex()],
+                    row_to_record,
+                )
+                .optional()
+                .map_err(failed)
+        };
+        let clearance_reserved = |record: &Option<TranscriptRecord>| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.status == NullifierStatus::ClearanceReserved)
+        };
+        let mut record = reservation_of(&lease)?;
+        if clearance_reserved(&record) {
+            return Err(ReopenRefusal::ClearanceReserved);
+        }
+        // The saved request first: only a request its owner's proof
+        // authorized tells which side of a disagreement is corrupt, and only
+        // such a request may be signed or have the other side derived from it.
+        if let Some(mismatch) = verify(&lease.api_request) {
+            return Err(ReopenRefusal::BindingCorrupt(mismatch));
+        }
+        let rebind = options.rebind && !conceding;
+        let mut lease_row = "unchanged";
+        let mut reservation = "unchanged";
+        if let Some(mismatch) = lease_binding_mismatch(&lease, record.as_ref())? {
+            if !rebind {
+                return Err(ReopenRefusal::BindingCorrupt(mismatch));
+            }
+            if LEASE_ROW_FIELDS.contains(&mismatch.field) {
+                rebind_lease_row(&transaction, &lease)?;
+                lease_row = "rewritten";
+                lease = read_lease(&lease.api_request.client_request_id).map_err(failed)?;
+                record = reservation_of(&lease)?;
+                if clearance_reserved(&record) {
+                    return Err(ReopenRefusal::ClearanceReserved);
+                }
+            }
+            if let Some(mismatch) = lease_binding_mismatch(&lease, record.as_ref())? {
+                if !mismatch.field.starts_with("nullifiers.") {
+                    return Err(ReopenRefusal::BindingCorrupt(mismatch));
+                }
+                reservation = rebind_reservation(&transaction, &lease, record.as_ref(), now)?;
+                record = reservation_of(&lease)?;
+                if let Some(mismatch) = lease_binding_mismatch(&lease, record.as_ref())? {
+                    return Err(ReopenRefusal::BindingCorrupt(mismatch));
+                }
+            }
+        }
+        let id = lease.client_request_id.clone();
+        let signed = record.is_some_and(|record| record.status == NullifierStatus::Finalized);
+        if signed && options.zero_charge {
+            return Err(ReopenRefusal::AlreadySigned);
+        }
+        // Reviews left under a former id of this row, repaired by hand, join
+        // it, so that they are acknowledged with it.
+        transaction
+            .execute(
+                "UPDATE settlement_reviews SET client_request_id = ?1
+                 WHERE request_nullifier IN (?2, ?3) AND client_request_id != ?1
+                   AND client_request_id NOT IN (SELECT client_request_id FROM openrouter_leases)",
+                params![id, lease.request_nullifier.to_hex(), row_nullifier],
+            )
+            .map_err(failed)?;
+        let repaired = repair_note(
+            saved_request,
+            lease_row,
+            client_request_id,
+            &id,
+            reservation,
+        );
+        let solvency_bound = lease.api_request.public_inputs.solvency_bound;
+        let review = |charge_basis: Option<&str>, detail: String| SettlementReview {
+            client_request_id: id.clone(),
+            request_nullifier: lease.request_nullifier,
+            key_source: lease.key_source.clone(),
+            reason: "binding_reopened".into(),
+            charge_basis: charge_basis.map(str::to_string),
+            detail,
+            reported_usage_micro_usd: None,
+            charge_applied: None,
+            solvency_bound,
+        };
+        if conceding {
+            let conceded = transaction
+                .execute(
+                    "UPDATE openrouter_leases SET charge_basis = 'operator_conceded',
+                        last_error = NULL, updated_at = ?1
+                     WHERE client_request_id = ?2 AND status = ?3",
+                    params![sql_time(now), id, status],
+                )
+                .map_err(failed)?;
+            if conceded != 1 {
+                return Err(
+                    ServerError::Internal("reopened lease changed while conceding".into()).into(),
+                );
+            }
+            insert_review(
+                &transaction,
+                &review(
+                    Some("operator_conceded"),
+                    format!(
+                        "the operator conceded the charge of the reopened lease, still \
+                         {status}{repaired}; settles: operator_conceded"
+                    ),
+                ),
+                sql_time(now),
+            )?;
+            transaction.commit().map_err(failed)?;
+            return Ok(ReopenedLease {
+                client_request_id: lease.client_request_id,
+                key_source: lease.key_source,
+                status,
+                delivered: lease.delivered,
+                settlement_deadline_at: lease.settlement_deadline_at,
+                settles: "operator_conceded",
+                key_cleanup_withdrawn: false,
+                reservation,
+                lease_row,
+                saved_request,
+                warning: None,
+            });
+        }
+        let status = if lease.key_hash.is_none() {
+            "provisioning"
+        } else if lease.key_source == "openrouter" && lease.usage_usd.is_some() {
+            "revoking"
+        } else {
+            "active"
+        };
+        // A key never returned to the client stays unreturned: the lease is
+        // committed to its zero settlement now, as the settler commits it
+        // before signing, so an exact retry can neither issue its key again
+        // nor re-create its row with a new deadline.
+        let never_delivered = status == "provisioning" || lease.delivered == Some(false);
+        let charge_basis = if options.zero_charge {
+            Some("operator_conceded")
+        } else if never_delivered {
+            Some("unissued")
+        } else {
+            None
+        };
+        let reopened = transaction
+            .execute(
+                "UPDATE openrouter_leases SET status = ?1, charge_basis = ?2, last_error = NULL,
+                    updated_at = ?3
+                 WHERE client_request_id = ?4 AND status = 'cancelled'",
+                params![status, charge_basis, sql_time(now), id],
+            )
+            .map_err(failed)?;
+        if reopened != 1 {
+            return Err(
+                ServerError::Internal("cancelled lease changed while reopening".into()).into(),
+            );
+        }
+        // Queued under the row's id at the cancellation.
+        let key_cleanup_withdrawn = transaction
+            .execute(
+                "DELETE FROM provider_key_cleanup WHERE client_request_id IN (?1, ?2)",
+                params![client_request_id, id],
+            )
+            .map_err(failed)?
+            > 0;
+        transaction
+            .execute(
+                "UPDATE settlement_reviews SET acknowledged_at = ?1
+                 WHERE client_request_id = ?2 AND reason = 'binding_corrupt'
+                   AND acknowledged_at IS NULL",
+                params![sql_time(now), id],
+            )
+            .map_err(failed)?;
+        // The cancellation queued the deletion of a direct key in its own
+        // transaction. With that row gone, the key was deleted: a direct
+        // lease resuming active (its usage never captured) cannot be measured.
+        let unmeasurable =
+            lease.key_source == "openrouter" && status == "active" && !key_cleanup_withdrawn;
+        let settles = if signed {
+            "signed_transcript"
+        } else if options.zero_charge {
+            "operator_conceded"
+        } else if never_delivered {
+            "zero_never_delivered"
+        } else if status == "revoking" {
+            "captured_usage"
+        } else if unmeasurable
+            || lease
+                .settlement_deadline_at
+                .is_some_and(|deadline| deadline <= now)
+        {
+            "deadline_fallback"
+        } else {
+            "measured_until_deadline"
+        };
+        let warning = (settles == "deadline_fallback").then_some(
+            "no usage of this lease can be measured: it is charged its full solvency bound at its \
+             settlement deadline (at once when that has passed); to concede its charge instead, \
+             run this command again with --zero-charge before restarting the server",
+        );
+        insert_review(
+            &transaction,
+            &review(
+                charge_basis,
+                format!(
+                    "repaired binding reopened by the operator as {status}{repaired}; \
+                     settles: {settles}"
+                ),
+            ),
+            sql_time(now),
+        )?;
+        transaction.commit().map_err(failed)?;
+        Ok(ReopenedLease {
+            client_request_id: lease.client_request_id,
+            key_source: lease.key_source,
+            status: status.to_string(),
+            delivered: lease.delivered,
+            settlement_deadline_at: lease.settlement_deadline_at,
+            settles,
+            key_cleanup_withdrawn,
+            reservation,
+            lease_row,
+            saved_request,
+            warning,
+        })
     }
 
     /// Queue a terminal direct lease's provider key for background cleanup.
@@ -1466,7 +2098,7 @@ impl NullifierStore {
                 "SELECT client_request_id, request_nullifier, key_source, reason, charge_basis,
                     detail, reported_usage_micro_usd, charge_applied, solvency_bound, created_at,
                     acknowledged_at
-                 FROM settlement_reviews ORDER BY created_at DESC, client_request_id LIMIT ?1",
+                 FROM settlement_reviews ORDER BY created_at DESC, review_id DESC LIMIT ?1",
             )
             .map_err(|error| ServerError::Database(format!("review scan failed: {error}")))?;
         let rows = statement
@@ -1549,15 +2181,435 @@ impl NullifierStore {
     }
 }
 
+/// Statuses of a lease still to be settled.
+const PENDING_LEASE_STATUSES: &[&str] =
+    &["provisioning", "active", "retiring", "disabled", "revoking"];
+
+/// What `zkapi settlement reopen` does beyond returning the lease to
+/// settlement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReopenOptions<'a> {
+    /// Finalize at zero instead (`operator_conceded`): the operator concedes
+    /// the request's charge. Also concedes a lease reopened earlier and not
+    /// yet signed.
+    pub zero_charge: bool,
+    /// Once the saved request verifies, repair the other side from it: the
+    /// lease row's client_request_id and request_nullifier (its reviews move
+    /// with a changed id), and the nullifier reservation (a Reserved row's
+    /// authenticators are rewritten, a missing row is re-created).
+    pub rebind: bool,
+    /// The authentic request, restoring a saved request that does not verify
+    /// or cannot be read. Accepted only if it verifies, its binding is the
+    /// one its reservation recorded at admission, and it shares the lease
+    /// row's client_request_id or request_nullifier.
+    pub saved_request: Option<&'a ApiRequestV2>,
+}
+
+/// Why `reopen_cancelled_lease` refused; nothing was changed.
+#[derive(Debug, thiserror::Error)]
+pub enum ReopenRefusal {
+    #[error("no lease has client_request_id {0}")]
+    UnknownLease(String),
+    #[error(
+        "the lease is {0}, not cancelled; only a cancelled lease can be reopened (with \
+         --zero-charge, also a lease reopened earlier that is not settled yet)"
+    )]
+    NotCancelled(String),
+    #[error(
+        "the lease is {0}, not cancelled yet: its binding_corrupt review was recorded while the \
+         usage of its direct key is still being captured; start the server again, and reopen \
+         the lease once it is cancelled (at its settlement deadline at the latest)"
+    )]
+    CapturePending(String),
+    #[error("the lease was not cancelled for a corrupt binding: it has no binding_corrupt review")]
+    NotBindingCorrupt,
+    #[error("this server does not settle leases of key source {0}")]
+    UnsupportedKeySource(String),
+    #[error(
+        "the request nullifier is ClearanceReserved: its owner already holds a mutual-close \
+         clearance for that state and exits by mutual close; there is nothing to settle"
+    )]
+    ClearanceReserved,
+    /// The field and its repair; see `BindingMismatch::remedy`.
+    #[error("the binding is still corrupt: {0}; {remedy}", remedy = .0.remedy())]
+    BindingCorrupt(BindingMismatch),
+    /// A `saved_request_mismatch` detail of the supplied request.
+    #[error("the request in --saved-request {0}")]
+    SuppliedRequestUnverified(&'static str),
+    #[error(
+        "the request in --saved-request is not this lease's: neither its client_request_id nor \
+         its request_nullifier is the lease row's"
+    )]
+    SuppliedRequestForAnotherLease,
+    #[error(
+        "the request in --saved-request is not the request this lease reserved: {0}; only that \
+         request can be restored (if nullifiers.api_request_binding is corrupt too, restore it \
+         from a backup first)"
+    )]
+    SuppliedRequestNotReserved(&'static str),
+    #[error(
+        "lease row {0} already holds the verified request's client_request_id or \
+         request_nullifier, so --rebind cannot rewrite this row to them: find out which row is \
+         that request's lease before reopening either"
+    )]
+    LeaseElsewhere(String),
+    #[error(
+        "the reservation is Finalized: a successor is already signed for the request it records, \
+         so --rebind cannot rewrite it; restore the nullifiers row from a backup, then run this \
+         command again"
+    )]
+    RebindSigned,
+    #[error(
+        "the request's reservation row is kept under nullifier {nullifier} ({status}): its \
+         nullifiers.nullifier is corrupt, not missing, and the row may hold a signed transcript; \
+         set it to the lease's request_nullifier instead of re-creating the row, then run this \
+         command again"
+    )]
+    ReservationElsewhere { nullifier: String, status: String },
+    #[error(
+        "a successor for this request is already signed: the lease settles from that transcript \
+         and its charge cannot be conceded"
+    )]
+    AlreadySigned,
+    #[error(transparent)]
+    Store(#[from] ServerError),
+}
+
+/// A lease returned to settlement by `reopen_cancelled_lease`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReopenedLease {
+    pub client_request_id: String,
+    pub key_source: String,
+    /// The settlement status the lease resumes from.
+    pub status: String,
+    pub delivered: Option<bool>,
+    /// Unchanged by the reopening.
+    pub settlement_deadline_at: Option<u64>,
+    /// How the restarted server settles it: `zero_never_delivered`,
+    /// `captured_usage` (the usage captured when its direct key was
+    /// disabled), `measured_until_deadline`, `deadline_fallback` (no usage
+    /// can be measured: the solvency bound, at its deadline),
+    /// `operator_conceded` or `signed_transcript`.
+    pub settles: &'static str,
+    /// A key deletion queued by the cancellation was withdrawn, so the key
+    /// can still be measured. Otherwise a direct key was deleted.
+    pub key_cleanup_withdrawn: bool,
+    /// The nullifier reservation: `unchanged`, or, with `--rebind`,
+    /// `rewritten` or `recreated` from the verified request.
+    pub reservation: &'static str,
+    /// The lease row's client_request_id and request_nullifier: `unchanged`,
+    /// or, with `--rebind`, `rewritten` from the verified request.
+    pub lease_row: &'static str,
+    /// The saved request: `unchanged`, or `restored` from `--saved-request`.
+    pub saved_request: &'static str,
+    /// Set when the lease is charged its full solvency bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'static str>,
+}
+
+/// The lease-row columns that `lease_binding_mismatch` compares with the
+/// saved request.
+const LEASE_ROW_FIELDS: &[&str] = &[
+    "openrouter_leases.client_request_id",
+    "openrouter_leases.request_nullifier",
+];
+
+/// Whether the lease has a `binding_corrupt` review since its last
+/// reopening: its corrupt binding was found, and reviewed, already.
+fn binding_corrupt_reviewed(
+    conn: &Connection,
+    client_request_id: &str,
+) -> Result<bool, ServerError> {
+    conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM settlement_reviews
+            WHERE client_request_id = ?1 AND reason = 'binding_corrupt'
+              AND review_id > COALESCE((SELECT MAX(review_id) FROM settlement_reviews
+                                        WHERE client_request_id = ?1
+                                          AND reason = 'binding_reopened'), 0))",
+        params![client_request_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| ServerError::Database(format!("review lookup failed: {error}")))
+}
+
+/// Restore a lease's saved request from a supplied copy (a backup, or its
+/// owner's) whose authenticity the database proves: it verifies as admission
+/// verified it (`verify`), its binding is the one its reservation recorded at
+/// admission, and it shares the lease row's client_request_id or
+/// request_nullifier (`row_nullifier`, canonical hex). Another request its
+/// owner authorized for the same note state is refused: it was never
+/// admitted. Returns `restored`, or `unchanged` when it is already saved: the
+/// saved request is then checked as any other.
+fn restore_saved_request(
+    conn: &Connection,
+    client_request_id: &str,
+    row_nullifier: &str,
+    supplied: &ApiRequestV2,
+    verify: SavedRequestCheck<'_>,
+) -> Result<&'static str, ReopenRefusal> {
+    let failed =
+        |error: rusqlite::Error| ServerError::Database(format!("request restore failed: {error}"));
+    if let Some(mismatch) = verify(supplied) {
+        return Err(ReopenRefusal::SuppliedRequestUnverified(mismatch.detail));
+    }
+    let nullifier = supplied.public_inputs.request_nullifier.to_hex();
+    if supplied.client_request_id != client_request_id && nullifier != row_nullifier {
+        return Err(ReopenRefusal::SuppliedRequestForAnotherLease);
+    }
+    let binding = api_request_binding(supplied)?;
+    let saved: String = conn
+        .query_row(
+            "SELECT api_request_json FROM openrouter_leases WHERE client_request_id = ?1",
+            params![client_request_id],
+            |row| row.get(0),
+        )
+        .map_err(failed)?;
+    if serde_json::from_str::<ApiRequestV2>(&saved)
+        .ok()
+        .and_then(|saved| api_request_binding(&saved).ok())
+        .is_some_and(|saved| saved == binding)
+    {
+        return Ok("unchanged");
+    }
+    let reservation = conn
+        .query_row(
+            "SELECT * FROM nullifiers WHERE nullifier = ?1",
+            params![nullifier],
+            row_to_record,
+        )
+        .optional()
+        .map_err(failed)?
+        .ok_or(ReopenRefusal::SuppliedRequestNotReserved(
+            "no nullifiers row has its request_nullifier",
+        ))?;
+    if reservation.status == NullifierStatus::ClearanceReserved {
+        return Err(ReopenRefusal::ClearanceReserved);
+    }
+    if reservation.api_request_binding.as_deref() != Some(binding.as_str()) {
+        return Err(ReopenRefusal::SuppliedRequestNotReserved(
+            "its binding is not nullifiers.api_request_binding",
+        ));
+    }
+    let request_json = serde_json::to_string(supplied)
+        .map_err(|error| ServerError::Internal(format!("request serialization failed: {error}")))?;
+    let restored = conn
+        .execute(
+            "UPDATE openrouter_leases SET api_request_json = ?1 WHERE client_request_id = ?2",
+            params![request_json, client_request_id],
+        )
+        .map_err(failed)?;
+    if restored != 1 {
+        return Err(ServerError::Internal("lease row changed while restoring".into()).into());
+    }
+    Ok("restored")
+}
+
+/// Repair the lease row of a lease whose saved request verified: set its
+/// client_request_id and request_nullifier from that request, moving the
+/// reviews recorded under its former id with it. Refuses when another lease
+/// row holds either value: that row, not this one, may be the request's
+/// lease.
+fn rebind_lease_row(conn: &Connection, lease: &OpenRouterLeaseRecord) -> Result<(), ReopenRefusal> {
+    let failed =
+        |error: rusqlite::Error| ServerError::Database(format!("lease row rebind failed: {error}"));
+    let request = &lease.api_request;
+    let nullifier = request.public_inputs.request_nullifier.to_hex();
+    let elsewhere: Option<String> = conn
+        .query_row(
+            "SELECT client_request_id FROM openrouter_leases
+             WHERE (client_request_id = ?1 OR request_nullifier = ?2) AND client_request_id != ?3
+             LIMIT 1",
+            params![
+                request.client_request_id,
+                nullifier,
+                lease.client_request_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(failed)?;
+    if let Some(other) = elsewhere {
+        return Err(ReopenRefusal::LeaseElsewhere(other));
+    }
+    let rows = conn
+        .execute(
+            "UPDATE openrouter_leases SET client_request_id = ?1, request_nullifier = ?2
+             WHERE client_request_id = ?3",
+            params![
+                request.client_request_id,
+                nullifier,
+                lease.client_request_id
+            ],
+        )
+        .map_err(failed)?;
+    if rows != 1 {
+        return Err(ServerError::Internal("lease row changed while rebinding".into()).into());
+    }
+    conn.execute(
+        "UPDATE settlement_reviews SET client_request_id = ?1 WHERE client_request_id = ?2",
+        params![request.client_request_id, lease.client_request_id],
+    )
+    .map_err(failed)?;
+    Ok(())
+}
+
+/// The repairs of a reopening, for its review's detail.
+fn repair_note(
+    saved_request: &str,
+    lease_row: &str,
+    former_id: &str,
+    id: &str,
+    reservation: &str,
+) -> String {
+    let mut note = String::new();
+    if saved_request == "restored" {
+        note.push_str("; its saved request was restored from the supplied request");
+    }
+    if lease_row == "rewritten" {
+        note.push_str("; its lease row was rewritten from the verified request");
+        if former_id != id {
+            note.push_str(&format!(" (its client_request_id was {former_id})"));
+        }
+    }
+    match reservation {
+        "rewritten" => note.push_str("; its reservation was rewritten from the verified request"),
+        "recreated" => {
+            note.push_str("; its missing reservation was recreated from the verified request")
+        }
+        _ => {}
+    }
+    note
+}
+
+/// Repair the reservation of a lease whose saved request verified: rewrite a
+/// Reserved row's authenticators from that request, or re-create a missing
+/// row. Refuses a signed (Finalized) row, and a row of this request kept
+/// under another nullifier: that row is mis-keyed, not missing, and may hold
+/// a signed transcript.
+fn rebind_reservation(
+    conn: &Connection,
+    lease: &OpenRouterLeaseRecord,
+    record: Option<&TranscriptRecord>,
+    now: u64,
+) -> Result<&'static str, ReopenRefusal> {
+    let failed = |error: rusqlite::Error| {
+        ServerError::Database(format!("reservation rebind failed: {error}"))
+    };
+    let request = &lease.api_request;
+    let binding = api_request_binding(request)?;
+    let nullifier = lease.request_nullifier.to_hex();
+    let reserved = status_to_str(NullifierStatus::Reserved);
+    match record {
+        Some(record) if record.status == NullifierStatus::Reserved => {
+            let rows = conn
+                .execute(
+                    "UPDATE nullifiers SET reservation_kind = 'openrouter_lease',
+                        client_request_id = ?1, payload_hash = ?2, api_request_binding = ?3
+                     WHERE nullifier = ?4 AND status = ?5",
+                    params![
+                        request.client_request_id,
+                        request.payload_hash.to_hex(),
+                        binding,
+                        nullifier,
+                        reserved
+                    ],
+                )
+                .map_err(failed)?;
+            if rows != 1 {
+                return Err(
+                    ServerError::Internal("reservation changed while rebinding".into()).into(),
+                );
+            }
+            Ok("rewritten")
+        }
+        Some(_) => Err(ReopenRefusal::RebindSigned),
+        None => {
+            let elsewhere: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT nullifier, status FROM nullifiers WHERE client_request_id = ?1 LIMIT 1",
+                    params![request.client_request_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(failed)?;
+            if let Some((nullifier, status)) = elsewhere {
+                return Err(ReopenRefusal::ReservationElsewhere { nullifier, status });
+            }
+            conn.execute(
+                "INSERT INTO nullifiers (
+                    nullifier, status, reservation_kind, client_request_id, payload_hash,
+                    api_request_binding, created_at
+                 ) VALUES (?1, ?2, 'openrouter_lease', ?3, ?4, ?5, ?6)",
+                params![
+                    nullifier,
+                    reserved,
+                    request.client_request_id,
+                    request.payload_hash.to_hex(),
+                    binding,
+                    sql_time(now)
+                ],
+            )
+            .map_err(failed)?;
+            Ok("recreated")
+        }
+    }
+}
+
+/// A stopped server's database, opened by an offline operator command. The
+/// server writer lock is held for the whole session: opening refuses while a
+/// server runs, and no server starts until this is dropped.
+pub struct OfflineStore {
+    store: NullifierStore,
+    _writer_lock: crate::writer_lock::ServerWriterLock,
+}
+
+impl OfflineStore {
+    /// Open an existing server database; never creates one.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ServerError> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(ServerError::Database(format!(
+                "no server database at {}",
+                path.display()
+            )));
+        }
+        let writer_lock = crate::writer_lock::ServerWriterLock::acquire(path)?;
+        let store = NullifierStore::new(path)?;
+        Ok(Self {
+            store,
+            _writer_lock: writer_lock,
+        })
+    }
+
+    /// See `NullifierStore::reopen_cancelled_lease`. The saved request, and a
+    /// request supplied to restore it, are verified with `verifier`, the
+    /// request verifier of the server's proof setup, as admission verified it.
+    pub fn reopen_cancelled_lease(
+        &self,
+        client_request_id: &str,
+        options: ReopenOptions<'_>,
+        verifier: &RequestVerifier,
+    ) -> Result<ReopenedLease, ReopenRefusal> {
+        self.store.reopen_cancelled_lease(
+            client_request_id,
+            options,
+            &|request| saved_request_mismatch(verifier, request),
+            current_timestamp(),
+        )
+    }
+}
+
 fn insert_review(
     conn: &Connection,
     review: &SettlementReview,
     now: i64,
 ) -> Result<(), ServerError> {
     debug_assert!(SETTLEMENT_REVIEW_REASONS.contains(&review.reason.as_str()));
-    // Keyed by lease: a lease finalizes once, so its first reason is kept.
+    // A log: one row per event. Each event is recorded once, by the
+    // transition that caused it; a reopened lease can be reviewed again.
     conn.execute(
-        "INSERT OR IGNORE INTO settlement_reviews (
+        "INSERT INTO settlement_reviews (
             client_request_id, request_nullifier, key_source, reason, charge_basis, detail,
             reported_usage_micro_usd, charge_applied, solvency_bound, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -1668,6 +2720,64 @@ fn migrate_oa_provisioning_outcome(conn: &Connection) -> Result<(), ServerError>
         .map_err(|error| ServerError::Database(format!("OA outcome migration failed: {error}")))?;
     }
     Ok(())
+}
+
+/// Settlement reviews were keyed by lease, one per lease. A reopened lease is
+/// reviewed again, so they are kept as a log: rebuild such a table once,
+/// keeping every row. Earlier writers keep working against the log.
+fn migrate_settlement_review_log(conn: &Connection) -> Result<(), ServerError> {
+    let failed = |error: rusqlite::Error| {
+        ServerError::Database(format!("settlement review migration failed: {error}"))
+    };
+    let migrated = |conn: &Connection| -> Result<bool, ServerError> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('settlement_reviews')
+                            WHERE name = 'review_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(failed)
+    };
+    if migrated(conn)? {
+        return Ok(());
+    }
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(failed)?;
+    // Checked again inside the write transaction: a concurrent opener may
+    // have migrated first.
+    if migrated(&transaction)? {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(
+            "ALTER TABLE settlement_reviews RENAME TO settlement_reviews_by_lease;
+             CREATE TABLE settlement_reviews (
+                review_id INTEGER PRIMARY KEY,
+                client_request_id TEXT NOT NULL,
+                request_nullifier TEXT NOT NULL,
+                key_source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                charge_basis TEXT,
+                detail TEXT NOT NULL,
+                reported_usage_micro_usd TEXT,
+                charge_applied INTEGER,
+                solvency_bound TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                acknowledged_at INTEGER
+             );
+             INSERT INTO settlement_reviews (
+                client_request_id, request_nullifier, key_source, reason, charge_basis, detail,
+                reported_usage_micro_usd, charge_applied, solvency_bound, created_at,
+                acknowledged_at
+             )
+             SELECT client_request_id, request_nullifier, key_source, reason, charge_basis, detail,
+                reported_usage_micro_usd, charge_applied, solvency_bound, created_at,
+                acknowledged_at
+             FROM settlement_reviews_by_lease ORDER BY created_at, client_request_id;
+             DROP TABLE settlement_reviews_by_lease;",
+        )
+        .map_err(failed)?;
+    transaction.commit().map_err(failed)
 }
 
 /// Older lease rows already contain the complete original request. Use that
@@ -2716,7 +3826,7 @@ mod tests {
                         key_hash: Some("hash-1"),
                         key_name: "zkapi-worst",
                     }),
-                    only_if_unissued: false,
+                    guard: FinalizeGuard::NotCancelled,
                 },
             )
             .unwrap());
@@ -2740,7 +3850,7 @@ mod tests {
                     charge_basis: "measured",
                     review: None,
                     key_cleanup: None,
-                    only_if_unissued: false,
+                    guard: FinalizeGuard::NotCancelled,
                 },
             )
             .unwrap());
@@ -2755,7 +3865,7 @@ mod tests {
         assert_eq!(stored.review.reported_usage_micro_usd, Some(u128::MAX));
         assert_eq!(stored.review.charge_applied, Some(1_000));
         assert_eq!(stored.acknowledged_at, None);
-        // One review per lease: the first reason is kept.
+        // A terminal lease is neither cancelled nor reviewed again.
         store
             .cancel_openrouter_lease("worst", &review("worst", "binding_corrupt"))
             .unwrap();
@@ -2801,8 +3911,10 @@ mod tests {
             charge_basis: "unissued",
             review: None,
             key_cleanup: None,
-            only_if_unissued: true,
+            guard: FinalizeGuard::Unissued,
         };
+        // An activation without delivery provenance may have been delivered.
+        assert!(!store.fence_unissued_settlement("raced").unwrap());
         assert!(!store
             .finalize_openrouter_lease_with("raced", &zero)
             .unwrap());
@@ -2813,6 +3925,11 @@ mod tests {
         store
             .create_openrouter_lease(&lease_request("unissued", 2), "openrouter", 10, 20, 21, 1.0)
             .unwrap();
+        // Only a row fenced before signing finalizes at zero.
+        assert!(!store
+            .finalize_openrouter_lease_with("unissued", &zero)
+            .unwrap());
+        assert!(store.fence_unissued_settlement("unissued").unwrap());
         assert!(store
             .finalize_openrouter_lease_with("unissued", &zero)
             .unwrap());
@@ -2820,6 +3937,100 @@ mod tests {
             store.lookup_openrouter_lease("unissued").unwrap().status,
             "finalized"
         );
+    }
+
+    fn create_bound_lease(store: &NullifierStore, id: &str, nullifier: u64, delivered: bool) {
+        store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request: &lease_request(id, nullifier),
+                key_source: "oa_org",
+                issued_at: 10,
+                expires_at: 20,
+                settle_after: 21,
+                spending_limit_usd: 1.0,
+                oa_client_request_id: Some("bound"),
+                ttl_seconds: Some(300),
+                settlement_deadline_at: Some(1_000),
+                delivered: Some(delivered),
+            })
+            .unwrap();
+    }
+
+    /// Review regression (unsettleable lease #1), at the store: a zero
+    /// settlement fences its lease before signing, after which the key can be
+    /// neither activated nor marked delivered; a delivered key can no longer
+    /// be fenced or finalized at zero.
+    #[test]
+    fn zero_settlement_fence_excludes_key_delivery() {
+        let store = NullifierStore::in_memory().unwrap();
+        let zero = LeaseFinalization {
+            usage_usd: 0.0,
+            charge_applied: 0,
+            charge_basis: "unissued",
+            review: None,
+            key_cleanup: None,
+            guard: FinalizeGuard::Unissued,
+        };
+        // Settlement first: issuance's later mark is refused.
+        create_bound_lease(&store, "fenced", 1, false);
+        store.activate_openrouter_lease("fenced", "hash-1").unwrap();
+        assert!(store.fence_unissued_settlement("fenced").unwrap());
+        assert!(store.fence_unissued_settlement("fenced").unwrap());
+        assert!(store.mark_openrouter_lease_delivered("fenced").is_err());
+        assert!(store
+            .finalize_openrouter_lease_with("fenced", &zero)
+            .unwrap());
+        let fenced = store.lookup_openrouter_lease("fenced").unwrap();
+        assert_eq!(fenced.status, "finalized");
+        assert_eq!(fenced.delivered, Some(false));
+        assert_eq!(fenced.charge_basis.as_deref(), Some("unissued"));
+        // Delivery first: no fence, and no zero finalization.
+        create_bound_lease(&store, "delivered", 2, false);
+        store
+            .activate_openrouter_lease("delivered", "hash-2")
+            .unwrap();
+        store.mark_openrouter_lease_delivered("delivered").unwrap();
+        assert!(!store.fence_unissued_settlement("delivered").unwrap());
+        assert!(!store
+            .finalize_openrouter_lease_with("delivered", &zero)
+            .unwrap());
+        let delivered = store.lookup_openrouter_lease("delivered").unwrap();
+        assert_eq!(delivered.status, "active");
+        assert_eq!(delivered.delivered, Some(true));
+        assert_eq!(delivered.charge_basis, None);
+        // A fenced provisioning row never activates a key.
+        create_bound_lease(&store, "provisioning", 3, false);
+        assert!(store.fence_unissued_settlement("provisioning").unwrap());
+        assert!(store
+            .activate_openrouter_lease("provisioning", "hash-3")
+            .is_err());
+        let provisioning = store.lookup_openrouter_lease("provisioning").unwrap();
+        assert_eq!(provisioning.status, "provisioning");
+        assert_eq!(provisioning.key_hash, None);
+        // Neither does a lease conceded by the operator; it is due at once.
+        create_bound_lease(&store, "conceded", 4, false);
+        store
+            .activate_openrouter_lease("conceded", "hash-4")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE openrouter_leases SET charge_basis = 'operator_conceded'
+                 WHERE client_request_id = 'conceded'",
+                [],
+            )
+            .unwrap();
+        assert!(store.mark_openrouter_lease_delivered("conceded").is_err());
+        assert!(!store.fence_unissued_settlement("conceded").unwrap());
+        let mut due: Vec<_> = store
+            .due_openrouter_leases(0)
+            .into_iter()
+            .map(|lease| lease.client_request_id)
+            .collect();
+        due.sort();
+        assert_eq!(due, ["conceded", "provisioning"]);
     }
 
     #[test]
@@ -3078,5 +4289,956 @@ mod tests {
                 .usage_usd,
             Some(0.5)
         );
+    }
+
+    #[test]
+    fn settlement_reviews_keyed_by_lease_migrate_to_a_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reviews.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settlement_reviews (
+                    client_request_id TEXT PRIMARY KEY, request_nullifier TEXT NOT NULL,
+                    key_source TEXT NOT NULL, reason TEXT NOT NULL, charge_basis TEXT,
+                    detail TEXT NOT NULL, reported_usage_micro_usd TEXT, charge_applied INTEGER,
+                    solvency_bound TEXT NOT NULL, created_at INTEGER NOT NULL, acknowledged_at INTEGER
+                );
+                CREATE INDEX settlement_reviews_open ON settlement_reviews(acknowledged_at, created_at);
+                INSERT INTO settlement_reviews (client_request_id, request_nullifier, key_source,
+                    reason, detail, solvency_bound, created_at, acknowledged_at)
+                VALUES ('old', '0x9', 'oa_org', 'binding_corrupt', 'corrupt', '1000', 5, 7);",
+            )
+            .unwrap();
+        }
+        let store = NullifierStore::new(&path).unwrap();
+        let old = store.settlement_reviews(10).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].review.reason, "binding_corrupt");
+        assert_eq!((old[0].created_at, old[0].acknowledged_at), (5, Some(7)));
+        // A lease now gets one row per review event.
+        store
+            .create_openrouter_lease(&lease_request("old", 9), "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .cancel_openrouter_lease("old", &review("old", "binding_corrupt"))
+            .unwrap();
+        let reviews = store.settlement_reviews(10).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].acknowledged_at, None);
+        drop(store);
+        // Idempotent, and the open-review index exists on the new table.
+        let store = NullifierStore::new(&path).unwrap();
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 2);
+        assert_eq!(store.settlement_counts(0).unwrap().open_reviews, 1);
+        let indexes: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('settlement_reviews')
+                 WHERE name IN ('settlement_reviews_open', 'settlement_reviews_lease')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2);
+    }
+
+    /// Reopen without verifying the saved request: these fixtures carry no
+    /// proofs (the processor tests verify real ones).
+    fn reopen(
+        store: &NullifierStore,
+        client_request_id: &str,
+        zero_charge: bool,
+        now: u64,
+    ) -> Result<ReopenedLease, ReopenRefusal> {
+        store.reopen_cancelled_lease(
+            client_request_id,
+            ReopenOptions {
+                zero_charge,
+                rebind: false,
+                saved_request: None,
+            },
+            &|_| None,
+            now,
+        )
+    }
+
+    /// A lease request whose payload hash matches its payload.
+    fn consistent_request(id: &str, nullifier: u64) -> ApiRequestV2 {
+        let mut request = lease_request(id, nullifier);
+        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
+        request
+    }
+
+    /// A reserved OA lease (activated with `key_hash`), cancelled for a
+    /// corrupt binding as the settler cancels one.
+    fn cancelled_lease(
+        store: &NullifierStore,
+        id: &str,
+        nullifier: u64,
+        key_hash: Option<&str>,
+        delivered: Option<bool>,
+    ) -> ApiRequestV2 {
+        let request = consistent_request(id, nullifier);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request: &request,
+                key_source: "oa_org",
+                issued_at: 10,
+                expires_at: 20,
+                settle_after: 21,
+                spending_limit_usd: 1.0,
+                oa_client_request_id: Some("bound"),
+                ttl_seconds: Some(300),
+                settlement_deadline_at: Some(1_000),
+                delivered,
+            })
+            .unwrap();
+        if let Some(hash) = key_hash {
+            store.activate_openrouter_lease(id, hash).unwrap();
+        }
+        store
+            .cancel_openrouter_lease(id, &review(id, "binding_corrupt"))
+            .unwrap();
+        request
+    }
+
+    /// Review regression (cancelled-lease remediation): reopening refuses,
+    /// changing nothing, while the binding is still corrupt (naming the field
+    /// to repair) and for a clearance-reserved nullifier; once repaired, the
+    /// lease resumes settlement.
+    #[test]
+    fn reopen_refuses_until_the_cancelled_binding_is_repaired() {
+        let store = NullifierStore::in_memory().unwrap();
+        assert!(matches!(
+            reopen(&store, "missing", false, 500),
+            Err(ReopenRefusal::UnknownLease(_))
+        ));
+        let request = cancelled_lease(&store, "corrupt", 1, Some("hash-1"), Some(true));
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let binding = api_request_binding(&request).unwrap();
+        let request_json = serde_json::to_string(&request).unwrap();
+        let payload_hash = request.payload_hash.to_hex();
+        let set = |sql: &str, value: &str| {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(sql, params![value])
+                .unwrap()
+        };
+        for (field, sql, corrupt, repaired) in [
+            (
+                "nullifiers.payload_hash",
+                "UPDATE nullifiers SET payload_hash = ?1",
+                "0x1",
+                payload_hash.as_str(),
+            ),
+            (
+                "nullifiers.api_request_binding",
+                "UPDATE nullifiers SET api_request_binding = ?1",
+                "stale",
+                binding.as_str(),
+            ),
+            (
+                "nullifiers.client_request_id",
+                "UPDATE nullifiers SET client_request_id = ?1",
+                "other",
+                "corrupt",
+            ),
+            (
+                "nullifiers.reservation_kind",
+                "UPDATE nullifiers SET reservation_kind = ?1",
+                "proxy",
+                "openrouter_lease",
+            ),
+            (
+                "openrouter_leases.api_request_json",
+                "UPDATE openrouter_leases SET api_request_json = ?1",
+                "not json",
+                request_json.as_str(),
+            ),
+            (
+                "nullifiers.nullifier",
+                "UPDATE nullifiers SET nullifier = ?1",
+                "0x5eed",
+                nullifier.as_str(),
+            ),
+        ] {
+            set(sql, corrupt);
+            match reopen(&store, "corrupt", false, 500) {
+                Err(ReopenRefusal::BindingCorrupt(mismatch)) => {
+                    assert_eq!(mismatch.field, field);
+                    let message = ReopenRefusal::BindingCorrupt(mismatch).to_string();
+                    assert!(message.contains(field), "{message}");
+                }
+                other => panic!("{field}: expected a binding refusal, got {other:?}"),
+            }
+            set(sql, repaired);
+        }
+        // The owner holds a clearance for that state: mutual close is its exit.
+        set("UPDATE nullifiers SET status = ?1", "ClearanceReserved");
+        let refusal = reopen(&store, "corrupt", true, 500).unwrap_err();
+        assert!(matches!(refusal, ReopenRefusal::ClearanceReserved));
+        assert!(refusal.to_string().contains("mutual close"), "{refusal}");
+        set("UPDATE nullifiers SET status = ?1", "Reserved");
+        // Nothing changed while it refused.
+        let lease = store.lookup_openrouter_lease("corrupt").unwrap();
+        assert_eq!(lease.status, "cancelled");
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 1);
+
+        let reopened = reopen(&store, "corrupt", false, 500).unwrap();
+        assert_eq!(
+            reopened,
+            ReopenedLease {
+                client_request_id: "corrupt".into(),
+                key_source: "oa_org".into(),
+                status: "active".into(),
+                delivered: Some(true),
+                settlement_deadline_at: Some(1_000),
+                settles: "measured_until_deadline",
+                key_cleanup_withdrawn: false,
+                reservation: "unchanged",
+                lease_row: "unchanged",
+                saved_request: "unchanged",
+                warning: None,
+            }
+        );
+        let lease = store.lookup_openrouter_lease("corrupt").unwrap();
+        assert_eq!(lease.status, "active");
+        assert_eq!(lease.settlement_deadline_at, Some(1_000));
+        assert_eq!((lease.charge_basis, lease.last_error), (None, None));
+        // The cancellation's review is handled; the reopening is reviewed.
+        let reviews = store.settlement_reviews(10).unwrap();
+        assert_eq!(reviews.len(), 2);
+        let by_reason = |reason: &str| {
+            reviews
+                .iter()
+                .find(|stored| stored.review.reason == reason)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_reason("binding_corrupt").acknowledged_at, Some(500));
+        let reopen_review = by_reason("binding_reopened");
+        assert_eq!(reopen_review.acknowledged_at, None);
+        assert_eq!(reopen_review.review.charge_basis, None);
+        assert!(reopen_review
+            .review
+            .detail
+            .contains("measured_until_deadline"));
+        assert!(matches!(
+            reopen(&store, "corrupt", false, 600),
+            Err(ReopenRefusal::NotCancelled(status)) if status == "active"
+        ));
+    }
+
+    #[test]
+    fn reopen_resumes_settlement_where_the_cancelled_lease_left_it() {
+        let store = NullifierStore::in_memory().unwrap();
+        // Never activated: provisioning again, committed to its zero
+        // settlement, so that no retry can issue its key.
+        cancelled_lease(&store, "keyless", 1, None, Some(false));
+        let reopened = reopen(&store, "keyless", false, 500).unwrap();
+        assert_eq!(reopened.status, "provisioning");
+        assert_eq!(reopened.settles, "zero_never_delivered");
+        let keyless = store.lookup_openrouter_lease("keyless").unwrap();
+        assert_eq!(keyless.charge_basis.as_deref(), Some("unissued"));
+        assert_eq!(keyless.settlement_deadline_at, Some(1_000));
+        assert!(store
+            .activate_openrouter_lease("keyless", "hash-1")
+            .is_err());
+        // Activated but never returned: active, settling at zero.
+        cancelled_lease(&store, "unreturned", 2, Some("hash-2"), Some(false));
+        let reopened = reopen(&store, "unreturned", false, 500).unwrap();
+        assert_eq!(
+            (reopened.status.as_str(), reopened.settles),
+            ("active", "zero_never_delivered")
+        );
+        assert!(store.mark_openrouter_lease_delivered("unreturned").is_err());
+        // Both are due at once, whatever their drain time.
+        let mut due: Vec<_> = store
+            .due_openrouter_leases(0)
+            .into_iter()
+            .map(|lease| lease.client_request_id)
+            .collect();
+        due.sort();
+        assert_eq!(due, ["keyless", "unreturned"]);
+        // Possibly delivered, past its unchanged deadline: the fallback.
+        cancelled_lease(&store, "late", 3, Some("hash-3"), None);
+        let reopened = reopen(&store, "late", false, 1_000).unwrap();
+        assert_eq!(
+            (reopened.status.as_str(), reopened.settles),
+            ("active", "deadline_fallback")
+        );
+        // Conceded: committed to zero, whatever was delivered.
+        cancelled_lease(&store, "conceded", 4, Some("hash-4"), Some(true));
+        let reopened = reopen(&store, "conceded", true, 500).unwrap();
+        assert_eq!(reopened.settles, "operator_conceded");
+        let lease = store.lookup_openrouter_lease("conceded").unwrap();
+        assert_eq!(lease.status, "active");
+        assert_eq!(lease.charge_basis.as_deref(), Some("operator_conceded"));
+        let reopen_review = store
+            .settlement_reviews(100)
+            .unwrap()
+            .into_iter()
+            .find(|stored| {
+                stored.review.client_request_id == "conceded"
+                    && stored.review.reason == "binding_reopened"
+            })
+            .unwrap()
+            .review;
+        assert_eq!(
+            reopen_review.charge_basis.as_deref(),
+            Some("operator_conceded")
+        );
+        assert!(store.mark_openrouter_lease_delivered("conceded").is_err());
+
+        // A direct key whose usage was captured resumes revoking, and its
+        // queued deletion is withdrawn so that settlement owns the key again.
+        let request = consistent_request("revoking", 5);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease(&request, "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease("revoking", "hash-5")
+            .unwrap();
+        for (from, to, usage) in [
+            ("active", "retiring", None),
+            ("retiring", "disabled", None),
+            ("disabled", "revoking", Some(0.25)),
+        ] {
+            store
+                .advance_openrouter_retirement("revoking", from, to, 0, usage)
+                .unwrap();
+        }
+        store
+            .cancel_openrouter_lease("revoking", &review("revoking", "binding_corrupt"))
+            .unwrap();
+        store
+            .enqueue_key_cleanup(
+                "revoking",
+                &KeyCleanup {
+                    key_source: "openrouter",
+                    key_hash: Some("hash-5"),
+                    key_name: "zkapi-revoking",
+                },
+            )
+            .unwrap();
+        let reopened = reopen(&store, "revoking", false, 500).unwrap();
+        assert_eq!(reopened.status, "revoking");
+        assert!(reopened.key_cleanup_withdrawn);
+        assert_eq!(
+            store.settlement_counts(500).unwrap().pending_key_cleanups,
+            0
+        );
+        assert_eq!(
+            store.lookup_openrouter_lease("revoking").unwrap().usage_usd,
+            Some(0.25)
+        );
+
+        // A successor already signed settles from its transcript; it cannot
+        // be conceded.
+        let signed = cancelled_lease(&store, "signed", 6, Some("hash-6"), Some(true));
+        let mut transcript = finalized(signed.public_inputs.request_nullifier);
+        transcript.reservation_kind = "openrouter_lease".into();
+        store
+            .finalize(&signed.public_inputs.request_nullifier, &transcript)
+            .unwrap();
+        assert!(matches!(
+            reopen(&store, "signed", true, 500),
+            Err(ReopenRefusal::AlreadySigned)
+        ));
+        assert_eq!(
+            reopen(&store, "signed", false, 500).unwrap().settles,
+            "signed_transcript"
+        );
+
+        // Only a cancellation for a corrupt binding is reopened.
+        let other = consistent_request("other", 7);
+        store.reserve_openrouter_lease(&other).unwrap();
+        store
+            .create_openrouter_lease(&other, "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .cancel_openrouter_lease("other", &review("other", "usage_clamped"))
+            .unwrap();
+        assert!(matches!(
+            reopen(&store, "other", false, 500),
+            Err(ReopenRefusal::NotBindingCorrupt)
+        ));
+    }
+
+    /// A possibly delivered direct lease with key `hash-<nullifier>`,
+    /// cancelled for a corrupt binding with its key cleanup queued, as the
+    /// settler cancels one whose usage was never captured.
+    fn cancelled_direct_lease(store: &NullifierStore, id: &str, nullifier: u64) -> ApiRequestV2 {
+        let request = consistent_request(id, nullifier);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request: &request,
+                key_source: "openrouter",
+                issued_at: 10,
+                expires_at: 20,
+                settle_after: 21,
+                spending_limit_usd: 1.0,
+                oa_client_request_id: None,
+                ttl_seconds: Some(300),
+                settlement_deadline_at: Some(1_000),
+                delivered: Some(true),
+            })
+            .unwrap();
+        let hash = format!("hash-{nullifier}");
+        store.activate_openrouter_lease(id, &hash).unwrap();
+        let key_name = format!("zkapi-{id}");
+        store
+            .cancel_corrupt_openrouter_lease(
+                id,
+                &review(id, "binding_corrupt"),
+                Some(KeyCleanup {
+                    key_source: "openrouter",
+                    key_hash: Some(&hash),
+                    key_name: &key_name,
+                }),
+            )
+            .unwrap();
+        request
+    }
+
+    /// Review regression (reopening a delivered direct lease): the
+    /// cancellation queues its key's deletion in its own transaction, so a
+    /// reopening knows whether the key still exists. Deleted before its usage
+    /// was captured, it cannot be measured: the reopening reports the
+    /// solvency-bound fallback and warns, instead of promising a measurement.
+    /// Still queued, its deletion is withdrawn and the key is measured.
+    #[test]
+    fn reopen_reports_the_bound_for_a_direct_key_deleted_unmeasured() {
+        let store = NullifierStore::in_memory().unwrap();
+        cancelled_direct_lease(&store, "deleted", 1);
+        cancelled_direct_lease(&store, "queued", 2);
+        assert_eq!(
+            store.settlement_counts(500).unwrap().pending_key_cleanups,
+            2
+        );
+        // The background cleanup deleted the first key.
+        store.complete_key_cleanup("deleted").unwrap();
+        let reopened = reopen(&store, "deleted", false, 500).unwrap();
+        assert_eq!(
+            (reopened.status.as_str(), reopened.settles),
+            ("active", "deadline_fallback")
+        );
+        assert!(!reopened.key_cleanup_withdrawn);
+        assert!(
+            reopened.warning.unwrap().contains("--zero-charge"),
+            "{reopened:?}"
+        );
+        let detail = store
+            .settlement_reviews(10)
+            .unwrap()
+            .into_iter()
+            .find(|stored| {
+                stored.review.client_request_id == "deleted"
+                    && stored.review.reason == "binding_reopened"
+            })
+            .unwrap()
+            .review
+            .detail;
+        assert!(detail.contains("deadline_fallback"), "{detail}");
+        let reopened = reopen(&store, "queued", false, 500).unwrap();
+        assert_eq!(
+            (reopened.status.as_str(), reopened.settles, reopened.warning),
+            ("active", "measured_until_deadline", None)
+        );
+        assert!(reopened.key_cleanup_withdrawn);
+        assert_eq!(
+            store.settlement_counts(500).unwrap().pending_key_cleanups,
+            0
+        );
+    }
+
+    /// Review regression (reopen authenticity): once the saved request
+    /// verifies, a refusal names the corrupt side and its repair: a
+    /// reservation field or a lease column is rebound (--rebind), and an
+    /// unreadable request is restored (--saved-request). --rebind never
+    /// rewrites a signed reservation, and a concession needs a lease reopened
+    /// earlier.
+    #[test]
+    fn rebind_repairs_only_an_unsigned_reservation() {
+        let store = NullifierStore::in_memory().unwrap();
+        let rebind = |id: &str| {
+            store.reopen_cancelled_lease(
+                id,
+                ReopenOptions {
+                    zero_charge: false,
+                    rebind: true,
+                    saved_request: None,
+                },
+                &|_| None,
+                500,
+            )
+        };
+        // A reservation field: --rebind suggested, and it repairs it.
+        let request = cancelled_lease(&store, "stale", 1, Some("hash-1"), Some(true));
+        store.execute_for_test(
+            "UPDATE nullifiers SET payload_hash = '0x1', client_request_id = 'other',
+                reservation_kind = 'proxy'
+             WHERE client_request_id = 'stale'",
+            [],
+        );
+        let refusal = reopen(&store, "stale", false, 500).unwrap_err();
+        assert!(refusal.to_string().contains("--rebind"), "{refusal}");
+        let reopened = rebind("stale").unwrap();
+        assert_eq!(reopened.reservation, "rewritten");
+        let record = store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .unwrap();
+        assert_eq!(record.payload_hash, Some(request.payload_hash));
+        assert_eq!(record.client_request_id.as_deref(), Some("stale"));
+        assert_eq!(record.reservation_kind, "openrouter_lease");
+        // Without a disagreement, --rebind changes nothing.
+        cancelled_lease(&store, "intact", 2, Some("hash-2"), Some(true));
+        assert_eq!(rebind("intact").unwrap().reservation, "unchanged");
+        // A lease column: the lease row is the corrupt side, rebound too.
+        let lease_side = cancelled_lease(&store, "lease-side", 3, Some("hash-3"), Some(true));
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET request_nullifier = '0x77'
+             WHERE client_request_id = 'lease-side'",
+            [],
+        );
+        let refusal = reopen(&store, "lease-side", false, 500).unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                if mismatch.field == "openrouter_leases.request_nullifier"),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("the lease row is the corrupt side")
+                && refusal.to_string().contains("--rebind"),
+            "{refusal}"
+        );
+        let reopened = rebind("lease-side").unwrap();
+        assert_eq!(
+            (reopened.lease_row, reopened.reservation),
+            ("rewritten", "unchanged")
+        );
+        assert_eq!(
+            store
+                .lookup_openrouter_lease("lease-side")
+                .unwrap()
+                .request_nullifier,
+            lease_side.public_inputs.request_nullifier
+        );
+        cancelled_lease(&store, "unreadable", 4, Some("hash-4"), Some(true));
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET api_request_json = 'not json'
+             WHERE client_request_id = 'unreadable'",
+            [],
+        );
+        let refusal = rebind("unreadable").unwrap_err();
+        assert!(
+            refusal.to_string().contains("--saved-request")
+                && refusal.to_string().contains("from a backup"),
+            "{refusal}"
+        );
+        // A signed reservation is never rewritten.
+        let signed = cancelled_lease(&store, "signed", 5, Some("hash-5"), Some(true));
+        let mut transcript = finalized(signed.public_inputs.request_nullifier);
+        transcript.reservation_kind = "openrouter_lease".into();
+        store
+            .finalize(&signed.public_inputs.request_nullifier, &transcript)
+            .unwrap();
+        store.execute_for_test(
+            "UPDATE nullifiers SET client_request_id = 'someone-else'
+             WHERE client_request_id = 'signed'",
+            [],
+        );
+        let refusal = rebind("signed").unwrap_err();
+        assert!(matches!(refusal, ReopenRefusal::RebindSigned), "{refusal}");
+        assert_eq!(
+            store.lookup_openrouter_lease("signed").unwrap().status,
+            "cancelled"
+        );
+        // A concession of a pending lease needs a reopening first.
+        let pending = consistent_request("never-cancelled", 6);
+        store.reserve_openrouter_lease(&pending).unwrap();
+        store
+            .create_openrouter_lease(&pending, "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease("never-cancelled", "hash-6")
+            .unwrap();
+        assert!(matches!(
+            reopen(&store, "never-cancelled", true, 500),
+            Err(ReopenRefusal::NotCancelled(status)) if status == "active"
+        ));
+        assert_eq!(
+            store
+                .lookup_openrouter_lease("never-cancelled")
+                .unwrap()
+                .charge_basis,
+            None
+        );
+    }
+
+    /// Review regression (lease-row repair): a lease row whose
+    /// client_request_id, its primary key, was corrupt was cancelled with its
+    /// review and queued key cleanup under the faulted id. --rebind rewrites
+    /// the row from the verified request in one transaction: its reviews move
+    /// with it, and its queued cleanup is withdrawn. It refuses, changing
+    /// nothing, while another lease row holds the request's id. A row renamed
+    /// by hand still finds its review by its nullifier, and adopts it.
+    #[test]
+    fn rebind_moves_a_corrupt_lease_id_with_its_reviews() {
+        let store = NullifierStore::in_memory().unwrap();
+        let rebind = |id: &str| {
+            store.reopen_cancelled_lease(
+                id,
+                ReopenOptions {
+                    rebind: true,
+                    ..ReopenOptions::default()
+                },
+                &|_| None,
+                500,
+            )
+        };
+        let found = |request: &ApiRequestV2, id: &str| SettlementReview {
+            request_nullifier: request.public_inputs.request_nullifier,
+            ..review(id, "binding_corrupt")
+        };
+        // A direct lease whose id was faulted before its cancellation.
+        let request = consistent_request("lease-a", 1);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request: &request,
+                key_source: "openrouter",
+                issued_at: 10,
+                expires_at: 20,
+                settle_after: 21,
+                spending_limit_usd: 1.0,
+                oa_client_request_id: None,
+                ttl_seconds: Some(300),
+                settlement_deadline_at: Some(1_000),
+                delivered: Some(true),
+            })
+            .unwrap();
+        store
+            .activate_openrouter_lease("lease-a", "hash-1")
+            .unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET client_request_id = 'lease-a-x'
+             WHERE client_request_id = 'lease-a'",
+            [],
+        );
+        store
+            .cancel_corrupt_openrouter_lease(
+                "lease-a-x",
+                &found(&request, "lease-a-x"),
+                Some(KeyCleanup {
+                    key_source: "openrouter",
+                    key_hash: Some("hash-1"),
+                    key_name: "zkapi-lease-a-x",
+                }),
+            )
+            .unwrap();
+        let refusal = reopen(&store, "lease-a-x", false, 500).unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                if mismatch.field == "openrouter_leases.client_request_id"),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("--rebind"), "{refusal}");
+        // Another row holding the request's id: neither row is rewritten.
+        store
+            .create_openrouter_lease(&consistent_request("lease-a", 2), "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        let refusal = rebind("lease-a-x").unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::LeaseElsewhere(other) if other == "lease-a"),
+            "{refusal}"
+        );
+        assert_eq!(
+            store.lookup_openrouter_lease("lease-a-x").unwrap().status,
+            "cancelled"
+        );
+        store.remove_failed_openrouter_lease("lease-a").unwrap();
+        let reopened = rebind("lease-a-x").unwrap();
+        assert_eq!(
+            (
+                reopened.client_request_id.as_str(),
+                reopened.lease_row,
+                reopened.status.as_str(),
+                reopened.settles
+            ),
+            ("lease-a", "rewritten", "active", "measured_until_deadline")
+        );
+        assert!(reopened.key_cleanup_withdrawn);
+        assert!(store.lookup_openrouter_lease("lease-a-x").is_none());
+        assert_eq!(
+            store.settlement_counts(500).unwrap().pending_key_cleanups,
+            0
+        );
+        let reviews = store.settlement_reviews(10).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews
+            .iter()
+            .all(|stored| stored.review.client_request_id == "lease-a"));
+        assert!(reviews
+            .iter()
+            .any(|stored| stored.review.reason == "binding_corrupt"
+                && stored.acknowledged_at == Some(500)));
+        let reopening = reviews
+            .iter()
+            .find(|stored| stored.review.reason == "binding_reopened")
+            .unwrap();
+        assert!(
+            reopening
+                .review
+                .detail
+                .contains("its client_request_id was lease-a-x"),
+            "{}",
+            reopening.review.detail
+        );
+
+        // Renamed by hand instead: the review left under the faulted id is
+        // found by the row's nullifier, and joins the row.
+        let other = consistent_request("lease-b", 3);
+        store.reserve_openrouter_lease(&other).unwrap();
+        store
+            .create_openrouter_lease(&other, "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease("lease-b", "hash-3")
+            .unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET client_request_id = 'lease-b-x'
+             WHERE client_request_id = 'lease-b'",
+            [],
+        );
+        store
+            .cancel_openrouter_lease("lease-b-x", &found(&other, "lease-b-x"))
+            .unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET client_request_id = 'lease-b'
+             WHERE client_request_id = 'lease-b-x'",
+            [],
+        );
+        let reopened = reopen(&store, "lease-b", false, 500).unwrap();
+        assert_eq!(
+            (reopened.lease_row, reopened.status.as_str()),
+            ("unchanged", "active")
+        );
+        let reviews: Vec<_> = store
+            .settlement_reviews(10)
+            .unwrap()
+            .into_iter()
+            .filter(|stored| {
+                stored.review.request_nullifier == other.public_inputs.request_nullifier
+            })
+            .collect();
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|stored| {
+            stored.review.client_request_id == "lease-b"
+                && (stored.review.reason == "binding_reopened" || stored.acknowledged_at.is_some())
+        }));
+    }
+
+    /// Review regression (corrupt saved request): --saved-request restores a
+    /// corrupt or unreadable saved request only from a copy that verifies,
+    /// whose binding is its reservation's, and that shares the lease row's id
+    /// or nullifier. Another request its owner authorized for the same note
+    /// state, another lease's request, a clearance-reserved nullifier and a
+    /// missing reservation are refused, changing nothing.
+    #[test]
+    fn saved_request_is_restored_only_from_the_reserved_request() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = cancelled_lease(&store, "bitrot", 1, Some("hash-1"), Some(true));
+        let other_lease = cancelled_lease(&store, "other", 2, Some("hash-2"), Some(true));
+        let mut same_state = request.clone();
+        same_state.public_inputs.request_time += 1;
+        let mut faulted = request.clone();
+        faulted.public_inputs.request_time += 7;
+        // Proof verification as these fixtures allow it: only requests their
+        // owners authorized verify.
+        let authorized: Vec<String> = [&request, &same_state, &other_lease]
+            .into_iter()
+            .map(|authorized| api_request_binding(authorized).unwrap())
+            .collect();
+        let verify = |candidate: &ApiRequestV2| {
+            (!authorized.contains(&api_request_binding(candidate).unwrap())).then_some(
+                BindingMismatch {
+                    field: SAVED_REQUEST_FIELD,
+                    detail: GROTH16_UNVERIFIED,
+                },
+            )
+        };
+        let restore = |saved: &ApiRequestV2| {
+            store.reopen_cancelled_lease(
+                "bitrot",
+                ReopenOptions {
+                    saved_request: Some(saved),
+                    ..ReopenOptions::default()
+                },
+                &verify,
+                500,
+            )
+        };
+        let set = |sql: &str| store.execute_for_test(sql, []);
+        let faulted_json = serde_json::to_string(&faulted).unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET api_request_json = ?1 WHERE client_request_id = 'bitrot'",
+            params![faulted_json],
+        );
+        let refusal = store
+            .reopen_cancelled_lease("bitrot", ReopenOptions::default(), &verify, 500)
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                if mismatch.field == SAVED_REQUEST_FIELD),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("--saved-request"), "{refusal}");
+        assert!(matches!(
+            restore(&faulted),
+            Err(ReopenRefusal::SuppliedRequestUnverified(detail)) if detail == GROTH16_UNVERIFIED
+        ));
+        assert!(matches!(
+            restore(&same_state),
+            Err(ReopenRefusal::SuppliedRequestNotReserved(detail))
+                if detail.contains("api_request_binding")
+        ));
+        assert!(matches!(
+            restore(&other_lease),
+            Err(ReopenRefusal::SuppliedRequestForAnotherLease)
+        ));
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        set(&format!(
+            "UPDATE nullifiers SET status = 'ClearanceReserved' WHERE nullifier = '{nullifier}'"
+        ));
+        assert!(matches!(
+            restore(&request),
+            Err(ReopenRefusal::ClearanceReserved)
+        ));
+        set(&format!(
+            "UPDATE nullifiers SET status = 'Reserved', nullifier = '0x5eed'
+             WHERE nullifier = '{nullifier}'"
+        ));
+        assert!(matches!(
+            restore(&request),
+            Err(ReopenRefusal::SuppliedRequestNotReserved(detail))
+                if detail.contains("no nullifiers row")
+        ));
+        set(&format!(
+            "UPDATE nullifiers SET nullifier = '{nullifier}' WHERE nullifier = '0x5eed'"
+        ));
+        // Nothing changed while it refused.
+        let lease = store.lookup_openrouter_lease("bitrot").unwrap();
+        assert_eq!(lease.status, "cancelled");
+        assert_eq!(
+            serde_json::to_string(&lease.api_request).unwrap(),
+            faulted_json
+        );
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 2);
+        // The reserved request restores it, also over an unreadable one.
+        set("UPDATE openrouter_leases SET api_request_json = 'not json'
+             WHERE client_request_id = 'bitrot'");
+        let reopened = restore(&request).unwrap();
+        assert_eq!(
+            (reopened.saved_request, reopened.status.as_str()),
+            ("restored", "active")
+        );
+        assert_eq!(
+            api_request_binding(&store.lookup_openrouter_lease("bitrot").unwrap().api_request)
+                .unwrap(),
+            api_request_binding(&request).unwrap()
+        );
+        let reopening = store
+            .settlement_reviews(10)
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.review.reason == "binding_reopened")
+            .unwrap();
+        assert!(
+            reopening
+                .review
+                .detail
+                .contains("saved request was restored"),
+            "{}",
+            reopening.review.detail
+        );
+        // A copy of an intact saved request changes nothing: the
+        // reservation's stale binding is then named, for --rebind.
+        store.execute_for_test(
+            "UPDATE nullifiers SET api_request_binding = 'stale' WHERE client_request_id = 'other'",
+            [],
+        );
+        let supplied = |rebind: bool| {
+            store.reopen_cancelled_lease(
+                "other",
+                ReopenOptions {
+                    rebind,
+                    saved_request: Some(&other_lease),
+                    ..ReopenOptions::default()
+                },
+                &verify,
+                500,
+            )
+        };
+        assert!(matches!(
+            supplied(false),
+            Err(ReopenRefusal::BindingCorrupt(mismatch))
+                if mismatch.field == "nullifiers.api_request_binding"
+        ));
+        let reopened = supplied(true).unwrap();
+        assert_eq!(
+            (reopened.saved_request, reopened.reservation),
+            ("unchanged", "rewritten")
+        );
+    }
+
+    /// Review regression (usage capture of a corrupt direct lease): a corrupt
+    /// binding found while its key's usage is still being captured is
+    /// reviewed once, however often the capture is retried, and again after
+    /// a reopening. The lease cannot be reopened, nor conceded, until it is
+    /// cancelled; its cancellation records its own review.
+    #[test]
+    fn corrupt_binding_is_reviewed_once_while_its_capture_is_retried() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = consistent_request("capturing", 1);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease(&request, "openrouter", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease("capturing", "hash-1")
+            .unwrap();
+        store
+            .advance_openrouter_retirement("capturing", "active", "retiring", 0, None)
+            .unwrap();
+        let found = review("capturing", "binding_corrupt");
+        assert!(store.review_corrupt_binding(&found).unwrap());
+        assert!(!store.review_corrupt_binding(&found).unwrap());
+        for zero_charge in [false, true] {
+            assert!(matches!(
+                reopen(&store, "capturing", zero_charge, 500),
+                Err(ReopenRefusal::CapturePending(status)) if status == "retiring"
+            ));
+        }
+        store.cancel_openrouter_lease("capturing", &found).unwrap();
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 2);
+        assert_eq!(
+            reopen(&store, "capturing", false, 500).unwrap().status,
+            "active"
+        );
+        // Found corrupt again after the reopening: reviewed again.
+        assert!(store.review_corrupt_binding(&found).unwrap());
+        assert!(!store.review_corrupt_binding(&found).unwrap());
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 4);
     }
 }

@@ -94,6 +94,10 @@ pub struct PendingLeaseView {
     pub key_source: String,
     pub status: String,
     pub delivered: Option<bool>,
+    /// Set before finalization only on a lease committed to a zero charge:
+    /// "unissued" (never delivered) or "operator_conceded" (reopened with a
+    /// concession).
+    pub charge_basis: Option<String>,
     pub expires_at: u64,
     pub settle_after: u64,
     pub settlement_deadline: Option<u64>,

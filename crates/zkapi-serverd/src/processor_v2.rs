@@ -8,7 +8,15 @@
 //! I/O at the solvency bound (or at captured usage when only key deletion
 //! failed), with an operator-visible review. Settlement never re-validates the
 //! frozen quote against live configuration. A corrupt binding is cancelled
-//! and never signed.
+//! and never signed, until the operator repairs and reopens it; a possibly
+//! delivered direct key's usage is captured before the cancellation, and a
+//! reopened lease's saved request is verified again before anything is
+//! signed for it.
+//!
+//! A zero settlement of a never-delivered lease holds the issuance lock, so
+//! it never overlaps an issuance that may still deliver the key, and it
+//! fences the row before signing: a key is only ever returned for a lease
+//! that settles from usage.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,8 +49,9 @@ use crate::dashboard::{
 use crate::error::ServerError;
 use crate::native_billing::{NativeBillingOracle, NativeBillingQuote};
 use crate::nullifier_store::{
-    api_request_binding, KeyCleanup, LeaseFinalization, NewOpenRouterLease, NullifierStore,
-    OaProvisioningOutcome, OpenRouterLeaseRecord, SettlementReview, TranscriptRecord,
+    api_request_binding, lease_binding_mismatch, saved_request_mismatch, FinalizeGuard, KeyCleanup,
+    LeaseFinalization, NewOpenRouterLease, NullifierStore, OaProvisioningOutcome,
+    OpenRouterLeaseRecord, SettlementReview, TranscriptRecord,
 };
 use crate::oa_org::{IssuedOpenRouterLease, OaOrgProvisioner, OaOrgUsage, OaOrgUsageExpectation};
 use crate::openrouter::OpenRouterProvisioner;
@@ -76,6 +85,9 @@ struct SettlementTiming {
     retire_lock_timeout: Duration,
     /// ...and this long for its settlement attempt.
     retire_timeout: Duration,
+    /// A tick waits this long for the issuance lock to finalize never
+    /// delivered leases past their deadline.
+    issue_lock_timeout: Duration,
     /// Background provider-key cleanup per tick and per key.
     cleanup_budget: Duration,
     cleanup_attempt_timeout: Duration,
@@ -85,13 +97,14 @@ struct SettlementTiming {
 
 impl Default for SettlementTiming {
     fn default() -> Self {
-        // tick budget + attempt timeout + cleanup stays well inside
-        // config::SETTLEMENT_SWEEP_SLACK_SECONDS (600).
+        // Issuance-lock wait + tick budget + attempt timeout + cleanup stays
+        // well inside config::SETTLEMENT_SWEEP_SLACK_SECONDS (600).
         Self {
             tick_budget: Duration::from_secs(120),
             attempt_timeout: Duration::from_secs(150),
             retire_lock_timeout: Duration::from_secs(10),
             retire_timeout: Duration::from_secs(45),
+            issue_lock_timeout: Duration::from_secs(30),
             cleanup_budget: Duration::from_secs(30),
             cleanup_attempt_timeout: Duration::from_secs(30),
             vault_root_ttl: Duration::from_secs(3),
@@ -603,6 +616,23 @@ impl RequestProcessor {
         ) && lease.delivered != Some(false)
     }
 
+    /// A pending lease whose key has not been returned to the client. While
+    /// issuance holds its lock it may still return it; such a lease settles
+    /// at zero only under that lock.
+    fn never_delivered(lease: &OpenRouterLeaseRecord) -> bool {
+        matches!(
+            lease.status.as_str(),
+            "provisioning" | "active" | "retiring" | "disabled" | "revoking"
+        ) && !Self::may_have_delivered(lease)
+    }
+
+    /// A pending lease reopened by the operator with a concession: it
+    /// finalizes at zero, whatever was delivered.
+    fn conceded(lease: &OpenRouterLeaseRecord) -> bool {
+        lease.charge_basis.as_deref() == Some("operator_conceded")
+            && !matches!(lease.status.as_str(), "finalized" | "cancelled")
+    }
+
     fn native_oa_request_id(request: &ApiRequestV2) -> Result<String, ServerError> {
         let binding = api_request_binding(request)?;
         let mut hash = Keccak256::new();
@@ -759,7 +789,12 @@ impl RequestProcessor {
             if existing.status == "cancelled" {
                 return Err(ServerError::NullifierUsed);
             }
-            if existing.status != "provisioning" || existing.key_hash.is_some() {
+            // A lease committed to a zero (or conceded) settlement never
+            // mints a key again; it is about to be finalized.
+            if existing.status != "provisioning"
+                || existing.key_hash.is_some()
+                || existing.charge_basis.is_some()
+            {
                 return Err(ServerError::LeasePending);
             }
             if existing.key_source == "oa_org"
@@ -942,14 +977,28 @@ impl RequestProcessor {
         // The chain may have consumed this nullifier during provider I/O.
         // Persist activation first so challenge evidence and settlement survive
         // either a consumed nullifier or an unavailable RPC, but never expose
-        // the runtime key unless its authorization is still unspent.
-        self.native_oracle
+        // the runtime key unless its authorization is still unspent. Then
+        // durably mark the key delivered before returning it: a key that is
+        // never returned can only ever be charged zero, and a lease committed
+        // to a zero settlement refuses the mark.
+        let delivered = match self
+            .native_oracle
             .assert_request_unspent(&request.public_inputs.request_nullifier)
-            .await?;
-        // Durably mark the key delivered before returning it. A key that is
-        // never returned can only ever be charged zero.
-        self.store
-            .mark_openrouter_lease_delivered(&request.client_request_id)?;
+            .await
+        {
+            Ok(()) => self
+                .store
+                .mark_openrouter_lease_delivered(&request.client_request_id),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            self.discard_undelivered_key(
+                &lease_config.source,
+                &request.client_request_id,
+                &key_hash,
+            );
+            return Err(error);
+        }
         Ok(IssuedOpenRouterLease {
             lease: OpenRouterLeaseResponse {
                 status: "active".to_string(),
@@ -994,8 +1043,44 @@ impl RequestProcessor {
             })
     }
 
+    /// An activated key that issuance will never return; its lease settles
+    /// at zero. A direct key is queued for disabling and deletion at once.
+    /// The OA org offers no revocation: an OA key was only ever seen by the
+    /// org, its station and this process, which drops it, and it expires with
+    /// the lease TTL.
+    fn discard_undelivered_key(
+        &self,
+        source: &OpenRouterLeaseSourceConfig,
+        client_request_id: &str,
+        key_hash: &str,
+    ) {
+        match source {
+            OpenRouterLeaseSourceConfig::OpenRouter { .. } => {
+                let key_name = format!("zkapi-{client_request_id}");
+                let cleanup = KeyCleanup {
+                    key_source: "openrouter",
+                    key_hash: Some(key_hash),
+                    key_name: &key_name,
+                };
+                if let Err(error) = self.store.enqueue_key_cleanup(client_request_id, &cleanup) {
+                    // Its zero settlement queues the deletion again.
+                    tracing::warn!(%client_request_id, error = %error, "could not queue an undelivered key for deletion");
+                }
+            }
+            OpenRouterLeaseSourceConfig::OaOrg { .. } => {
+                tracing::warn!(
+                    %client_request_id,
+                    key_hash,
+                    "OA key activated but never returned; the org offers no revocation, so it lapses at the lease TTL"
+                );
+            }
+        }
+    }
+
     /// Read-only expiration handshake. It serializes behind in-flight issuance
     /// without provisioning a key or mutating the wallet/nullifier database.
+    /// The issuance lock is held only to check that nothing reserved the
+    /// request, before and again after the oracle reads, never across them.
     pub async fn expire_unaccepted_native_lease(
         &self,
         client_request_id: &str,
@@ -1018,19 +1103,7 @@ impl RequestProcessor {
                 "native expiry check deployment mismatch".into(),
             ));
         }
-        let _guard = self.lease_issue_lock.lock().await;
-        if self
-            .store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
-            .is_some()
-            || self
-                .store
-                .lookup_openrouter_lease(client_request_id)
-                .is_some()
-            || self.store.lookup_by_client_id(client_request_id).is_some()
-        {
-            return Err(ServerError::LeasePending);
-        }
+        self.ensure_unaccepted(client_request_id, request).await?;
         // Admission rejects an expired quote whatever the configuration, so a
         // configuration change can never strand an expired unaccepted journal.
         let status = if quote.expires_at <= current_timestamp() {
@@ -1051,6 +1124,10 @@ impl RequestProcessor {
                 Ok(()) => return Err(ServerError::LeasePending),
             }
         };
+        // An issuance that reserved the request meanwhile is seen here. One
+        // that takes the lock later reads the oracle and the clock later, and
+        // expiry and supersession only advance, so it cannot reserve it.
+        self.ensure_unaccepted(client_request_id, request).await?;
         Ok(serde_json::json!({
             "status":status, "client_request_id":client_request_id,
             "request_nullifier":request.public_inputs.request_nullifier,
@@ -1058,11 +1135,37 @@ impl RequestProcessor {
         }))
     }
 
+    /// Under the issuance lock (awaiting earlier in-flight issuance), require
+    /// that neither the request's nullifier nor its ID has a reservation.
+    async fn ensure_unaccepted(
+        &self,
+        client_request_id: &str,
+        request: &ApiRequestV2,
+    ) -> Result<(), ServerError> {
+        let _guard = self.lease_issue_lock.lock().await;
+        if self
+            .store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .is_some()
+            || self
+                .store
+                .lookup_openrouter_lease(client_request_id)
+                .is_some()
+            || self.store.lookup_by_client_id(client_request_id).is_some()
+        {
+            return Err(ServerError::LeasePending);
+        }
+        Ok(())
+    }
+
     /// Settle every due lease. Pass 1 finalizes without provider or chain I/O:
-    /// never-delivered leases at zero (provisioning rows only when issuance is
-    /// idle) and possibly delivered leases past their write-once deadline.
-    /// Pass 2 settles from provider usage, bounded per attempt and per tick.
-    /// Pass 3 deletes provider keys of terminal leases, outside the lock.
+    /// conceded leases and never-delivered leases at zero, and possibly
+    /// delivered leases past their write-once deadline. A never-delivered
+    /// lease needs the issuance lock: a busy lock defers it to the next tick,
+    /// or, once it is past its deadline, to a bounded wait for the lock that
+    /// follows pass 1. Pass 2 settles from provider usage, bounded per attempt
+    /// and per tick. Pass 3 deletes provider keys of terminal leases, outside
+    /// the lock.
     pub async fn settle_due_openrouter_leases(&self) {
         {
             let _settlement_guard = self.lease_settlement_lock.lock().await;
@@ -1070,16 +1173,25 @@ impl RequestProcessor {
             let now = current_timestamp();
             self.assign_missing_settlement_deadlines(now);
             let mut provider_io = Vec::new();
+            let mut overdue_unissued = Vec::new();
             for lease in self.store.due_openrouter_leases(now) {
-                let result = if lease.status == "provisioning" {
-                    // Issuance holds this lock across provider I/O; a busy
-                    // lock defers this zero finalization to the next tick.
-                    let Ok(_issue_guard) = self.lease_issue_lock.try_lock() else {
-                        continue;
-                    };
-                    self.finalize_never_delivered_lease(&lease.client_request_id)
-                } else if !Self::may_have_delivered(&lease) {
-                    self.finalize_never_delivered_lease(&lease.client_request_id)
+                let result = if Self::conceded(&lease) {
+                    self.finalize_conceded_lease(&lease.client_request_id)
+                } else if Self::never_delivered(&lease) {
+                    // Issuance holds this lock across provider I/O and until
+                    // it has returned or abandoned the key.
+                    match self.lease_issue_lock.try_lock() {
+                        Ok(_issue_guard) => {
+                            self.finalize_never_delivered_lease(&lease.client_request_id)
+                        }
+                        Err(_) => {
+                            if matches!(self.settlement_deadline(&lease, now), Ok(deadline) if now >= deadline)
+                            {
+                                overdue_unissued.push(lease);
+                            }
+                            continue;
+                        }
+                    }
                 } else {
                     match self.settlement_deadline(&lease, now) {
                         Ok(deadline)
@@ -1100,6 +1212,31 @@ impl RequestProcessor {
                 };
                 if let Err(error) = result {
                     self.note_settlement_failure(&lease, &error);
+                }
+            }
+            if !overdue_unissued.is_empty() {
+                // Queue for the lock (FIFO) instead of skipping: no stream of
+                // lock holders can postpone these past their deadline. The
+                // wait is bounded so that the rest of the tick still runs.
+                match tokio::time::timeout(
+                    self.timing.issue_lock_timeout,
+                    self.lease_issue_lock.lock(),
+                )
+                .await
+                {
+                    Ok(_issue_guard) => {
+                        for lease in &overdue_unissued {
+                            if let Err(error) =
+                                self.finalize_never_delivered_lease(&lease.client_request_id)
+                            {
+                                self.note_settlement_failure(lease, &error);
+                            }
+                        }
+                    }
+                    Err(_) => tracing::warn!(
+                        leases = overdue_unissued.len(),
+                        "issuance lock stayed busy; never-delivered leases past their settlement deadline are retried next tick"
+                    ),
                 }
             }
             for lease in provider_io {
@@ -1215,17 +1352,39 @@ impl RequestProcessor {
 
     /// Callers hold the settlement lock.
     async fn retire_locked(&self, lease: &OpenRouterLeaseRecord) -> Result<(), ServerError> {
+        if matches!(lease.status.as_str(), "finalized" | "cancelled") {
+            return Ok(());
+        }
+        let result = if Self::conceded(lease) {
+            self.finalize_conceded_lease(&lease.client_request_id)
+        } else if Self::never_delivered(lease) {
+            // Issuance may still return this key until it releases its lock.
+            // Wait for it (within the retirement timeout), then settle at
+            // zero only a lease that is still undelivered.
+            let issue_guard = self.lease_issue_lock.lock().await;
+            let current = self
+                .store
+                .try_lookup_openrouter_lease(&lease.client_request_id)?
+                .ok_or_else(|| ServerError::Internal("pending lease disappeared".into()))?;
+            if !Self::never_delivered(&current) {
+                drop(issue_guard);
+                return self.retire_delivered(&current).await;
+            }
+            self.finalize_never_delivered_lease(&current.client_request_id)
+        } else {
+            return self.retire_delivered(lease).await;
+        };
+        if let Err(error) = &result {
+            self.note_settlement_failure(lease, error);
+        }
+        result
+    }
+
+    /// Retire a lease that may have been delivered, or that became terminal.
+    async fn retire_delivered(&self, lease: &OpenRouterLeaseRecord) -> Result<(), ServerError> {
         let now = current_timestamp();
         let result = match lease.status.as_str() {
             "finalized" | "cancelled" => return Ok(()),
-            // Never delivered: settle at zero, serialized with issuance.
-            "provisioning" => {
-                let _issue_guard = self.lease_issue_lock.lock().await;
-                self.finalize_never_delivered_lease(&lease.client_request_id)
-            }
-            "active" | "retiring" | "disabled" | "revoking" if !Self::may_have_delivered(lease) => {
-                self.finalize_never_delivered_lease(&lease.client_request_id)
-            }
             "active" | "retiring" | "disabled" | "revoking" => {
                 match self.settlement_deadline(lease, now)? {
                     deadline
@@ -1249,36 +1408,35 @@ impl RequestProcessor {
     }
 
     /// Check a lease row against its nullifier reservation. A mismatch is a
-    /// corrupt binding (never signed); a different deployment or signing key
-    /// is an operator configuration error and stays pending.
+    /// corrupt binding (never signed), named in its review; a different
+    /// deployment or signing key is an operator configuration error and stays
+    /// pending. A lease the operator reopened has its saved request verified
+    /// again, as admission verified it: one its owner's proof does not
+    /// authorize is a corrupt binding too.
     fn check_lease_binding(
         &self,
         lease: &OpenRouterLeaseRecord,
     ) -> Result<LeaseBinding, ServerError> {
-        let request = &lease.api_request;
-        let public = &request.public_inputs;
-        let Some(record) = self
+        let public = &lease.api_request.public_inputs;
+        let record = self
             .store
-            .try_lookup_by_nullifier(&lease.request_nullifier)?
-        else {
-            return Ok(LeaseBinding::Corrupt(
-                "lease has no nullifier reservation".into(),
-            ));
+            .try_lookup_by_nullifier(&lease.request_nullifier)?;
+        let record = match (lease_binding_mismatch(lease, record.as_ref())?, record) {
+            (None, Some(record)) => record,
+            (mismatch, _) => {
+                // Unverified here: either side may be the corrupt one.
+                return Ok(LeaseBinding::Corrupt(mismatch.map_or_else(
+                    || "lease has no nullifier reservation".into(),
+                    |mismatch| {
+                        format!(
+                            "lease row does not match its nullifier reservation: {mismatch} \
+                             (either side may be corrupt; `zkapi settlement reopen` verifies \
+                             the saved request and names the side to repair)"
+                        )
+                    },
+                )));
+            }
         };
-        let binding = api_request_binding(request)?;
-        if lease.client_request_id != request.client_request_id
-            || lease.request_nullifier != public.request_nullifier
-            || record.status == NullifierStatus::ClearanceReserved
-            || record.reservation_kind != "openrouter_lease"
-            || record.client_request_id.as_deref() != Some(request.client_request_id.as_str())
-            || record.payload_hash != Some(request.payload_hash)
-            || record.api_request_binding.as_deref() != Some(binding.as_str())
-            || canonical_payload_hash(request.payload.as_bytes()) != request.payload_hash
-        {
-            return Ok(LeaseBinding::Corrupt(
-                "lease row does not match its nullifier reservation".into(),
-            ));
-        }
         let signing_key = self.state_signing_key();
         if public.protocol_version != self.config.protocol_version
             || public.chain_id != self.config.chain_id
@@ -1290,6 +1448,16 @@ impl RequestProcessor {
                 "lease belongs to a different deployment or state signing key; refusing to sign"
                     .into(),
             ));
+        }
+        // A signed transcript is only reconciled: nothing more is signed.
+        if record.status != NullifierStatus::Finalized
+            && self.store.lease_reopened(&lease.client_request_id)?
+        {
+            if let Some(mismatch) = saved_request_mismatch(&self.verifier, &lease.api_request) {
+                return Ok(LeaseBinding::Corrupt(format!(
+                    "the reopened lease's saved request does not verify: {mismatch}"
+                )));
+            }
         }
         Ok(LeaseBinding::Valid(Box::new(record)))
     }
@@ -1327,7 +1495,11 @@ impl RequestProcessor {
     }
 
     /// Cancel a lease whose binding is corrupt. Nothing is ever signed for
-    /// it; a direct key it may hold is still disabled and deleted.
+    /// it; a direct key it may hold is still disabled and deleted in the
+    /// background, queued with the cancellation. (A possibly delivered direct
+    /// lease settled with provider I/O reaches this only once its usage is
+    /// captured, or at its deadline, so that a reopening can charge that
+    /// usage; a review was also recorded when its corruption was found.)
     fn cancel_corrupt_lease(
         &self,
         lease: &OpenRouterLeaseRecord,
@@ -1341,19 +1513,46 @@ impl RequestProcessor {
             None,
             None,
         );
+        Self::alert_corrupt_binding(lease);
+        let key_name = format!("zkapi-{}", lease.client_request_id);
+        self.store.cancel_corrupt_openrouter_lease(
+            &lease.client_request_id,
+            &review,
+            Self::direct_key_cleanup(lease, &key_name),
+        )
+    }
+
+    /// Record the `binding_corrupt` review of a pending lease at once, while
+    /// its cancellation waits for its key's usage to be captured, so that its
+    /// alert is not delayed: once, not on every attempt.
+    fn review_corrupt_binding(
+        &self,
+        lease: &OpenRouterLeaseRecord,
+        detail: &str,
+    ) -> Result<(), ServerError> {
+        let review = Self::review(
+            lease,
+            "binding_corrupt",
+            None,
+            format!(
+                "{detail}; its key is disabled and its usage captured first, retried like any \
+                 settlement until its deadline, then the lease is cancelled"
+            ),
+            None,
+            None,
+        );
+        if self.store.review_corrupt_binding(&review)? {
+            Self::alert_corrupt_binding(lease);
+        }
+        Ok(())
+    }
+
+    fn alert_corrupt_binding(lease: &OpenRouterLeaseRecord) {
         tracing::error!(
             client_request_id = %lease.client_request_id,
             reason = "binding_corrupt",
             "settlement required operator review"
         );
-        self.store
-            .cancel_openrouter_lease(&lease.client_request_id, &review)?;
-        let key_name = format!("zkapi-{}", lease.client_request_id);
-        if let Some(cleanup) = Self::direct_key_cleanup(lease, &key_name) {
-            self.store
-                .enqueue_key_cleanup(&lease.client_request_id, &cleanup)?;
-        }
-        Ok(())
     }
 
     /// The transcript committed before the lease row (a crash window, or a
@@ -1386,15 +1585,17 @@ impl RequestProcessor {
                 review: None,
                 // Deletion is idempotent: a crash may have preceded it.
                 key_cleanup: Self::direct_key_cleanup(lease, &key_name),
-                only_if_unissued: false,
+                guard: FinalizeGuard::NotCancelled,
             },
         )?;
         Ok(())
     }
 
     /// Finalize a lease whose runtime key was never returned to the client
-    /// at zero: provisioning rows (callers hold lease_issue_lock), and
-    /// activations whose key was never delivered. Zero-charge successors are
+    /// at zero: provisioning rows, and activations whose key was never
+    /// delivered. Callers hold lease_issue_lock, so no issuance can deliver
+    /// the key meanwhile; the row is also fenced before signing, so that the
+    /// key can never be delivered afterwards. Zero-charge successors are
     /// always signed. A direct key that may exist is deleted in the background.
     fn finalize_never_delivered_lease(&self, client_request_id: &str) -> Result<(), ServerError> {
         let lease = self
@@ -1404,12 +1605,7 @@ impl RequestProcessor {
         if matches!(lease.status.as_str(), "finalized" | "cancelled") {
             return Ok(());
         }
-        if Self::may_have_delivered(&lease)
-            || !matches!(
-                lease.status.as_str(),
-                "provisioning" | "active" | "retiring" | "disabled" | "revoking"
-            )
-        {
+        if !Self::never_delivered(&lease) {
             return Err(ServerError::Internal(
                 "lease may have been delivered; it cannot settle at zero".into(),
             ));
@@ -1424,7 +1620,13 @@ impl RequestProcessor {
         if record.status != NullifierStatus::Reserved {
             return Err(ServerError::LeasePending);
         }
-        let request = &lease.api_request;
+        // Commit to the zero charge before signing it: from here on the key
+        // can neither be activated nor marked delivered.
+        if !self.store.fence_unissued_settlement(client_request_id)? {
+            return Err(ServerError::Internal(
+                "lease key was delivered before its zero settlement".into(),
+            ));
+        }
         let reason = match (lease.status.as_str(), lease.key_source.as_str()) {
             ("provisioning", "oa_org") => match lease.oa_provisioning_outcome {
                 OaProvisioningOutcome::NotStarted => "issuance_not_started",
@@ -1462,6 +1664,93 @@ impl RequestProcessor {
                 "direct:openrouter-unissued",
             )
         };
+        if !self.finalize_at_zero(
+            &lease,
+            body,
+            billing_label,
+            "unissued",
+            FinalizeGuard::Unissued,
+        )? {
+            return Ok(());
+        }
+        tracing::info!(
+            client_request_id = %lease.client_request_id,
+            reason,
+            "finalized a never-delivered lease at zero"
+        );
+        Ok(())
+    }
+
+    /// Finalize at zero a lease the operator reopened with a concession
+    /// (`charge_basis` "operator_conceded"), whatever was delivered: the
+    /// operator concedes its charge. Signed only once the binding, deployment
+    /// and signing key check out again. A direct key that may exist is
+    /// deleted in the background.
+    fn finalize_conceded_lease(&self, client_request_id: &str) -> Result<(), ServerError> {
+        let lease = self
+            .store
+            .try_lookup_openrouter_lease(client_request_id)?
+            .ok_or_else(|| ServerError::Internal("pending lease disappeared".into()))?;
+        if matches!(lease.status.as_str(), "finalized" | "cancelled") {
+            return Ok(());
+        }
+        if !Self::conceded(&lease) {
+            return Err(ServerError::Internal(
+                "lease charge was not conceded".into(),
+            ));
+        }
+        let record = match self.check_lease_binding(&lease)? {
+            LeaseBinding::Valid(record) => record,
+            LeaseBinding::Corrupt(detail) => return self.cancel_corrupt_lease(&lease, &detail),
+        };
+        if record.status == NullifierStatus::Finalized {
+            return self.reconcile_finalized_lease(&lease, &record);
+        }
+        if record.status != NullifierStatus::Reserved {
+            return Err(ServerError::LeasePending);
+        }
+        let source_type = if lease.key_source == "oa_org" {
+            "oa_org_ephemeral_lease_settlement"
+        } else {
+            "openrouter_ephemeral_lease_settlement"
+        };
+        let body = serde_json::json!({
+            "type": source_type,
+            "issued_at": lease.issued_at,
+            "expires_at": lease.expires_at,
+            "usage_usd": 0,
+            "charge_basis": "operator_conceded",
+            "settlement_reason": "operator_conceded",
+        });
+        let billing_label = format!("direct:{}-operator-conceded", lease.key_source);
+        if !self.finalize_at_zero(
+            &lease,
+            body,
+            &billing_label,
+            "operator_conceded",
+            FinalizeGuard::Conceded,
+        )? {
+            return Ok(());
+        }
+        tracing::info!(
+            client_request_id = %lease.client_request_id,
+            "finalized a reopened lease at zero; the operator conceded its charge"
+        );
+        Ok(())
+    }
+
+    /// Sign the zero-charge successor of a lease committed to it, then
+    /// finalize the row under `guard`. Returns false when the signer rejected
+    /// the saved request: the lease is then cancelled as a corrupt binding.
+    fn finalize_at_zero(
+        &self,
+        lease: &OpenRouterLeaseRecord,
+        body: serde_json::Value,
+        billing_label: &str,
+        charge_basis: &str,
+        guard: FinalizeGuard,
+    ) -> Result<bool, ServerError> {
+        let request = &lease.api_request;
         let payload = self.fallback_settlement_payload(request, body);
         match self.finalize_request(
             request,
@@ -1477,7 +1766,8 @@ impl RequestProcessor {
         ) {
             Ok(_) => {}
             Err(ServerError::InvalidProof(detail) | ServerError::InvalidRequest(detail)) => {
-                return self.cancel_corrupt_lease(&lease, &detail)
+                self.cancel_corrupt_lease(lease, &detail)?;
+                return Ok(false);
             }
             Err(error) => return Err(error),
         }
@@ -1487,12 +1777,12 @@ impl RequestProcessor {
             &LeaseFinalization {
                 usage_usd: 0.0,
                 charge_applied: 0,
-                charge_basis: "unissued",
+                charge_basis,
                 review: None,
                 // Best effort and outside every lock: retries now return the
                 // finalized response before any key creation.
-                key_cleanup: Self::direct_key_cleanup(&lease, &key_name),
-                only_if_unissued: lease.status == "provisioning",
+                key_cleanup: Self::direct_key_cleanup(lease, &key_name),
+                guard,
             },
         )?;
         if !finalized {
@@ -1501,12 +1791,7 @@ impl RequestProcessor {
                 "lease changed during zero settlement".into(),
             ));
         }
-        tracing::info!(
-            client_request_id = %lease.client_request_id,
-            reason,
-            "finalized a never-delivered lease at zero"
-        );
-        Ok(())
+        Ok(true)
     }
 
     /// Finalize a possibly delivered lease without provider I/O: at its
@@ -1660,7 +1945,7 @@ impl RequestProcessor {
                 charge_basis: basis,
                 review: Some(&review),
                 key_cleanup: Self::direct_key_cleanup(&lease, &key_name),
-                only_if_unissued: false,
+                guard: FinalizeGuard::NotCancelled,
             },
         )?;
         Ok(())
@@ -1790,85 +2075,31 @@ impl RequestProcessor {
         lease: &crate::nullifier_store::OpenRouterLeaseRecord,
         provisioner: &OpenRouterProvisioner,
     ) -> Result<(), ServerError> {
-        let record = match self.check_lease_binding(lease)? {
-            LeaseBinding::Valid(record) => record,
-            LeaseBinding::Corrupt(detail) => return self.cancel_corrupt_lease(lease, &detail),
+        // A corrupt binding is never signed. Its key, which may have been
+        // delivered, is still retired up to its captured usage first, retried
+        // like any settlement until its deadline (where the fallback cancels
+        // it without usage): the cancellation keeps that usage, so that a
+        // reopening charges it, and queues the key's deletion. Its review is
+        // recorded at once.
+        let corrupt = match self.check_lease_binding(lease)? {
+            LeaseBinding::Valid(record) if record.status == NullifierStatus::Finalized => {
+                // Also reconcile a legacy/crash-window finalized transcript; its
+                // key deletion is queued and retried in the background.
+                return self.reconcile_finalized_lease(lease, &record);
+            }
+            LeaseBinding::Valid(_) => None,
+            LeaseBinding::Corrupt(detail) => {
+                self.review_corrupt_binding(lease, &detail)?;
+                Some(detail)
+            }
         };
-        if record.status == NullifierStatus::Finalized {
-            // Also reconcile a legacy/crash-window finalized transcript; its
-            // key deletion is queued and retried in the background.
-            return self.reconcile_finalized_lease(lease, &record);
+        let usage_usd = self.capture_openrouter_usage(lease, provisioner).await?;
+        if let Some(detail) = corrupt {
+            return self.cancel_corrupt_lease(lease, &detail);
         }
         let key_hash = lease.key_hash.as_deref().ok_or_else(|| {
             ServerError::Internal("active OpenRouter lease has no key hash".to_string())
         })?;
-        let mut phase = lease.status.as_str();
-        let mut settle_after = lease.settle_after;
-        if phase == "active" {
-            self.store.advance_openrouter_retirement(
-                &lease.client_request_id,
-                "active",
-                "retiring",
-                current_timestamp(),
-                None,
-            )?;
-            phase = "retiring";
-        }
-        if phase == "retiring" {
-            provisioner.disable_key(key_hash).await?;
-            // OpenRouter does not issue a finalized receipt. Its aggregate
-            // accounting requires the configured drain/reconciliation interval
-            // after disabling, including when retiring a key before expiry.
-            let grace = self.lease_config()?.settlement_grace_seconds;
-            settle_after = current_timestamp().saturating_add(grace);
-            self.store.advance_openrouter_retirement(
-                &lease.client_request_id,
-                "retiring",
-                "disabled",
-                settle_after,
-                None,
-            )?;
-            phase = "disabled";
-        }
-        let usage_usd = if phase == "disabled" {
-            let now = current_timestamp();
-            if now < settle_after {
-                return Err(ServerError::LeaseSettlementPending {
-                    retry_after_seconds: settle_after - now,
-                });
-            }
-            let usage = provisioner.get_key_usage(key_hash).await?;
-            if !usage.disabled {
-                // The write-once deadline still applies across this cycle.
-                self.store.advance_openrouter_retirement(
-                    &lease.client_request_id,
-                    "disabled",
-                    "retiring",
-                    now,
-                    None,
-                )?;
-                return Err(ServerError::Internal(
-                    "OpenRouter settlement key is still enabled".to_string(),
-                ));
-            }
-            // Capture usage durably before deletion makes it unavailable.
-            self.store.advance_openrouter_retirement(
-                &lease.client_request_id,
-                "disabled",
-                "revoking",
-                now,
-                Some(usage.usage_usd),
-            )?;
-            usage.usage_usd
-        } else if phase == "revoking" {
-            lease.usage_usd.ok_or_else(|| {
-                ServerError::Unsettleable(
-                    "OpenRouter revocation has no persisted usage".to_string(),
-                )
-            })?
-        } else {
-            return Err(ServerError::LeasePending);
-        };
         // Fail closed until the deadline. A 503 or ambiguous DELETE leaves the
         // nullifier reserved and the revoking lease visible to the scanner.
         provisioner.delete_key(key_hash).await?;
@@ -1930,6 +2161,87 @@ impl RequestProcessor {
         self.finish_measured_settlement(lease, usage_usd, response.charge_applied, basis, review)
     }
 
+    /// Retire a direct key up to its captured usage, persisting each phase
+    /// before its side effect: disable it (retiring), wait out the provider's
+    /// drain interval (disabled), then capture its usage (revoking). A
+    /// revoking lease returns the usage captured earlier.
+    async fn capture_openrouter_usage(
+        &self,
+        lease: &OpenRouterLeaseRecord,
+        provisioner: &OpenRouterProvisioner,
+    ) -> Result<f64, ServerError> {
+        let key_hash = lease.key_hash.as_deref().ok_or_else(|| {
+            ServerError::Internal("active OpenRouter lease has no key hash".to_string())
+        })?;
+        let mut phase = lease.status.as_str();
+        let mut settle_after = lease.settle_after;
+        if phase == "active" {
+            self.store.advance_openrouter_retirement(
+                &lease.client_request_id,
+                "active",
+                "retiring",
+                current_timestamp(),
+                None,
+            )?;
+            phase = "retiring";
+        }
+        if phase == "retiring" {
+            provisioner.disable_key(key_hash).await?;
+            // OpenRouter does not issue a finalized receipt. Its aggregate
+            // accounting requires the configured drain/reconciliation interval
+            // after disabling, including when retiring a key before expiry.
+            let grace = self.lease_config()?.settlement_grace_seconds;
+            settle_after = current_timestamp().saturating_add(grace);
+            self.store.advance_openrouter_retirement(
+                &lease.client_request_id,
+                "retiring",
+                "disabled",
+                settle_after,
+                None,
+            )?;
+            phase = "disabled";
+        }
+        if phase == "disabled" {
+            let now = current_timestamp();
+            if now < settle_after {
+                return Err(ServerError::LeaseSettlementPending {
+                    retry_after_seconds: settle_after - now,
+                });
+            }
+            let usage = provisioner.get_key_usage(key_hash).await?;
+            if !usage.disabled {
+                // The write-once deadline still applies across this cycle.
+                self.store.advance_openrouter_retirement(
+                    &lease.client_request_id,
+                    "disabled",
+                    "retiring",
+                    now,
+                    None,
+                )?;
+                return Err(ServerError::Internal(
+                    "OpenRouter settlement key is still enabled".to_string(),
+                ));
+            }
+            // Capture usage durably before deletion makes it unavailable.
+            self.store.advance_openrouter_retirement(
+                &lease.client_request_id,
+                "disabled",
+                "revoking",
+                now,
+                Some(usage.usage_usd),
+            )?;
+            Ok(usage.usage_usd)
+        } else if phase == "revoking" {
+            lease.usage_usd.ok_or_else(|| {
+                ServerError::Unsettleable(
+                    "OpenRouter revocation has no persisted usage".to_string(),
+                )
+            })
+        } else {
+            Err(ServerError::LeasePending)
+        }
+    }
+
     /// A signing failure caused by the persisted request itself cannot heal.
     fn deterministic_as_unsettleable(error: ServerError) -> ServerError {
         match error {
@@ -1964,7 +2276,7 @@ impl RequestProcessor {
                 charge_basis: basis,
                 review: review.as_ref(),
                 key_cleanup: None,
-                only_if_unissued: false,
+                guard: FinalizeGuard::NotCancelled,
             },
         )?;
         Ok(())
@@ -2295,6 +2607,8 @@ impl RequestProcessor {
             .lookup_openrouter_lease(client_request_id)
             .map(|lease| OpenRouterLeaseStatusResponse {
                 settlement_deadline: self.pending_settlement_deadline(&lease, now),
+                // The basis of a finalized charge only.
+                charge_basis: lease.charge_basis.filter(|_| lease.status == "finalized"),
                 status: lease.status,
                 client_request_id: lease.client_request_id,
                 issued_at: lease.issued_at,
@@ -2304,7 +2618,6 @@ impl RequestProcessor {
                 usage_usd: lease.usage_usd,
                 charge_applied: lease.charge_applied,
                 last_error: lease.last_error,
-                charge_basis: lease.charge_basis,
             })
     }
 
@@ -2582,6 +2895,7 @@ impl RequestProcessor {
                     key_source: lease.key_source,
                     status: lease.status,
                     delivered: lease.delivered,
+                    charge_basis: lease.charge_basis,
                     expires_at: lease.expires_at,
                     settle_after: lease.settle_after,
                     settlement_deadline: deadline,
@@ -4970,6 +5284,59 @@ mod tests {
             .map(|stored| stored.review)
     }
 
+    /// A genuine browser-wallet lease request under `oa_lease_processor`'s
+    /// deployment and keys (a real Groth16 proof over a fresh note), with the
+    /// wallet state and journal that install its successor.
+    fn browser_lease_request(
+        id: &str,
+    ) -> (
+        zkapi_browser::BrowserWalletConfig,
+        zkapi_browser::BrowserNoteState,
+        zkapi_browser::PreparedRequest,
+    ) {
+        let mut wallet_server = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        wallet_server.config.request_charge_cap = 400_000;
+        let (wallet, state, tree) = crate::test_support::browser_note(&wallet_server, 2_000_000);
+        let now = current_timestamp();
+        let key =
+            std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
+        let prepared = zkapi_browser::prepare_request(
+            &wallet,
+            &state,
+            zkapi_browser::PrepareRequestArgs {
+                payload: crate::test_support::lease_payload(&wallet_server.config, now),
+                active_root: tree.root(),
+                merkle_siblings: tree.get_siblings(0).to_vec(),
+                client_request_id: id.into(),
+                request_time: now,
+                created_at_ms: now * 1000,
+            },
+            &key,
+        )
+        .unwrap();
+        (wallet, state, prepared)
+    }
+
+    /// The store-level reopening without verifying the saved request: what
+    /// an operator tool that skipped verification (or a database edit after
+    /// a reopening) leaves for the server.
+    fn reopen_unverified(
+        store: &NullifierStore,
+        client_request_id: &str,
+        options: crate::nullifier_store::ReopenOptions<'_>,
+        now: u64,
+    ) -> Result<crate::nullifier_store::ReopenedLease, crate::nullifier_store::ReopenRefusal> {
+        store.reopen_cancelled_lease(client_request_id, options, &|_| None, now)
+    }
+
+    fn conceded() -> crate::nullifier_store::ReopenOptions<'static> {
+        crate::nullifier_store::ReopenOptions {
+            zero_charge: true,
+            rebind: false,
+            saved_request: None,
+        }
+    }
+
     fn frozen_quote(request: &ApiRequestV2) -> serde_json::Value {
         serde_json::from_str::<serde_json::Value>(&request.payload).unwrap()["billing_quote"]
             .clone()
@@ -6085,6 +6452,2167 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.current_balance, 2_000_000 - 400_000);
+    }
+
+    // ---- Zero settlement vs. key delivery (review: unsettleable lease) ------
+
+    /// The fixture's lease row as production issuance creates it for a new
+    /// request: delivered = false, with its TTL and write-once deadline.
+    fn production_issuance_row(processor: &RequestProcessor, request: &ApiRequestV2, oa: bool) {
+        processor
+            .store
+            .remove_failed_openrouter_lease(&request.client_request_id)
+            .unwrap();
+        let oa_id = oa.then(|| RequestProcessor::native_oa_request_id(request).unwrap());
+        let lease_config = processor.config.openrouter_leases.clone().unwrap();
+        processor
+            .create_issuance_lease(request, &lease_config, 3.0, oa_id.as_deref())
+            .unwrap();
+    }
+
+    /// A chain RPC reporting every request nullifier unspent; its
+    /// `park_at`-th usedNullifiers read waits for a permit of the returned
+    /// semaphore. Issuance's post-activation read is the second.
+    async fn parked_spend_rpc(
+        processor: &mut RequestProcessor,
+        park_at: usize,
+    ) -> (
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Semaphore>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (notify, permits) = (parked.clone(), release.clone());
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let (reads, notify, permits) = (reads.clone(), notify.clone(), permits.clone());
+                async move {
+                    let chain_id = body["method"] == "eth_chainId";
+                    if !chain_id && reads.fetch_add(1, Ordering::SeqCst) + 1 == park_at {
+                        notify.notify_one();
+                        permits.acquire().await.unwrap().forget();
+                    }
+                    let result = if chain_id {
+                        "0x1".to_string()
+                    } else {
+                        format!("0x{:064x}", 0)
+                    };
+                    axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        configure_issuance_rpc(
+            processor,
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (parked, release, server)
+    }
+
+    /// A chain RPC answering every read after `latency`: request nullifiers
+    /// are unspent, and the oracle's finalized round is `round`, at $1000,
+    /// updated at `updated_at`.
+    async fn slow_chain_rpc(
+        processor: &mut RequestProcessor,
+        latency: Duration,
+        updated_at: u64,
+        round: Arc<std::sync::atomic::AtomicU64>,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let round = round.clone();
+                async move {
+                    tokio::time::sleep(latency).await;
+                    let data = body["params"][0]["data"].as_str().unwrap_or_default();
+                    let result = if body["method"] == "eth_chainId" {
+                        "0x1".to_string()
+                    } else if data == "0x313ce567" {
+                        format!("0x{:064x}", 8)
+                    } else if data == "0x4d1352fd" {
+                        format!("0x{:064x}", 1_000_000_000)
+                    } else if data.starts_with("0x9a6fc8f5") || data == "0xfeaf968c" {
+                        let round = if data == "0xfeaf968c" {
+                            round.load(std::sync::atomic::Ordering::SeqCst)
+                        } else {
+                            u64::from_str_radix(&data[10..], 16).unwrap()
+                        };
+                        format!(
+                            "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
+                            round, 100_000_000_000u64, updated_at, updated_at, round
+                        )
+                    } else {
+                        // usedNullifiers(request_nullifier): false.
+                        format!("0x{:064x}", 0)
+                    };
+                    axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        configure_issuance_rpc(
+            processor,
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
+    }
+
+    fn spawn_issuance(
+        processor: &Arc<RequestProcessor>,
+        request: &ApiRequestV2,
+    ) -> tokio::task::JoinHandle<Result<IssuedOpenRouterLease, ServerError>> {
+        let (processor, request) = (processor.clone(), request.clone());
+        tokio::spawn(async move { processor.issue_openrouter_lease(&request).await })
+    }
+
+    fn spawn_retirement(
+        processor: &Arc<RequestProcessor>,
+        request: &ApiRequestV2,
+    ) -> tokio::task::JoinHandle<Result<OpenRouterLeaseStatusResponse, ServerError>> {
+        let (processor, request) = (processor.clone(), request.clone());
+        tokio::spawn(async move {
+            processor
+                .retire_openrouter_lease(&request.client_request_id, &request)
+                .await
+        })
+    }
+
+    /// The review's invariant: a key returned to the client never belongs to
+    /// a lease committed to, or finalized at, zero as never delivered.
+    fn assert_returned_key_settles_from_usage(
+        processor: &RequestProcessor,
+        request: &ApiRequestV2,
+        issued: &Result<IssuedOpenRouterLease, ServerError>,
+        context: &str,
+    ) {
+        let lease = processor
+            .store
+            .lookup_openrouter_lease(&request.client_request_id)
+            .unwrap();
+        let record = record_of(processor, request);
+        let zero_unissued = lease.charge_basis.as_deref() == Some("unissued")
+            || (record.status == NullifierStatus::Finalized
+                && payload_of(&record)["charge_basis"] == "unissued");
+        match issued {
+            Ok(_) => {
+                assert!(
+                    !zero_unissued,
+                    "{context}: a returned key settled at zero: {lease:?}"
+                );
+                assert_eq!(lease.delivered, Some(true), "{context}");
+            }
+            Err(_) => assert_ne!(lease.delivered, Some(true), "{context}"),
+        }
+    }
+
+    /// Review regression (unsettleable lease #1), deterministic: the client
+    /// retires its own lease while issuance waits in the post-activation
+    /// chain read. The retirement waits for that issuance, which returns the
+    /// key, then settles the delivered lease from usage, never at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retirement_waits_for_in_flight_issuance_of_its_key() {
+        for oa in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+            let (mut processor, request, server) = issuance_processor(oa, state).await;
+            production_issuance_row(&processor, &request, oa);
+            let (parked, release, rpc) = parked_spend_rpc(&mut processor, 2).await;
+            let processor = Arc::new(processor);
+            let issuance = spawn_issuance(&processor, &request);
+            parked.notified().await;
+            let lease = processor
+                .store
+                .lookup_openrouter_lease(&request.client_request_id)
+                .unwrap();
+            assert_eq!(
+                (lease.status.as_str(), lease.delivered),
+                ("active", Some(false))
+            );
+            let retirement = spawn_retirement(&processor, &request);
+            // Nothing settles the key while issuance may still return it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !retirement.is_finished(),
+                "oa={oa}: retirement did not wait for issuance"
+            );
+            assert_eq!(
+                record_of(&processor, &request).status,
+                NullifierStatus::Reserved
+            );
+            release.add_permits(1);
+            let issued = issuance.await.unwrap();
+            assert_eq!(
+                issued
+                    .as_ref()
+                    .map(|issued| issued.lease.api_key.as_str())
+                    .ok(),
+                Some("runtime-key"),
+                "oa={oa}"
+            );
+            // It then settles the delivered key from usage, which this
+            // provider mock never reports.
+            assert!(retirement.await.unwrap().is_err());
+            assert_returned_key_settles_from_usage(
+                &processor,
+                &request,
+                &issued,
+                &format!("oa={oa}"),
+            );
+            assert_eq!(
+                record_of(&processor, &request).status,
+                NullifierStatus::Reserved
+            );
+            rpc.abort();
+            server.abort();
+        }
+    }
+
+    /// Review regression (unsettleable lease #1), stress: on a multi-threaded
+    /// runtime the client retires its lease while issuance is in flight,
+    /// parked in its last chain read and released at varying moments, and,
+    /// unparked on a file-backed database, at a moment an attacker would pick
+    /// from the public lease status. A key returned to the client is never
+    /// settled at zero as never delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retirement_racing_key_delivery_never_frees_a_returned_key() {
+        let iterations: u64 = std::env::var("ZKAPI_RACE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(24);
+        let mut seed = current_timestamp_ms();
+        let mut returned = 0;
+        for iteration in 0..iterations {
+            for oa in [false, true] {
+                let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+                let (mut processor, request, server) = issuance_processor(oa, state).await;
+                production_issuance_row(&processor, &request, oa);
+                let (parked, release, rpc) = parked_spend_rpc(&mut processor, 2).await;
+                let processor = Arc::new(processor);
+                let issuance = spawn_issuance(&processor, &request);
+                parked.notified().await;
+                let retirement = spawn_retirement(&processor, &request);
+                let delay = Duration::from_micros((iteration % 6) * 250);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                release.add_permits(1);
+                let issued = issuance.await.unwrap();
+                let _ = retirement.await.unwrap();
+                let context = format!("parked oa={oa} iteration={iteration}");
+                assert_returned_key_settles_from_usage(&processor, &request, &issued, &context);
+                returned += u64::from(issued.is_ok());
+                rpc.abort();
+                server.abort();
+
+                let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+                let (mut processor, request, server) = issuance_processor(oa, state).await;
+                let directory = tempfile::tempdir().unwrap();
+                let store =
+                    Arc::new(NullifierStore::new(directory.path().join("server.db")).unwrap());
+                store.reserve_openrouter_lease(&request).unwrap();
+                processor.store = store;
+                production_issuance_row(&processor, &request, oa);
+                let round = Arc::new(std::sync::atomic::AtomicU64::new(123));
+                let rpc = slow_chain_rpc(&mut processor, Duration::from_millis(5), 0, round).await;
+                let processor = Arc::new(processor);
+                let issuance = spawn_issuance(&processor, &request);
+                while !issuance.is_finished()
+                    && processor
+                        .openrouter_lease_status(&request.client_request_id)
+                        .is_none_or(|status| status.status != "active")
+                {
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+                // A random moment of the 10 ms post-activation read.
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                std::thread::sleep(Duration::from_micros((seed >> 33) % 10_000));
+                let retirement = spawn_retirement(&processor, &request);
+                let issued = issuance.await.unwrap();
+                let _ = retirement.await.unwrap();
+                let context = format!("timed oa={oa} iteration={iteration}");
+                assert_returned_key_settles_from_usage(&processor, &request, &issued, &context);
+                returned += u64::from(issued.is_ok());
+                rpc.abort();
+                server.abort();
+            }
+        }
+        // Retirement never cancels an issuance in flight.
+        assert_eq!(returned, iterations * 4);
+    }
+
+    /// Review regression (unsettleable lease #1), sweep: an activated lease
+    /// whose key was not returned settles at zero only under the issuance
+    /// lock. While an issuance holds it, and may still return the key, the
+    /// sweep defers the lease; once the lock is free it settles it at zero.
+    #[tokio::test]
+    async fn sweep_defers_undelivered_activation_while_issuance_holds_the_lock() {
+        let processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        let now = current_timestamp();
+        let request = lease_request_for(&processor, "undelivered-due", 610, None);
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now + 3_600),
+                key_hash: Some("undelivered-hash"),
+                delivered: Some(false),
+                ttl: Some(300),
+            },
+        );
+        let issue_guard = processor.lease_issue_lock.lock().await;
+        processor.settle_due_openrouter_leases().await;
+        let lease = processor
+            .store
+            .lookup_openrouter_lease(&request.client_request_id)
+            .unwrap();
+        assert_eq!(
+            (lease.status.as_str(), lease.charge_basis),
+            ("active", None)
+        );
+        assert_eq!(
+            record_of(&processor, &request).status,
+            NullifierStatus::Reserved
+        );
+        drop(issue_guard);
+        processor.settle_due_openrouter_leases().await;
+        let record = record_of(&processor, &request);
+        assert_eq!(record.charge_applied, Some(0));
+        assert_eq!(payload_of(&record)["reason"], "key_never_delivered");
+    }
+
+    /// Defense in depth: a lease fenced for a zero settlement while issuance
+    /// waited in its last chain read never returns its key. A direct key is
+    /// queued for deletion at once; the OA org offers no revocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fenced_lease_never_returns_its_key() {
+        for oa in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+            let (mut processor, request, server) = issuance_processor(oa, state.clone()).await;
+            production_issuance_row(&processor, &request, oa);
+            let (parked, release, rpc) = parked_spend_rpc(&mut processor, 2).await;
+            let processor = Arc::new(processor);
+            let issuance = spawn_issuance(&processor, &request);
+            parked.notified().await;
+            assert!(processor
+                .store
+                .fence_unissued_settlement(&request.client_request_id)
+                .unwrap());
+            release.add_permits(1);
+            let issued = issuance.await.unwrap();
+            assert!(issued.is_err(), "oa={oa}: a fenced lease returned its key");
+            assert_returned_key_settles_from_usage(
+                &processor,
+                &request,
+                &issued,
+                &format!("oa={oa}"),
+            );
+            assert_eq!(
+                processor.settlement_counts().unwrap().pending_key_cleanups,
+                u64::from(!oa)
+            );
+            processor.settle_due_openrouter_leases().await;
+            let record = record_of(&processor, &request);
+            assert_eq!(record.charge_applied, Some(0));
+            let payload = payload_of(&record);
+            assert_eq!(payload["charge_basis"], "unissued");
+            assert_eq!(payload["reason"], "key_never_delivered");
+            let cleanup = state.lock().unwrap().cleanup.clone();
+            if oa {
+                assert!(cleanup.is_empty());
+            } else {
+                assert_eq!(cleanup, ["disable:test-hash", "delete:test-hash"]);
+            }
+            rpc.abort();
+            server.abort();
+        }
+    }
+
+    /// A direct provisioning row, never delivered, past its write-once
+    /// deadline, replacing the fixture's row.
+    fn overdue_provisioning_row(processor: &RequestProcessor, request: &ApiRequestV2, now: u64) {
+        processor
+            .store
+            .remove_failed_openrouter_lease(&request.client_request_id)
+            .unwrap();
+        processor
+            .store
+            .create_openrouter_lease_bound(&NewOpenRouterLease {
+                request,
+                key_source: "openrouter",
+                issued_at: now - 100_000,
+                expires_at: now - 99_700,
+                settle_after: now - 99_700,
+                spending_limit_usd: 3.0,
+                oa_client_request_id: None,
+                ttl_seconds: Some(300),
+                settlement_deadline_at: Some(now - 50_000),
+                delivered: Some(false),
+            })
+            .unwrap();
+    }
+
+    /// Review regression (unsettleable lease #2): a closed-loop flood of
+    /// proof-less /expire calls, each of which used to hold the issuance lock
+    /// across five oracle reads, cannot keep never-delivered leases past
+    /// their deadline from finalizing at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expire_flood_cannot_postpone_overdue_zero_settlements() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+        let (mut processor, direct, server) = issuance_processor(false, state).await;
+        let now = current_timestamp();
+        overdue_provisioning_row(&processor, &direct, now);
+        let oa = lease_request_for(&processor, "oa-overdue", 601, None);
+        add_lease(
+            &processor,
+            &oa,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 29_700,
+                deadline: Some(now - 8_000),
+                key_hash: None,
+                delivered: Some(false),
+                ttl: Some(300),
+            },
+        );
+        let round = Arc::new(AtomicU64::new(123));
+        let rpc = slow_chain_rpc(&mut processor, Duration::from_millis(15), now - 5, round).await;
+        let processor = Arc::new(processor);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let attackers: Vec<_> = (0..4u64)
+            .map(|worker| {
+                let (processor, template) = (processor.clone(), direct.clone());
+                let (stop, sent) = (stop.clone(), sent.clone());
+                tokio::spawn(async move {
+                    let mut n = worker * 1_000_000;
+                    while !stop.load(Ordering::SeqCst) {
+                        // A random ID and nullifier with a current quote and
+                        // no proof: all /expire needs.
+                        n += 1;
+                        let mut request = template.clone();
+                        request.client_request_id = format!("attacker-{n}");
+                        request.public_inputs.request_nullifier = Felt252::from_u64(9_000_000 + n);
+                        request.payload =
+                            crate::test_support::lease_payload(&processor.config, now - 5);
+                        request.payload_hash = canonical_payload_hash(request.payload.as_bytes());
+                        let _ = processor
+                            .expire_unaccepted_native_lease(&request.client_request_id, &request)
+                            .await;
+                        sent.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        while sent.load(Ordering::SeqCst) < 8 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finalized = |request: &ApiRequestV2| {
+            record_of(&processor, request).status == NullifierStatus::Finalized
+        };
+        let mut ticks = 0;
+        while ticks < 10 && !(finalized(&direct) && finalized(&oa)) {
+            processor.settle_due_openrouter_leases().await;
+            ticks += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let settled_under_flood = finalized(&direct) && finalized(&oa);
+        stop.store(true, Ordering::SeqCst);
+        for attacker in attackers {
+            attacker.await.unwrap();
+        }
+        assert!(
+            settled_under_flood,
+            "the flood kept overdue leases reserved through {ticks} sweep ticks"
+        );
+        for request in [&direct, &oa] {
+            let record = record_of(&processor, request);
+            assert_eq!(record.charge_applied, Some(0));
+            assert_eq!(payload_of(&record)["charge_basis"], "unissued");
+        }
+        rpc.abort();
+        server.abort();
+    }
+
+    /// Review regression (unsettleable lease #2): past its deadline, a
+    /// never-delivered lease waits for a busy issuance lock, bounded, instead
+    /// of skipping it every tick; a lock held past the bound still lets the
+    /// tick finish its other work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overdue_zero_settlement_waits_a_bounded_time_for_the_issuance_lock() {
+        let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+        let (mut processor, request, server) = issuance_processor(false, state).await;
+        let now = current_timestamp();
+        overdue_provisioning_row(&processor, &request, now);
+        // A possibly delivered lease past its deadline needs no issuance lock.
+        let delivered = lease_request_for(&processor, "delivered-overdue", 602, None);
+        add_lease(
+            &processor,
+            &delivered,
+            LeaseSetup {
+                key_source: "openrouter",
+                expires_at: now - 100,
+                deadline: Some(now - 1),
+                key_hash: Some("delivered-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        processor.timing.issue_lock_timeout = Duration::from_millis(200);
+        let processor = Arc::new(processor);
+        let hold = |duration: Duration| {
+            let (processor, acquired) = (processor.clone(), Arc::new(tokio::sync::Notify::new()));
+            let notify = acquired.clone();
+            let holder = tokio::spawn(async move {
+                let _issue_guard = processor.lease_issue_lock.lock().await;
+                notify.notify_one();
+                tokio::time::sleep(duration).await;
+            });
+            (acquired, holder)
+        };
+        // Held past the bound: the tick finishes its other work and retries
+        // the lease next tick.
+        let (acquired, holder) = hold(Duration::from_secs(5));
+        acquired.notified().await;
+        let started = Instant::now();
+        processor.settle_due_openrouter_leases().await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let lease_status = |request: &ApiRequestV2| {
+            processor
+                .store
+                .lookup_openrouter_lease(&request.client_request_id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(lease_status(&request), "provisioning");
+        assert_eq!(lease_status(&delivered), "finalized");
+        assert_eq!(
+            record_of(&processor, &delivered).charge_applied,
+            Some(delivered.public_inputs.solvency_bound)
+        );
+        holder.abort();
+        let _ = holder.await;
+        // Released within the bound: the same tick finalizes it at zero.
+        let (acquired, holder) = hold(Duration::from_millis(50));
+        acquired.notified().await;
+        processor.settle_due_openrouter_leases().await;
+        holder.await.unwrap();
+        let record = record_of(&processor, &request);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(0));
+        server.abort();
+    }
+
+    /// Review regression (unsettleable lease #2): /expire holds the issuance
+    /// lock only to check that nothing reserved the request, never across its
+    /// oracle reads, and checks again before acknowledging: a request reserved
+    /// meanwhile is never acknowledged as unaccepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expire_releases_the_issuance_lock_during_oracle_reads() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        let updated_at = current_timestamp() - 5;
+        let latest = Arc::new(std::sync::atomic::AtomicU64::new(123));
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = {
+            let (latest, notify, permits) = (latest.clone(), parked.clone(), release.clone());
+            let parked_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            axum::Router::new().route(
+                "/",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let (latest, notify, permits, parked_once) = (
+                        latest.clone(),
+                        notify.clone(),
+                        permits.clone(),
+                        parked_once.clone(),
+                    );
+                    async move {
+                        let data = body["params"][0]["data"].as_str().unwrap_or_default();
+                        let result = if body["method"] == "eth_chainId" {
+                            "0x1".to_string()
+                        } else if data == "0x313ce567" {
+                            format!("0x{:064x}", 8)
+                        } else if data == "0x4d1352fd" {
+                            format!("0x{:064x}", 1_000_000_000)
+                        } else {
+                            let round = if data == "0xfeaf968c" {
+                                latest.load(std::sync::atomic::Ordering::SeqCst)
+                            } else {
+                                // The first read of the quoted round waits.
+                                if !parked_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    notify.notify_one();
+                                    permits.acquire().await.unwrap().forget();
+                                }
+                                123
+                            };
+                            format!(
+                                "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
+                                round, 100_000_000_000u64, updated_at, updated_at, round
+                            )
+                        };
+                        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}))
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        configure_issuance_rpc(
+            &mut processor,
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let rpc = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let payload = crate::test_support::lease_payload(&processor.config, updated_at);
+        let reserved =
+            lease_request_for(&processor, "reserved-meanwhile", 606, Some(payload.clone()));
+        let unaccepted = lease_request_for(&processor, "superseded", 607, Some(payload));
+        let processor = Arc::new(processor);
+        let expiry = {
+            let (processor, request) = (processor.clone(), reserved.clone());
+            tokio::spawn(async move {
+                processor
+                    .expire_unaccepted_native_lease(&request.client_request_id, &request)
+                    .await
+            })
+        };
+        parked.notified().await;
+        // The oracle read runs without the issuance lock...
+        drop(
+            processor
+                .lease_issue_lock
+                .try_lock()
+                .expect("/expire held the issuance lock across its oracle reads"),
+        );
+        // ...while an issuance reserves the request, and a newer round
+        // finalizes.
+        processor.store.reserve_openrouter_lease(&reserved).unwrap();
+        latest.store(124, std::sync::atomic::Ordering::SeqCst);
+        release.add_permits(1);
+        assert!(matches!(
+            expiry.await.unwrap(),
+            Err(ServerError::LeasePending)
+        ));
+        // An unreserved request is acknowledged as superseded.
+        let ack = processor
+            .expire_unaccepted_native_lease(&unaccepted.client_request_id, &unaccepted)
+            .await
+            .unwrap();
+        assert_eq!(ack["status"], "superseded_unaccepted");
+        rpc.abort();
+    }
+
+    // ---- Reopening a cancelled lease (review: binding_corrupt remediation) --
+
+    /// Review regression (cancelled-lease remediation): the offline reopen
+    /// command and a serving processor exclude each other through the
+    /// database writer lock, and the command never creates a database.
+    #[test]
+    fn reopen_command_and_server_exclude_each_other() {
+        use crate::nullifier_store::OfflineStore;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        let error = OfflineStore::open(&path).err().unwrap();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        let (config, signer) = (processor.config.clone(), processor.signer.clone());
+        drop(processor);
+        let offline = OfflineStore::open(&path).unwrap();
+        let store = || Arc::new(NullifierStore::new(&path).unwrap());
+        assert!(
+            RequestProcessor::try_new(config.clone(), store(), signer.clone(), Felt252::ZERO)
+                .is_err()
+        );
+        drop(offline);
+        assert!(RequestProcessor::try_new(config, store(), signer, Felt252::ZERO).is_ok());
+        let missing = directory.path().join("missing.db");
+        assert!(OfflineStore::open(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    /// Review regression (cancelled-lease remediation): a lease cancelled for
+    /// a corrupt binding is reopened once the operator repairs the binding;
+    /// the next sweep checks the binding again and finalizes it with a
+    /// signed successor that the browser wallet installs: from measured
+    /// usage, at the solvency bound past its deadline, at zero when never
+    /// delivered, and at zero when the operator concedes the charge.
+    #[test]
+    fn reopened_lease_settles_with_a_successor_the_wallet_installs() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        use zkapi_browser::{CompleteResponseArgs, PrepareRequestArgs};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (usage_url, usage_server, usage_calls) = runtime.block_on(oa_usage_server(1_234, 5));
+        let serving = |path: &std::path::Path| {
+            let mut processor = oa_lease_processor(Arc::new(NullifierStore::new(path).unwrap()));
+            processor.config.request_charge_cap = 400_000;
+            processor.oa_org = Some(Arc::new(
+                OaOrgProvisioner::new(usage_url.clone(), "test-secret".into()).unwrap(),
+            ));
+            processor
+        };
+        // One real browser request, settled in a fresh database per case.
+        let mut wallet_server = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        wallet_server.config.request_charge_cap = 400_000;
+        let (wallet, state, tree) = crate::test_support::browser_note(&wallet_server, 2_000_000);
+        let now = current_timestamp();
+        let key =
+            std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
+        let prepared = zkapi_browser::prepare_request(
+            &wallet,
+            &state,
+            PrepareRequestArgs {
+                payload: crate::test_support::lease_payload(&wallet_server.config, now),
+                active_root: tree.root(),
+                merkle_siblings: tree.get_siblings(0).to_vec(),
+                client_request_id: "reopened-lease".into(),
+                request_time: now,
+                created_at_ms: now * 1000,
+            },
+            &key,
+        )
+        .unwrap();
+        drop(wallet_server);
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let request = prepared.request;
+        let id = request.client_request_id.clone();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let bound = request.public_inputs.solvency_bound;
+        for (case, delivered, deadline, zero_charge, settles, charge, basis) in [
+            (
+                "measured",
+                Some(true),
+                now + 3_600,
+                false,
+                "measured_until_deadline",
+                1_234,
+                "measured",
+            ),
+            (
+                "bound",
+                Some(true),
+                now - 1,
+                false,
+                "deadline_fallback",
+                bound,
+                "worst_case",
+            ),
+            (
+                "never delivered",
+                Some(false),
+                now + 3_600,
+                false,
+                "zero_never_delivered",
+                0,
+                "unissued",
+            ),
+            (
+                "conceded",
+                Some(true),
+                now + 3_600,
+                true,
+                "operator_conceded",
+                0,
+                "operator_conceded",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let set_payload_hash = |store: &NullifierStore, payload_hash: String| {
+                store.execute_for_test(
+                    "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+                    rusqlite::params![payload_hash, nullifier],
+                );
+            };
+            let processor = serving(&path);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(deadline),
+                    key_hash: Some("reopen-hash"),
+                    delivered,
+                    ttl: Some(300),
+                },
+            );
+            // A database fault: the reservation's payload hash changes.
+            set_payload_hash(&processor.store, "0x1".into());
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let status = processor.openrouter_lease_status(&id).unwrap();
+            assert_eq!(status.status, "cancelled", "{case}");
+            assert_eq!(
+                record_of(&processor, &request).status,
+                NullifierStatus::Reserved
+            );
+            let cancelled = review_of(&processor, &request).unwrap();
+            assert_eq!(cancelled.reason, "binding_corrupt");
+            assert!(
+                cancelled.detail.contains("nullifiers.payload_hash"),
+                "{}",
+                cancelled.detail
+            );
+            // The operator stops the server and reopens the lease, which is
+            // refused until the binding is repaired.
+            drop(processor);
+            {
+                let offline = OfflineStore::open(&path).unwrap();
+                let options = ReopenOptions {
+                    zero_charge,
+                    rebind: false,
+                    saved_request: None,
+                };
+                match offline.reopen_cancelled_lease(&id, options, &verifier) {
+                    Err(ReopenRefusal::BindingCorrupt(mismatch)) => {
+                        assert_eq!(mismatch.field, "nullifiers.payload_hash")
+                    }
+                    other => panic!("{case}: expected a binding refusal, got {other:?}"),
+                }
+                set_payload_hash(
+                    &NullifierStore::new(&path).unwrap(),
+                    request.payload_hash.to_hex(),
+                );
+                let reopened = offline
+                    .reopen_cancelled_lease(&id, options, &verifier)
+                    .unwrap();
+                assert_eq!(
+                    (reopened.status.as_str(), reopened.settles),
+                    ("active", settles),
+                    "{case}"
+                );
+                assert_eq!(reopened.settlement_deadline_at, Some(deadline));
+            }
+            // The restarted server finalizes it on its next sweep.
+            let calls = *usage_calls.lock().unwrap();
+            let processor = serving(&path);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let status = processor.openrouter_lease_status(&id).unwrap();
+            assert_eq!(
+                (status.status.as_str(), status.charge_basis.as_deref()),
+                ("finalized", Some(basis)),
+                "{case}"
+            );
+            assert_eq!(
+                *usage_calls.lock().unwrap() - calls,
+                usize::from(case == "measured"),
+                "{case}"
+            );
+            let response = processor
+                .recover_by_client_id(&id)
+                .unwrap()
+                .request_response
+                .unwrap();
+            assert_eq!(response.charge_applied, charge, "{case}");
+            let payload: serde_json::Value =
+                serde_json::from_str(&response.response_payload).unwrap();
+            assert_eq!(payload["charge_basis"], basis);
+            assert_eq!(payload["billing_quote"], frozen_quote(&request));
+            let next = zkapi_browser::complete_response(
+                &wallet,
+                CompleteResponseArgs {
+                    state: state.clone(),
+                    journal: prepared.journal.clone(),
+                    response,
+                },
+            )
+            .unwrap();
+            assert_eq!(next.current_balance, 2_000_000 - charge, "{case}");
+            // The cancellation's review was handled; the reopening is open.
+            let reviews = processor.store.settlement_reviews(10).unwrap();
+            assert!(reviews
+                .iter()
+                .any(|stored| stored.review.reason == "binding_corrupt"
+                    && stored.acknowledged_at.is_some()));
+            assert!(reviews
+                .iter()
+                .any(|stored| stored.review.reason == "binding_reopened"
+                    && stored.acknowledged_at.is_none()));
+        }
+        usage_server.abort();
+    }
+
+    /// Review regression (cancelled-lease remediation): the server checks a
+    /// reopened lease's binding, deployment and signing key again before it
+    /// signs anything. A binding corrupt again is cancelled again with a new
+    /// review; a lease of another signing key is never signed by this one.
+    #[tokio::test]
+    async fn reopened_lease_is_checked_again_before_anything_is_signed() {
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = oa_lease_processor(store.clone());
+        let now = current_timestamp();
+        let set_reservation = |request: &ApiRequestV2, column: &str, value: String| {
+            store.execute_for_test(
+                &format!("UPDATE nullifiers SET {column} = ?1 WHERE nullifier = ?2"),
+                rusqlite::params![value, request.public_inputs.request_nullifier.to_hex()],
+            );
+        };
+        let reviews_of = |request: &ApiRequestV2| {
+            store
+                .settlement_reviews(100)
+                .unwrap()
+                .into_iter()
+                .filter(|stored| stored.review.client_request_id == request.client_request_id)
+                .collect::<Vec<_>>()
+        };
+        let setup = |id: &str, nullifier: u64| {
+            let request = lease_request_for(&processor, id, nullifier, None);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(now + 3_600),
+                    key_hash: Some(id),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            request
+        };
+        // Cancelled, repaired and reopened with a concession, then corrupt
+        // again before the sweep: cancelled again, never signed.
+        let again = setup("corrupt-again", 604);
+        set_reservation(&again, "payload_hash", "0x1".into());
+        processor.settle_due_openrouter_leases().await;
+        set_reservation(&again, "payload_hash", again.payload_hash.to_hex());
+        reopen_unverified(&store, &again.client_request_id, conceded(), now).unwrap();
+        set_reservation(&again, "api_request_binding", "stale".into());
+        processor.settle_due_openrouter_leases().await;
+        let lease = store
+            .lookup_openrouter_lease(&again.client_request_id)
+            .unwrap();
+        assert_eq!(lease.status, "cancelled");
+        let record = record_of(&processor, &again);
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        assert!(record.next_state_sig.is_none());
+        let reviews = reviews_of(&again);
+        assert_eq!(reviews.len(), 3);
+        let open: Vec<_> = reviews
+            .iter()
+            .filter(|stored| stored.acknowledged_at.is_none())
+            .map(|stored| stored.review.reason.as_str())
+            .collect();
+        assert_eq!(open.len(), 2);
+        assert!(open.contains(&"binding_reopened") && open.contains(&"binding_corrupt"));
+        assert!(reviews.iter().any(|stored| stored.acknowledged_at.is_none()
+            && stored
+                .review
+                .detail
+                .contains("nullifiers.api_request_binding")));
+
+        // Reopened with a concession, under another state signing key: that
+        // server refuses to sign; this deployment's server verifies the
+        // genuine request and signs the zero.
+        let foreign = browser_lease_request("other-key").2.request;
+        add_lease(
+            &processor,
+            &foreign,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now + 3_600),
+                key_hash: Some("other-key"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        let lease = store
+            .lookup_openrouter_lease(&foreign.client_request_id)
+            .unwrap();
+        let review = RequestProcessor::review(
+            &lease,
+            "binding_corrupt",
+            None,
+            "simulated corruption, since repaired".into(),
+            None,
+            None,
+        );
+        store
+            .cancel_openrouter_lease(&foreign.client_request_id, &review)
+            .unwrap();
+        reopen_unverified(&store, &foreign.client_request_id, conceded(), now).unwrap();
+        let other_key = RequestProcessor::try_new(
+            processor.config.clone(),
+            store.clone(),
+            Arc::new(ServerSigner::new(
+                &Felt252::from_u64(13),
+                &Felt252::from_u64(14),
+            )),
+            Felt252::ZERO,
+        )
+        .unwrap();
+        other_key.settle_due_openrouter_leases().await;
+        let lease = store
+            .lookup_openrouter_lease(&foreign.client_request_id)
+            .unwrap();
+        assert_eq!(lease.status, "active");
+        assert_eq!(lease.charge_basis.as_deref(), Some("operator_conceded"));
+        assert!(lease.last_error.unwrap().contains("refusing to sign"));
+        assert_eq!(
+            record_of(&processor, &foreign).status,
+            NullifierStatus::Reserved
+        );
+        processor.settle_due_openrouter_leases().await;
+        let record = record_of(&processor, &foreign);
+        assert_eq!(record.charge_applied, Some(0));
+        let payload = payload_of(&record);
+        assert_eq!(payload["charge_basis"], "operator_conceded");
+        assert_eq!(payload["type"], "oa_org_ephemeral_lease_settlement");
+        assert_eq!(payload["billing_quote"], frozen_quote(&foreign));
+    }
+
+    /// A direct OpenRouter key mock with one key: PATCH disables it, GET
+    /// reports $0.01 of usage (its first `failing_reads` GETs answer 503),
+    /// DELETE deletes it; a deleted key answers 404. Records each call's
+    /// method.
+    #[derive(Default)]
+    struct DirectKeyMock {
+        disabled: bool,
+        deleted: bool,
+        failing_reads: usize,
+        calls: Vec<String>,
+    }
+
+    async fn direct_key_server(
+        state: Arc<std::sync::Mutex<DirectKeyMock>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::{Path, State},
+            http::{Method, StatusCode},
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        type KeyState = Arc<std::sync::Mutex<DirectKeyMock>>;
+        async fn key(
+            State(state): State<KeyState>,
+            method: Method,
+            Path(_hash): Path<String>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut key = state.lock().unwrap();
+            key.calls.push(method.to_string());
+            if key.deleted {
+                return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})));
+            }
+            if method == Method::GET && key.failing_reads > 0 {
+                key.failing_reads -= 1;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "unavailable"})),
+                );
+            }
+            if method == Method::PATCH {
+                key.disabled = true;
+            } else if method == Method::DELETE {
+                key.deleted = true;
+                return (StatusCode::OK, Json(json!({"deleted": true})));
+            }
+            (
+                StatusCode::OK,
+                Json(json!({"data": {"usage": 0.01, "byok_usage": 0.0, "disabled": key.disabled}})),
+            )
+        }
+        let app = Router::new()
+            .route("/v1/keys/{hash}", get(key).patch(key).delete(key))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, server)
+    }
+
+    /// Review regression (reopening a delivered direct lease): a corrupt
+    /// binding found while settling a possibly delivered direct lease is
+    /// cancelled only once the key's usage is captured, and the cancelled row
+    /// keeps that usage while the key is deleted. Reopened, the lease resumes
+    /// revoking, reports `captured_usage` and settles at that usage, not at
+    /// its solvency bound, with a successor the wallet installs.
+    #[test]
+    fn corrupt_direct_lease_keeps_its_captured_usage_for_a_reopening() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = Arc::new(std::sync::Mutex::new(DirectKeyMock::default()));
+        let (url, server) = runtime.block_on(direct_key_server(state.clone()));
+        let serving = |path: &std::path::Path| {
+            let mut processor = oa_lease_processor(Arc::new(NullifierStore::new(path).unwrap()));
+            processor.config.openrouter_leases.as_mut().unwrap().source =
+                OpenRouterLeaseSourceConfig::OpenRouter {
+                    management_key: "k".into(),
+                    api_base: url.clone(),
+                };
+            processor.openrouter = Some(Arc::new(
+                OpenRouterProvisioner::new("k".into(), url.clone()).unwrap(),
+            ));
+            processor.oa_org = None;
+            processor
+        };
+        let (wallet, note, prepared) = browser_lease_request("direct-delivered");
+        let request = prepared.request.clone();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let set_payload_hash = |store: &NullifierStore, payload_hash: String| {
+            store.execute_for_test(
+                "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+                rusqlite::params![payload_hash, nullifier],
+            );
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let now = current_timestamp();
+        let processor = serving(&path);
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "openrouter",
+                expires_at: now - 100,
+                deadline: Some(now + 3_600),
+                key_hash: Some("k1"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        // A database fault: the reservation's payload hash changes.
+        set_payload_hash(&processor.store, "0x1".into());
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        let lease = processor
+            .store
+            .lookup_openrouter_lease("direct-delivered")
+            .unwrap();
+        assert_eq!(lease.status, "cancelled");
+        // Disabled and measured before the cancellation, which queued the
+        // key's deletion; that ran in the same tick.
+        assert_eq!(lease.usage_usd, Some(0.01));
+        assert_eq!(
+            state.lock().unwrap().calls,
+            ["PATCH", "GET", "PATCH", "DELETE"]
+        );
+        assert!(state.lock().unwrap().deleted);
+        assert_eq!(
+            record_of(&processor, &request).status,
+            NullifierStatus::Reserved
+        );
+        assert_eq!(
+            review_of(&processor, &request).unwrap().reason,
+            "binding_corrupt"
+        );
+        // The operator repairs the binding, stops the server and reopens.
+        set_payload_hash(&processor.store, request.payload_hash.to_hex());
+        drop(processor);
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let reopened = OfflineStore::open(&path)
+            .unwrap()
+            .reopen_cancelled_lease("direct-delivered", ReopenOptions::default(), &verifier)
+            .unwrap();
+        assert_eq!(
+            (reopened.status.as_str(), reopened.settles, reopened.warning),
+            ("revoking", "captured_usage", None)
+        );
+        assert!(!reopened.key_cleanup_withdrawn);
+        // The restarted server settles at once at the captured usage: $0.01
+        // is 10,000 units at the test quote, well below the solvency bound.
+        let processor = serving(&path);
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        let record = record_of(&processor, &request);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(10_000));
+        assert!(request.public_inputs.solvency_bound > 10_000);
+        assert_eq!(payload_of(&record)["charge_basis"], "measured");
+        // The deleted key was never read again: only the idempotent DELETE.
+        assert_eq!(
+            state.lock().unwrap().calls,
+            ["PATCH", "GET", "PATCH", "DELETE", "DELETE"]
+        );
+        let response = processor
+            .recover_by_client_id("direct-delivered")
+            .unwrap()
+            .request_response
+            .unwrap();
+        let next = zkapi_browser::complete_response(
+            &wallet,
+            zkapi_browser::CompleteResponseArgs {
+                state: note,
+                journal: prepared.journal,
+                response,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.current_balance, 2_000_000 - 10_000);
+        server.abort();
+    }
+
+    /// Review regression (reopening a delivered direct lease): a lease that
+    /// was reopened and is not signed yet can still be conceded, for
+    /// instance once the reopening warned that only its solvency bound can
+    /// be charged. A signed one cannot.
+    #[test]
+    fn reopened_lease_can_be_conceded_until_it_is_signed() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (wallet, note, prepared) = browser_lease_request("concede-later");
+        let request = prepared.request.clone();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let now = current_timestamp();
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now - 1),
+                key_hash: Some("concede-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET payload_hash = '0x1' WHERE nullifier = ?1",
+            rusqlite::params![nullifier],
+        );
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        assert_eq!(
+            processor
+                .openrouter_lease_status("concede-later")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+            rusqlite::params![request.payload_hash.to_hex(), nullifier],
+        );
+        drop(processor);
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let offline = OfflineStore::open(&path).unwrap();
+        // Past its deadline, nothing can be measured: the reopening warns
+        // that the full solvency bound would be charged...
+        let reopened = offline
+            .reopen_cancelled_lease("concede-later", ReopenOptions::default(), &verifier)
+            .unwrap();
+        assert_eq!(reopened.settles, "deadline_fallback");
+        assert!(reopened.warning.unwrap().contains("--zero-charge"));
+        // ...and the operator concedes the charge instead, before restarting.
+        let concession = offline
+            .reopen_cancelled_lease("concede-later", conceded(), &verifier)
+            .unwrap();
+        assert_eq!(
+            (concession.status.as_str(), concession.settles),
+            ("active", "operator_conceded")
+        );
+        assert!(matches!(
+            offline.reopen_cancelled_lease("concede-later", ReopenOptions::default(), &verifier),
+            Err(ReopenRefusal::NotCancelled(status)) if status == "active"
+        ));
+        drop(offline);
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        let record = record_of(&processor, &request);
+        assert_eq!(record.charge_applied, Some(0));
+        assert_eq!(payload_of(&record)["charge_basis"], "operator_conceded");
+        let reopenings = processor
+            .store
+            .settlement_reviews(10)
+            .unwrap()
+            .into_iter()
+            .filter(|stored| stored.review.reason == "binding_reopened")
+            .count();
+        assert_eq!(reopenings, 2);
+        let response = processor
+            .recover_by_client_id("concede-later")
+            .unwrap()
+            .request_response
+            .unwrap();
+        let next = zkapi_browser::complete_response(
+            &wallet,
+            zkapi_browser::CompleteResponseArgs {
+                state: note,
+                journal: prepared.journal,
+                response,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.current_balance, 2_000_000);
+        drop(processor);
+        // Signed: nothing left to concede.
+        assert!(matches!(
+            OfflineStore::open(&path)
+                .unwrap()
+                .reopen_cancelled_lease("concede-later", conceded(), &verifier),
+            Err(ReopenRefusal::NotCancelled(status)) if status == "finalized"
+        ));
+    }
+
+    /// Review regression (reopen authenticity): a fault inside the saved
+    /// request (here its solvency bound) shows up as a disagreement with the
+    /// reservation's request binding. Recomputing that binding from the row,
+    /// as the review's field name might suggest, does not get the lease
+    /// reopened: the command verifies the saved request against its Groth16
+    /// proof first and names the request as the corrupt side, also with
+    /// --rebind or --zero-charge. Restored from a backup, the request
+    /// verifies; the reservation, now the corrupt side, is rebound from it,
+    /// and the server signs no more than the proven bound.
+    #[test]
+    fn reopen_refuses_a_saved_request_its_proof_does_not_authorize() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (wallet, note, prepared) = browser_lease_request("tampered");
+        let request = prepared.request.clone();
+        let proven_bound = request.public_inputs.solvency_bound;
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let now = current_timestamp();
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now - 1),
+                key_hash: Some("tampered-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        let mut tampered = request.clone();
+        tampered.public_inputs.solvency_bound = proven_bound * 3;
+        let set_request = |store: &NullifierStore, saved: &ApiRequestV2| {
+            store.execute_for_test(
+                "UPDATE openrouter_leases SET api_request_json = ?1
+                 WHERE client_request_id = 'tampered'",
+                rusqlite::params![serde_json::to_string(saved).unwrap()],
+            );
+        };
+        set_request(&processor.store, &tampered);
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        assert_eq!(
+            processor
+                .openrouter_lease_status("tampered")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        let detail = review_of(&processor, &request).unwrap().detail;
+        assert!(
+            detail.contains("nullifiers.api_request_binding"),
+            "{detail}"
+        );
+        assert!(detail.contains("either side may be corrupt"), "{detail}");
+        // The misled repair: the reservation's binding recomputed from the row.
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET api_request_binding = ?1 WHERE nullifier = ?2",
+            rusqlite::params![api_request_binding(&tampered).unwrap(), nullifier],
+        );
+        drop(processor);
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        for options in [
+            ReopenOptions::default(),
+            ReopenOptions {
+                zero_charge: false,
+                rebind: true,
+                saved_request: None,
+            },
+            conceded(),
+        ] {
+            let refusal = OfflineStore::open(&path)
+                .unwrap()
+                .reopen_cancelled_lease("tampered", options, &verifier)
+                .unwrap_err();
+            let message = refusal.to_string();
+            match refusal {
+                ReopenRefusal::BindingCorrupt(mismatch) => {
+                    assert_eq!(mismatch.field, "openrouter_leases.api_request_json");
+                    assert!(message.contains("Groth16"), "{message}");
+                    assert!(message.contains("backup"), "{message}");
+                }
+                other => panic!("{options:?}: expected the request refused, got {other:?}"),
+            }
+        }
+        // Nothing changed while it refused.
+        let store = NullifierStore::new(&path).unwrap();
+        assert_eq!(
+            store.lookup_openrouter_lease("tampered").unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(store.settlement_reviews(10).unwrap().len(), 1);
+        // The request restored from a backup verifies: the reservation, whose
+        // binding the misled repair changed, is now the corrupt side.
+        set_request(&store, &request);
+        drop(store);
+        let offline = OfflineStore::open(&path).unwrap();
+        let refusal = offline
+            .reopen_cancelled_lease("tampered", ReopenOptions::default(), &verifier)
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                if mismatch.field == "nullifiers.api_request_binding"),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("--rebind"), "{refusal}");
+        let reopened = offline
+            .reopen_cancelled_lease(
+                "tampered",
+                ReopenOptions {
+                    zero_charge: false,
+                    rebind: true,
+                    saved_request: None,
+                },
+                &verifier,
+            )
+            .unwrap();
+        assert_eq!(reopened.reservation, "rewritten");
+        assert_eq!(reopened.settles, "deadline_fallback");
+        drop(offline);
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        let record = record_of(&processor, &request);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(record.charge_applied, Some(proven_bound));
+        let signed: RequestPublicInputsV2 =
+            serde_json::from_str(record.request_inputs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(signed.solvency_bound, proven_bound);
+        let response = processor
+            .recover_by_client_id("tampered")
+            .unwrap()
+            .request_response
+            .unwrap();
+        let next = zkapi_browser::complete_response(
+            &wallet,
+            zkapi_browser::CompleteResponseArgs {
+                state: note,
+                journal: prepared.journal,
+                response,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.current_balance, 2_000_000 - proven_bound);
+    }
+
+    /// Review regression (reopen authenticity): the server verifies a
+    /// reopened lease's saved request again before it signs anything. A
+    /// request changed after a verified reopening, with its reservation
+    /// binding recomputed to match, is cancelled again, never signed.
+    #[test]
+    fn server_verifies_a_reopened_lease_before_signing() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let request = browser_lease_request("edited-after-reopen").2.request;
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let now = current_timestamp();
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now - 1),
+                key_hash: Some("edited-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        let set_payload_hash = |store: &NullifierStore, payload_hash: String| {
+            store.execute_for_test(
+                "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+                rusqlite::params![payload_hash, nullifier],
+            );
+        };
+        set_payload_hash(&processor.store, "0x1".into());
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        set_payload_hash(&processor.store, request.payload_hash.to_hex());
+        drop(processor);
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        OfflineStore::open(&path)
+            .unwrap()
+            .reopen_cancelled_lease("edited-after-reopen", ReopenOptions::default(), &verifier)
+            .unwrap();
+        // Edited after the reopening, consistently on both sides.
+        let mut edited = request.clone();
+        edited.public_inputs.solvency_bound *= 3;
+        let store = NullifierStore::new(&path).unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET api_request_json = ?1
+             WHERE client_request_id = 'edited-after-reopen'",
+            rusqlite::params![serde_json::to_string(&edited).unwrap()],
+        );
+        store.execute_for_test(
+            "UPDATE nullifiers SET api_request_binding = ?1 WHERE nullifier = ?2",
+            rusqlite::params![api_request_binding(&edited).unwrap(), nullifier],
+        );
+        drop(store);
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        let lease = processor
+            .store
+            .lookup_openrouter_lease("edited-after-reopen")
+            .unwrap();
+        assert_eq!(lease.status, "cancelled");
+        let record = record_of(&processor, &request);
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        assert!(record.next_state_sig.is_none());
+        let detail = processor
+            .store
+            .settlement_reviews(10)
+            .unwrap()
+            .into_iter()
+            .find(|stored| {
+                stored.review.reason == "binding_corrupt" && stored.acknowledged_at.is_none()
+            })
+            .unwrap()
+            .review
+            .detail;
+        assert!(
+            detail.contains("the reopened lease's saved request does not verify")
+                && detail.contains("openrouter_leases.api_request_json"),
+            "{detail}"
+        );
+    }
+
+    /// Review regression (unrepairable reservations): a reservation whose
+    /// request binding went stale, or whose row is missing, cannot be
+    /// repaired with sqlite3 (the binding is a keccak digest of the saved
+    /// request). Once the saved request verifies, --rebind rewrites the
+    /// reservation from it or re-creates the missing row, and the reopened
+    /// lease settles with a successor the wallet installs. A reservation row
+    /// kept under another nullifier is mis-keyed, not missing: it is never
+    /// duplicated.
+    #[test]
+    fn rebind_repairs_a_reservation_from_the_verified_request() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (wallet, note, prepared) = browser_lease_request("rebound");
+        let request = prepared.request.clone();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let rebind = |zero_charge| ReopenOptions {
+            zero_charge,
+            rebind: true,
+            saved_request: None,
+        };
+        for (case, corrupt, field, zero_charge, reservation, charge) in [
+            (
+                "stale binding",
+                "UPDATE nullifiers SET api_request_binding = 'stale' WHERE nullifier = ?1",
+                "nullifiers.api_request_binding",
+                false,
+                "rewritten",
+                request.public_inputs.solvency_bound,
+            ),
+            (
+                "missing row",
+                "DELETE FROM nullifiers WHERE nullifier = ?1",
+                "nullifiers.nullifier",
+                true,
+                "recreated",
+                0,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let now = current_timestamp();
+            let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(now - 1),
+                    key_hash: Some("rebound-hash"),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            processor
+                .store
+                .execute_for_test(corrupt, rusqlite::params![nullifier]);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            assert_eq!(
+                processor.openrouter_lease_status("rebound").unwrap().status,
+                "cancelled",
+                "{case}"
+            );
+            drop(processor);
+            let offline = OfflineStore::open(&path).unwrap();
+            // Neither a plain reopening nor a concession repairs it...
+            for options in [ReopenOptions::default(), conceded()] {
+                let refusal = offline
+                    .reopen_cancelled_lease("rebound", options, &verifier)
+                    .unwrap_err();
+                assert!(
+                    matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                        if mismatch.field == field),
+                    "{case}: {refusal}"
+                );
+                assert!(
+                    refusal.to_string().contains("--rebind"),
+                    "{case}: {refusal}"
+                );
+            }
+            // ...--rebind does, from the verified request.
+            let reopened = offline
+                .reopen_cancelled_lease("rebound", rebind(zero_charge), &verifier)
+                .unwrap();
+            assert_eq!(reopened.reservation, reservation, "{case}");
+            drop(offline);
+            let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+            let record = record_of(&processor, &request);
+            assert_eq!(record.status, NullifierStatus::Reserved, "{case}");
+            assert_eq!(
+                record.api_request_binding,
+                Some(api_request_binding(&request).unwrap())
+            );
+            let review = processor
+                .store
+                .settlement_reviews(10)
+                .unwrap()
+                .into_iter()
+                .find(|stored| stored.review.reason == "binding_reopened")
+                .unwrap()
+                .review;
+            assert!(review.detail.contains(reservation), "{}", review.detail);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let record = record_of(&processor, &request);
+            assert_eq!(record.status, NullifierStatus::Finalized, "{case}");
+            assert_eq!(record.charge_applied, Some(charge), "{case}");
+            let response = processor
+                .recover_by_client_id("rebound")
+                .unwrap()
+                .request_response
+                .unwrap();
+            let next = zkapi_browser::complete_response(
+                &wallet,
+                zkapi_browser::CompleteResponseArgs {
+                    state: note.clone(),
+                    journal: prepared.journal.clone(),
+                    response,
+                },
+            )
+            .unwrap();
+            assert_eq!(next.current_balance, 2_000_000 - charge, "{case}");
+        }
+
+        // Mis-keyed: the row's nullifier column changed. Not re-created.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let now = current_timestamp();
+        let processor = oa_lease_processor(Arc::new(NullifierStore::new(&path).unwrap()));
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now - 100,
+                deadline: Some(now - 1),
+                key_hash: Some("rebound-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET nullifier = '0x5eed' WHERE nullifier = ?1",
+            rusqlite::params![nullifier],
+        );
+        runtime.block_on(processor.settle_due_openrouter_leases());
+        drop(processor);
+        let refusal = OfflineStore::open(&path)
+            .unwrap()
+            .reopen_cancelled_lease("rebound", rebind(false), &verifier)
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, ReopenRefusal::ReservationElsewhere { nullifier, .. }
+                if nullifier == "0x5eed"),
+            "{refusal}"
+        );
+        let store = NullifierStore::new(&path).unwrap();
+        assert!(store
+            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .is_none());
+        assert_eq!(
+            store.lookup_openrouter_lease("rebound").unwrap().status,
+            "cancelled"
+        );
+    }
+
+    /// A serving processor whose OA org relay is `usage_url`, as in the
+    /// settlement tests that measure OA usage.
+    fn oa_usage_processor(path: &std::path::Path, usage_url: &str) -> RequestProcessor {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::new(path).unwrap()));
+        processor.config.request_charge_cap = 400_000;
+        processor.oa_org = Some(Arc::new(
+            OaOrgProvisioner::new(usage_url.to_string(), "test-secret".into()).unwrap(),
+        ));
+        processor
+    }
+
+    /// Install the signed successor of `request` in its owner's browser
+    /// wallet, and return the new balance.
+    fn installed_balance(
+        processor: &RequestProcessor,
+        wallet: &zkapi_browser::BrowserWalletConfig,
+        note: &zkapi_browser::BrowserNoteState,
+        prepared: &zkapi_browser::PreparedRequest,
+    ) -> u128 {
+        let response = processor
+            .recover_by_client_id(&prepared.request.client_request_id)
+            .unwrap()
+            .request_response
+            .unwrap();
+        zkapi_browser::complete_response(
+            wallet,
+            zkapi_browser::CompleteResponseArgs {
+                state: note.clone(),
+                journal: prepared.journal.clone(),
+                response,
+            },
+        )
+        .unwrap()
+        .current_balance
+    }
+
+    /// Two genuine requests that their owner authorized for the same note
+    /// state, so with the same nullifier, differing only in request time.
+    fn same_state_lease_requests(
+        id: &str,
+    ) -> (
+        zkapi_browser::BrowserWalletConfig,
+        zkapi_browser::BrowserNoteState,
+        zkapi_browser::PreparedRequest,
+        zkapi_browser::PreparedRequest,
+    ) {
+        let mut wallet_server = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        wallet_server.config.request_charge_cap = 400_000;
+        let (wallet, state, tree) = crate::test_support::browser_note(&wallet_server, 2_000_000);
+        let now = current_timestamp();
+        let key =
+            std::fs::read(std::path::Path::new(&setup_directory()).join("request.pk")).unwrap();
+        let prepare = |request_time: u64| {
+            zkapi_browser::prepare_request(
+                &wallet,
+                &state,
+                zkapi_browser::PrepareRequestArgs {
+                    payload: crate::test_support::lease_payload(&wallet_server.config, now),
+                    active_root: tree.root(),
+                    merkle_siblings: tree.get_siblings(0).to_vec(),
+                    client_request_id: id.into(),
+                    request_time,
+                    created_at_ms: request_time * 1000,
+                },
+                &key,
+            )
+            .unwrap()
+        };
+        let first = prepare(now);
+        let second = prepare(now + 1);
+        (wallet, state, first, second)
+    }
+
+    /// Review regression (lease-row repair): a fault in the lease row's
+    /// client_request_id, its primary key, is cancelled with its review under
+    /// the faulted id. Setting the column by hand, as the command used to
+    /// advise, left the review behind, so that every reopening was refused.
+    /// The command now names --rebind, which rewrites the row from the
+    /// verified request and moves its reviews with it; a row renamed by hand
+    /// is still found by its nullifier. Either way the lease settles with a
+    /// successor the wallet installs.
+    #[test]
+    fn rebind_rewrites_a_lease_row_whose_client_request_id_is_corrupt() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (usage_url, usage_server, _) = runtime.block_on(oa_usage_server(1_234, 5));
+        let (wallet, note, prepared) = browser_lease_request("lease-a");
+        let request = prepared.request.clone();
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let rebind = ReopenOptions {
+            rebind: true,
+            ..ReopenOptions::default()
+        };
+        for renamed_by_hand in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let now = current_timestamp();
+            let processor = oa_usage_processor(&path, &usage_url);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(now + 3_600),
+                    key_hash: Some("lease-a-hash"),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            // A database fault in the lease row's primary key.
+            processor.store.execute_for_test(
+                "UPDATE openrouter_leases SET client_request_id = 'lease-a-x'
+                 WHERE client_request_id = 'lease-a'",
+                [],
+            );
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            assert_eq!(
+                processor
+                    .store
+                    .lookup_openrouter_lease("lease-a-x")
+                    .unwrap()
+                    .status,
+                "cancelled"
+            );
+            let reviews = processor.store.settlement_reviews(10).unwrap();
+            assert_eq!(reviews.len(), 1);
+            assert_eq!(reviews[0].review.client_request_id, "lease-a-x");
+            drop(processor);
+            let offline = OfflineStore::open(&path).unwrap();
+            let refusal = offline
+                .reopen_cancelled_lease("lease-a-x", ReopenOptions::default(), &verifier)
+                .unwrap_err();
+            assert!(
+                matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                    if mismatch.field == "openrouter_leases.client_request_id"),
+                "{refusal}"
+            );
+            assert!(refusal.to_string().contains("--rebind"), "{refusal}");
+            let reopened = if renamed_by_hand {
+                NullifierStore::new(&path).unwrap().execute_for_test(
+                    "UPDATE openrouter_leases SET client_request_id = 'lease-a'
+                     WHERE client_request_id = 'lease-a-x'",
+                    [],
+                );
+                offline
+                    .reopen_cancelled_lease("lease-a", ReopenOptions::default(), &verifier)
+                    .unwrap()
+            } else {
+                offline
+                    .reopen_cancelled_lease("lease-a-x", rebind, &verifier)
+                    .unwrap()
+            };
+            assert_eq!(reopened.client_request_id, "lease-a");
+            assert_eq!(
+                reopened.lease_row,
+                if renamed_by_hand {
+                    "unchanged"
+                } else {
+                    "rewritten"
+                }
+            );
+            assert_eq!(reopened.settles, "measured_until_deadline");
+            assert!(matches!(
+                offline.reopen_cancelled_lease("lease-a-x", rebind, &verifier),
+                Err(ReopenRefusal::UnknownLease(_))
+            ));
+            drop(offline);
+            // The lease's reviews are all under its id, its cancellation's
+            // acknowledged by the reopening.
+            let processor = oa_usage_processor(&path, &usage_url);
+            let reviews = processor.store.settlement_reviews(10).unwrap();
+            assert_eq!(reviews.len(), 2);
+            assert!(reviews
+                .iter()
+                .all(|stored| stored.review.client_request_id == "lease-a"));
+            assert!(reviews
+                .iter()
+                .any(|stored| stored.review.reason == "binding_corrupt"
+                    && stored.acknowledged_at.is_some()));
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let status = processor.openrouter_lease_status("lease-a").unwrap();
+            assert_eq!(
+                (status.status.as_str(), status.charge_basis.as_deref()),
+                ("finalized", Some("measured"))
+            );
+            assert_eq!(
+                installed_balance(&processor, &wallet, &note, &prepared),
+                2_000_000 - 1_234
+            );
+        }
+        usage_server.abort();
+    }
+
+    /// Review regression (corrupt saved request): a fault inside the saved
+    /// request could only be repaired from a database backup, while its
+    /// owner's copy of the request was refused everywhere. --saved-request
+    /// restores it from a copy whose authenticity the database proves: the
+    /// copy verifies, and its binding is the one its reservation recorded at
+    /// admission. A tampered copy, another request its owner authorized for
+    /// the same note state, and another lease's request are refused, changing
+    /// nothing. Restored, also over an unreadable saved request, the lease
+    /// settles with a successor the wallet installs.
+    #[test]
+    fn saved_request_restores_a_corrupt_request_from_an_authentic_copy() {
+        use crate::nullifier_store::{
+            OfflineStore, ReopenOptions, ReopenRefusal, GROTH16_UNVERIFIED, SAVED_REQUEST_FIELD,
+        };
+        fn supplying(saved_request: &ApiRequestV2) -> ReopenOptions<'_> {
+            ReopenOptions {
+                saved_request: Some(saved_request),
+                ..ReopenOptions::default()
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (usage_url, usage_server, _) = runtime.block_on(oa_usage_server(1_234, 5));
+        let (wallet, note, prepared, same_state) = same_state_lease_requests("bitrot");
+        let request = prepared.request.clone();
+        assert_eq!(
+            same_state.request.public_inputs.request_nullifier,
+            request.public_inputs.request_nullifier
+        );
+        let other_lease = browser_lease_request("other-lease").2.request;
+        let mut faulted = request.clone();
+        faulted.public_inputs.request_time += 1;
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        for unreadable in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let now = current_timestamp();
+            let processor = oa_usage_processor(&path, &usage_url);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(now + 3_600),
+                    key_hash: Some("bitrot-hash"),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            let set_saved = |store: &NullifierStore, saved: &str| {
+                store.execute_for_test(
+                    "UPDATE openrouter_leases SET api_request_json = ?1
+                     WHERE client_request_id = 'bitrot'",
+                    rusqlite::params![saved],
+                );
+            };
+            // A fault inside the saved request: its request time changes.
+            set_saved(&processor.store, &serde_json::to_string(&faulted).unwrap());
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            assert_eq!(
+                processor.openrouter_lease_status("bitrot").unwrap().status,
+                "cancelled"
+            );
+            if unreadable {
+                // Damaged further after its cancellation.
+                set_saved(&processor.store, "{\"client_request_id\":\"bitr");
+            }
+            drop(processor);
+            let offline = OfflineStore::open(&path).unwrap();
+            let refusal = offline
+                .reopen_cancelled_lease("bitrot", ReopenOptions::default(), &verifier)
+                .unwrap_err();
+            assert!(
+                matches!(&refusal, ReopenRefusal::BindingCorrupt(mismatch)
+                    if mismatch.field == SAVED_REQUEST_FIELD),
+                "{refusal}"
+            );
+            assert!(refusal.to_string().contains("--saved-request"), "{refusal}");
+            assert!(matches!(
+                offline.reopen_cancelled_lease("bitrot", supplying(&faulted), &verifier),
+                Err(ReopenRefusal::SuppliedRequestUnverified(detail)) if detail == GROTH16_UNVERIFIED
+            ));
+            assert!(matches!(
+                offline.reopen_cancelled_lease("bitrot", supplying(&same_state.request), &verifier),
+                Err(ReopenRefusal::SuppliedRequestNotReserved(_))
+            ));
+            assert!(matches!(
+                offline.reopen_cancelled_lease("bitrot", supplying(&other_lease), &verifier),
+                Err(ReopenRefusal::SuppliedRequestForAnotherLease)
+            ));
+            {
+                let store = NullifierStore::new(&path).unwrap();
+                assert_eq!(store.settlement_reviews(10).unwrap().len(), 1);
+                assert_eq!(store.settlement_counts(now).unwrap().cancelled, 1);
+            }
+            let reopened = offline
+                .reopen_cancelled_lease("bitrot", supplying(&request), &verifier)
+                .unwrap();
+            assert_eq!(
+                (reopened.saved_request, reopened.settles),
+                ("restored", "measured_until_deadline")
+            );
+            drop(offline);
+            let processor = oa_usage_processor(&path, &usage_url);
+            let restored = processor.store.lookup_openrouter_lease("bitrot").unwrap();
+            assert_eq!(
+                api_request_binding(&restored.api_request).unwrap(),
+                api_request_binding(&request).unwrap()
+            );
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let status = processor.openrouter_lease_status("bitrot").unwrap();
+            assert_eq!(
+                (status.status.as_str(), status.charge_basis.as_deref()),
+                ("finalized", Some("measured"))
+            );
+            assert_eq!(
+                installed_balance(&processor, &wallet, &note, &prepared),
+                2_000_000 - 1_234
+            );
+        }
+        usage_server.abort();
+    }
+
+    /// Review regression (usage capture of a corrupt direct lease): one
+    /// transient provider error while capturing the usage of a possibly
+    /// delivered direct lease with a corrupt binding used to cancel it at
+    /// once and delete its key, its usage lost. The capture is now retried
+    /// like any settlement, while the corruption is reviewed (and alerted) at
+    /// once, and the lease cannot be reopened yet. It is cancelled with its
+    /// usage once that is read, and a reopening charges that usage. Still
+    /// unread at its deadline, it is cancelled then, without usage.
+    #[test]
+    fn corrupt_direct_lease_capture_is_retried_like_any_settlement() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (wallet, note, prepared) = browser_lease_request("flaky-corrupt");
+        let request = prepared.request.clone();
+        let nullifier = request.public_inputs.request_nullifier.to_hex();
+        let bound = request.public_inputs.solvency_bound;
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        let set_payload_hash = |store: &NullifierStore, payload_hash: String| {
+            store.execute_for_test(
+                "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+                rusqlite::params![payload_hash, nullifier],
+            );
+        };
+        let corrupt_reviews = |store: &NullifierStore| {
+            store
+                .settlement_reviews(10)
+                .unwrap()
+                .into_iter()
+                .filter(|stored| stored.review.reason == "binding_corrupt")
+                .collect::<Vec<_>>()
+        };
+        for deadline_passes in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(DirectKeyMock {
+                failing_reads: 1,
+                ..DirectKeyMock::default()
+            }));
+            let (url, server) = runtime.block_on(direct_key_server(state.clone()));
+            let serving = |path: &std::path::Path| {
+                let mut processor =
+                    oa_lease_processor(Arc::new(NullifierStore::new(path).unwrap()));
+                processor.config.openrouter_leases.as_mut().unwrap().source =
+                    OpenRouterLeaseSourceConfig::OpenRouter {
+                        management_key: "k".into(),
+                        api_base: url.clone(),
+                    };
+                processor.openrouter = Some(Arc::new(
+                    OpenRouterProvisioner::new("k".into(), url.clone()).unwrap(),
+                ));
+                processor.oa_org = None;
+                processor
+            };
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let now = current_timestamp();
+            let processor = serving(&path);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "openrouter",
+                    expires_at: now - 100,
+                    deadline: Some(now + 3_600),
+                    key_hash: Some("k1"),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            set_payload_hash(&processor.store, "0x1".into());
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            // The usage read failed once: retried, not cancelled. The key is
+            // disabled, not deleted, and the corruption is reviewed at once.
+            let lease = processor
+                .store
+                .lookup_openrouter_lease("flaky-corrupt")
+                .unwrap();
+            assert_eq!((lease.status.as_str(), lease.usage_usd), ("disabled", None));
+            assert_eq!(state.lock().unwrap().calls, ["PATCH", "GET"]);
+            let reviews = corrupt_reviews(&processor.store);
+            assert_eq!(reviews.len(), 1);
+            assert!(
+                reviews[0].review.detail.contains("nullifiers.payload_hash")
+                    && reviews[0].review.detail.contains("usage captured first"),
+                "{}",
+                reviews[0].review.detail
+            );
+            drop(processor);
+            assert!(matches!(
+                OfflineStore::open(&path).unwrap().reopen_cancelled_lease(
+                    "flaky-corrupt",
+                    ReopenOptions::default(),
+                    &verifier
+                ),
+                Err(ReopenRefusal::CapturePending(status)) if status == "disabled"
+            ));
+            if deadline_passes {
+                NullifierStore::new(&path).unwrap().execute_for_test(
+                    "UPDATE openrouter_leases SET settlement_deadline_at = ?1
+                     WHERE client_request_id = 'flaky-corrupt'",
+                    rusqlite::params![(now - 1) as i64],
+                );
+            }
+            let processor = serving(&path);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let lease = processor
+                .store
+                .lookup_openrouter_lease("flaky-corrupt")
+                .unwrap();
+            assert_eq!(lease.status, "cancelled");
+            // Read once the provider answered; at the deadline, never read.
+            let (usage, calls) = if deadline_passes {
+                (None, vec!["PATCH", "GET", "PATCH", "DELETE"])
+            } else {
+                (Some(0.01), vec!["PATCH", "GET", "GET", "PATCH", "DELETE"])
+            };
+            assert_eq!(lease.usage_usd, usage);
+            assert_eq!(state.lock().unwrap().calls, calls);
+            // Retries add no review; the cancellation adds its own.
+            assert_eq!(corrupt_reviews(&processor.store).len(), 2);
+            set_payload_hash(&processor.store, request.payload_hash.to_hex());
+            drop(processor);
+            let reopened = OfflineStore::open(&path)
+                .unwrap()
+                .reopen_cancelled_lease("flaky-corrupt", ReopenOptions::default(), &verifier)
+                .unwrap();
+            let charge = if deadline_passes {
+                assert_eq!(
+                    (reopened.status.as_str(), reopened.settles),
+                    ("active", "deadline_fallback")
+                );
+                assert!(reopened.warning.is_some());
+                bound
+            } else {
+                assert_eq!(
+                    (reopened.status.as_str(), reopened.settles, reopened.warning),
+                    ("revoking", "captured_usage", None)
+                );
+                10_000
+            };
+            let processor = serving(&path);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let record = record_of(&processor, &request);
+            assert_eq!(record.status, NullifierStatus::Finalized);
+            assert_eq!(record.charge_applied, Some(charge));
+            assert_eq!(
+                installed_balance(&processor, &wallet, &note, &prepared),
+                2_000_000 - charge
+            );
+            server.abort();
+        }
     }
 
     #[test]

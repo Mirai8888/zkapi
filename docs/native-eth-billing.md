@@ -125,9 +125,22 @@ creation, the server durably activates the lease and repeats the same check
 before returning its secret, and it records that the key was delivered only
 immediately before returning it. If a withdrawal consumed the nullifier during
 provider I/O, or the read fails, no key is returned; the active record stays for
-status and settlement, which charges such an undelivered key nothing. RPC
-availability is therefore required for new key delivery, including retries.
-Existing lease status and settlement do not require this issuance check.
+status and settlement, which charges such an undelivered key nothing, and a
+direct key is queued for deletion at once. RPC availability is therefore
+required for new key delivery, including retries. Existing lease status and
+settlement do not require this issuance check.
+
+A key is only ever returned for a lease that settles from usage. Issuance holds
+the issuance lock from its first check until it has returned or abandoned the
+key. The background settler and a client's retirement settle a never-delivered
+lease at zero only while holding that same lock (a retirement waits for it) and
+read the lease again once they hold it: a key delivered meanwhile settles from
+usage instead. Before signing the zero-charge successor, the settlement also
+commits the lease row to it, after which the key can neither be activated nor
+marked delivered, and an issuance whose delivery mark is refused never returns
+its key. Such a direct key is deleted in the background. The OA org offers no
+key revocation: an OA key that was never returned was seen only by the org, its
+station and this server, and lapses at its TTL.
 
 A withdrawal started after key delivery still requires timely operation of the
 challenger. The challenger contests an escape at a lease's state only after
@@ -162,13 +175,17 @@ verification immediately before reservation, with equality treated as expired.
 Issuance attempts share one lock, so an exact POST that returns this rejection
 has also waited for earlier in-flight attempts. A local clock or an unknown GET
 alone does not authorize deleting a journal; startup remains read-only.
-`POST /v2/openrouter/leases/{id}/expire` accepts the exact saved request and waits
-on the same issuance lock. It returns `expired_unaccepted` when the server clock
-says expired, or `superseded_unaccepted` when a newer finalized round exists,
-with the exact request ID, nullifier and payload hash. Both acknowledgments
-require that neither its nullifier nor request ID has a reservation. Superseded
-recovery relies on Ethereum finality: an ordinary head reorganization cannot
-revive the old quote. A finalized-chain safety violation is outside this model,
+`POST /v2/openrouter/leases/{id}/expire` accepts the exact saved request. It
+returns `expired_unaccepted` when the server clock says expired, or
+`superseded_unaccepted` when a newer finalized round exists, with the exact
+request ID, nullifier and payload hash. Both acknowledgments require that
+neither its nullifier nor request ID has a reservation. That is checked under
+the same issuance lock, which waits for earlier in-flight attempts, before and
+again after the oracle reads; the lock is not held across them. An issuance
+that reserved the request meanwhile is seen, and a later one reads the clock
+and the oracle later, so it cannot accept an expired or superseded quote.
+Superseded recovery relies on Ethereum finality: an ordinary head
+reorganization cannot revive the old quote. A finalized-chain safety violation is outside this model,
 as it is for the private note's confirmed chain state. This endpoint is
 read-only: it never generates a key, signs, reserves or cancels anything. Every
 other result preserves the journal. It allows interrupted startup/withdrawal recovery without
@@ -215,7 +232,9 @@ nullifier again, and the owner exits from the signed successor state. On vaults
 deployed before this release the nullifier stays consumed.
 Do not reuse a daemon, verifier or setup from another circuit. Configure the published manifest separately; these flags do
 not rewrite static frontend manifests. The browser SDK handles funding and
-withdrawals; the operator CLI runs setup, signing-key, server and indexer commands.
+withdrawals; the operator CLI runs setup, signing-key, server and indexer
+commands, and `zkapi settlement reopen` (see
+[Reopening a cancelled lease](#reopening-a-cancelled-lease)).
 
 OA provisioning retries accept a shortened remaining lifetime only when the
 relay explicitly marks the station response `replayed: true`. Its original
@@ -258,8 +277,9 @@ The nullifier is finalized, never deleted or made reusable.
 If finalization is interrupted, the next background scan or exact saved-proof
 settlement request finishes it. A persisted signed successor is reused after a
 crash; it is never replaced with a new signature. A provisioning row is
-finalized at zero only while no issuance attempt for it is in progress and only
-while it still has no key.
+finalized at zero only while it still has no key and only while holding the
+issuance lock, so never during an issuance attempt; see
+[Settlement terminality](#settlement-terminality) for when.
 
 Every other OA lease that never returned a key to the client is also finalized
 at zero once its settlement is due, whatever its outcome: `not_started`,
@@ -298,6 +318,21 @@ no longer hold its note state reserved indefinitely:
   `issued: false`, `delivered: false` and a `reason`
   (`issuance_not_started`, `issuer_policy_rejected`, `issuance_not_completed`
   or `key_never_delivered`).
+- Such a lease is due once its `settle_after` passes (for a provisioning row,
+  normally its creation plus TTL and grace; for an activated one, its key's
+  expiry plus grace) or its settlement deadline passes, and at once after a
+  confirmed OA rejection or once the lease is committed to its zero charge.
+  Its zero settlement needs the issuance lock (see above). A settlement tick
+  (every `--openrouter-settlement-poll-seconds`) finalizes a due lease when that
+  lock is free and otherwise defers it to the next tick. Once the lease is past
+  its settlement deadline, the tick instead queues for the lock, in arrival
+  order, for up to 30 seconds after its other zero settlements, then finishes
+  its other work. Lock holders that come and go, such as issuance attempts or
+  `/expire` checks, can therefore no longer postpone it; only a lock held, or
+  a queue of holders waiting, for longer than 30 seconds defers it to the next
+  tick. Its owner can also finalize it at once by retiring it with the exact
+  saved request, which waits for the lock within the 45-second retirement
+  timeout.
 - A lease that may have been delivered (active, retiring, disabled or revoking)
   is settled from measured usage, clamped to its solvency bound
   (`charge_basis` `measured` or `clamped`). Transient failures, such as an
@@ -316,9 +351,23 @@ no longer hold its note state reserved indefinitely:
   spending limit was derived from it.
 - `cancelled` is used only for a lease whose saved binding does not match its
   nullifier record. The server never signs it and records a `binding_corrupt`
-  review, and a retry of the request returns `nullifier_used`. Its nullifier
-  stays reserved without evidence, so its owner exits from that state by escape,
-  which the challenger does not contest.
+  review naming the first mismatching field, and a retry of the request returns
+  `nullifier_used`. A direct key that may have been delivered is first disabled
+  and its usage captured, so that a reopening can charge that usage. The
+  capture is retried like any settlement until the deadline; the corruption is
+  reviewed as soon as it is found, and the lease is cancelled, with a second
+  review, once its usage is read, or at its deadline without it. The
+  cancellation queues the key's deletion. Its nullifier stays reserved without
+  evidence, which blocks most owners: SDK builds on a vault without
+  `vault_revision` 2 (strict mode, every shipped profile) refuse
+  to escape at that state, zkapi-clientd has no escape, and a reserved nullifier
+  never receives a mutual-close clearance. Only an SDK on a `vault_revision` 2
+  vault can escape there, through the explicit override once
+  `unsettled_request_escape_after_seconds` has passed; the challenger does not
+  contest it. The operator's remedy is to
+  [reopen the lease](#reopening-a-cancelled-lease) once its binding is
+  repaired. Conceding its charge (`--zero-charge`) is a choice of charge within
+  that remedy, not a way around the repair.
 - Keys of terminal direct leases that may still exist at the provider (worst
   case, never delivered or cancelled) are disabled and then deleted in the
   background, outside the settlement lock; a 404 counts as done, and failures
@@ -345,20 +394,36 @@ settlement writes a row to the `settlement_reviews` table with one of the
 reasons `usage_clamped`, `deadline_worst_case`, `unsettleable_worst_case`,
 `finalized_before_key_deletion` or `binding_corrupt`, and logs
 `settlement required operator review` at error level. Alert on that line.
+Reopening a cancelled lease adds a `binding_reopened` row, as does conceding the
+charge of a reopened lease later. The table is a log: one lease can have
+several rows, such as its cancellation, its reopening and its final settlement.
+A `binding_corrupt` row's detail names the first disagreeing field; either side
+of the disagreement may be the corrupt one, which the reopen command tells
+apart. A direct lease that may have been delivered gets one such row when its
+corruption is found and another when it is cancelled.
 `GET /v1/dashboard/settlement?limit=N` (operator-only and never proxied by the
 gateway; password-gated like the other dashboard routes on Sepolia) returns:
 
 - `counts`: `pending`, `retrying`, `provisioning`, `cancelled`,
   `unknown_status`, `open_reviews`, `pending_key_cleanups` and
   `next_deadline_in_seconds`;
-- `pending`: each unsettled lease with its status, delivery, deadline, seconds
-  remaining, attempts, first error time and last error;
+- `pending`: each unsettled lease with its status, delivery, charge basis
+  already committed (`unissued` or `operator_conceded`, otherwise null),
+  deadline, seconds remaining, attempts, first error time and last error;
 - `reviews`: each review with its reason, charge basis, reported usage, applied
   charge, solvency bound and acknowledgement time.
 
 `GET /v1/dashboard/summary` includes the same counts as `settlement`.
-Acknowledge a handled review by setting `acknowledged_at`; the
-[Docker guide](../docker/aws/README.md#monitoring) has the commands.
+Acknowledge each handled review row by setting its `acknowledged_at`, selected
+by its `review_id`; the [Docker guide](../docker/aws/README.md#monitoring) has
+the commands.
+
+Keep backups of the server database, for example with sqlite3's online backup
+(`sudo sqlite3 -readonly /var/lib/zkapi/server.db ".backup /var/backups/zkapi/server.db"`
+on the Docker host), without stopping the server. A backup is never restored
+over the live database; it is a source of the authentic saved request when a
+lease's own copy is corrupt (see
+[Reopening a cancelled lease](#reopening-a-cancelled-lease)).
 
 Every file-backed signing processor holds an exclusive database sidecar lock
 for its lifetime. Challenger reads remain available. Stop all older server
@@ -366,8 +431,133 @@ writers before deployment: old binaries and manual database writes do not honor
 this lock. Preserve the sidecar, database and backup together; never unlink the
 lock to bypass an active writer. Do not downgrade a migrated live database to an
 older writer. An older writer ignores the settlement deadline, delivery and
-review columns, compares saved quotes with its live settings again, and treats
+review columns, compares saved quotes with its live settings again, treats
 `cancelled` and direct provisioning rows as not due, so its settlement can stall
-again; rows already finalized stay finalized. Rollback requires a compatible
-writer or stopped-service reconciliation of affected rows, not restoring an old
-database over newer wallet activity.
+again, and ignores both a lease's commitment to a zero charge and an operator
+concession; rows already finalized stay finalized. Rollback requires a
+compatible writer or stopped-service reconciliation of affected rows, not
+restoring an old database over newer wallet activity.
+
+## Reopening a cancelled lease
+
+A `binding_corrupt` review names the first field in which the lease row
+disagrees with its nullifier reservation. The server has not checked which side
+is corrupt: the saved request (`openrouter_leases.api_request_json`), the lease
+row's other columns, or the reservation (the `nullifiers` row). Wait until the
+lease is `cancelled`: a direct lease that may have been delivered is reviewed
+when its corruption is found but cancelled only once its key's usage is
+captured (at its deadline at the latest), and the command refuses it until
+then. Then stop the API server and run the command against its database, with
+its proof setup. In the [Docker deployment](../docker/aws/README.md), with `dc`
+defined as under its Monitoring section:
+
+```sh
+dc stop server
+dc run --rm --no-deps --entrypoint zkapi server settlement reopen \
+  --db-path /data/server.db --client-request-id "$ID"
+dc start server
+```
+
+`$ID` is the `client_request_id` the review names. The container sees the
+database as `/data/server.db`, and the default `--proof-setup-dir`
+(`protocol/setup/v2` under the image's working directory, or
+`ZKAPI_PROOF_SETUP_DIR` from the deployment) is the server's setup. On a host
+install, run
+`zkapi --proof-setup-dir <the server's setup> settlement reopen --db-path <the server's --db-path> --client-request-id "$ID"`;
+the global `--proof-setup-dir` goes before `settlement`. The command takes the
+server's database writer lock: it refuses while a server holds it, and no
+server starts while it runs. It changes nothing unless the lease is `cancelled`
+with a `binding_corrupt` review and passes these checks in order; a refusal
+names the first field that fails and its repair:
+
+1. The nullifier is not `ClearanceReserved`: that owner already holds a
+   clearance and exits by mutual close.
+2. The saved request verifies as admission verified it: its payload hashes to
+   its `payload_hash`, its proof's authorization tag binds its
+   `client_request_id` and payload, and its Groth16 proof verifies against its
+   public inputs. Together these cover every field of the request. A request
+   that fails, or cannot be read, is the corrupt side. Never recompute the
+   reservation from it: the server would then sign a successor for a request
+   that its owner never authorized. Instead run the command again with
+   `--saved-request FILE` (`-` reads standard input), a JSON copy of the
+   authentic request from either source:
+   - a backup of the server database:
+     `sqlite3 -readonly backup.db "SELECT api_request_json FROM openrouter_leases WHERE client_request_id = '$ID'" > request.json`;
+   - its owner's copy, which the wallet keeps until the lease settles:
+     `prepared_request` in zkapi-clientd's `pending_journal.json`, in its state
+     directory (`jq .prepared_request pending_journal.json > request.json`), or
+     in the browser SDK's request journal.
+
+   The copy is accepted only if it verifies, its binding is the
+   `api_request_binding` its reservation recorded at admission, and it shares
+   the lease row's `client_request_id` or `request_nullifier`. A tampered copy,
+   another request its owner authorized for the same note state, and another
+   lease's request are refused. If the reservation's `api_request_binding` is
+   corrupt too, restore that column from a backup first. In the Docker
+   deployment, pass the copy on standard input:
+   `dc run -T --rm --no-deps --entrypoint zkapi server settlement reopen --db-path /data/server.db --client-request-id "$ID" --saved-request - < request.json`.
+3. The lease row agrees with the verified request: its `client_request_id` and
+   `request_nullifier`. The request having verified, the lease row is the
+   corrupt side: run the command again with `--rebind`, which sets both columns
+   from the request and moves the lease's reviews to its corrected id. It
+   refuses while another lease row holds the request's id or nullifier. Do not
+   set these columns by hand: `client_request_id` also keys the lease's reviews
+   and key cleanup. (A row renamed by hand is still found by its nullifier.)
+4. The reservation agrees with it: its row exists, its kind is
+   `openrouter_lease`, and its `client_request_id`, `payload_hash` and
+   `api_request_binding` match. The request having verified, the reservation is
+   the corrupt side. Its `api_request_binding` is a keccak digest of the
+   request, which `sqlite3` cannot compute: run the command again with
+   `--rebind`, which rewrites a `Reserved` row's fields from the verified
+   request, or re-creates a missing row as `Reserved`. It refuses a `Finalized`
+   row (a successor is already signed: restore that row from a backup) and a
+   row of the request kept under another nullifier (mis-keyed, not missing:
+   repair its `nullifier` column instead). Re-creating a missing row assumes
+   that no successor was signed for it: a transcript lost with the row is
+   signed again.
+
+`--saved-request` and `--rebind` combine. Once every check passes, the command
+returns the lease to settlement with its write-once deadline unchanged, and
+prints the lease's new state as JSON:
+
+- `client_request_id`: the lease's id, as corrected by `--rebind`.
+- `status`: a lease without a key resumes `provisioning`, a direct lease whose
+  usage was captured resumes `revoking`, and any other resumes `active`.
+- `settles`, how the restarted server settles it:
+  - `zero_never_delivered`: a lease never delivered is committed to its zero
+    charge at once, so that a retry of the request cannot issue its key.
+  - `captured_usage`: a direct key that may have been delivered was disabled
+    and its usage captured before the cancellation. That usage, clamped to the
+    solvency bound, is charged at the first tick.
+  - `measured_until_deadline`: usage is measured until the deadline, then the
+    lease falls back to captured usage or its solvency bound. The command
+    withdraws a key deletion the cancellation queued and that has not run yet
+    (`key_cleanup_withdrawn: true`), so that the key can still be read.
+  - `deadline_fallback`: no usage can be measured, because the deadline has
+    passed or because a direct key was deleted before its usage was captured.
+    The lease is charged its full solvency bound at its deadline (at once if it
+    has passed), and the output adds a `warning`.
+  - `operator_conceded` or `signed_transcript`, below.
+- `reservation`: `unchanged`, or, with `--rebind`, `rewritten` or `recreated`.
+- `lease_row`: `unchanged`, or, with `--rebind`, `rewritten`.
+- `saved_request`: `unchanged`, or `restored` from `--saved-request`.
+
+With `--zero-charge` the lease is finalized at zero instead, with `charge_basis`
+and `settlement_reason` `operator_conceded`: the operator concedes the request's
+charge, as the owner's escape would have, and a direct key is deleted. The same
+checks apply: a request that does not verify, or a binding still corrupt, is
+not conceded either. `--zero-charge` also concedes a lease reopened earlier that
+is not settled yet, for instance after a `deadline_fallback` warning; run it
+before restarting the server. A request whose successor is already signed
+settles from that transcript and cannot be conceded. The command acknowledges
+the lease's `binding_corrupt` reviews and records a `binding_reopened` review,
+and records another for a later concession.
+
+The restarted server verifies a reopened lease's saved request again, and
+checks its binding, deployment and signing key, before it signs anything; a
+lease that fails is cancelled again with a new review. The owner's wallet
+installs the signed receipt through its ordinary recovery, as for any finalized
+lease. Once signed, the transcript is challenge evidence: an escape the owner
+started at that state is contested, and the owner exits from the signed
+successor state. Reopen before the note expires, or its deposit goes to the
+treasury.

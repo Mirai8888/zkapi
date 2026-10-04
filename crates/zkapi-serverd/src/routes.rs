@@ -499,6 +499,13 @@ struct HealthResponse {
     testnet_password_required: bool,
     /// POST /v2/withdraw/clearance requires `ownership_proof`.
     clearance_ownership_proof_required: bool,
+    /// New proof-less clearances admitted this minute.
+    legacy_clearance_window_used: u32,
+    /// Their per-minute limit, shared by every caller; 0 while legacy
+    /// clearance is off.
+    legacy_clearance_window_limit: u32,
+    /// Proof-less clearances refused by that limit since the process started.
+    legacy_clearance_rejected_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -515,6 +522,7 @@ struct AttestationResponse {
 
 async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse> {
     let config = processor.config();
+    let legacy = processor.legacy_clearance_usage();
     Json(HealthResponse {
         status: "ok",
         protocol_version: config.protocol_version,
@@ -528,6 +536,9 @@ async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse
         request_modes: vec!["direct_openrouter"],
         testnet_password_required: config.testnet_password.is_some(),
         clearance_ownership_proof_required: !config.allow_legacy_clearance,
+        legacy_clearance_window_used: legacy.window_used,
+        legacy_clearance_window_limit: legacy.window_limit,
+        legacy_clearance_rejected_total: legacy.rejected_total,
     })
 }
 
@@ -821,7 +832,9 @@ fn build_error_response(
             StatusCode::CONFLICT
         }
         ServerError::NoteExpired => StatusCode::GONE,
-        ServerError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        ServerError::CapacityExhausted | ServerError::LegacyClearanceCapacity { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         ServerError::Internal(_) | ServerError::Database(_) | ServerError::Unsettleable(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -834,6 +847,9 @@ fn build_error_response(
             ..
         }
         | ServerError::LeaseSettlementPending {
+            retry_after_seconds,
+        }
+        | ServerError::LegacyClearanceCapacity {
             retry_after_seconds,
         } => Some(*retry_after_seconds),
         _ => None,
@@ -1003,6 +1019,25 @@ mod rate_limit_tests {
             assert_eq!(body.error_code, code);
             assert_eq!(body.retriable, retriable, "{code}");
         }
+    }
+
+    #[test]
+    fn legacy_clearance_capacity_is_a_distinct_503_with_retry_after() {
+        let error = ServerError::LegacyClearanceCapacity {
+            retry_after_seconds: 42,
+        };
+        let (status, headers, Json(body)) = build_error_response(&error, "clearance", None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers.get(RETRY_AFTER).unwrap(), "42");
+        assert_eq!(body.error_code, "legacy_clearance_capacity");
+        assert!(body.retriable);
+        assert_eq!(body.retry_after_seconds, Some(42));
+        // Verification saturation keeps its own code.
+        let (status, headers, Json(body)) =
+            build_error_response(&ServerError::CapacityExhausted, "clearance", None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.get(RETRY_AFTER).is_none());
+        assert_eq!(body.error_code, "capacity_exhausted");
     }
 
     #[test]
@@ -1662,11 +1697,14 @@ pub(crate) mod settlement_route_tests {
 
     #[tokio::test]
     async fn health_reports_clearance_ownership_requirement() {
-        for (legacy, required) in [(false, true), (true, false)] {
+        for (legacy, required, limit) in [(false, true, 0), (true, false, 60)] {
             let app = create_router(Arc::new(processor(legacy)));
             let (status, body) = get_json(&app, "/health").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["clearance_ownership_proof_required"], required);
+            assert_eq!(body["legacy_clearance_window_used"], 0);
+            assert_eq!(body["legacy_clearance_window_limit"], limit);
+            assert_eq!(body["legacy_clearance_rejected_total"], 0);
             // No settlement data on the public health endpoint.
             assert!(body.get("settlement").is_none());
         }
@@ -1697,6 +1735,91 @@ pub(crate) mod settlement_route_tests {
             .store()
             .lookup_by_nullifier(&Felt252::from_u64(42))
             .is_none());
+    }
+
+    async fn post_clearance(
+        app: &Router,
+        request: &ClearanceRequest,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/withdraw/clearance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, headers) = (response.status(), response.headers().clone());
+        let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        (status, headers, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn junk_exhausting_the_legacy_budget_gets_its_own_code_and_shows_on_health() {
+        let fixture = crate::test_support::ownership_fixture().await;
+        let (state_seed, clear_seed) = crate::test_support::OWNERSHIP_SEEDS;
+        let processor = RequestProcessor::try_new(
+            ServerConfig {
+                allow_legacy_clearance: true,
+                legacy_clearance_max_per_minute: 60,
+                ..crate::test_support::ownership_server_config()
+            },
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            Arc::new(ServerSigner::new(
+                &Felt252::from_u64(state_seed),
+                &Felt252::from_u64(clear_seed),
+            )),
+            fixture.root,
+        )
+        .unwrap();
+        let app = create_router(Arc::new(processor));
+        // Stay inside one budget window on the real clock.
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60;
+        if elapsed > 50 {
+            tokio::time::sleep(Duration::from_secs(60 - elapsed)).await;
+        }
+        let proofless = |nullifier| ClearanceRequest {
+            withdrawal_nullifier: nullifier,
+            ownership_proof: None,
+        };
+        for junk in 0..60 {
+            let junk = proofless(Felt252::from_u64(0xdead_0000 + junk));
+            assert_eq!(post_clearance(&app, &junk).await.0, StatusCode::OK);
+        }
+        let nullifier = fixture.plan.public_inputs.withdrawal_nullifier;
+        let (status, headers, body) = post_clearance(&app, &proofless(nullifier)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error_code"], "legacy_clearance_capacity");
+        assert_eq!(body["retriable"], true);
+        let retry_after: u64 = headers[RETRY_AFTER].to_str().unwrap().parse().unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        assert_eq!(body["retry_after_seconds"], retry_after);
+        // The owner's ownership proof is admitted regardless.
+        let proved = ClearanceRequest {
+            withdrawal_nullifier: nullifier,
+            ownership_proof: Some(zkapi_types::wire::ClearanceOwnershipProof {
+                public_inputs: fixture.plan.public_inputs.clone(),
+                proof: fixture.plan.proof.clone(),
+            }),
+        };
+        let (status, _, body) = post_clearance(&app, &proved).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["withdrawal_nullifier"],
+            serde_json::to_value(nullifier).unwrap()
+        );
+        let (_, health) = get_json(&app, "/health").await;
+        assert_eq!(health["legacy_clearance_window_used"], 60);
+        assert_eq!(health["legacy_clearance_window_limit"], 60);
+        assert_eq!(health["legacy_clearance_rejected_total"], 1);
     }
 
     #[tokio::test]

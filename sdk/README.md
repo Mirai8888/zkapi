@@ -215,12 +215,21 @@ trust anchor and never from the served manifest:
   then sends an escape-form ownership proof (a second withdrawal proof, to the
   user's real destination and current balance) with
   `POST /v2/withdraw/clearance`. This also happens when `vault_revision` is 2 or
-  more. Otherwise the request is sent without a proof first and, on
-  `400 clearance_ownership_required`, once more with one. An ownership proof is
-  never generated for a transmitted state unless the server reports its
-  nullifier `unknown` or `clearance_reserved`. It is never persisted. The returned
-  clearance is persisted with the plan and reused while the state's nullifier
-  is unchanged.
+  more. Otherwise the request is sent without a proof first. A server with
+  legacy clearance on may reserve on it, so the note is marked withdrawal-only
+  before it is sent. If the server answers `400 clearance_ownership_required`,
+  or `503 legacy_clearance_capacity` (an upgraded server whose shared
+  proof-less budget is spent), nothing was reserved: the wallet restores its
+  previous withdrawal state, generates the ownership proof, and only then marks
+  the note withdrawal-only again and sends the request once more with the
+  proof. A proving failure or a refused transmitted-state check (below) leaves
+  that previous state, so a note that was usable for chat stays usable. After
+  any other failure of the proof-less request the note stays withdrawal-only,
+  because the server may have reserved it. `503 capacity_exhausted` is retried
+  with the same body. An ownership proof is never generated for a transmitted
+  state unless the server reports its nullifier `unknown` or
+  `clearance_reserved`. It is never persisted. The returned clearance is
+  persisted with the plan and reused while the state's nullifier is unchanged.
 
 On a revision-2 vault, `client.withdraw('escape', onStatus, { destination,
 overrideUnsettledRequest: true })` is an explicit, separately keyed escape
@@ -383,8 +392,12 @@ The packaged mainnet and Sepolia configurations use
 signing keys, proof artifacts, and circuit hashes. Hosts may supply reviewed
 explicit profiles as described above. The packaged profiles declare neither
 `vault_revision` nor `clearance_ownership_proof`: they run in strict mode and
-send clearance requests without a proof first, adding one only when the server
-answers `clearance_ownership_required`.
+send clearance requests without a proof first, adding one when the server
+answers `400 clearance_ownership_required` or `503 legacy_clearance_capacity`.
+Once a deployment's server is upgraded, its profile must declare
+`"clearance_ownership_proof": "optional"` in `trusted_deployment`, because
+proof-less requests share a legacy budget that anyone can exhaust (see the
+[migration guide](../docs/migration-hardened-vault.md#phase-2-publish-clients)).
 
 The runtime checks that active notes, pending deposits, leases, and unfinished
 recovery state match the selected deployment. Preserve wallet state and recovery

@@ -128,6 +128,73 @@ impl RecentRoots {
     }
 }
 
+/// The transitional budget of new proof-less clearance reservations: one
+/// window per UNIX minute, shared by every caller, so anyone can spend it. A
+/// request with an ownership proof never consults it.
+#[derive(Default)]
+struct LegacyClearanceWindow {
+    minute: u64,
+    admitted: u32,
+    /// This window's exhaustion was logged.
+    warned: bool,
+    /// Proof-less requests refused since the process started.
+    rejected_total: u64,
+}
+
+/// A proof-less clearance refused until the next window.
+struct LegacyClearanceRefusal {
+    retry_after_seconds: u64,
+    /// The window's first refusal: the only one that is logged.
+    first_in_window: bool,
+    rejected_total: u64,
+}
+
+impl LegacyClearanceWindow {
+    fn admit(&mut self, now: u64, limit: u32) -> Result<(), LegacyClearanceRefusal> {
+        let minute = now / 60;
+        if self.minute != minute {
+            *self = Self {
+                minute,
+                rejected_total: self.rejected_total,
+                ..Self::default()
+            };
+        }
+        if self.admitted < limit {
+            self.admitted += 1;
+            return Ok(());
+        }
+        self.rejected_total = self.rejected_total.saturating_add(1);
+        Err(LegacyClearanceRefusal {
+            retry_after_seconds: 60 - now % 60,
+            first_in_window: !std::mem::replace(&mut self.warned, true),
+            rejected_total: self.rejected_total,
+        })
+    }
+
+    fn usage(&self, now: u64, limit: u32) -> LegacyClearanceUsage {
+        LegacyClearanceUsage {
+            window_used: if self.minute == now / 60 {
+                self.admitted
+            } else {
+                0
+            },
+            window_limit: limit,
+            rejected_total: self.rejected_total,
+        }
+    }
+}
+
+/// The legacy clearance budget as `/health` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyClearanceUsage {
+    /// New proof-less reservations admitted in the current minute.
+    pub window_used: u32,
+    /// The per-minute budget; 0 while legacy clearance is off.
+    pub window_limit: u32,
+    /// Proof-less requests refused by the budget since the process started.
+    pub rejected_total: u64,
+}
+
 /// (root, nullifier) pairs whose verified ownership proof used a root the
 /// vault did not have, with the vault root read and an expiry. While the
 /// (cached, single-flight) vault root is unchanged, replays are answered from
@@ -182,8 +249,8 @@ pub struct RequestProcessor {
     clearance_permits: tokio::sync::Semaphore,
     /// The last vault currentRoot() read (or its failure) and when.
     vault_root_cache: tokio::sync::Mutex<Option<(Result<Felt252, String>, Instant)>>,
-    /// (UNIX minute, proof-less clearance reservations in that minute).
-    legacy_clearances: Mutex<(u64, u32)>,
+    /// The current minute's proof-less clearance budget.
+    legacy_clearances: Mutex<LegacyClearanceWindow>,
     timing: SettlementTiming,
     dashboard: Option<Arc<DashboardHub>>,
     openrouter: Option<Arc<OpenRouterProvisioner>>,
@@ -291,7 +358,7 @@ impl RequestProcessor {
             rejected_clearances: Mutex::new(RejectedClearances::default()),
             clearance_permits: tokio::sync::Semaphore::new(CLEARANCE_VERIFY_PERMITS),
             vault_root_cache: tokio::sync::Mutex::new(None),
-            legacy_clearances: Mutex::new((0, 0)),
+            legacy_clearances: Mutex::new(LegacyClearanceWindow::default()),
             timing: SettlementTiming::default(),
             dashboard: None,
             openrouter,
@@ -2289,20 +2356,45 @@ impl RequestProcessor {
         })
     }
 
+    /// Spend one slot of the shared per-minute budget on a new proof-less
+    /// reservation. Exhaustion has its own error code, so a client can tell
+    /// it from verification saturation and send its ownership proof instead.
     fn admit_legacy_clearance(&self) -> Result<(), ServerError> {
-        let minute = current_timestamp() / 60;
-        let mut window = self
+        let admitted = self
             .legacy_clearances
             .lock()
-            .map_err(|_| ServerError::Internal("legacy clearance limiter poisoned".into()))?;
-        if window.0 != minute {
-            *window = (minute, 0);
+            .map_err(|_| ServerError::Internal("legacy clearance limiter poisoned".into()))?
+            .admit(
+                current_timestamp(),
+                self.config.legacy_clearance_max_per_minute,
+            );
+        let Err(refusal) = admitted else {
+            return Ok(());
+        };
+        // Junk requests can exhaust the budget every minute: log once per window.
+        if refusal.first_in_window {
+            tracing::warn!(
+                max_per_minute = self.config.legacy_clearance_max_per_minute,
+                rejected_total = refusal.rejected_total,
+                "legacy clearance budget exhausted: proof-less clearances are refused until the next minute"
+            );
         }
-        if window.1 >= self.config.legacy_clearance_max_per_minute {
-            return Err(ServerError::CapacityExhausted);
-        }
-        window.1 += 1;
-        Ok(())
+        Err(ServerError::LegacyClearanceCapacity {
+            retry_after_seconds: refusal.retry_after_seconds,
+        })
+    }
+
+    /// The legacy clearance budget for `/health`.
+    pub fn legacy_clearance_usage(&self) -> LegacyClearanceUsage {
+        let limit = if self.config.allow_legacy_clearance {
+            self.config.legacy_clearance_max_per_minute
+        } else {
+            0
+        };
+        self.legacy_clearances
+            .lock()
+            .map(|window| window.usage(current_timestamp(), limit))
+            .unwrap_or_default()
     }
 
     /// Verify an escape-form withdrawal proof for exactly this nullifier and
@@ -6415,12 +6507,16 @@ mod tests {
         // Re-requesting an existing reservation creates no new row.
         processor.process_clearance(&proofless(1)).await.unwrap();
         // The in-process cap bounds new proof-less rows per minute.
-        *processor.legacy_clearances.lock().unwrap() = (current_timestamp() / 60, 2);
+        *processor.legacy_clearances.lock().unwrap() = LegacyClearanceWindow {
+            minute: current_timestamp() / 60,
+            admitted: 2,
+            ..LegacyClearanceWindow::default()
+        };
         let error = processor
             .process_clearance(&proofless(2))
             .await
             .unwrap_err();
-        assert!(matches!(error, ServerError::CapacityExhausted));
+        assert!(matches!(error, ServerError::LegacyClearanceCapacity { .. }));
         assert!(error.is_retriable());
         assert!(processor
             .store
@@ -6443,6 +6539,108 @@ mod tests {
             .store
             .lookup_by_nullifier(&tampered.withdrawal_nullifier)
             .is_none());
+    }
+
+    #[test]
+    fn legacy_clearance_window_resets_each_minute_and_logs_once() {
+        let start = 1_700_000_040;
+        let mut window = LegacyClearanceWindow::default();
+        assert!(window.admit(start, 2).is_ok());
+        assert!(window.admit(start + 1, 2).is_ok());
+        let refusals: Vec<_> = [start + 15, start + 59]
+            .into_iter()
+            .map(|now| window.admit(now, 2).unwrap_err())
+            .map(|r| (r.retry_after_seconds, r.first_in_window, r.rejected_total))
+            .collect();
+        assert_eq!(refusals, [(45, true, 1), (1, false, 2)]);
+        assert_eq!(
+            window.usage(start + 59, 2),
+            LegacyClearanceUsage {
+                window_used: 2,
+                window_limit: 2,
+                rejected_total: 2
+            }
+        );
+        // A new minute brings a new budget and one more log line; the
+        // rejection count is cumulative.
+        assert_eq!(window.usage(start + 60, 2).window_used, 0);
+        assert!(window.admit(start + 60, 2).is_ok());
+        let refusal = window.admit(start + 60, 1).unwrap_err();
+        assert_eq!(
+            (refusal.retry_after_seconds, refusal.first_in_window),
+            (60, true)
+        );
+        assert_eq!(refusal.rejected_total, 3);
+    }
+
+    /// Start a scenario on the real clock well inside one budget window.
+    async fn inside_one_legacy_window() {
+        let elapsed = current_timestamp() % 60;
+        if elapsed > 50 {
+            tokio::time::sleep(Duration::from_secs(60 - elapsed)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn junk_proofless_clearances_never_starve_an_ownership_proof() {
+        let fixture = crate::test_support::ownership_fixture().await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.allow_legacy_clearance = true;
+        processor.config.legacy_clearance_max_per_minute = 60;
+        processor.update_root(fixture.root);
+        inside_one_legacy_window().await;
+        // Anyone can spend the shared budget on junk nullifiers.
+        for junk in 0..60 {
+            processor
+                .process_clearance(&ClearanceRequest {
+                    withdrawal_nullifier: Felt252::from_u64(0xdead_0000 + junk),
+                    ownership_proof: None,
+                })
+                .await
+                .unwrap();
+        }
+        // The owner's proof-less request is told that the budget, not
+        // verification capacity, is exhausted, and reserves nothing...
+        let nullifier = fixture.plan.public_inputs.withdrawal_nullifier;
+        let error = processor
+            .process_clearance(&ClearanceRequest {
+                withdrawal_nullifier: nullifier,
+                ownership_proof: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ServerError::LegacyClearanceCapacity { retry_after_seconds }
+                    if (1..=60).contains(&retry_after_seconds)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.error_code(), "legacy_clearance_capacity");
+        assert!(processor.store.lookup_by_nullifier(&nullifier).is_none());
+        // ...and its ownership proof never consults the budget.
+        processor
+            .process_clearance(&clearance(fixture))
+            .await
+            .unwrap();
+        assert_eq!(
+            processor
+                .store
+                .clearance_auth(&nullifier)
+                .unwrap()
+                .as_deref(),
+            Some("ownership_proof")
+        );
+        assert_eq!(processor.store.get_all_nullifiers().len(), 61);
+        assert_eq!(
+            processor.legacy_clearance_usage(),
+            LegacyClearanceUsage {
+                window_used: 60,
+                window_limit: 60,
+                rejected_total: 1
+            }
+        );
     }
 
     #[tokio::test]

@@ -42,6 +42,14 @@ pub enum ServerError {
     #[error("capacity exhausted")]
     CapacityExhausted,
 
+    /// A proof-less clearance found this minute's transitional legacy budget
+    /// spent. Nothing was reserved; a request with an ownership proof never
+    /// consults the budget.
+    #[error(
+        "legacy clearance capacity exhausted; send an ownership proof or retry after {retry_after_seconds} seconds"
+    )]
+    LegacyClearanceCapacity { retry_after_seconds: u64 },
+
     #[error("nullifier already used")]
     NullifierUsed,
 
@@ -88,6 +96,7 @@ impl ServerError {
             ServerError::Unsettleable(_) => "lease_unsettleable",
             ServerError::ClearanceOwnershipRequired => "clearance_ownership_required",
             ServerError::CapacityExhausted => "capacity_exhausted",
+            ServerError::LegacyClearanceCapacity { .. } => "legacy_clearance_capacity",
             ServerError::NullifierUsed => "nullifier_used",
             ServerError::Database(_) => "database_error",
             ServerError::InvalidRequest(_) => "invalid_request",
@@ -114,6 +123,8 @@ impl ServerError {
             ServerError::NoteExpired => false,
             // Clearance proof verification is bounded; retry after backoff.
             ServerError::CapacityExhausted => true,
+            // Retry after the window, or at once with an ownership proof.
+            ServerError::LegacyClearanceCapacity { .. } => true,
             ServerError::NullifierUsed => false,
             ServerError::InvalidRequest(_) => false,
             ServerError::ProtocolMismatch(_) => false,

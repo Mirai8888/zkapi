@@ -87,13 +87,27 @@ A request proof is never accepted. Errors:
 | 400 | `protocol_mismatch` | Another protocol version, chain or vault |
 | 409 | `stale_root` | Unknown root; `latest_root` is the vault's `currentRoot()`. Retry the same body, then prove again |
 | 409 | `nullifier_used` | The nullifier already authorized a request |
-| 503 | `capacity_exhausted` | Verification capacity is busy; retry the same body |
+| 503 | `capacity_exhausted` | Ownership-proof verification capacity is busy; retry the same body |
+| 503 | `legacy_clearance_capacity` | No `ownership_proof` while legacy clearance is on, and this minute's proof-less budget is spent; nothing was reserved. Send the ownership proof, or retry after `Retry-After` |
 
 A clearance reservation is permanent and its signature has no expiry. The
 server never logs or stores ownership proofs. Public `/health` reports
 `clearance_ownership_proof_required`; it is `false` only while the transitional
 `--allow-legacy-clearance` setting also accepts proof-less requests, at most
 `--legacy-clearance-max-per-minute` (default 60) new ones per minute.
+
+That budget is one per server process, shared by every caller, so anyone can
+spend it with junk nullifiers, each of which stays reserved. A proof-less
+request for a new nullifier that finds it spent gets
+`503 legacy_clearance_capacity` with `Retry-After` (and `retry_after_seconds`)
+set to the seconds until the next minute. A request with `ownership_proof` never
+uses the budget. Only a server that verifies ownership proofs returns this
+code, so a client answers it, like `clearance_ownership_required`, with its
+proof. The server logs the exhaustion at most once a minute. `/health` reports
+`legacy_clearance_window_used` and `legacy_clearance_window_limit` (new
+proof-less reservations this minute, out of the budget; the limit is `0` while
+legacy clearance is off) and `legacy_clearance_rejected_total` (proof-less
+requests refused by the budget since the process started).
 
 ## Indexer
 

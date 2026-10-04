@@ -3058,6 +3058,7 @@ class BrowserWalletRuntime extends EventTarget {
             || existing?.mode === 'mutual';
         let clearance = persistedClearance;
         if (mode === 'mutual' && !clearance) {
+            const replacedMarker = this.runtime.preparedWithdrawal ?? null;
             clearance = await this.obtainClearance({
                 state,
                 destination,
@@ -3080,7 +3081,11 @@ class BrowserWalletRuntime extends EventTarget {
                         clearanceReserved: true,
                         createdAt: Number(existing?.createdAt || Date.now())
                     }
-                })
+                }),
+                // A refusal that reserved nothing restores exactly what this
+                // attempt replaced: an earlier attempt's marker may still
+                // stand for a reservation, so it is never dropped.
+                rollbackMarker: () => this.commit({ ...this.runtime, preparedWithdrawal: replacedMarker })
             });
             if (clearance === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;
         }
@@ -3372,27 +3377,34 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Obtain the server clearance for a mutual close (G6 client half). With a
      * declared capability the request always carries an escape-form ownership
-     * proof; otherwise it is proof-less first, and on 400
-     * clearance_ownership_required the proof is generated and sent once. An
-     * ownership proof is never generated for a transmitted state unless the
-     * server reports that nullifier unknown or clearance_reserved.
+     * proof; otherwise it is proof-less first. A refusal that reserved nothing
+     * (400 clearance_ownership_required, or 503 legacy_clearance_capacity from
+     * an upgraded server whose shared proof-less budget is spent) rolls the
+     * withdrawal-only marker back, then the proof is generated and sent once
+     * exactly as with the capability. An ownership proof is never generated
+     * for a transmitted state unless the server reports that nullifier
+     * unknown or clearance_reserved.
      */
-    async obtainClearance({ state, destination, nullifier, path, selected = true, signal = null, commitMarker = null }) {
+    async obtainClearance({
+        state, destination, nullifier, path, selected = true, signal = null,
+        commitMarker = null, rollbackMarker = null
+    }) {
         const proved = async () => {
             const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
             if (gate.advanced) return WITHDRAWAL_RESTART;
             return this.generateOwnershipProof({ state, destination, nullifier, path });
         };
         if (!this.vaultCapabilities().sendOwnershipProof) {
+            // A server with legacy clearance on may reserve on this request.
             if (commitMarker) await commitMarker();
             try {
                 return await this.postClearance({ withdrawal_nullifier: nullifier }, nullifier, signal);
             } catch (error) {
-                if (error?.code !== 'clearance_ownership_required') throw error;
+                if (!['clearance_ownership_required', 'legacy_clearance_capacity'].includes(error?.code)) throw error;
             }
-            const ownership = await proved();
-            if (ownership === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;
-            return this.postClearance({ withdrawal_nullifier: nullifier, ownership_proof: ownership }, nullifier, signal);
+            // This request reserved nothing: until the proof is ready, a gate
+            // refusal, a proving failure or a closed tab leaves the note as it was.
+            if (rollbackMarker) await rollbackMarker();
         }
         const ownership = await proved();
         if (ownership === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;

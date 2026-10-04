@@ -122,7 +122,7 @@ before discarding a transmitted request on `stale_root` or
 | Method + path | `POST /v2/withdraw/clearance` |
 | Request | `ClearanceRequest { withdrawal_nullifier: Felt252, ownership_proof: { public_inputs: WithdrawalPublicInputsV2, proof: { backend: "groth16_bn254", proof: base64 } } }` |
 | Response (200) | `ClearanceResponseV2 { status, withdrawal_nullifier, signature: {r_x,r_y,s} }` |
-| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `503 capacity_exhausted` |
+| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `503 capacity_exhausted`, `503 legacy_clearance_capacity` |
 
 `ownership_proof` is an escape-form withdrawal proof for the same nullifier.
 Its `public_inputs` use the JSON form of the 14 withdrawal inputs, with
@@ -141,8 +141,8 @@ server's current root or one it observed within
 the vault's `currentRoot()` (cached for a few seconds) and, if the proof's root
 differs, returns `409 stale_root` with that vault root in `latest_root`; a
 failed vault read returns retriable `500 internal_error`. Groth16
-verification failures return `400 invalid_proof`. Verification runs
-under a small concurrency limit; saturation returns retriable
+verification failures return `400 invalid_proof`. Ownership-proof verification
+runs under a small concurrency limit; saturation returns retriable
 `503 capacity_exhausted`. Retry `stale_root` and `capacity_exhausted` with the
 same body and backoff, then prove again against a fresh root. A missing proof
 returns `400 clearance_ownership_required`, which is not retriable, and
@@ -156,16 +156,31 @@ withdrawals use `has_clearance = false` and require no server clearance.
 
 `--allow-legacy-clearance` (`ZKAPI_ALLOW_LEGACY_CLEARANCE`, default off) is a
 transitional setting that also signs proof-less requests from older clients.
-New proof-less reservations are then capped per process at
-`--legacy-clearance-max-per-minute` (default 60; beyond it
-`503 capacity_exhausted`). `GET /health` reports
-`clearance_ownership_proof_required: false` while the setting is on.
+New proof-less reservations are then capped at
+`--legacy-clearance-max-per-minute` (default 60) per minute. That budget is
+one per server process, shared by every caller, so anyone can spend it with
+junk nullifiers, each of which stays reserved. A proof-less request for a new
+nullifier that finds it spent gets retriable `503 legacy_clearance_capacity`,
+with `Retry-After` (and `retry_after_seconds`) set to the seconds until the
+next minute, and nothing is reserved. Answer it, like
+`clearance_ownership_required`, with the ownership proof: a request with a
+proof never uses the budget. Only a server that verifies ownership proofs
+returns this code; `capacity_exhausted` means only that ownership-proof
+verification is saturated. The server logs the exhaustion at most once a
+minute.
+
+`GET /health` reports `clearance_ownership_proof_required: false` while the
+setting is on, `legacy_clearance_window_used` and
+`legacy_clearance_window_limit` (new proof-less reservations this minute, out
+of the budget; the limit is `0` while the setting is off), and
+`legacy_clearance_rejected_total` (proof-less requests refused by the budget
+since the process started).
 
 ## Operations and errors
 
 | Method and path | Purpose |
 |---|---|
-| `GET /health` | Liveness, protocol/deployment identity, current root, `direct_openrouter` request mode, `testnet_password_required`, and `clearance_ownership_proof_required` |
+| `GET /health` | Liveness, protocol/deployment identity, current root, `direct_openrouter` request mode, `testnet_password_required`, `clearance_ownership_proof_required`, and the legacy clearance budget: `legacy_clearance_window_used`, `legacy_clearance_window_limit` and `legacy_clearance_rejected_total` |
 | `GET /v1/attestation` | Protocol/deployment identity, current root, `state_signing_key: {x,y}`, and `clearance_signing_key: {x,y}` |
 | `GET /v1/dashboard/summary` | Read-only deployment and usage summary, including settlement counts |
 | `GET /v1/dashboard/settlement` | Pending leases with their deadlines, and settlements that need operator review |
@@ -188,7 +203,8 @@ Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
 `400 clearance_ownership_required`, `409 stale_root`, `409 replay`,
-`409 nullifier_used`, `410 note_expired`, and `503 capacity_exhausted`.
+`409 nullifier_used`, `410 note_expired`, `503 capacity_exhausted`, and
+`503 legacy_clearance_capacity`.
 Throttled responses also carry `Retry-After` when available. A deployment's
 reverse proxy defines which protocol routes the browser may access. The
 reference gateway also limits `POST /v2/*` per network source and answers a

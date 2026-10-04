@@ -22,7 +22,13 @@ paths:
         "200":
           description: >-
             Public health, including chain_id, current_root,
-            testnet_password_required and clearance_ownership_proof_required
+            testnet_password_required, clearance_ownership_proof_required, and
+            the transitional proof-less clearance budget:
+            legacy_clearance_window_used and legacy_clearance_window_limit (new
+            proof-less reservations this minute, out of the per-minute budget;
+            the limit is 0 while legacy clearance is off) and
+            legacy_clearance_rejected_total (proof-less requests refused by the
+            budget since the process started)
   /v2/auth:
     get:
       summary: Validate the Sepolia service password without side effects
@@ -118,7 +124,18 @@ paths:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "429": {$ref: "#/components/responses/GatewayRateLimited"}
         "503":
-          description: capacity_exhausted; retry the same body after a backoff
+          description: >-
+            capacity_exhausted (ownership-proof verification is busy; retry the
+            same body after a backoff) or legacy_clearance_capacity (no
+            ownership_proof while --allow-legacy-clearance is set, and this
+            minute's proof-less budget, shared by every caller, is spent;
+            nothing was reserved; send the ownership proof, or retry after
+            Retry-After). Only a server that verifies ownership proofs returns
+            legacy_clearance_capacity.
+          headers:
+            Retry-After:
+              description: With legacy_clearance_capacity, seconds until the next budget minute
+              schema: {type: integer, minimum: 1, maximum: 60}
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -373,8 +390,9 @@ components:
           description: >-
             Stable machine code. OA limits use oa_minute_request_limit,
             oa_hourly_issuance_budget, or oa_rate_limited. Clearance adds
-            clearance_ownership_required, nullifier_used and capacity_exhausted.
-            The reference gateway uses gateway_rate_limited.
+            clearance_ownership_required, nullifier_used, capacity_exhausted
+            and legacy_clearance_capacity. The reference gateway uses
+            gateway_rate_limited.
         error_message: {type: string}
         retriable: {type: boolean}
         latest_root: {type: string, pattern: "^0x[0-9a-f]+$"}
@@ -382,7 +400,9 @@ components:
         retry_after_seconds:
           type: integer
           minimum: 0
-          description: Present with OA rate limits and matches the Retry-After header.
+          description: >-
+            Present with OA rate limits and legacy_clearance_capacity, and
+            matches the Retry-After header.
     OpenRouterLease:
       type: object
       required: [status, client_request_id, api_key, openrouter_api_base, issued_at, expires_at, valid_for_seconds, settle_after, spending_limit_usd, key_source]

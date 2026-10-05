@@ -84,11 +84,15 @@ type depositRebind struct {
 
 // depositSlot is the empty slot a signed deposit's zero path was checked
 // against, in the indexer's tree, just before signing. PathSHA256 identifies
-// the exact 32 sibling words in that transaction's calldata.
+// the exact 32 sibling words in that transaction's calldata. EmptyBefore
+// counts the empty slots right below NoteID in that tree: the calldata can
+// land below NoteID only in that run (see findDepositLeaf). Records written
+// before it was kept have none.
 type depositSlot struct {
-	NoteID     uint32 `json:"note_id"`
-	PathSHA256 string `json:"path_sha256"`
-	PreparedAt int64  `json:"prepared_at"`
+	NoteID      uint32 `json:"note_id"`
+	PathSHA256  string `json:"path_sha256"`
+	PreparedAt  int64  `json:"prepared_at"`
+	EmptyBefore uint32 `json:"empty_before,omitempty"`
 }
 
 // NewFundingHandler manages local custody through the authenticated CLI admin API.

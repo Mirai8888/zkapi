@@ -51,6 +51,14 @@ const DEFAULT_CHALLENGE_GAS: u128 = 7_600_000;
 const RELOG_SECONDS: u64 = 300;
 /// Indexer-listed escapes missing from the checkpoint checked per poll.
 const MAX_ESCAPE_CHECKS_PER_POLL: usize = 64;
+/// A listed note the vault holds no escape for is still read on every
+/// listing until reads this far apart have found none: the indexer's head
+/// view can be ahead of this daemon's RPC, so a fresh escape can read as
+/// absent at first.
+const DEAD_ESCAPE_CONFIRM_SECONDS: u64 = 60;
+/// After that, it is read again only once this many listings have passed,
+/// so such entries cannot spend the per-poll budget of the others.
+const DEAD_ESCAPE_RECHECK_POLLS: u64 = 16;
 const MAX_ERROR_CHARS: usize = 512;
 
 /// EIP-1559 fee proposals. The signer enforces its own caps, which must be at
@@ -316,6 +324,60 @@ struct WithdrawalState {
     deadline: u64,
 }
 
+/// A note the indexer lists as pending while the vault holds no escape for
+/// it: the list lags the vault, or its log source missed the escape's end
+/// and keeps the entry until a resync. Never kept for a tracked note, whose
+/// vault record every poll reads.
+struct DeadEscape {
+    /// The listed nullifier; another one listed for the note is read at once.
+    nullifier: Felt252,
+    /// When the vault was first read without the escape.
+    first_seen: u64,
+    /// When the vault was last read without it.
+    last_seen: u64,
+    /// The listing in which the vault was last read for it.
+    checked_at: u64,
+    /// The head of a poll after the first read without the escape, so at or
+    /// above that read's block.
+    read_by: Option<u64>,
+    /// A list served at a block between two reads without the escape named
+    /// the note: the indexer has processed a block in which the vault held
+    /// none, so its list does not merely lag the vault.
+    bracketed: bool,
+}
+
+impl DeadEscape {
+    /// Reads at least `seconds` apart have found no escape.
+    fn absent_for(&self, seconds: u64) -> bool {
+        self.last_seen.saturating_sub(self.first_seen) >= seconds
+    }
+
+    /// A read in this poll, at or above its `head`, brackets a list served
+    /// at block `listed` with the first read: `listed` lies from `read_by`
+    /// up to `head`. A list served without its block cannot be placed, and
+    /// only time decides.
+    fn brackets(&self, listed: Option<u64>, head: u64) -> bool {
+        listed.is_none_or(|block| self.read_by.is_some_and(|read| read <= block) && block <= head)
+    }
+
+    /// Reported as a disagreement: reads `warning` seconds apart have found
+    /// no escape, and a list served between two of them named the note.
+    fn reported(&self, warning: u64) -> bool {
+        self.bracketed && self.absent_for(warning)
+    }
+
+    /// Skipped at this listing: confirmed, and between its re-reads, unless
+    /// its report, due `warning` seconds after the first read, waits for a
+    /// read and this listing (`brackets`) or an earlier one can complete it.
+    fn resting(&self, listing: u64, now: u64, warning: u64, brackets: bool) -> bool {
+        self.absent_for(DEAD_ESCAPE_CONFIRM_SECONDS)
+            && listing - self.checked_at < DEAD_ESCAPE_RECHECK_POLLS
+            && (self.reported(warning)
+                || now.saturating_sub(self.first_seen) < warning
+                || !(self.bracketed || brackets))
+    }
+}
+
 /// A JSON-RPC error object. Display stays `"{method}: {error_json}"`.
 #[derive(Debug)]
 pub(crate) struct RpcError {
@@ -434,6 +496,12 @@ pub struct ChallengeService {
     poll: PollStatus,
     indexer: IndexerStatus,
     indexer_logged_at: Option<u64>,
+    /// Pending-escapes listings processed since the daemon started.
+    escape_listings: u64,
+    /// The listed note the next listing's vault reads start at.
+    escape_cursor: u32,
+    /// Listed notes the vault held no escape for when last read.
+    dead_escapes: BTreeMap<u32, DeadEscape>,
     sender: SenderStatus,
     sender_balance: Option<u128>,
     /// The signer's transaction fee cap, from `zkapi_signerStatus` or a
@@ -547,6 +615,9 @@ impl ChallengeService {
             poll: PollStatus::default(),
             indexer: IndexerStatus::default(),
             indexer_logged_at: None,
+            escape_listings: 0,
+            escape_cursor: 0,
+            dead_escapes: BTreeMap::new(),
             sender,
             sender_balance: None,
             signer_tx_fee_cap: None,
@@ -707,7 +778,7 @@ impl ChallengeService {
         self.previous_evaluations = std::mem::take(&mut self.evaluations);
         *scanned_head = Some(head.clone());
         self.load_vault_constants().await;
-        self.sync_pending_escapes().await?;
+        self.sync_pending_escapes(head.number).await?;
         if self.observation_due() {
             self.observe_sender().await;
             self.observe_indexer(&head).await;
@@ -900,7 +971,22 @@ impl ChallengeService {
     /// indexer that checks only its root can list a stale nullifier and
     /// deadline. Older indexers without the endpoint are tolerated with a
     /// status warning.
-    async fn sync_pending_escapes(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Each poll reads at most MAX_ESCAPE_CHECKS_PER_POLL listed notes, from
+    /// the note where the previous poll's reads stopped, wrapping around, so
+    /// every listed note due for a read is read within
+    /// ceil(n / MAX_ESCAPE_CHECKS_PER_POLL) polls. A listed, untracked note
+    /// the vault holds no escape for stays due on every listing until reads
+    /// DEAD_ESCAPE_CONFIRM_SECONDS apart have found none; it is then read
+    /// again only every DEAD_ESCAPE_RECHECK_POLLS listings. It is reported as
+    /// a disagreement, which calls for a resync, once reads
+    /// --blocked-warning-seconds apart have found none and a list served at
+    /// a block between two of them named it. A list served below the first
+    /// such read may only lag the vault, and one beyond this poll's `head`
+    /// may hold an escape this RPC does not show yet; neither is reported.
+    /// The entry is due for its report's read as soon as the period has
+    /// passed and a listing can complete it.
+    async fn sync_pending_escapes(&mut self, head: u64) -> anyhow::Result<()> {
         let now = unix_now();
         let listed = match self
             .indexer_get::<PendingEscapesResponse>("/v1/escapes/pending")
@@ -927,6 +1013,9 @@ impl ChallengeService {
         };
         self.indexer.pending_escapes = "ok".into();
         self.indexer.pending_escapes_unavailable_since = None;
+        self.escape_listings += 1;
+        let listing = self.escape_listings;
+        let warning = self.config.alarms.blocked_warning_seconds;
         let mut changed = false;
         let mut checked = 0;
         let mut disagreements = Vec::new();
@@ -947,6 +1036,8 @@ impl ChallengeService {
                 )
             })
         };
+        let listed_block = listed.block_number;
+        let mut unread = Vec::new();
         for escape in listed.escapes {
             // A note tracked as listed is compared with the vault on every
             // reconcile, which also keeps its deadline.
@@ -961,7 +1052,33 @@ impl ChallengeService {
                 }
                 continue;
             }
+            unread.push(escape);
+        }
+        // A dead entry lasts while its note is listed under the same
+        // nullifier and untracked: reconcile reads a tracked note every poll.
+        let listed_as: BTreeMap<u32, Felt252> = unread
+            .iter()
+            .map(|escape| (escape.note_id, escape.withdrawal_nullifier))
+            .collect();
+        let tracked = &self.checkpoint.pending;
+        self.dead_escapes.retain(|note, dead| {
+            listed_as.get(note) == Some(&dead.nullifier) && !tracked.contains_key(note)
+        });
+        for dead in self.dead_escapes.values_mut() {
+            // This poll's head was fetched after every earlier listing's reads.
+            dead.read_by.get_or_insert(head);
+        }
+        unread.sort_by_key(|escape| escape.note_id);
+        let start = unread.partition_point(|escape| escape.note_id < self.escape_cursor);
+        unread.rotate_left(start);
+        for escape in unread {
+            if self.dead_escapes.get(&escape.note_id).is_some_and(|dead| {
+                dead.resting(listing, now, warning, dead.brackets(listed_block, head))
+            }) {
+                continue;
+            }
             if checked == MAX_ESCAPE_CHECKS_PER_POLL {
+                self.escape_cursor = escape.note_id;
                 break;
             }
             checked += 1;
@@ -973,8 +1090,28 @@ impl ChallengeService {
                 }
             };
             if !state.exists {
-                continue; // The list may lag the vault.
+                if self.checkpoint.pending.contains_key(&escape.note_id) {
+                    continue; // Tracked under another nullifier; reconcile retires it.
+                }
+                // The list may lag the vault, or never learn the escape ended;
+                // or this RPC may not yet show a fresh escape.
+                let dead = self
+                    .dead_escapes
+                    .entry(escape.note_id)
+                    .or_insert(DeadEscape {
+                        nullifier: escape.withdrawal_nullifier,
+                        first_seen: now,
+                        last_seen: now,
+                        checked_at: listing,
+                        read_by: None,
+                        bracketed: false,
+                    });
+                dead.last_seen = now;
+                dead.checked_at = listing;
+                dead.bracketed |= dead.brackets(listed_block, head);
+                continue;
             }
+            self.dead_escapes.remove(&escape.note_id);
             disagreements.extend(differs(&escape, state.nullifier, state.deadline));
             // The vault is authoritative, whatever the list says.
             if self
@@ -1003,6 +1140,33 @@ impl ChallengeService {
             self.indexer.escapes_added_from_indexer += 1;
             changed |= self.track_escape(escape.note_id, state.nullifier, Some(state.deadline));
         }
+        let mut since = self
+            .indexer
+            .pending_escapes_disagreement_since
+            .unwrap_or(now);
+        let persisted: Vec<_> = self
+            .dead_escapes
+            .iter()
+            .filter(|(_, dead)| dead.reported(warning))
+            .collect();
+        if let Some(first_seen) = persisted.iter().map(|(_, dead)| dead.first_seen).min() {
+            // Reads at both ends of the warning period found no escape, and a
+            // list served at a block between two of them named the note: the
+            // indexer's list has disagreed with the vault since the first.
+            since = since.min(first_seen);
+            disagreements.push(format!(
+                "{} listed note(s) with no pending escape in the vault: {}",
+                persisted.len(),
+                persisted
+                    .iter()
+                    .map(|(note, dead)| format!(
+                        "note {note} listed with nullifier {}",
+                        dead.nullifier
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let disagreement = (!disagreements.is_empty()).then(|| bounded(&disagreements.join("; ")));
         if disagreement.is_some() && self.indexer.pending_escapes_disagreement.is_none() {
             tracing::warn!(
@@ -1010,10 +1174,6 @@ impl ChallengeService {
                 "indexer pending-escapes list disagrees with the vault; tracking the vault's escapes"
             );
         }
-        let since = self
-            .indexer
-            .pending_escapes_disagreement_since
-            .unwrap_or(now);
         self.indexer.pending_escapes_disagreement_since = disagreement.as_ref().map(|_| since);
         self.indexer.pending_escapes_disagreement = disagreement;
         if changed {
@@ -3165,7 +3325,9 @@ fn refused_tx_fee_cap(error: &anyhow::Error, gas: u64) -> Option<u128> {
 
 /// Gas limit x maxFeePerGas of a refused send: the refusal's `gas_limit` and
 /// `max_fee_per_gas` (the bundled signer reports both with
-/// `upstream_tx_fee_cap`), else the send's own.
+/// `upstream_tx_fee_cap`), else the send's own. A reported fee that leaves
+/// no bound (zero) cannot be what the node refused; like a zero signer cap,
+/// it is ignored for the send's own.
 fn refused_tx_fee(error: &anyhow::Error, gas: u64, max_fee: u128) -> u128 {
     let data = error
         .downcast_ref::<RpcError>()
@@ -3174,9 +3336,14 @@ fn refused_tx_fee(error: &anyhow::Error, gas: u64, max_fee: u128) -> u128 {
         data.and_then(|data| data.get(name))
             .and_then(|value| quantity_u128(value).ok())
     };
-    field("gas_limit")
+    let reported = field("gas_limit")
         .unwrap_or(u128::from(gas))
-        .saturating_mul(field("max_fee_per_gas").unwrap_or(max_fee))
+        .saturating_mul(field("max_fee_per_gas").unwrap_or(max_fee));
+    if headroom(reported) > 0 {
+        reported
+    } else {
+        u128::from(gas).saturating_mul(max_fee)
+    }
 }
 
 /// The smallest value nodes accept as a 10% replacement bump.
@@ -3321,6 +3488,9 @@ struct IndexerHealth {
 
 #[derive(Deserialize)]
 struct PendingEscapesResponse {
+    /// The block of the indexer's view the list was taken from.
+    #[serde(default)]
+    block_number: Option<u64>,
     escapes: Vec<PendingEscape>,
 }
 
@@ -3430,6 +3600,8 @@ mod tests {
         drop_logs: bool,
         /// None: an indexer that predates /v1/escapes/pending.
         escapes: Option<Vec<Value>>,
+        /// The block the pending-escapes list is served at; None: the head.
+        escapes_block: Option<u64>,
         indexer_root: Option<Value>,
         indexer_health: &'static str,
         roots_by_hash: BTreeMap<String, Felt252>,
@@ -3449,6 +3621,8 @@ mod tests {
         fee_capped_hashes: BTreeSet<String>,
         /// The zkapi_signerStatus result; None: an RPC without the method.
         signer_status: Option<Value>,
+        /// pendingWithdrawals reads per note.
+        withdrawal_reads: BTreeMap<u32, usize>,
     }
 
     impl MockChain {
@@ -3485,6 +3659,7 @@ mod tests {
                 refuse_notes: BTreeSet::new(),
                 drop_logs: false,
                 escapes: Some(vec![]),
+                escapes_block: None,
                 indexer_root: None,
                 indexer_health: "ok",
                 roots_by_hash: BTreeMap::new(),
@@ -3497,6 +3672,7 @@ mod tests {
                 fee_capped_sends: 0,
                 fee_capped_hashes: BTreeSet::new(),
                 signer_status: None,
+                withdrawal_reads: BTreeMap::new(),
             }
         }
     }
@@ -3578,6 +3754,7 @@ mod tests {
                 }
                 if data.starts_with(&call_data("pendingWithdrawals(uint32)")) {
                     let note = u32::from_str_radix(&data[data.len() - 8..], 16).unwrap();
+                    *state.withdrawal_reads.entry(note).or_default() += 1;
                     if let Some((active, nullifier, deadline)) = state.withdrawals.get(&note) {
                         encoded(&[
                             Felt252::from_u64(*active as u64),
@@ -3786,8 +3963,8 @@ mod tests {
         match &state.escapes {
             None => StatusCode::NOT_FOUND.into_response(),
             Some(escapes) => Json(json!({
-                "block_number": state.head_number, "block_hash": state.block_hash,
-                "root": state.root, "escapes": escapes,
+                "block_number": state.escapes_block.unwrap_or(state.head_number),
+                "block_hash": state.block_hash, "root": state.root, "escapes": escapes,
             }))
             .into_response(),
         }
@@ -3880,6 +4057,12 @@ mod tests {
 
         fn sends(&self) -> Vec<Value> {
             self.chain.lock().unwrap().sends.clone()
+        }
+
+        /// pendingWithdrawals reads of `note` so far.
+        fn withdrawal_reads(&self, note: u32) -> usize {
+            let chain = self.chain.lock().unwrap();
+            chain.withdrawal_reads.get(&note).copied().unwrap_or(0)
         }
 
         fn reserve(&self, service: &mut ChallengeService, note: u32, expired: bool) {
@@ -5737,6 +5920,23 @@ mod tests {
             refused_tx_fee_cap(&capped(json!({ "reason": "tx_fee_above_cap" })), 7),
             None
         );
+        // The refused fee of upstream_tx_fee_cap: as reported, else the
+        // send's own, also for a report that leaves no bound.
+        let refused = |data: Value| refused_tx_fee(&capped(data), 7, 100);
+        assert_eq!(
+            refused(
+                json!({ "reason": "upstream_tx_fee_cap", "gas_limit": "0x5", "max_fee_per_gas": "0x40" })
+            ),
+            320
+        );
+        assert_eq!(refused(json!({ "reason": "upstream_tx_fee_cap" })), 700);
+        for zero in [
+            json!({ "reason": "upstream_tx_fee_cap", "gas_limit": "0x0", "max_fee_per_gas": "0x0" }),
+            json!({ "reason": "upstream_tx_fee_cap", "max_fee_per_gas": "0x0" }),
+            json!({ "reason": "upstream_tx_fee_cap", "gas_limit": "0x1", "max_fee_per_gas": "0x1" }),
+        ] {
+            assert_eq!(refused(zero.clone()), 700, "{zero}");
+        }
         assert!(matches!(
             classify(
                 json!({ "code": -32000, "message": "m", "data": { "reason": "simulation_failed" } })
@@ -6931,5 +7131,540 @@ mod tests {
         assert_eq!(detached.superseded_hashes, vec![refused_hash]);
         assert_eq!(detached.max_fee_per_gas_wei, Some((142 * GWEI).to_string()));
         assert_eq!(detached.gas_limit, None);
+    }
+
+    /// Review regression (node fee bound): a signer other than the bundled
+    /// one can refuse with upstream_tx_fee_cap while reporting a zero gas
+    /// limit or fee per gas. As with a zero signer cap, that zero is
+    /// ignored: the refused send's own gas x maxFeePerGas is learned, so
+    /// later refusals keep lowering the bid until the node accepts one, and
+    /// the node-refusal warning shows.
+    #[tokio::test]
+    async fn refusal_reporting_a_zero_fee_still_lowers_the_bids() {
+        let node_cap = ONE_ETHER / 2;
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.tx_fee_cap = Some((node_cap, "upstream_tx_fee_cap"));
+            chain.estimate = 6_278_618;
+            chain.base_fee = Some(10 * GWEI);
+            chain.head_timestamp = chain.deadline - 9;
+            chain.send_errors.push_back(json!({ "code": -32003,
+                "message": "Upstream RPC refused the transaction fee",
+                "data": { "reason": "upstream_tx_fee_cap", "gas_limit": "0x0", "max_fee_per_gas": "0x0" } }));
+        }
+        let mut service = fixture.service_with(mainnet_fees);
+        assert!(service.poll_once().await.is_err());
+        let sends = fixture.sends();
+        let refused = fee(&sends[0], "gas") * fee(&sends[0], "maxFeePerGas");
+        assert_eq!(service.node_refused_tx_fee, Some(refused));
+        assert_eq!(
+            service.status().sender.node_tx_fee_cap_bound_wei,
+            Some(headroom(refused).to_string())
+        );
+        for _ in 0..5 {
+            let _ = service.poll_once().await;
+            fixture.chain.lock().unwrap().head_number += 1;
+        }
+        let sent = sent_tx_fees(&fixture, node_cap);
+        let accepted = sent.iter().position(|(_, accepted)| *accepted);
+        let accepted = accepted.unwrap_or_else(|| panic!("no bid was accepted: {sent:?}"));
+        assert!(
+            sent[..=accepted]
+                .windows(2)
+                .all(|pair| pair[1].0 <= headroom(pair[0].0)),
+            "{sent:?}"
+        );
+        let status = service.status();
+        assert_eq!(obligation(&status, 0).state, ObligationState::Submitted);
+        assert!(status
+            .config_warnings
+            .iter()
+            .any(|warning| warning.contains("upstream_tx_fee_cap")));
+    }
+
+    /// An escape of `note`, as the indexer's pending-escapes list names it.
+    fn listed(note: u32, nullifier: Felt252, deadline: u64) -> Value {
+        json!({ "note_id": note, "withdrawal_nullifier": nullifier, "challenge_deadline": deadline })
+    }
+
+    /// Review regression (pending-escapes backstop): a listed note whose
+    /// vault record does not exist (a dead entry, which a lossy log source
+    /// leaves in the indexer until a resync) stays due until reads
+    /// DEAD_ESCAPE_CONFIRM_SECONDS apart find no escape, and each poll's
+    /// reads resume where the previous poll's budget ran out. So 100 dead
+    /// entries at low note IDs never starve a live escape listed after them:
+    /// it is tracked within ceil(101 / 64) polls. Once confirmed, they are
+    /// no longer read on every poll.
+    #[tokio::test]
+    async fn dead_listed_escapes_never_starve_a_live_one() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            // Only the indexer lists the live escape.
+            chain.drop_logs = true;
+            let (nullifier, deadline) = (chain.nullifier, chain.deadline);
+            let mut escapes = Vec::new();
+            for note in 0..100 {
+                // Paid out or closed in the vault; the indexer missed it.
+                chain.withdrawals.insert(note, (false, Felt252::ZERO, 0));
+                escapes.push(listed(note, Felt252::from_u64(0x384), deadline));
+            }
+            chain.withdrawals.insert(500, (true, nullifier, deadline));
+            escapes.push(listed(500, nullifier, deadline));
+            chain.escapes = Some(escapes);
+        }
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        // The budget ran out at note 64; the next poll starts there.
+        assert_eq!(service.escape_cursor, 64);
+        assert!(!service.checkpoint.pending.contains_key(&500));
+        for _ in 1..101usize.div_ceil(MAX_ESCAPE_CHECKS_PER_POLL) {
+            service.poll_once().await.unwrap();
+        }
+        assert!(
+            service.checkpoint.pending.contains_key(&500),
+            "the live escape was starved by dead entries"
+        );
+        assert_eq!(fixture.sends().len(), 1, "the live escape is challenged");
+        assert_eq!(
+            obligation(&service.status(), 500).state,
+            ObligationState::Submitted
+        );
+        // Confirmed dead entries are not read again on every poll.
+        for dead in service.dead_escapes.values_mut() {
+            dead.first_seen -= DEAD_ESCAPE_CONFIRM_SECONDS;
+        }
+        let reads = |fixture: &Fixture| -> Vec<usize> {
+            (0..100)
+                .map(|note| fixture.withdrawal_reads(note))
+                .collect()
+        };
+        let before = reads(&fixture);
+        for _ in 0..3 {
+            service.poll_once().await.unwrap();
+        }
+        assert_eq!(reads(&fixture), before);
+    }
+
+    /// Review regression (cursor): listed notes whose vault escape is live
+    /// under another nullifier than listed (stale hints) are read on every
+    /// listing, as the vault's escape is tracked for them. 70 of them at low
+    /// note IDs never starve an untracked live escape listed after them:
+    /// each poll's reads resume where the previous poll's budget ran out.
+    #[tokio::test]
+    async fn stale_hints_never_starve_a_live_escape() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            let (nullifier, deadline) = (chain.nullifier, chain.deadline);
+            let mut escapes = Vec::new();
+            for note in 0..70 {
+                // The owner escaped again; the indexer lists the old escape.
+                chain
+                    .withdrawals
+                    .insert(note, (true, Felt252::from_u64(78), deadline));
+                escapes.push(listed(note, Felt252::from_u64(0x384), deadline));
+            }
+            chain.withdrawals.insert(500, (true, nullifier, deadline));
+            escapes.push(listed(500, nullifier, deadline));
+            chain.escapes = Some(escapes);
+        }
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(service.escape_cursor, 64);
+        assert_eq!(service.checkpoint.pending.len(), 64);
+        service.poll_once().await.unwrap();
+        assert!(
+            service.checkpoint.pending.contains_key(&500),
+            "the live escape was starved by stale hints"
+        );
+        assert!((0..70)
+            .all(|note| service.checkpoint.pending[&note].nullifier == Felt252::from_u64(78)));
+        // This poll read notes 64 to 69, note 500 and notes 0 to 56.
+        assert_eq!(service.escape_cursor, 57);
+        let detail = service
+            .status()
+            .indexer
+            .pending_escapes_disagreement
+            .unwrap();
+        assert!(
+            detail.starts_with("note 64 listed with nullifier 0x384"),
+            "{detail}"
+        );
+    }
+
+    /// Review regression (stale first read): this daemon's RPC can lag the
+    /// indexer's head view, so a fresh escape the event scan missed can read
+    /// as absent at first; and an indexer that missed a challenge and
+    /// re-escape pair lists the ended escape's nullifier while the vault
+    /// held none for a moment. Neither waits for the dead-entry back-off:
+    /// both are read again at the next listing and tracked.
+    #[tokio::test]
+    async fn dead_entries_stay_due_until_confirmed() {
+        let fixture = Fixture::new().await;
+        let (nullifier, deadline) = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            let (nullifier, deadline) = (chain.nullifier, chain.deadline);
+            chain.withdrawals.insert(500, (false, Felt252::ZERO, 0));
+            chain.withdrawals.insert(7, (false, Felt252::ZERO, 0));
+            chain.escapes = Some(vec![
+                listed(7, Felt252::from_u64(0x384), deadline),
+                listed(500, nullifier, deadline),
+            ]);
+            (nullifier, deadline)
+        };
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        assert_eq!(service.dead_escapes.len(), 2);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            // This RPC now shows the escape, and the owner escaped again.
+            chain.withdrawals.insert(500, (true, nullifier, deadline));
+            chain
+                .withdrawals
+                .insert(7, (true, Felt252::from_u64(78), deadline + 5));
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(service.checkpoint.pending[&500].nullifier, nullifier);
+        assert_eq!(
+            service.checkpoint.pending[&7].nullifier,
+            Felt252::from_u64(78)
+        );
+        assert!(service.dead_escapes.is_empty());
+        assert_eq!(fixture.sends().len(), 1, "the fresh escape is challenged");
+        // Once confirmed, it rests between re-reads: a later re-escape is
+        // tracked at the DEAD_ESCAPE_RECHECK_POLLS-th listing.
+        fixture.chain.lock().unwrap().escapes =
+            Some(vec![listed(9, Felt252::from_u64(0x384), deadline)]);
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .insert(9, (false, Felt252::ZERO, 0));
+        service.poll_once().await.unwrap();
+        service.dead_escapes.get_mut(&9).unwrap().first_seen -= DEAD_ESCAPE_CONFIRM_SECONDS;
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .insert(9, (true, Felt252::from_u64(79), deadline));
+        for _ in 1..DEAD_ESCAPE_RECHECK_POLLS {
+            service.poll_once().await.unwrap();
+        }
+        assert_eq!(fixture.withdrawal_reads(9), 1);
+        assert!(!service.checkpoint.pending.contains_key(&9));
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            service.checkpoint.pending[&9].nullifier,
+            Felt252::from_u64(79)
+        );
+    }
+
+    /// A dead entry is reported under the indexer's
+    /// pending_escapes_disagreement once reads --blocked-warning-seconds
+    /// apart found no escape, so the "resync the indexer" alarm reaches the
+    /// operator. The read that completes the period is made as soon as it is
+    /// due, and no report goes out without it. The entry is then read again
+    /// every DEAD_ESCAPE_RECHECK_POLLS listings, stays reported, and is
+    /// forgotten once unlisted.
+    #[tokio::test]
+    async fn dead_listed_escape_is_reported_once_it_persists() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            chain.withdrawals.insert(1, (false, Felt252::ZERO, 0));
+            let deadline = chain.deadline;
+            chain.escapes = Some(vec![listed(1, Felt252::from_u64(0x384), deadline)]);
+        }
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        // The list may only lag the vault: nothing is reported yet.
+        let status = service.status();
+        assert_eq!(status.indexer.pending_escapes_disagreement, None);
+        assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
+        // Confirmed a minute after the first read, and the warning period
+        // has passed since the first read: its report waits for a read.
+        let warning = service.config.alarms.blocked_warning_seconds;
+        {
+            let dead = service.dead_escapes.get_mut(&1).unwrap();
+            dead.first_seen -= warning;
+            dead.last_seen -= warning - DEAD_ESCAPE_CONFIRM_SECONDS;
+        }
+        // A read that fails confirms nothing.
+        fixture.chain.lock().unwrap().fail_note_one = true;
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().indexer.pending_escapes_disagreement, None);
+        fixture.chain.lock().unwrap().fail_note_one = false;
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.withdrawal_reads(1), 2);
+        let reported = |service: &ChallengeService| {
+            let status = service.status();
+            let detail = status.indexer.pending_escapes_disagreement.clone().unwrap();
+            assert!(
+                detail.contains("note 1 listed with nullifier 0x384")
+                    && detail.contains("no pending escape"),
+                "{detail}"
+            );
+            assert!(
+                status.alarms.iter().any(|alarm| alarm
+                    .contains("pending-escapes list disagrees with the vault")
+                    && alarm.contains("resync the indexer")),
+                "{:?}",
+                status.alarms
+            );
+            assert_eq!(status.status, Severity::Warning);
+        };
+        reported(&service);
+        // Read again only every DEAD_ESCAPE_RECHECK_POLLS listings.
+        for _ in 1..DEAD_ESCAPE_RECHECK_POLLS {
+            service.poll_once().await.unwrap();
+        }
+        assert_eq!(fixture.withdrawal_reads(1), 2);
+        reported(&service);
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            fixture.withdrawal_reads(1),
+            3,
+            "a dead entry is still read now and then"
+        );
+        reported(&service);
+        // A resynced indexer no longer lists it.
+        fixture.chain.lock().unwrap().escapes = Some(vec![]);
+        service.poll_once().await.unwrap();
+        assert!(service.dead_escapes.is_empty());
+        assert_eq!(service.status().indexer.pending_escapes_disagreement, None);
+    }
+
+    /// Review regression (report without a confirming read): a dead entry
+    /// whose warning period has passed since its first read is read before
+    /// it is reported. Here the vault holds an escape by then, which is
+    /// tracked; nothing is reported as missing from the vault.
+    #[tokio::test]
+    async fn a_dead_entry_found_live_at_its_report_read_is_tracked() {
+        let fixture = Fixture::new().await;
+        let (nullifier, deadline) = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            let (nullifier, deadline) = (chain.nullifier, chain.deadline);
+            chain.withdrawals.insert(500, (false, Felt252::ZERO, 0));
+            chain.escapes = Some(vec![listed(500, nullifier, deadline)]);
+            (nullifier, deadline)
+        };
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let warning = service.config.alarms.blocked_warning_seconds;
+        {
+            let dead = service.dead_escapes.get_mut(&500).unwrap();
+            dead.first_seen -= warning;
+            dead.last_seen -= warning - DEAD_ESCAPE_CONFIRM_SECONDS;
+        }
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .insert(500, (true, nullifier, deadline));
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.contains_key(&500));
+        assert!(service.dead_escapes.is_empty());
+        let status = service.status();
+        assert_eq!(status.indexer.pending_escapes_disagreement, None);
+        assert!(
+            !status
+                .alarms
+                .iter()
+                .any(|alarm| alarm.contains("no pending escape in the vault")),
+            "{:?}",
+            status.alarms
+        );
+    }
+
+    /// Review regression (lag or loss): a list served at a block that may
+    /// lie below a vault read that found no escape may only lag the vault,
+    /// as the list of an indexer whose view stalled before a payout does
+    /// (its root is unchanged, so its status stays consistent). However long
+    /// reads keep finding no escape, that is not reported and asks for no
+    /// resync, and neither is a list served at a block this daemon's RPC has
+    /// not reached. Once a list served between two reads that found no
+    /// escape still names the note, the indexer has processed a block in
+    /// which the vault held none: it is reported at once.
+    #[tokio::test]
+    async fn a_lagging_list_is_reported_only_once_served_past_an_absent_read() {
+        let fixture = Fixture::new().await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            // Paid out; the indexer's view is a block behind the head.
+            chain.withdrawals.insert(1, (false, Felt252::ZERO, 0));
+            let deadline = chain.deadline;
+            chain.escapes = Some(vec![listed(1, Felt252::from_u64(0x384), deadline)]);
+            chain.escapes_block = Some(chain.head_number - 1);
+        }
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        // Confirmed, and the warning period has passed since the first read.
+        let warning = service.config.alarms.blocked_warning_seconds;
+        {
+            let dead = service.dead_escapes.get_mut(&1).unwrap();
+            dead.first_seen -= warning;
+            dead.last_seen -= warning - DEAD_ESCAPE_CONFIRM_SECONDS;
+        }
+        let not_reported = |service: &ChallengeService| {
+            let status = service.status();
+            assert_eq!(status.indexer.pending_escapes_disagreement, None);
+            assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
+        };
+        // The first read ran at block 5 or above, which only the next poll's
+        // head (8) bounds; the indexer's view stalls at block 6.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_number = 8;
+            chain.escapes_block = Some(6);
+        }
+        // The entry rests; its re-read spans the warning period.
+        for _ in 0..DEAD_ESCAPE_RECHECK_POLLS {
+            service.poll_once().await.unwrap();
+            not_reported(&service);
+        }
+        assert_eq!(fixture.withdrawal_reads(1), 2);
+        assert!(service.dead_escapes[&1].absent_for(warning));
+        // A list served beyond this daemon's head may hold an escape its
+        // RPC does not show yet.
+        fixture.chain.lock().unwrap().escapes_block = Some(10);
+        service.poll_once().await.unwrap();
+        not_reported(&service);
+        assert_eq!(fixture.withdrawal_reads(1), 2);
+        // The RPC reaches that block, and the vault still holds no escape.
+        fixture.chain.lock().unwrap().head_number = 10;
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.withdrawal_reads(1), 3);
+        let status = service.status();
+        let detail = status.indexer.pending_escapes_disagreement.unwrap();
+        assert!(
+            detail.contains("note 1 listed with nullifier 0x384"),
+            "{detail}"
+        );
+        assert!(
+            status
+                .alarms
+                .iter()
+                .any(|alarm| alarm.contains("no pending escape")
+                    && alarm.contains("resync the indexer")),
+            "{:?}",
+            status.alarms
+        );
+        // Shown once, it stays reported while the note is listed, also after
+        // a re-read in a listing served beyond this daemon's head.
+        fixture.chain.lock().unwrap().escapes_block = Some(12);
+        for _ in 0..DEAD_ESCAPE_RECHECK_POLLS {
+            service.poll_once().await.unwrap();
+        }
+        assert_eq!(fixture.withdrawal_reads(1), 4);
+        assert!(service
+            .status()
+            .indexer
+            .pending_escapes_disagreement
+            .is_some());
+    }
+
+    /// Review regression (relisted note): a confirmed dead entry rests only
+    /// while its note is listed under the same nullifier. Once the indexer
+    /// lists the note's live escape, which the event scan missed, the note
+    /// is read at the next listing and tracked, without waiting for the
+    /// DEAD_ESCAPE_RECHECK_POLLS back-off.
+    #[tokio::test]
+    async fn a_dead_entry_relisted_under_another_nullifier_is_read_at_once() {
+        let fixture = Fixture::new().await;
+        let deadline = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            chain.withdrawals.insert(9, (false, Felt252::ZERO, 0));
+            let deadline = chain.deadline;
+            chain.escapes = Some(vec![listed(9, Felt252::from_u64(0x384), deadline)]);
+            deadline
+        };
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        service.dead_escapes.get_mut(&9).unwrap().first_seen -= DEAD_ESCAPE_CONFIRM_SECONDS;
+        // Confirmed: it rests.
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.withdrawal_reads(9), 1);
+        let renewed = Felt252::from_u64(0x4f);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.withdrawals.insert(9, (true, renewed, deadline));
+            chain.escapes = Some(vec![listed(9, renewed, deadline)]);
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(service.checkpoint.pending[&9].nullifier, renewed);
+        assert!(service.dead_escapes.is_empty());
+    }
+
+    /// Review regression: a note tracked under the vault's escape, while the
+    /// indexer still lists an older nullifier the vault once held no escape
+    /// for, is not reported as missing from the vault. Reconcile reads a
+    /// tracked note every poll, so no dead entry is kept for it.
+    #[tokio::test]
+    async fn a_tracked_note_is_never_reported_as_dead() {
+        let fixture = Fixture::new().await;
+        let deadline = {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.drop_logs = true;
+            chain.withdrawals.insert(7, (false, Felt252::ZERO, 0));
+            let deadline = chain.deadline;
+            chain.escapes = Some(vec![listed(7, Felt252::from_u64(0x384), deadline)]);
+            deadline
+        };
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let warning = service.config.alarms.blocked_warning_seconds;
+        service.dead_escapes.get_mut(&7).unwrap().first_seen -= warning;
+        // The event scan tracks the owner's new escape.
+        let renewed = Felt252::from_u64(78);
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .insert(7, (true, renewed, deadline));
+        service.checkpoint.pending.insert(
+            7,
+            PendingChallenge {
+                nullifier: renewed,
+                challenge_deadline: Some(deadline),
+                ..Default::default()
+            },
+        );
+        service.poll_once().await.unwrap();
+        assert!(service.dead_escapes.is_empty());
+        let detail = service
+            .status()
+            .indexer
+            .pending_escapes_disagreement
+            .unwrap();
+        assert!(
+            detail.contains("note 7 listed with nullifier 0x384")
+                && detail.contains("the vault holds")
+                && !detail.contains("no pending escape"),
+            "{detail}"
+        );
+        // Its escape ends; it is retired, never kept as a dead entry while
+        // tracked.
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .withdrawals
+            .insert(7, (false, Felt252::ZERO, 0));
+        service.poll_once().await.unwrap();
+        assert!(service.dead_escapes.is_empty());
+        assert!(!service.checkpoint.pending.contains_key(&7));
     }
 }

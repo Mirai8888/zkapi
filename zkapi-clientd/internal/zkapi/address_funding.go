@@ -210,7 +210,8 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		return conflicted(err), nil
 	}
 	// A finalized deposit revert is retired, or reported as retryable, only
-	// after the indexer shows the note did not land where it could have.
+	// after the indexer's tree shows no deposit of the note within
+	// findDepositLeaf's bounds from every slot a deposit of it was signed for.
 	revertUnconfirmed := func(receipt *addressReceipt) (AddressFundingStatus, bool, error) {
 		deposit, err := h.readAddressDeposit(config)
 		if err != nil {
@@ -597,11 +598,11 @@ func validDepositRecovery(record depositRecord) bool {
 	if r := record.Rebind; r != nil && r.ExpiryTs == 0 {
 		return false
 	}
-	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0) {
+	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.EmptyBefore > s.NoteID) {
 		return false
 	}
 	for _, s := range record.SignedSlots {
-		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 {
+		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.EmptyBefore > s.NoteID {
 			return false
 		}
 	}

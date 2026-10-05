@@ -9101,6 +9101,64 @@ mod tests {
         assert_eq!(refusal.rejected_total, 3);
     }
 
+    /// Log lines written while a subscriber built on it is the default.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review regression (legacy clearance budget): junk requests can keep
+    /// the budget exhausted, and each refusal must not write a log line.
+    /// Pinned end to end, through the subscriber: three refusals in one
+    /// window write exactly one 'legacy clearance budget exhausted' line.
+    #[test]
+    fn legacy_clearance_exhaustion_is_logged_once_per_window() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.allow_legacy_clearance = true;
+        processor.config.legacy_clearance_max_per_minute = 2;
+        // Well inside one window on the real clock.
+        let elapsed = current_timestamp() % 60;
+        if elapsed > 50 {
+            std::thread::sleep(Duration::from_secs(60 - elapsed));
+        }
+        *processor.legacy_clearances.lock().unwrap() = LegacyClearanceWindow {
+            minute: current_timestamp() / 60,
+            admitted: 2,
+            ..LegacyClearanceWindow::default()
+        };
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let refused: Vec<_> = tracing::subscriber::with_default(subscriber, || {
+            (0..3).map(|_| processor.admit_legacy_clearance()).collect()
+        });
+        assert!(
+            refused
+                .iter()
+                .all(|result| matches!(result, Err(ServerError::LegacyClearanceCapacity { .. }))),
+            "{refused:?}"
+        );
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("legacy clearance budget exhausted").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("rejected_total=1"), "{text}");
+    }
+
     /// Start a scenario on the real clock well inside one budget window.
     async fn inside_one_legacy_window() {
         let elapsed = current_timestamp() % 60;

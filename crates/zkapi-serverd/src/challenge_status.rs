@@ -329,7 +329,11 @@ pub struct IndexerStatus {
     /// Escapes the event scan had not delivered when the indexer listed them.
     pub escapes_added_from_indexer: u64,
     /// Listed escapes whose nullifier or deadline differs from the vault's
-    /// `pendingWithdrawals`, in the latest list; the vault's are tracked.
+    /// `pendingWithdrawals`, in the latest list (the vault's are tracked),
+    /// and listed, untracked notes for which vault reads at least
+    /// `blocked_warning_seconds` apart found no escape, once a list served
+    /// at a block between two of those reads named them (a list that may
+    /// only lag the vault is not reported).
     pub pending_escapes_disagreement: Option<String>,
     pub pending_escapes_disagreement_since: Option<u64>,
 }

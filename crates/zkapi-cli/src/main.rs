@@ -240,7 +240,8 @@ enum SettlementCommand {
         /// the lease row's client_request_id and request_nullifier (its
         /// reviews follow a changed id), and the nullifier reservation's
         /// payload hash, request binding, request id and kind, or a missing
-        /// reservation row.
+        /// reservation row. With --zero-charge, also for a lease reopened
+        /// earlier.
         #[arg(long)]
         rebind: bool,
         /// A JSON file (`-` for standard input) holding the authentic

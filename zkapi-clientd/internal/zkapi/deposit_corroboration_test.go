@@ -388,6 +388,7 @@ func TestMalformedSignedSlotIsPreserved(t *testing.T) {
 	for name, slot := range map[string]depositSlot{
 		"path":        {NoteID: 12, PathSHA256: "0x12", PreparedAt: 1},
 		"preparation": {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64)},
+		"empty run":   {NoteID: 12, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: 1, EmptyBefore: 13},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newAddressFixture(t, true)
@@ -435,6 +436,47 @@ func TestDepositLeafSearchSkipsEmptiedSlots(t *testing.T) {
 	}
 	if _, found := search("0x5", depositRevertScanSlots); found {
 		t.Fatal("the search compared more occupied slots than its bound")
+	}
+}
+
+// Calldata lands below its slot only in the run of slots that were empty
+// right below it when it was built. That run is searched under its own
+// bound, so leaves restored in it never hide a landing at or after the slot.
+// A record without a run (written before runs were kept) searches only from
+// its slot.
+func TestDepositLeafSearchCoversTheEmptyRunBelowItsSlot(t *testing.T) {
+	commitment, expiry := fieldValue("0x1234"), bucketedExpiry()
+	const run = depositRevertScanSlots + 6 // Slots [12, 82) were empty below slot 82.
+	search := func(landing uint32, restored int, emptyBefore uint32) (uint32, bool) {
+		leaves := make([]string, 0, 12+run+depositRevertScanSlots+1)
+		for i := range 12 {
+			leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
+		}
+		for i := range run + depositRevertScanSlots {
+			leaf := "0x0"
+			if id := 12 + i; id >= 12+run || i < restored {
+				leaf = fmt.Sprintf("0x%x", 0x5000+id) // Restored in the run, or later deposits.
+			}
+			leaves = append(leaves, leaf)
+		}
+		leaves[landing] = fmt.Sprintf("0x%x", noteLeaf(landing, commitment, 100000, expiry))
+		slot := &depositSlot{NoteID: 12 + run, PathSHA256: "0x" + strings.Repeat("f", 64), PreparedAt: time.Now().Unix(), EmptyBefore: emptyBefore}
+		return findDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slot, commitment, 100000, 2592000, time.Now().Unix())
+	}
+	if id, found := search(12, 0, run); !found || id != 12 {
+		t.Fatalf("a landing at the start of the run was not found: %d %v", id, found)
+	}
+	if id, found := search(12+run, run, run); !found || id != 12+run {
+		t.Fatalf("leaves restored in the run hid a landing at the slot: %d %v", id, found)
+	}
+	if id, found := search(12+depositRevertScanSlots-1, depositRevertScanSlots-1, run); !found || id != 12+depositRevertScanSlots-1 {
+		t.Fatalf("a landing within the run's bound was not found: %d %v", id, found)
+	}
+	if _, found := search(12+depositRevertScanSlots, depositRevertScanSlots, run); found {
+		t.Fatal("the run's search compared more occupied slots than its bound")
+	}
+	if _, found := search(12, 0, 0); found {
+		t.Fatal("a slot recorded without a run was searched below itself")
 	}
 }
 
@@ -816,6 +858,59 @@ func TestRetryOfWithheldDepositTargetsItsEmptySlot(t *testing.T) {
 	if len(f.accepted) != 2 || notes != 1 {
 		t.Fatalf("signed %d deposits, %d of them on chain", len(f.accepted), notes)
 	}
+}
+
+// The indexer serves a head view, which can be a short fork. A deposit built
+// on a fork whose slot 12 was deposited and emptied again targets slot 13,
+// and its calldata is just as valid at slot 12 of the canonical tree once
+// that fork is orphaned. Its slot is saved with the run of empty slots below
+// it, which every search covers too, so the revert check, quotes and repair
+// find it there, and no second deposit of the note is signed.
+func TestDepositBuiltOnForkedViewIsFoundBelowItsSlot(t *testing.T) {
+	f := newAddressFixture(t, true)
+	f.mu.Lock()
+	f.setLeaf(12, new(big.Int)) // The fork's slot 12, deposited and emptied.
+	f.mu.Unlock()
+	first, err := f.fundNative(t, 100000)
+	if err != nil || first.Phase != "deposit_pending" {
+		t.Fatalf("deposit was not signed: %+v %v", first, err)
+	}
+	f.mu.Lock()
+	f.leaves = f.leaves[:12] // The fork is orphaned: the canonical next slot is 12.
+	f.leafVersion++
+	root, _ := f.tree()
+	data := f.accepted[first.TransactionHash].Data()
+	siblings := make([]*big.Int, merkleDepth)
+	for i := range siblings {
+		siblings[i] = new(big.Int).SetBytes(data[68+32*i : 100+32*i])
+	}
+	valid := merkleRoot(12, new(big.Int), siblings).Cmp(root) == 0
+	commitment := "0x" + hex.EncodeToString(data[4:36])
+	f.mu.Unlock()
+	if !valid {
+		t.Fatal("the deposit built for slot 13 is not valid at canonical slot 12")
+	}
+	// It lands at 12, while the RPC reports a finalized revert.
+	f.mine(t, first.TransactionHash, true)
+	f.mu.Lock()
+	f.registerDeposit(12, commitment, 100000, bucketedExpiry())
+	f.mu.Unlock()
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("revert not recorded: %+v %v", status, err)
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "at note 12") {
+		t.Fatalf("a retry was quoted: %v", err)
+	}
+	for range 2 {
+		status, err := f.h.FundAddress(context.Background(), 100000)
+		if err != nil || status.Phase != "verification_conflict" || !strings.Contains(status.Message, "note 12") {
+			t.Fatalf("the deposit that landed below its slot was retired: %+v %v", status, err)
+		}
+	}
+	if len(f.accepted) != 1 {
+		t.Fatal("a second deposit was signed for the same note")
+	}
+	f.repairBindsNote(t, 12, first.TransactionHash)
 }
 
 // Guided setup quotes again every five seconds while it waits for funds. A

@@ -145,26 +145,40 @@ private state:
 - **Reverted deposits.** Before a finalized failed deposit is retired or
   requoted, the indexer must show that this note did not land at the empty
   slot the signed transaction was built for. The slot is checked against the
-  indexer's tree and saved with the note just before signing. A reported
-  revert can also be a deposit the RPC withheld and relays later, so the
-  slot of every deposit signed for the note is kept. Another deposit of the
-  same note is signed only when a search of the indexer tree it is built
-  from, starting at each of those slots, does not find the note. An earlier
-  deposit missing from that tree cannot land beside the new one. Quotes run
-  the same search only to refuse early. While the indexer is unavailable, a
-  quote is still given, but approval signs nothing. The search is bounded:
-  it compares the first 64 occupied slots after each kept slot, for expiry
-  days back to about 63 days before the search. A deposit lands after its
-  slot only when every slot in between is empty. So a landed deposit is
-  missed only in two cases. After it lands, challenges restore 64 or more
-  escaped notes between the slot it was built for and the slot it landed
-  in. Or it landed about 63 or more days earlier, past its note's 30-day
-  term on the packaged deployments unless vault pauses extended it by more
-  than 33 days. If the note is found, the deposit is reported as a
-  `verification_conflict` and no replacement is signed. Running
+  indexer's tree and saved with the note just before signing, together with
+  the run of empty slots right below it in that tree. A reported revert can
+  also be a deposit the RPC withheld and relays later, so the slot of every
+  deposit signed for the note is kept. Another deposit of the same note is
+  signed only when a search of the indexer tree it is built from, starting
+  at each of those slots, does not find the note. An earlier deposit missing
+  from that tree cannot land beside the new one. Quotes run the same search
+  to refuse early. While the indexer is unavailable, a quote is still given,
+  but approval signs nothing. A saved `verification_conflict` without a
+  pending transaction is the exception: there the quote's search decides
+  whether the conflict clears, so it must complete, and while the indexer is
+  unavailable the quote is refused and the conflict stays. The search is
+  bounded: it compares the first 64 occupied slots from each kept slot on,
+  and the first 64 in the empty run below it, for expiry days back to about
+  63 days before the search. A deposit lands after its slot only when every
+  slot in between is empty, and before it only inside that run, when the
+  indexer's view it was built from was a short fork that was then orphaned.
+  So a landed deposit is missed only in two cases. After it lands, challenges
+  restore 64 or more escaped notes between the slot it was built for (or the
+  start of the run) and the slot it landed in. Or it landed about 63 or more
+  days earlier, past its note's 30-day term on the packaged deployments unless
+  vault pauses extended it by more than 33 days. (A slot saved by a
+  pre-release build of this version records no run and is never searched
+  below, so a deposit signed for such a slot from a view that was then
+  orphaned is also missed when it landed below the slot.) If the note is
+  found, the deposit is reported as a `verification_conflict` and no
+  replacement is signed. Running
   `zkapi-clientd config` again checks once more; **repair** (below) binds
   the note that landed. Deposits that reuse your public commitment with a
-  different amount are ignored, so they cannot block a genuine retry.
+  different amount are ignored, so they cannot block a genuine retry. A
+  deposit signed by 0.1.6 or earlier, or whose `pending-deposit.json` such
+  a release rewrote (dropping `slot`, `signed_slots` and each slot's
+  `empty_before`), has no recorded slot: its reported revert is retired, and
+  a retry signed, without this search.
 - **Withdrawals.** Before the wallet companion deletes its note state, the
   vault (at the payout receipt's block) must show the note closed and the
   indexer must no longer list its leaf; until then the withdrawal keeps

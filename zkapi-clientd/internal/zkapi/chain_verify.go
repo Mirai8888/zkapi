@@ -158,6 +158,20 @@ func (s *treeSnapshot) leaf(id uint32) (value *big.Int, present bool, err error)
 	return value, true, nil
 }
 
+// emptyBeforeNext counts the empty leaves right below next_note_id: notes
+// deposited last and closed or escaping since.
+func (s *treeSnapshot) emptyBeforeNext() uint32 {
+	start := s.NextNoteID
+	for start > 0 {
+		leaf, present, err := s.leaf(start - 1)
+		if err != nil || !present || leaf.Sign() != 0 {
+			break
+		}
+		start--
+	}
+	return s.NextNoteID - start
+}
+
 // indexerGet reads a public, parameterless route of the packaged indexer
 // through the configured transport, with no credentials and no redirects.
 // Every caller gets the same response, so the indexer never learns which
@@ -315,6 +329,11 @@ func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingC
 // is saved with the note record before the transaction exists, so a later
 // reported revert can be checked against what actually happened there.
 //
+// The slot also records the run of empty leaves right below it. The indexer
+// serves a head view, which can be a short fork: calldata built on a fork
+// whose last notes were deposited and closed again can land at a lower slot
+// of the canonical tree once that fork is orphaned, but only inside that run.
+//
 // A deposit reported as reverted may have been withheld and still land, and
 // a second deposit of this note would share its nullifier. So the same
 // snapshot is searched for our leaf from the slot of every deposit of this
@@ -322,10 +341,15 @@ func (h *FundingHandler) corroborateDeposit(ctx context.Context, config fundingC
 // and that search come from one tree. An earlier deposit missing from it
 // cannot land beside the new one: the vault accepts each only against a
 // tree without the other's leaf. An earlier deposit in it is found unless it
-// lies outside findDepositLeaf's bounds. That happens only in two cases.
-// After it landed, challengeEscapeWithdrawal restored 64 or more leaves
-// between the slot it was built for and the slot it landed in. Or it landed
-// about 63 or more days ago.
+// lies outside findDepositLeaf's bounds. For a slot that records its run,
+// that happens only in two cases. After it landed,
+// challengeEscapeWithdrawal restored 64 or more leaves between the slot it
+// was built for and the slot it landed in, or, for a deposit that landed in
+// the run below that slot, between the start of the run and its slot. Or it
+// landed about 63 or more days ago. A slot saved by an earlier release
+// records no run and is never searched below, so a deposit signed for it
+// from a view that was then orphaned, which landed below that slot, is
+// missed as well.
 func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConfig, record *addressFundingRecord, deposit *depositRecord) (string, error) {
 	path, err := h.depositPath(ctx)
 	if err != nil {
@@ -367,7 +391,7 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
 	deposit.SignedSlots = signed
-	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix()}
+	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix(), EmptyBefore: snapshot.emptyBeforeNext()}
 	if err := h.save(*deposit); err != nil {
 		return "", err
 	}
@@ -399,8 +423,9 @@ func signedDepositSlot(deposit *depositRecord, saved *addressTransaction) (*depo
 // checkDepositRevert decides whether a finalized failed deposit may be retired.
 // A hostile RPC can report a revert for a deposit that actually created our
 // note; retiring it would reuse the note secret in a second deposit. The
-// indexer must show that this note did not land where the signed calldata of
-// this or any earlier deposit of it could apply. Foreign deposits reusing the
+// indexer's tree must show no deposit of this note where findDepositLeaf
+// searches, from the slots of this and every earlier signed deposit of it;
+// the search is bounded (see bindDepositPath). Foreign deposits reusing the
 // public commitment with another amount never match our leaf, so they cannot
 // block a genuine retry. Deposits signed before slots were recorded keep the
 // previous behaviour.
@@ -518,6 +543,9 @@ func priorDepositKey(config fundingConfig, deposit *depositRecord, slots []depos
 		if ordered[i].NoteID != ordered[j].NoteID {
 			return ordered[i].NoteID < ordered[j].NoteID
 		}
+		if ordered[i].EmptyBefore != ordered[j].EmptyBefore {
+			return ordered[i].EmptyBefore < ordered[j].EmptyBefore
+		}
 		if ordered[i].PreparedAt != ordered[j].PreparedAt {
 			return ordered[i].PreparedAt < ordered[j].PreparedAt
 		}
@@ -526,7 +554,7 @@ func priorDepositKey(config fundingConfig, deposit *depositRecord, slots []depos
 	var key strings.Builder
 	fmt.Fprintf(&key, "%s|%s|%d|%d", config.Indexer, strings.ToLower(deposit.Commitment), deposit.Amount, ttl)
 	for _, slot := range ordered {
-		fmt.Fprintf(&key, "|%d:%d:%s", slot.NoteID, slot.PreparedAt, strings.ToLower(slot.PathSHA256))
+		fmt.Fprintf(&key, "|%d-%d:%d:%s", slot.NoteID, slot.EmptyBefore, slot.PreparedAt, strings.ToLower(slot.PathSHA256))
 	}
 	return key.String()
 }
@@ -580,17 +608,21 @@ func noteDepositTransactions(record *addressFundingRecord, deposit *depositRecor
 }
 
 // findSignedDepositLeaf searches from each signed slot, earliest first. Slots
-// with the same note ID are searched once, from the earliest preparation.
+// with the same note ID and empty run are searched once, from the earliest
+// preparation.
 func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
 	ordered := append([]depositSlot{}, slots...)
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].NoteID != ordered[j].NoteID {
 			return ordered[i].NoteID < ordered[j].NoteID
 		}
+		if ordered[i].EmptyBefore != ordered[j].EmptyBefore {
+			return ordered[i].EmptyBefore < ordered[j].EmptyBefore
+		}
 		return ordered[i].PreparedAt < ordered[j].PreparedAt
 	})
 	for i := range ordered {
-		if i > 0 && ordered[i].NoteID == ordered[i-1].NoteID {
+		if i > 0 && ordered[i].NoteID == ordered[i-1].NoteID && ordered[i].EmptyBefore == ordered[i-1].EmptyBefore {
 			continue
 		}
 		if id, found := findDepositLeaf(snapshot, &ordered[i], commitment, amount, ttl, now); found {
@@ -602,30 +634,41 @@ func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitme
 
 // findDepositLeaf looks for exactly our leaf (commitment, amount and a
 // day-bucketed expiry from plausibleExpiries) at the prepared slot and the
-// occupied slots after it. Every comparison costs a Poseidon hash per expiry
-// day, so it compares at most depositRevertScanSlots occupied slots. Empty
-// slots are skipped without counting. Calldata built for one slot lands at a
-// later one only while every slot in between is empty, because the vault
-// checks the path against its live root. So when it lands, its slot is the
-// first occupied one. Afterwards challengeEscapeWithdrawal can restore leaves
-// that escapes removed in between, and a landing behind
+// occupied slots after it, then in the run of slots that were empty right
+// below it (slot.EmptyBefore). Every comparison costs a Poseidon hash per
+// expiry day, so each of the two ranges compares at most
+// depositRevertScanSlots occupied slots. Empty slots are skipped without
+// counting. Calldata built for one slot lands at a later one only while
+// every slot in between is empty, because the vault checks the path against
+// its live root. It lands at an earlier one only inside that run: its
+// siblings fix every leaf below the slot it was built for, and a leaf
+// commits to its note ID, so they fit a lower slot only where every slot in
+// between was empty. So when it lands, its slot is the first occupied one
+// from where its range starts. Afterwards challengeEscapeWithdrawal can
+// restore leaves that escapes removed in between, and a landing behind
 // depositRevertScanSlots restored leaves is not found.
 func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
 	expiries := plausibleExpiries(slot.PreparedAt, now, ttl)
-	compared := 0
-	for id := uint64(slot.NoteID); id < uint64(snapshot.NextNoteID) && compared < depositRevertScanSlots; id++ {
-		leaf, ok := parseFieldElement(snapshot.Leaves[id])
-		if !ok || leaf.Sign() == 0 {
-			continue
-		}
-		compared++
-		for _, expiry := range expiries {
-			if leaf.Cmp(noteLeaf(uint32(id), commitment, amount, expiry)) == 0 {
-				return uint32(id), true
+	search := func(from, to uint64) (uint32, bool) {
+		compared := 0
+		for id := from; id < to && id < uint64(snapshot.NextNoteID) && compared < depositRevertScanSlots; id++ {
+			leaf, ok := parseFieldElement(snapshot.Leaves[id])
+			if !ok || leaf.Sign() == 0 {
+				continue
+			}
+			compared++
+			for _, expiry := range expiries {
+				if leaf.Cmp(noteLeaf(uint32(id), commitment, amount, expiry)) == 0 {
+					return uint32(id), true
+				}
 			}
 		}
+		return 0, false
 	}
-	return 0, false
+	if id, found := search(uint64(slot.NoteID), uint64(snapshot.NextNoteID)); found {
+		return id, true
+	}
+	return search(uint64(slot.NoteID)-uint64(min(slot.EmptyBefore, slot.NoteID)), uint64(slot.NoteID))
 }
 
 // plausibleExpiries lists every bucketed expiry for a deposit mined between

@@ -331,7 +331,10 @@ components:
         response_code: {type: integer}
         response_payload:
           type: string
-          description: Settlement JSON, including billing_quote and charge_basis
+          description: >-
+            Settlement JSON, including billing_quote and charge_basis; fallback
+            settlements add settlement_reason (settlement_deadline,
+            unsettleable or operator_conceded)
         response_hash: {$ref: "#/components/schemas/Felt"}
         charge_applied: {type: integer, minimum: 0}
         next_commitment:
@@ -361,7 +364,13 @@ components:
       type: object
       required: [status, client_request_id, issued_at, expires_at, settle_after, spending_limit_usd]
       properties:
-        status: {type: string, enum: [provisioning, active, retiring, disabled, revoking, finalized, cancelled]}
+        status:
+          type: string
+          enum: [provisioning, active, retiring, disabled, revoking, finalized, cancelled]
+          description: >-
+            cancelled marks a corrupt server record that is never signed
+            unless the operator repairs it and reopens the lease, which returns
+            it to a pending status
         client_request_id: {type: string}
         issued_at: {type: integer}
         expires_at: {type: integer}
@@ -372,8 +381,11 @@ components:
         last_error: {type: string}
         charge_basis:
           type: string
-          enum: [measured, clamped, worst_case, unissued]
-          description: How a finalized charge was determined
+          enum: [measured, clamped, worst_case, unissued, operator_conceded]
+          description: >-
+            How a finalized charge was determined; operator_conceded is zero,
+            for a lease the operator reopened after a corrupt binding and whose
+            charge it conceded
         settlement_deadline:
           type: integer
           description: >-

@@ -110,6 +110,32 @@ decimals or maximum age affects only new admissions (and the acknowledgement of
 an unaccepted quote that has not yet expired). Keep those settings equal to the
 published manifest.
 
+Wallets follow the same rule for a request the server has admitted. The browser
+SDK and the `zkapi-clientd` companion check the quote saved with a journaled
+request only for internal consistency and its chain, never against the current
+pins. After a client release changes `native_price_feed_address`,
+`native_price_feed_decimals` or `native_price_max_age_seconds`, a wallet with an
+unsettled request still opens, recovers and withdraws, and installs the
+request's finalized receipt. A journaled request that the server never admitted
+is different: the server compares a new admission's quote with its pins before
+its freshness, so it refuses that request with `invalid_request`, not
+`native_quote_expired`. A wallet retires such a request through
+`POST /v2/openrouter/leases/{id}/expire` only after its quote has expired, at
+most the old maximum age after it was quoted, and only on the server's matching
+`expired_unaccepted` acknowledgement. The SDK does this in the recovery it runs
+before each lease. `zkapi-clientd` does it when the server refuses the request
+on a lease at the request's original model budget; a lease at another model
+budget reports `lease_pending` without contacting the server. Until then the
+wallet's next lease may fail with `invalid_request`; status, recovery and
+withdrawal keep working, and a `zkapi-clientd` withdrawal settlement discards
+the request once the server knows neither the request nor its nullifier. Prefer
+to change native-price pins when no wallet has a request in flight.
+`zkapi-clientd` 0.1.6 and earlier check journaled quotes against the pinned
+manifest and cannot open such a wallet at all, so ship a pin change only in a
+clientd release built with the updated `companion.patch`. Until then, clientd
+wallets must have no request in flight when the pins change. The clientd
+companion converts only 8-decimal ETH/USD answers.
+
 An accepted reservation does not authorize new access after its state has been
 withdrawn. Before contacting either provider to create a key, including an exact
 reserved/provisioning retry, the server checks the configured chain ID and the
@@ -444,12 +470,14 @@ A `binding_corrupt` review names the first field in which the lease row
 disagrees with its nullifier reservation. The server has not checked which side
 is corrupt: the saved request (`openrouter_leases.api_request_json`), the lease
 row's other columns, or the reservation (the `nullifiers` row). Wait until the
-lease is `cancelled`: a direct lease that may have been delivered is reviewed
-when its corruption is found but cancelled only once its key's usage is
-captured (at its deadline at the latest), and the command refuses it until
-then. Then stop the API server and run the command against its database, with
-its proof setup. In the [Docker deployment](../docker/aws/README.md), with `dc`
-defined as under its Monitoring section:
+lease is `cancelled` (read its row's `status`; the dashboard's `pending` list
+holds at most `limit` leases, so a lease missing from it may still be
+pending): a direct lease that may have been delivered is reviewed when its
+corruption is found but cancelled only once its key's usage is captured (at
+its deadline at the latest), and the command refuses it until then. Then stop
+the API server and run the command against its database, with its proof setup.
+In the [Docker deployment](../docker/aws/README.md), with `dc` defined as under
+its Monitoring section:
 
 ```sh
 dc stop server
@@ -502,7 +530,9 @@ names the first field that fails and its repair:
    from the request and moves the lease's reviews to its corrected id. It
    refuses while another lease row holds the request's id or nullifier. Do not
    set these columns by hand: `client_request_id` also keys the lease's reviews
-   and key cleanup. (A row renamed by hand is still found by its nullifier.)
+   and key cleanup. (A row renamed by hand is still found by its nullifier,
+   and a key deletion that its cancellation queued under the former id is
+   withdrawn as well.)
 4. The reservation agrees with it: its row exists, its kind is
    `openrouter_lease`, and its `client_request_id`, `payload_hash` and
    `api_request_binding` match. The request having verified, the reservation is
@@ -515,6 +545,18 @@ names the first field that fails and its repair:
    repair its `nullifier` column instead). Re-creating a missing row assumes
    that no successor was signed for it: a transcript lost with the row is
    signed again.
+
+Three refusals ask for a repair that the command cannot make: a corrupt
+`api_request_binding` together with a saved request that does not verify
+(restore that column from a backup), a `Finalized` reservation (restore its
+`nullifiers` row from a backup), and a reservation kept under another
+nullifier (set its `nullifier` column to the lease's `request_nullifier`).
+These are hand edits of the server database, outside the supported runbooks,
+and no tested statement is given for them. Make them only with the server
+stopped and a fresh copy of the database kept, restore values only from a
+backup taken before the corruption, and run `sqlite3` as the server's user
+(uid 10001 in the Docker deployment). Then run the command again, which
+repeats every check.
 
 `--saved-request` and `--rebind` combine. Once every check passes, the command
 returns the lease to settlement with its write-once deadline unchanged, and
@@ -546,12 +588,16 @@ With `--zero-charge` the lease is finalized at zero instead, with `charge_basis`
 and `settlement_reason` `operator_conceded`: the operator concedes the request's
 charge, as the owner's escape would have, and a direct key is deleted. The same
 checks apply: a request that does not verify, or a binding still corrupt, is
-not conceded either. `--zero-charge` also concedes a lease reopened earlier that
-is not settled yet, for instance after a `deadline_fallback` warning; run it
-before restarting the server. A request whose successor is already signed
-settles from that transcript and cannot be conceded. The command acknowledges
-the lease's `binding_corrupt` reviews and records a `binding_reopened` review,
-and records another for a later concession.
+not conceded either. `--rebind` and `--saved-request` repair it as for a
+reopening, also for a lease reopened earlier whose binding was found corrupt
+again: `--zero-charge --rebind`. `--zero-charge` also concedes a lease
+reopened earlier that is not settled yet, for instance after a
+`deadline_fallback` warning; run it before restarting the server. A request
+whose successor is already signed settles from that transcript and cannot be
+conceded. Each reopening, and each later concession of a reopened lease,
+acknowledges the lease's open `binding_corrupt` reviews and records a
+`binding_reopened` review, so a lease has one such review for each of those
+runs to acknowledge.
 
 The restarted server verifies a reopened lease's saved request again, and
 checks its binding, deployment and signing key, before it signs anything; a

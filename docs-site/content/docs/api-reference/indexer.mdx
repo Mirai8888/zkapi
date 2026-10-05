@@ -37,11 +37,12 @@ applies each batch of events with consistency checks, then reads the vault's
 `currentRoot()` and `nextNoteId()` at that block hash and publishes the view
 only when both match its mirror. It persists a checkpoint only at
 `--confirmations` blocks behind the head (default 12), and re-derives the head
-view from that checkpoint on every new head, so a shallower reorganization
-is absorbed. A deeper reorganization that changed the vault state, or a
-mirror that keeps disagreeing with the vault, takes the tree routes out of
-service and rebuilds the mirror from the deployment block. Automatic rebuilds
-are rate-limited.
+view from that checkpoint on every new head, so a shallower reorganization is
+absorbed. A checkpoint restored at startup is served only once this process
+has verified it, or a view built on it, against the vault. A deeper
+reorganization that changed the vault state, or a mirror that keeps
+disagreeing with the vault, takes the tree routes out of service and rebuilds
+the mirror from the deployment block. Automatic rebuilds are rate-limited.
 
 While no verified view is available, every tree route and
 `/v1/escapes/pending` return `503` with `Retry-After: 5` and the same public
@@ -51,21 +52,40 @@ body:
 {"status":"unavailable","error_code":"indexer_unavailable","error_message":"the indexer has no verified view of the vault state; retry later","retriable":true,"retry_after_seconds":5}
 ```
 
-Retry after the indicated delay; never build a transaction from an
-unverified tree. The public body never reveals the indexer's internal state.
+Retry after the indicated delay; never build a transaction from an unverified
+tree. The public body never reveals the indexer's internal state.
 `GET /health` returns `200` only with status `ok`; otherwise it returns `503`
 with status `syncing`, `stale`, `diverged`, or `rebuilding`. Its body reports
 the head, served and confirmed blocks, roots, lag, failures, divergence and
-rebuild counts. The view becomes `stale` after `--stale-after-secs` (default
-120) without a verified poll, or when the RPC's head block is older than
-`--max-head-age-secs` (default 180; `0` disables the check for chains that
-mine on demand). Keep `/health`, `/metrics` and `/v1/escapes/pending` internal;
-the reference gateway proxies only `/v1/tree/` to the indexer.
+rebuild counts, and `missed_re_escape_count` with its subset
+`missed_re_escape_finalized_count`, exported as
+`zkapi_indexer_missed_re_escapes_total{event="challenged"}` and
+`{event="finalized"}` on `/metrics`. These count committed challenges and
+finalizations of an escape the indexer never saw initiated, once per escape:
+its RPC's logs missed a challenge and re-escape of the note, or a
+reorganization below the checkpoint replaced the escape. The indexer applies
+such an event and keeps serving. Each is logged once, a challenge at WARN and
+a finalization at ERROR. The counts restart with the process. The view becomes
+`stale` after `--stale-after-secs` (default 120) without a verified poll, or
+when the RPC's head block is older than `--max-head-age-secs` (default 180;
+`0` disables the check for chains that mine on demand). Keep `/health`,
+`/metrics` and `/v1/escapes/pending` internal; the reference gateway proxies
+only `/v1/tree/` to the indexer.
 
 `GET /v1/escapes/pending` returns
-`{ block_number, block_hash, root, escapes: [{ note_id, withdrawal_nullifier, challenge_deadline }] }`.
-The challenge service uses it to find escapes its own log scan missed, then
-reads each one from the vault before acting.
+`{ block_number, block_hash, root, escapes: [{ note_id, withdrawal_nullifier, challenge_deadline }] }`
+from the same verified view. The root check covers the list only through the
+notes' leaves: an open escape zeroes its note's leaf, so the list leaves no open
+escape out, short of a reorganization below the checkpoint or a stale log
+backend. Each entry is the last one the indexer applied from the vault's logs,
+and is a hint. A challenge restores the leaf, so if the RPC's logs miss both a
+challenge and a later re-escape of the same note, the entry keeps the
+challenged escape's nullifier and deadline until the note's next challenge or
+finalization. If they miss a finalization, or both a challenge and a later
+mutual close or expiry claim, the note stays listed with no open escape until a
+resync. Read `pendingWithdrawals(noteId)` from the vault before acting on an
+entry. The challenge service uses the list to find escapes its own log scan
+missed, and tracks the escape the vault holds.
 
 Both `zkapi-indexerd` and `zkapi indexer` accept `--confirmations`,
 `--chain-id`, `--resync`, `--stale-after-secs`, `--max-block-range` (default

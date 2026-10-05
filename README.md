@@ -69,6 +69,8 @@ protocol services, wallet proofs and contracts are real. See the
   private status endpoints.
 - `zkapi signing-keys`: derive deployment public keys from operator seeds
   (the published development keys are rejected).
+- `zkapi settlement reopen`: with the API server stopped, verify, repair and
+  reopen a lease cancelled for a corrupt binding.
 - `zkapi setup --output-dir NEW_DIRECTORY`: generate a fresh single-party Groth16 setup.
 
 Native server startup requires a pinned oracle RPC/feed, a lease issuer, and

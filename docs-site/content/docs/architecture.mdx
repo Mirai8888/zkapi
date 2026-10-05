@@ -48,13 +48,20 @@ update before saving the next state.
 In the same storage transaction as the journal, the SDK appends the request to
 an archive of transmitted requests. A server error alone never discards a
 journal: on `stale_root` the SDK first rereads the vault root and the server's
-nullifier record, and a discarded journal stays in the archive. Before an
-escape it consults that archive, because an escape from a state that
-already authorized a request can be challenged. For vaults declared as
+nullifier record, and a discarded journal stays whole in the archive while the
+note state is current, so a receipt finalized later still installs. Before an
+escape it consults that archive, because an escape from a state that already
+authorized a request can be challenged. For vaults declared as
 `vault_revision: 2` it may escape from such a state once the server reports
 the nullifier `unknown` or `clearance_reserved`, or through an explicit,
-time-gated override. For other vaults it refuses. See `sdk/README.md` for the
-exact codes and configuration.
+time-gated override; for other vaults it refuses. Only a receipt that verifies
+vetoes that override. When the server claims a finalized receipt the browser
+cannot apply (`receipt_journal_missing`), the override stays available behind
+that case's own warning and acknowledgement, because a genuine claim makes the
+escape's challenge certain. The claim stands until a reading saved after it
+reports the nullifier `unknown` or `clearance_reserved`. The archive orders
+saved readings by a sequence number stamped in its write transaction, never by
+the device clock. See `sdk/README.md` for the exact codes and configuration.
 
 ## Server and verification
 

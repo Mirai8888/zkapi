@@ -148,31 +148,42 @@ for the signer and in `deployment.env` for the daemon (the signer reads only
 (`tx_fee_above_cap`). The daemon bids within the lower of its own value and the
 signer's, which `zkapi_signerStatus` reports, and its `/status` warns when the
 two differ. A real challenge has a gas limit of about 7.53M, so at 1 ETH no bid
-exceeds about 132 gwei, whatever the fee caps:
+exceeds about 132 gwei, whatever the fee caps. The middle column is the ceiling
+at which every challenge can bid the full fee cap, with room up to a 7.6M gas
+limit:
 
-| Fee cap | Gas limit x fee cap | Highest bid at the default 1 ETH |
+| Fee cap | 7.6M gas x fee cap | Highest bid at the default 1 ETH |
 | --- | --- | --- |
-| 10 gwei (Sepolia default) | 0.075 ETH | 10 gwei |
-| 100 gwei | 0.75 ETH | 100 gwei |
-| 300 gwei | 2.26 ETH | about 132 gwei; the daemon warns that its fee cap exceeds the ceiling |
+| 10 gwei (Sepolia default) | 0.076 ETH | 10 gwei |
+| 100 gwei | 0.76 ETH | 100 gwei |
+| 300 gwei | 2.28 ETH | about 132 gwei; the daemon warns that its fee cap exceeds the ceiling |
 
 For a higher fee cap, raise the node's `--rpc.txfeecap` and
-`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`,
-for example to at least 2.26 ETH for a 300 gwei fee cap, or keep the fee cap
-within the ceiling. A hosted provider's cap usually cannot be raised. A value
-above the node's cap makes the signer report `upstream_tx_fee_cap`, which the
-daemon treats as critical at once. It then bids within 10/11 of the lowest
-refused fee until it restarts, and its `/status` warns with that fee
+`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`
+to at least the middle column (2.28 ETH for a 300 gwei fee cap), or keep the
+fee cap within the ceiling. A hosted provider's cap usually cannot be raised.
+A value above the node's cap makes the signer report `upstream_tx_fee_cap`,
+which the daemon treats as critical at once. It then bids within 10/11 of the
+lowest refused fee until it restarts, and its `/status` warns with that fee
 ([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
-signer also warns
-`tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap exceeds
-the ceiling; see [Node transaction fee cap](signer/README.md#node-transaction-fee-cap).
+signer also warns `tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x
+its fee cap exceeds the ceiling; see
+[Node transaction fee cap](signer/README.md#node-transaction-fee-cap).
 
 Fund the sender with at least (N + K) x gas limit x the highest bid, that is the
 fee cap or, when lower, the ceiling / gas limit. N is the number of challenges
 that may be pending at once and K a budget of reverted attempts. That is 0.75
 ETH per challenge at a 100 gwei cap, and at most the ceiling (1 ETH by default)
-per challenge at any cap.
+per challenge at any cap. The signer's status warns `balance_below_required`
+below its `required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH
+at 100 gwei and the default 12M gas), which is more than one challenge needs:
+fund up to it, or lower `ZKAPI_CHALLENGE_MAX_GAS` toward the challenge's gas
+limit while keeping a margin above it, for example 8M (0.8 ETH at 100 gwei). A
+challenge's gas limit is its gas estimate plus 20%, about 7.53M as measured;
+re-measure after redeploying the vault. The signer refuses a larger gas limit
+with `gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
+critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised: at 7.6M a
+challenge 0.9% costlier than measured is refused.
 
 `challenge.env` holds the daemon's own bounds, which it proposes to the signer
 (its transaction fee cap is in `deployment.env`, above):
@@ -180,7 +191,7 @@ per challenge at any cap.
 | Variable | Requirement |
 | --- | --- |
 | `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | Required. At most the signer's `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`. |
-| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; 5 to 10 times the priority fee leaves several more before it. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. |
+| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; 5 to 10 times the priority fee leaves several more before it. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
 
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the
@@ -300,6 +311,8 @@ dc exec -T challenger curl -sS -X POST http://signer:8547 -H 'content-type: appl
   -d '{"jsonrpc":"2.0","id":1,"method":"zkapi_signerStatus","params":[]}'
 # API: false while legacy clearance is enabled.
 curl -fsS http://127.0.0.1:8080/health | jq .clearance_ownership_proof_required
+# API: the legacy proof-less clearance budget and its refusals.
+curl -fsS http://127.0.0.1:8080/health | jq '{legacy_clearance_window_used, legacy_clearance_window_limit, legacy_clearance_rejected_total}'
 # Settlement: pending leases, deadlines and open reviews (operator-only route).
 dc exec -T server curl -fsS 'http://127.0.0.1:3000/v1/dashboard/settlement?limit=50'
 ```
@@ -327,43 +340,149 @@ Alert on:
   `challenge obligation status changed` at error level, and a rising
   `missed_total` in `/status`;
 - indexer `/health` not 200 for more than two minutes (outside a planned replay),
-  an increase in its `divergence_count` or `rebuild_count`
-  (`zkapi_indexer_divergences_total`, `zkapi_indexer_rebuilds_total`), and a
-  `head_age_seconds` near `INDEXER_MAX_HEAD_AGE_SECS`; also its ERROR log
+  an increase in its `divergence_count`, `rebuild_count` or
+  `missed_re_escape_count` (`zkapi_indexer_divergences_total`,
+  `zkapi_indexer_rebuilds_total`, `zkapi_indexer_missed_re_escapes_total`), and
+  a `head_age_seconds` near `INDEXER_MAX_HEAD_AGE_SECS`; also its ERROR log
   lines, such as `indexer mirror diverged from vault state; tree endpoints
-  return 503`;
+  return 503` and `escape finalized that the indexer never saw initiated`. A
+  missed re-escape means that the indexer RPC's `eth_getLogs` dropped a
+  challenge and re-escape of a note, or that a reorganization below the
+  checkpoint replaced an escape: check that RPC's log completeness, then resync
+  (below). Each is counted once per escape, logged at warn level for a
+  challenge and at error level for a finalization, and the counts restart with
+  the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
+  the vault paid out that escape, so also confirm that the challenger tracked
+  it;
 - the indexer's `root` differing from `currentRoot()` read at its `served_block`
-  through a different RPC than the indexer's own (commands under Indexer resync);
+  through a different RPC than the indexer's own, and a note that its
+  `/v1/escapes/pending` lists while the vault holds no escape for it (both
+  checks are under Indexer resync, step 1; run them daily). The challenger also
+  reports such a dead entry, as the pending-escapes warning above, once reads
+  `--blocked-warning-seconds` apart find no escape for it and a list served
+  after the first such read still names it; the daily check stays an
+  independent cross-check through another RPC, and the indexer `/health` and
+  `head_age_seconds` checks above catch a stalled list;
 - `settlement required operator review` in the server log, and a nonzero
   `open_reviews` in `/v1/dashboard/settlement`;
+- on a hardened vault, its owner and treasury events: any
+  `OwnershipTransferStarted` you did not send, `TreasuryChangeScheduled`,
+  `Paused`, `Unpaused` and `TreasuryPaymentDeferred` (see the migration guide's
+  [Operations runbooks](../../docs/migration-hardened-vault.md#operations-runbooks));
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
-  `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`),
+  `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
+  suppress the last only while the signer's
+  `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` x 7.6M gas is at most its
+  `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, and check that again after every fee-cap
+  change, because with a challenger from an earlier release the same warning
+  also covers fee caps at which every challenge is refused (this release's
+  challenger instead bids no higher than the ceiling / gas limit); see the
+  signer README, Upgrading from 0.1, step 2),
   signer `/health` failures, and signer audit lines
   `"event":"challenge_refused"` with reason `base_fee_above_max_fee`,
   `insufficient_balance`, `tx_fee_above_cap`, `upstream_tx_fee_cap` or
   `broadcast_ambiguous`;
 - `clearance_ownership_proof_required: false` after the announced end of the
   legacy clearance window;
+- a rising `legacy_clearance_rejected_total` in the API `/health`, or the server
+  log line `legacy clearance budget exhausted` (at most once a minute): someone
+  is spending the shared proof-less clearance budget, and clients without an
+  ownership proof cannot mutually close until the next minute;
 - sustained `gateway_rate_limited` lines in the gateway log, per zone.
 
 Acknowledge a settlement review after handling it, with the host's `sqlite3`.
-Run writes as the container's user 10001, so that no root-owned journal file
-can be left behind:
+The table is a log keyed by `review_id`: one lease can have several rows, such
+as its cancellation, its reopening and its final settlement. Acknowledging by
+`client_request_id` would also acknowledge a later `binding_reopened` row, or
+the new `binding_corrupt` row of a re-cancellation. Run writes as the
+container's user 10001, so that no root-owned journal file can be left behind:
 
 ```sh
 sudo sqlite3 -readonly /var/lib/zkapi/server.db \
-  "SELECT client_request_id, reason, charge_basis, charge_applied, solvency_bound, detail FROM settlement_reviews WHERE acknowledged_at IS NULL;"
+  "SELECT review_id, client_request_id, reason, charge_basis, charge_applied, solvency_bound, detail FROM settlement_reviews WHERE acknowledged_at IS NULL;"
 sudo setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 /var/lib/zkapi/server.db \
-  "UPDATE settlement_reviews SET acknowledged_at = strftime('%s','now') WHERE client_request_id = 'REPLACE_WITH_ID';"
+  "UPDATE settlement_reviews SET acknowledged_at = strftime('%s','now') WHERE review_id = REPLACE_WITH_REVIEW_ID;"
+```
+
+A `binding_corrupt` review leaves most owners without an exit until the lease is
+reopened: browser SDK profiles without `vault_revision` 2 and `zkapi-clientd`
+cannot escape at that state, and the server grants no mutual-close clearance for
+its reserved nullifier. Only an SDK on a `vault_revision` 2 vault can escape
+there, through its explicit override once
+`unsettled_request_escape_after_seconds` has passed. Reopen the lease before the
+note expires, or its deposit goes to the treasury. With `ID` set to the
+review's `client_request_id`, first wait until the lease row's status is
+`cancelled`. Check the row itself: the dashboard's `pending` list holds at most
+`limit` leases, ordered by deadline, so a lease missing from it may still be
+pending.
+
+```sh
+sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+  "SELECT client_request_id, status FROM openrouter_leases WHERE client_request_id = '$ID';"
+```
+
+Then reopen it:
+
+```sh
+dc stop server
+dc run --rm --no-deps --entrypoint zkapi server settlement reopen \
+  --db-path /data/server.db --client-request-id "$ID"
+dc start server
+```
+
+The challenger may keep running; it only reads the database. The command
+verifies the lease's saved request against its proof with the image's proof
+setup (`ZKAPI_PROOF_SETUP_DIR` when `deployment.env` sets it). It changes
+nothing while it refuses, and each refusal names the field and its repair:
+
+- If it names `openrouter_leases.api_request_json`, the saved request is the
+  corrupt side: run it again with the authentic request, from a backup of the
+  server database or from its owner, on standard input
+  (`dc run -T --rm --no-deps --entrypoint zkapi server settlement reopen --db-path /data/server.db --client-request-id "$ID" --saved-request - < request.json`).
+- If it names another field, follow the repair it names, usually `--rebind`.
+  A `Finalized` reservation, a reservation kept under another nullifier, and a
+  corrupt `nullifiers.api_request_binding` together with a corrupt saved
+  request each need a hand repair of the database instead (see
+  [Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease)).
+  A `ClearanceReserved` refusal needs nothing: that owner exits by mutual close.
+
+Add `--zero-charge` to concede the request's charge; a lease reopened earlier
+whose binding is found corrupt again is repaired and conceded with
+`--zero-charge --rebind`. The restarted server verifies the lease again before
+it signs. Once the query above, with the `client_request_id` the command
+printed (`--rebind` may have corrected it), shows `finalized`, acknowledge each
+of the lease's `binding_reopened` reviews: a later `--zero-charge` concession
+adds one. Each reopening or concession itself acknowledges the lease's open
+`binding_corrupt` reviews. See
+[Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease).
+
+Back up the server database regularly with sqlite3's online backup; the server
+keeps running:
+
+```sh
+sudo install -d -m 700 /var/backups/zkapi
+sudo sqlite3 -readonly /var/lib/zkapi/server.db ".backup /var/backups/zkapi/server-$(date +%F).db"
 ```
 
 ## Indexer resync
 
 Resync when the indexer reports `diverged`, when its root disagrees with the
-vault, or when the challenger reports `indexer_diverged`. Waiting never repairs a
-divergence. The indexer rebuilds automatically after a detected divergence or a
-reorganization below its checkpoint, at most once per 300 seconds; a resync
-forces an immediate rebuild from `DEPLOY_BLOCK`.
+vault, when it lists a note that the vault holds no escape for (step 1), when
+the challenger reports `indexer_diverged`, or when the challenger's `/status`
+keeps showing `indexer.pending_escapes_disagreement`. The indexer verifies only
+its root and next note ID, so a listing left stale by a dropped challenge and
+re-escape is otherwise corrected only by the note's next challenge or
+finalization, and a note left listed by a dropped finalization, or by a
+challenge and a close or claim that were both dropped, only by a resync. The
+challenger reports such a dead entry in `indexer.pending_escapes_disagreement`,
+with a warning, once reads `--blocked-warning-seconds` apart find no escape for
+it and a list served after the first such read still names it (a list that may
+only lag the vault is not reported). Once reads 60 seconds apart have found
+none, it reads that note only every 16 polls, so dead entries do not hold up
+its checks of the other listed escapes. Waiting never repairs a divergence. The indexer rebuilds
+automatically after a detected divergence or a reorganization below its
+checkpoint, at most once per 300 seconds; a resync forces an immediate rebuild
+from `DEPLOY_BLOCK`.
 
 1. Compare the indexer with the vault, reading the vault through an RPC other
    than the indexer's (set `VAULT` to the vault address and `CHECK_RPC_URL` to
@@ -376,6 +495,18 @@ forces an immediate rebuild from `DEPLOY_BLOCK`.
    cast to-dec "$(echo "$H" | jq -r .root)"
    cast to-dec "$(cast call "$VAULT" 'currentRoot()' --block "$B" --rpc-url "$CHECK_RPC_URL")"
    cast call "$VAULT" 'nextNoteId()(uint32)' --block "$B" --rpc-url "$CHECK_RPC_URL"
+   ```
+
+   Then check that the vault holds an escape for every note the indexer lists
+   as pending, at the block of that list. Any output is a dead entry:
+
+   ```sh
+   L=$(sudo docker compose -f docker/aws/compose.yml exec -T indexer curl -fsS http://127.0.0.1:3001/v1/escapes/pending)
+   LB=$(echo "$L" | jq -r .block_number)
+   for i in $(echo "$L" | jq -r '.escapes[].note_id'); do
+     exists=$(cast call --json "$VAULT" 'pendingWithdrawals(uint32)(bool,uint256,uint256,uint128,address,uint64)' "$i" --block "$LB" --rpc-url "$CHECK_RPC_URL" | jq -r '.[0]')
+     [ "$exists" = true ] || echo "note $i is listed, but the vault holds no escape for it at block $LB"
+   done
    ```
 
 2. Request a resync and restart. The indexer archives its checkpoint as
@@ -397,8 +528,15 @@ forces an immediate rebuild from `DEPLOY_BLOCK`.
 A replay costs about (head − `DEPLOY_BLOCK`) / 1000 `eth_getLogs` calls, paced at
 one per 100 ms, plus verification. Start it at least twice that long before the
 nearest pending challenge deadline. Never edit the checkpoint or SQLite files by
-hand, never delete `challenges.json`, and never point two indexers at one
-checkpoint (the second refuses: `another indexer holds this checkpoint`).
+hand, beyond the documented `sqlite3` statements (acknowledging settlement
+reviews under Monitoring, and the
+[receipt journal missing](../../docs/migration-hardened-vault.md#operations-runbooks)
+remediation) and the hand repairs that
+[Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease)
+names for refusals the reopen command cannot repair, which are database
+surgery outside these runbooks; never delete `challenges.json`, and never point
+two indexers at one checkpoint (the second refuses: `another indexer holds this
+checkpoint`).
 
 ## Upgrades and running two deployments
 
@@ -407,6 +545,13 @@ Upgrade a deployment in place by rebuilding from the new release with a new
 `/var/lib/zkapi` while the services are stopped. Release-specific order and
 checks for this release are in
 [the hardened-vault migration guide](../../docs/migration-hardened-vault.md).
+To roll the indexer back to an earlier image, move `indexer.cursor` aside first
+so that the earlier indexer replays from `DEPLOY_BLOCK`; that replay is the
+only rollback path. An earlier indexer resumes from a checkpoint without
+verifying it against the vault, and the checkpoint this release archived at the
+upgrade (`indexer.cursor.v1-<unix_ms>.bak`) may be the diverged mirror it was
+replacing. That file has the mirror's leaves but no root, and nothing here can
+check it against the vault: keep it for forensics and never restore it.
 
 A redeployed vault is a new deployment: new public manifest and hostname, a new
 signer key and exclusive sender, and a fresh data directory (database, indexer

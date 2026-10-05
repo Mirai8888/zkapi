@@ -11,8 +11,8 @@ immutable constructor parameters. It has no XMSS root-rotation API.
 This page describes the vault in this repository, which deployment manifests
 declare as `vault_revision: 2`. Earlier deployed revisions require the exact
 current root and permanently consume a challenged nullifier; their
-`claimExpired` ignores pauses and their `setTreasury` takes effect at once. See
-[Protocol](/docs/protocol#compatibility-and-trust).
+`claimExpired` ignores pauses, and their `setTreasury` and `transferOwnership`
+take effect at once. See [Protocol](/docs/protocol#compatibility-and-trust).
 
 ## Deposit
 
@@ -137,10 +137,22 @@ assumes no further pause and returns zero for an unknown note.
 | `acceptTreasury()` | Owner, while not paused | Applies the scheduled treasury once ready; emits `TreasurySet(newTreasury)` |
 | `cancelTreasuryChange()` | Owner, at any time | Clears the scheduled change; emits `TreasuryChangeCancelled(cancelledTreasury)` |
 | `withdrawTreasuryArrears()` | Anyone, while not paused | Pays `treasuryArrears` to the current treasury; emits `TreasuryArrearsPaid(treasury, amount)` |
-| `transferOwnership(address)` | Owner, at any time | Ownable key rotation |
-| `renounceOwnership()` | Owner, while not paused | Ownable renunciation |
+| `transferOwnership(address)` | Owner, at any time | Nominates `pendingOwner()` (the zero address cancels); emits `OwnershipTransferStarted(previousOwner, newOwner)`. `owner()` does not change until the nominee accepts |
+| `acceptOwnership()` | `pendingOwner()`, at any time | Completes the transfer and clears `pendingOwner()`; emits `OwnershipTransferred(previousOwner, newOwner)`. Any other caller reverts `OwnableUnauthorizedAccount(account)` |
+| `renounceOwnership()` | Owner, while not paused | Ownable renunciation; also clears `pendingOwner()` |
 
-Pauses are unbounded; they freeze exits but cannot move user funds.
+Until a nominee accepts with `acceptOwnership()` (`0x79ba5097`), the current
+owner keeps every power and can replace the nomination. A rotation away from a
+possibly compromised owner key must therefore submit the nomination and the
+acceptance consecutively in one private bundle that is included atomically,
+never as separate transactions through the public mempool; for a Safe nominee,
+the bundle carries a pre-signed Safe `execTransaction` calling
+`acceptOwnership()`. See
+[owner and operator powers](/docs/protocol#owner-and-operator-powers) and the
+[owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md#operations-runbooks).
+
+Pauses are unbounded; they block new exits and expiry claims (escapes already
+started still finalize) but cannot move user funds.
 `readyAt` and `pendingTreasuryReadyAt` count on the vault's active clock (wall
 clock minus all paused time), so a change waits `treasuryChangeDelay` of
 unpaused time. `acceptTreasury()` reverts `NoPendingTreasuryChange()` without a
@@ -160,6 +172,7 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `rootRetiredAt(uint256)` | `0x7600ff88` | When the root was last replaced; zero if never |
 | `challengedNullifiers(uint256)` | `0x6cda756a` | Whether an escape at the nullifier was challenged |
 | `effectiveExpiry(uint32)` | `0x7cb4a03c` | Earliest wall-clock `claimExpired` time |
+| `pendingOwner()` | `0xe30c3978` | Nominated owner that has not accepted yet, or zero |
 | `pausedAt()` | `0x2e55d0f2` | Start of the current pause; zero while unpaused |
 | `lastUnpausedAt()` | `0xe07baba6` | Time of the latest unpause; zero if never |
 | `totalPausedDuration()` | `0x3067c650` | Seconds of completed pauses |
@@ -192,6 +205,7 @@ and six-word layouts.
 |---|---|
 | `Paused(address)` | `0x62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a258` |
 | `Unpaused(address)` | `0x5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa` |
+| `OwnershipTransferStarted(address,address)` | `0x38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e22700` |
 | `TreasuryChangeScheduled(address,uint64)` | `0xc6c2218a88093c850424bc0b3f475912876098dcc3cb7f14a52c580293569750` |
 | `TreasuryChangeCancelled(address)` | `0x126edc9f10a40adff641028274713504fd84689745c30ee6ce1a196cc5259bc1` |
 | `TreasuryPaymentDeferred(address,uint128)` | `0xa9e48d8fad50644ba563492da0b64e3b5cb7d3c5f4ab14ebb3d94a7f621220d2` |

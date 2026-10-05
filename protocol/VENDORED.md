@@ -30,5 +30,7 @@ particular, this import does not regenerate the proving keys or verifiers.
 ## Included dependency sources
 
 The import revisions above describe provenance. The included OpenZeppelin
-sources are Ownable, Context, ReentrancyGuard and StorageSlot, with their
-license. The included forge-std sources are its helpers and licenses.
+sources are Ownable, Ownable2Step, Context, ReentrancyGuard and StorageSlot,
+with their license. `Ownable2Step.sol`, added for the vault's two-step
+ownership transfer, is byte-for-byte the file of the recorded revision
+(v5.6.1). The included forge-std sources are its helpers and licenses.

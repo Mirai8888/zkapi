@@ -96,7 +96,8 @@ the wallet settles at zero. A delivered lease is charged its measured usage,
 clamped to the proven `solvency_bound` before conversion. If its usage cannot
 be settled at all, or is still unavailable when the server's write-once
 settlement deadline passes, the lease settles at `solvency_bound`. The server
-only refuses to sign a lease whose own record is corrupt. It refuses to start unless the lease lifetime
+refuses to sign only a lease whose own record is corrupt, until the operator
+verifies, repairs and reopens it. It refuses to start unless the lease lifetime
 plus that deadline fit within half the vault's challenge period, so every
 signed transcript exists well before an escape from the same state could
 finalize.
@@ -191,9 +192,10 @@ The vault rules on this page are those of the vault in this repository,
 declared to clients as `vault_revision: 2`. The deployments currently packaged
 with the SDK and `zkapi-clientd` run an earlier revision. Such vaults keep
 their original rules: a successful challenge consumes the nullifier
-permanently, withdrawals must prove against the exact current root, and
-`claimExpired` and a one-step `setTreasury` remain available while paused.
-Wallets refuse escapes that such a vault could burn. See the
+permanently, withdrawals must prove against the exact current root,
+`claimExpired` and a one-step `setTreasury` remain available while paused, and
+`transferOwnership` takes effect at once. Wallets refuse escapes that such a
+vault could burn. See the
 [hardened vault migration](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md).
 
 ### Owner and operator powers
@@ -204,16 +206,16 @@ the vault has no upgrade path. The deployment script requires an explicit
 `OWNER` outside local chains; use a multisig or timelock.
 
 - **Pause.** `pause()` stops deposits, `mutualClose`,
-  `initiateEscapeWithdrawal`, `claimExpired`, scheduling or accepting a
-  treasury change, and `withdrawTreasuryArrears`. Challenges and
+  `initiateEscapeWithdrawal`, `claimExpired`, scheduling or accepting a treasury
+  change, and `withdrawTreasuryArrears`. Challenges and
   `finalizeEscapeWithdrawal` stay open, so pending escapes still resolve. A
-  pause has no time limit: the owner can freeze every exit indefinitely, but
+  pause has no time limit: the owner can block every new exit indefinitely, but
   no vault function lets it take user funds. Paused time extends every note's
   claim deadline, and after any `unpause()` no note can be claimed as expired
-  for `unpauseClaimGrace = max(challengePeriod, 1 day)`. Pause and unpause
-  emit `Paused(address)` and `Unpaused(address)`; redundant calls revert. The
-  one-day root window counts wall-clock time, so a long pause can retire the
-  root of a prepared withdrawal proof, which must then be proved again.
+  for `unpauseClaimGrace = max(challengePeriod, 1 day)`. Pause and unpause emit
+  `Paused(address)` and `Unpaused(address)`; redundant calls revert. The one-day
+  root window counts wall-clock time, so a long pause can retire the root of a
+  prepared withdrawal proof, which must then be proved again.
 - **Treasury.** `setTreasury(address)` only schedules a change.
   `acceptTreasury()` applies it after
   `treasuryChangeDelay = max(challengePeriod, 2 days)` of unpaused time, and
@@ -222,9 +224,25 @@ the vault has no upgrade path. The deployment script requires an explicit
   treasury that rejects a payment, or needs more than 100,000 gas to accept
   it, cannot block a user payout: its share accrues in `treasuryArrears`, which
   anyone can pay to the current treasury with `withdrawTreasuryArrears()`.
-- **Ownership.** `transferOwnership` remains available while paused, for key
-  rotation. `renounceOwnership` reverts while paused, so a pause cannot become
-  permanent by mistake.
+- **Ownership.** Transfers are two-step. `transferOwnership(newOwner)` only
+  records `pendingOwner()` and emits `OwnershipTransferStarted`; the transfer
+  completes when that address calls `acceptOwnership()`. Both work while paused,
+  for key rotation. Until the nominee accepts, the current owner keeps every
+  power, including `unpause()`, and can replace the nomination or cancel it with
+  `transferOwnership(address(0))`. A mistyped or unusable address therefore can
+  no longer leave a paused vault without an owner. The same holds for a
+  compromised key: a rotation away from it is complete only once the new owner
+  has accepted, and until then whoever holds the old key can replace the
+  nomination and accept it themselves. Such a rotation must therefore submit the
+  nomination and the acceptance together, consecutively in one private bundle
+  that is included atomically, never as separate transactions through the public
+  mempool; a Safe nominee's acceptance in the bundle is a pre-signed Safe
+  `execTransaction` calling `acceptOwnership()` (see the
+  [owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md#operations-runbooks)).
+  `renounceOwnership` reverts while paused and clears any nomination. Neither
+  bounds the owner: whoever holds the owner key can keep the vault paused
+  indefinitely, and if the key of an owner that has accepted is lost while the
+  vault is paused, the freeze is permanent. No owner can move user funds.
 
 The operator runs the API server, indexer and challenge service. It signs
 every successor state and every clearance, so it can refuse service or

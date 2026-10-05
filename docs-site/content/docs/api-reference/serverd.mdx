@@ -47,15 +47,17 @@ reports `charge_basis`:
 | `clamped` | Usage above the lease limit, clamped to the proof's `solvency_bound` before conversion |
 | `worst_case` | `solvency_bound`: usage was still unavailable at the deadline, or could not be settled at all |
 | `unissued` | Zero: the key never reached the client |
+| `operator_conceded` | Zero: the operator reopened a lease cancelled for a corrupt binding and conceded its charge (`zkapi settlement reopen --zero-charge`) |
 
 The signed settlement payload repeats `charge_basis`, adds `settlement_reason`
-(`settlement_deadline` or `unsettleable`) to fallback settlements, and keeps
-the frozen `billing_quote`. Settlement never re-validates that quote against
-the server's current price configuration. `cancelled` marks a server record
-whose binding is corrupt: it is never signed, its nullifier stays reserved,
-and a retry returns `409 nullifier_used`. The server refuses to start unless
-TTL, grace, settlement deadline and polling slack fit within half of the
-vault's `challengePeriod()`. See
+(`settlement_deadline`, `unsettleable` or `operator_conceded`) to fallback
+settlements, and keeps the frozen `billing_quote`. Settlement never
+re-validates that quote against the server's current price configuration.
+`cancelled` marks a server record whose binding is corrupt: it is never signed
+until the operator verifies, repairs and reopens the lease; its nullifier stays
+reserved meanwhile, and a retry returns `409 nullifier_used`. The server
+refuses to start unless TTL, grace, settlement deadline and polling slack fit
+within half of the vault's `challengePeriod()`. See
 [settlement terminality](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#settlement-terminality)
 for the operator review records.
 
@@ -186,6 +188,16 @@ since the process started).
 | `GET /v1/dashboard/settlement` | Pending leases with their deadlines, and settlements that need operator review |
 | `GET /v1/dashboard/recent` | Recent request events |
 | `GET /v1/dashboard/events` | Server-sent dashboard events |
+
+`GET /v1/dashboard/settlement` lists the newest settlement reviews with their
+`reason`: `usage_clamped`, `deadline_worst_case`, `unsettleable_worst_case`,
+`finalized_before_key_deletion`, `binding_corrupt` (a lease cancelled, or
+about to be cancelled, for a corrupt binding) or `binding_reopened` (a lease
+the operator reopened, or whose charge it conceded later). Reviews form a log
+keyed by `review_id`, so one lease can have several; the operator acknowledges
+each by its `review_id` in the database. The dashboard omits `review_id`: read
+it from the `settlement_reviews` table, as in the Docker guide's
+[Monitoring](https://github.com/ethereum/zkapi/blob/main/docker/aws/README.md#monitoring).
 
 The attestation endpoint publishes signer metadata. It does not supply a
 platform-signed enclave attestation. Compare its identity and keys with

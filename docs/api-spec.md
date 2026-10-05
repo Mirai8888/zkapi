@@ -51,10 +51,18 @@ never reached the client settles at zero. A delivered lease whose usage is
 still unavailable at its write-once `settlement_deadline` settles at
 `solvency_bound` and is recorded for operator review. Lease status and
 recovery responses carry `settlement_deadline` until then; a finalized lease
-reports `charge_basis` (`measured`, `clamped`, `worst_case` or `unissued`),
-which the signed payload repeats. Status `cancelled` marks a corrupt server
-record that is never signed. See
-[settlement terminality](native-eth-billing.md#settlement-terminality).
+reports `charge_basis` (`measured`, `clamped`, `worst_case`, `unissued` or
+`operator_conceded`), which the signed payload repeats. A fallback payload adds
+`settlement_reason` (`settlement_deadline`, `unsettleable` or
+`operator_conceded`). Status `cancelled` marks a corrupt server record that is
+never signed unless the operator repairs it and reopens the lease
+(`zkapi settlement reopen`), which verifies its saved request first. Each
+clamped, deadline, unsettleable, deletion-pending, corrupt-binding or reopened
+settlement is recorded for operator review with the reason `usage_clamped`,
+`deadline_worst_case`, `unsettleable_worst_case`,
+`finalized_before_key_deletion`, `binding_corrupt` or `binding_reopened`. See
+[settlement terminality](native-eth-billing.md#settlement-terminality) and
+[operator review](native-eth-billing.md#operator-review).
 
 OA-org issuance includes verifier-backed station/org evidence checked by the
 browser's independently pinned verifier. Directly managed keys use durable
@@ -121,5 +129,14 @@ Without a verified view, these routes return `503` with
 `Retry-After: 5` and the constant body
 `{"status":"unavailable","error_code":"indexer_unavailable",...,"retriable":true,"retry_after_seconds":5}`.
 `/health` (`200` only when `ok`), `/metrics` and `/v1/escapes/pending` are
-internal. On-chain mutual close, escape and expiry recovery use the
-native vault ABI through the browser SDK.
+internal. `/v1/escapes/pending` lists
+`{note_id, withdrawal_nullifier, challenge_deadline}` for each open escape in
+the same view. The root check covers it only through the notes' leaves, so it
+leaves no open escape out; each entry is the last one applied from the vault's
+logs, a hint. Logs that miss both a challenge and the note's next re-escape,
+mutual close or expiry claim, or that miss a finalization, leave the root
+unchanged, so an entry can carry a challenged escape's nullifier and deadline,
+or outlive the note's escape. Consumers must read `pendingWithdrawals(noteId)`
+from the vault.
+On-chain mutual close, escape and expiry recovery use the native vault ABI
+through the browser SDK.

@@ -111,18 +111,25 @@ limit allows. Status warns `tx_fee_cap_below_fee_cap` while
 gas limit the signer accepts, so it is conservative: at the default 12M gas and
 1 ETH it appears above a fee cap of about 83.3 gwei, while a 7.53M-gas challenge
 still signs at the full fee cap up to about 132.7 gwei. Lowering
-`ZKAPI_CHALLENGE_MAX_GAS` toward, never below, the challenge's gas limit clears
-it (7.6M allows about 131.6 gwei). That changes the warning and the gas limit
-bound, not which bids fit the transaction fee cap.
+`ZKAPI_CHALLENGE_MAX_GAS` toward the challenge's gas limit clears it (8M allows
+125 gwei, 7.6M about 131.6 gwei). That changes the warning and the gas limit
+bound, not which bids fit the transaction fee cap. Keep a margin above the
+measured 7.53M, which is the daemon's gas estimate plus 20%: a challenge whose
+gas limit exceeds `ZKAPI_CHALLENGE_MAX_GAS` is refused with
+`gas_limit_exceeds_cap` (the upgraded challenger reports `signer_refused`,
+critical at once), and at 7.6M one 0.9% costlier than measured already is.
+8M leaves about 6%.
 
 If the node's cap is lower than the variable, geth refuses the broadcast with
 `tx fee (1.07 ether) exceeds the configured cap (1.00 ether)`, and the signer
 reports `upstream_tx_fee_cap`: nothing was broadcast. Only that wording is
 recognized; another client's refusal stays `broadcast_ambiguous`, so never set
 the variable above the node's cap. The signer takes the node's refusal as
-final: use one node, or a provider whose nodes share one cap. No status warning
-covers this case, because the signer cannot read the node's cap; alert on the
-audit line (see [Operation](#operation)).
+final: use one node, or a provider whose nodes share one cap. The signer's
+status has no warning for this case, because the signer cannot read the node's
+cap; the upgraded challenger's `/status` warns once the node refused a fee, and
+the audit log has a `challenge_refused` line for the first such refusal of each
+nonce (see [Operation](#operation)).
 
 ## Funding
 
@@ -140,9 +147,10 @@ reverted attempts. A challenge that reverts still pays for its gas, for example
 when an unrelated deposit changes the vault root after the simulation, and the
 daemon then retries. A real Groth16 challenge measured 6,278,618 gas; with the
 daemon's 20% buffer its gas limit is about 7.53M: 0.75 ETH per challenge at a
-100 gwei cap, within the default 1 ETH transaction fee cap. 2.26 ETH at 300 gwei
+100 gwei cap, within the default 1 ETH transaction fee cap. A 300 gwei cap
 needs the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` raised to
-at least 2.26 ETH; at the default no challenge reserves more than 1 ETH.
+at least 2.28 ETH (7.6M gas x 300 gwei, which leaves room above the measured
+7.53M); at the default no challenge reserves more than 1 ETH.
 Re-measure after redeploying the vault. `zkapi_signerStatus.required_balance`
 is `MAX_GAS` x fee cap, a conservative figure for one challenge. Multiply it for
 concurrency and the retry budget.
@@ -233,8 +241,8 @@ higher `maxFeePerGas`, so the anvil tests cannot prove the 10% rule.
 
 ## Fee-spike runbook
 
-With the **current `zkapi-challenged`** (it proposes no fees, so every challenge
-bids the fee cap with the default tip):
+With the **earlier `zkapi-challenged`**, from a release before this one (it
+proposes no fees, so every challenge bids the fee cap with the default tip):
 
 - Every challenge whose gas limit x fee cap exceeds the transaction fee cap is
   refused at any base fee (`tx_fee_above_cap`, or `upstream_tx_fee_cap` from
@@ -289,7 +297,10 @@ when it reports `tx_fee_cap_reached`, raising the fee caps changes nothing:
 raise the node's `--rpc.txfeecap` first, then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
 in `signer.env` (restart the signer) and in `deployment.env` (restart the
 challenger). A `tx_fee_above_cap` or `upstream_tx_fee_cap` refusal means these
-settings disagree; nothing was broadcast.
+settings disagree; nothing was broadcast. After `upstream_tx_fee_cap` the
+challenger bids within 10/11 of the lowest refused transaction fee until it
+restarts, so it keeps challenging below the node's cap. Restart it after
+aligning the caps.
 
 **Private relays.** The upstream is used for reads, simulation and broadcast. A
 private or MEV-protection relay may not expose pending transactions through
@@ -302,7 +313,7 @@ replacement behaviour on Sepolia before Mainnet.
 
 ## Upgrading from 0.1
 
-The new signer is backward compatible with the current challenger and the
+The new signer is backward compatible with the earlier challenger and the
 unchanged challenge ABI, as long as that challenger's bids fit the transaction
 fee cap (step 1).
 
@@ -310,7 +321,7 @@ fee cap (step 1).
    `eth_gasPrice` for legacy transactions; the new fee cap is bid as
    `maxFeePerGas`. Set `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`, which is required
    on Mainnet, and set `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` to the upstream node's
-   `--rpc.txfeecap` unless that is the default 1 ETH. The current challenger
+   `--rpc.txfeecap` unless that is the default 1 ETH. The earlier challenger
    bids the full fee cap on every challenge, so while it runs, every challenge
    whose gas limit x fee cap exceeds the transaction fee cap is refused: at
    1 ETH, a fee cap above about 132.7 gwei refuses every 7.53M-gas challenge.
@@ -328,13 +339,22 @@ fee cap (step 1).
      -d '{"jsonrpc":"2.0","id":1,"method":"zkapi_signerStatus","params":[]}'
    ```
 
-   Expect `warnings: []` before relying on the deployment. The one exception
-   is `tx_fee_cap_below_fee_cap` with a fee cap above the transaction fee cap /
+   Expect `warnings: []` before relying on the deployment. A sender funded
+   with less than `required_balance` (`MAX_GAS` x fee cap, more than one
+   7.53M-gas challenge needs) shows `balance_below_required`; fund up to it, as
+   [Funding](#funding) asks. The one other exception is
+   `tx_fee_cap_below_fee_cap` with a fee cap above the transaction fee cap /
    `ZKAPI_CHALLENGE_MAX_GAS` but within the step 1 limit (about 83.3 to 132.7
    gwei at 1 ETH and the default 12M gas): real challenges still sign there.
-   Either accept that warning and leave it out of your warnings alert, or
-   lower `ZKAPI_CHALLENGE_MAX_GAS` toward, never below, the challenge's gas
-   limit to clear it.
+   Prefer to clear it by lowering `ZKAPI_CHALLENGE_MAX_GAS` toward the
+   challenge's gas limit with a margin, for example 8M (see
+   [Node transaction fee cap](#node-transaction-fee-cap)), which also lowers
+   `required_balance`.
+   Never drop the warning from alerting: while the earlier challenger runs, the
+   same warning also appears for fee caps at which every challenge is refused.
+   Suppress it only while `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` x 7.6M gas is at
+   most `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` (about 131.6 gwei at 1 ETH), and check
+   that again after every fee-cap change.
 3. Upgrade the existing deployment in place: same vault, same sender. Run a
    redeployed vault as a separate stack with its own signer, fresh sender key,
    challenger and data directory. Never repoint a signer or challenger away
@@ -353,10 +373,14 @@ per hash) contain no raw transactions, upstream text or key material. Alert on
 status `warnings` (for `tx_fee_cap_below_fee_cap`, see step 2 of
 [Upgrading from 0.1](#upgrading-from-01)) and on `challenge_refused` lines with
 reason `base_fee_above_max_fee`, `insufficient_balance`, `tx_fee_above_cap`,
-`upstream_tx_fee_cap` or `broadcast_ambiguous`. Only the audit line reports
-`upstream_tx_fee_cap`: no status warning covers a node cap below
-`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. Keep the private key out of the
-server/indexer/challenger environments and deployment manifests.
+`upstream_tx_fee_cap` or `broadcast_ambiguous`. The signer's status has no
+warning for a node cap below `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. The upgraded
+challenger's `/status` warns once its node refused a fee (`the signer's node
+refused a transaction fee of ... wei (upstream_tx_fee_cap)`), and the audit log
+has a `challenge_refused` line for the first such refusal of each nonce: the
+refusals that follow on that nonce, at lower bids, repeat its reason and are
+not logged again. Keep the private key out of the server/indexer/challenger
+environments and deployment manifests.
 
 ## Tests
 

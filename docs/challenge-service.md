@@ -120,9 +120,10 @@ Other cases:
 - An escape whose nullifier has no record, or only a withdrawal clearance, is an
   honest exit (`no_evidence`). It is tracked and never alerts.
 - A reservation without a lease row (issuance never completed) or with a
-  `cancelled` lease (a corrupt binding the server never signs) never yields
-  evidence. It is a warning, and at the deadline it becomes
-  `expired_without_evidence`, not missed.
+  `cancelled` lease (a corrupt binding the server does not sign unless the
+  operator reopens the lease) never yields evidence. It is a warning, and at the
+  deadline it becomes `expired_without_evidence`, not missed. A reopened lease
+  is awaiting settlement again, and its signed transcript is evidence.
 - A finalized record with a missing or malformed proof or inputs is
   `evidence_invalid`, and a database read failure is `evidence_db_error`. Both
   are critical at once; neither is ever treated as "no evidence".
@@ -166,19 +167,32 @@ only siblings, gas and fees may change.
 
 Because both fees must rise by 10%, the caps allow a limited number of
 replacements on a nonce: about seven when the tip cap is twice the first tip.
-Two of them are kept for the critical threshold. Until an obligation (or one
-queued behind it) is critical, bids stay within 100/121 of both caps, that is
-10/11 twice, and only go higher when the base fee needs it. When only those two
-are left, the pending challenge is kept and reported as blocked by
-`fee_reserve_held`, with the detail `the remaining fee headroom is reserved for
-the critical threshold`. It is not replaced again before the critical threshold
-(`challengePeriod()` / 4 before the deadline by default) unless the base fee
-rises above it, so a market that needs a higher tip delays its inclusion until
-then. Like an exhausted cap, the hold therefore warns after
+Two of them are kept for the critical threshold. The caps here are the daemon's
+tip cap and its effective fee cap, min(fee cap, ceiling / gas limit). Until an
+obligation (or one queued behind it) is critical, bids stay within 100/121 of
+both caps, that is 10/11 twice, and only go higher when the base fee needs it.
+When only those two are left, the pending challenge is kept and reported as
+blocked by `fee_reserve_held`, with the detail `the remaining fee headroom is
+reserved for the critical threshold`. It is not replaced again before the
+critical threshold (`challengePeriod()` / 4 before the deadline by default)
+unless the base fee rises above it, so a market that needs a higher tip delays
+its inclusion until then. Like an exhausted cap, the hold therefore warns after
 `--blocked-warning-seconds` and turns critical after
-`--critical-blocked-seconds`. Raising both caps raises the limit, and the next
-poll replaces the challenge. A spike bid whose fee cap is already at that limit
-cannot rise by 10%, so it is held from its first replacement. A critical
+`--critical-blocked-seconds`. The limit that holds it is 100/121 of the tip cap
+and of the effective fee cap. Raising both caps (the signer's first, restarting
+each service) lets the next poll replace the challenge once 100/121 of the new
+caps is at least 10% above both of its fees. A 10% raise is enough for a bid at
+that limit. A bid placed higher while the base fee needed it cannot be replaced
+once the base fee falls back: from 10/11 of the caps it is held, and from the
+caps themselves it reports `fee_cap_reached`, `tip_cap_reached` or, when the
+ceiling limits the effective fee cap, `tx_fee_cap_reached` (then
+`fee_reserve_held` after a smaller raise). It needs just over 21% or 33% more
+on both caps (1.21 or 1.1 x 1.21 times them). The effective fee cap follows
+the fee cap only up to the ceiling / gas limit,
+`sender.tx_fee_cap_max_fee_per_gas_wei` on `/status`; to raise it further, also
+raise the node's `--rpc.txfeecap` and
+`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` for the signer and the daemon. Without such a
+change, the challenge is replaced at the critical threshold. A critical
 obligation bids 10/11 of both caps, then the caps themselves. A pending bid that
 the base fee has risen above may spend the reserve earlier, since it cannot be
 included otherwise. Stale-root replacements do not spend the reserve either:
@@ -186,8 +200,7 @@ when only the reserve is left, a pending challenge with outdated siblings is
 kept, and if it reverts the daemon resubmits on a new nonce after the
 confirmation depth. With the tip cap at twice the first tip, about five
 replacements come before the critical threshold; a tip cap of 5 to 10 times the
-first tip leaves room for more. The caps here are the daemon's fee and tip caps,
-the fee cap lowered to the ceiling / gas limit when that is lower.
+first tip leaves room for more.
 
 A challenge reverts `StaleRoot()` (`0x607447de`) when an unrelated deposit,
 close or expiry claim changes the vault root after the simulation: the vault
@@ -253,12 +266,18 @@ The obligation reports:
   not passed the nonce, it is re-sent within the ceiling, provided its
   obligation is still pending and a bid within the ceiling is includable before
   the deadline. A nonce that such a daemon locked at a refused bid, with
-  candidate hashes no node knows, is otherwise not recovered automatically: if
-  the escape was finalized or replaced before the upgrade, or the deadline
+  candidate hashes no node knows, is otherwise not recovered automatically, and
+  it blocks later notes until it is consumed. If the escape was finalized or
+  replaced before the upgrade, the nonce is reported as `unmined nonce N of a
+  completed or replaced note M requires signer intervention`. If the deadline
   passes first (for example while the base fee stays above the ceiling), the
-  nonce is reported as `unmined nonce N of a completed or replaced note M
-  requires signer intervention` and blocks later notes until it is consumed. The
-  daemon cannot tell those hashes from a broadcast transaction; see
+  missed obligation is first reported as blocked by `nonce_blocked` (alarm
+  `note M missed (nonce_blocked)`), with the detail `expired obligation retains
+  unmined reserved nonce N, which an attempt may hold; resolve it at the
+  signer` and its bid in the obligation's `max_fee_per_gas_wei`. Only once the
+  escape is finalized is the nonce reported as `unmined nonce N of a completed
+  or replaced note M requires signer intervention`. The daemon cannot tell those
+  hashes from a broadcast transaction; see
   [Recovery and verification](#recovery-and-verification).
 - `fee_reserve_held`: the pending challenge spent the replacements allowed
   before the critical threshold (see
@@ -298,10 +317,14 @@ reason:
 - `upstream_tx_fee_cap`: the signer's node refused the transaction fee, because
   its RPC fee cap is below the ceiling. This is critical at once. The node never
   reports its cap, so the daemon lowers the ceiling to 10/11 of the lowest
-  transaction fee it refused (`sender.node_tx_fee_cap_bound_wei`). Each refusal
-  lowers the next bid by at least 9% until the node accepts one, usually within
-  a few polls. The bound stays above 10/11 of the node's cap, so at most about
-  9% of that cap goes unused. It lasts until the daemon restarts, with a
+  transaction fee it refused (`sender.node_tx_fee_cap_bound_wei`). The refused
+  fee is the refusal's `gas_limit` x `max_fee_per_gas`, each taken from the
+  refused bid when the signer omits it. A product that leaves no bound, such
+  as zero, is ignored like a zero `tx_fee_cap_wei`, and the refused bid's own
+  gas limit x `maxFeePerGas` is used instead. Each refusal lowers the next bid
+  by at least 9% until the node accepts one, usually within a few polls. The
+  bound stays above 10/11 of the node's cap, so at most about 9% of that cap
+  goes unused. It lasts until the daemon restarts, with a
   `/status` warning that names the refused fee. Lower
   `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` for both services to the node's cap and
   restart both, or raise the node's cap and restart the daemon.
@@ -352,46 +375,90 @@ when nothing was broadcast on it (see
 [When no valid bid remains](#when-no-valid-bid-remains)). Otherwise it still
 prevents new allocations, because a transaction signed for it may still be
 pending: it has a candidate hash, a send's outcome was unknown, or a daemon from
-an earlier release reserved it without a record. It is reported as critical
-(`unmined nonce N of a completed or replaced note M requires signer
-intervention`). The daemon does not reuse the nonce for another note or send a
-cancellation, and the bounded signer does not expose cancellation calls. Look up
-the candidate hashes on `/status` (`detached_nonces`, or the obligation's
-`transaction_hash` and `superseded_hashes`) on a full node: a pending one mines
-or reverts by itself, and the queue then continues. Only when no node knows any
-of them and the nonce stays unmined, consume the nonce with the sender's key
-outside the sidecar, for example with a zero-value transfer from the sender to
-itself at exactly that nonce. Each detached nonce on `/status` also shows the
-latest recorded bid (`max_fee_per_gas_wei`, `max_priority_fee_per_gas_wei`,
-and `gas_limit`, which records from earlier releases lack; a challenge needs
-about 7.53M gas). When gas limit x `maxFeePerGas` exceeds the node's RPC fee
-cap, the node refused that bid before its pool, although a signer from an
-earlier release reported the refusal as possibly broadcast: this is the usual
-cause of a nonce that no node knows, left by a daemon that bid above the
-transaction fee ceiling. This restriction is distinct from an expired
-obligation whose nonce has already mined; that obligation cannot starve the
-remaining queue.
+an earlier release reserved it without a record. While the expired escape is
+still pending, its obligation is blocked by `nonce_blocked` (`expired obligation
+retains unmined reserved nonce N, which an attempt may hold; resolve it at the
+signer`). Once the escape is finalized or replaced, the detached nonce is
+reported as critical (`unmined nonce N of a completed or replaced note M
+requires signer intervention`). The daemon does not reuse the nonce for another
+note or send a cancellation, and the bounded signer does not expose cancellation
+calls. Look up the candidate hashes on `/status` (`detached_nonces`, or the
+obligation's `transaction_hash` and `superseded_hashes`) on a full node: a
+pending one mines or reverts by itself, and the queue then continues. Only when
+no node knows any of them and the nonce stays unmined, consume the nonce with
+the sender's key outside the sidecar, for example with a zero-value transfer
+from the sender to itself at exactly that nonce. Each detached nonce on
+`/status` also shows the latest recorded bid (`max_fee_per_gas_wei`,
+`max_priority_fee_per_gas_wei`, and `gas_limit`, which records from earlier
+releases lack; a challenge needs about 7.53M gas). When gas limit x
+`maxFeePerGas` exceeds the node's RPC fee cap, the node refused that bid before
+its pool, although a signer from an earlier release reported the refusal as
+possibly broadcast: this is the usual cause of a nonce that no node knows, left
+by a daemon that bid above the transaction fee ceiling. This restriction is
+distinct from an expired obligation whose nonce has already mined; that
+obligation cannot starve the remaining queue.
 
 ## Escape completeness
 
 The event scan can miss an escape when the RPC's `eth_getLogs` lags its head.
-Every poll therefore also reads the indexer's internal
-`GET /v1/escapes/pending` list. Only its note IDs count: for each listed note
-that the checkpoint does not track under the listed nullifier, the daemon reads
-the vault's `pendingWithdrawals(noteId)` and tracks the escape the vault holds,
-with the vault's nullifier and deadline, whatever the list says. The list
-describes the indexer's view at its `block_hash`, and the vault can change
-after that block. A challenge and a re-escape of the same note leave the root
-unchanged. This release's indexer checks each listed nullifier and deadline
-against `pendingWithdrawals(noteId)` at its `block_hash`, so its list is exact
-for that block. An indexer from an earlier release checks only its root: if its
-log source dropped such a pair, it keeps listing the older, challenged escape.
-A listed nullifier or deadline that differs from the vault's is shown as
-`indexer.pending_escapes_disagreement` on `/status`, is logged at warn level,
-and warns after `--blocked-warning-seconds`; if it persists, resync the
-indexer. At most 64 vault reads run per poll. An indexer without the endpoint
-shows a permanent `unsupported` warning, and an unavailable list warns after
-`--blocked-warning-seconds`.
+Every poll therefore also reads the indexer's internal `GET /v1/escapes/pending`
+list. Only its note IDs count: for each listed note that the checkpoint does not
+track under the listed nullifier, the daemon reads the vault's
+`pendingWithdrawals(noteId)` and tracks the escape the vault holds, with the
+vault's nullifier and deadline, whatever the list says. The list describes the
+indexer's view at its `block_hash`, and the vault can change after that block.
+The indexer verifies only its root and next note ID, so the listed nullifier and
+deadline are hints. A challenge and a re-escape of the same note leave the root
+unchanged: if the indexer's log source dropped such a pair, it keeps listing the
+older, challenged escape until the note's next challenge or finalization, which
+it then applies and counts in `missed_re_escape_count`. A dropped finalization,
+or a challenge and a later mutual close or expiry claim of the note that were
+both dropped, also leave the root unchanged; the note then stays listed with no
+escape in the vault until the indexer is resynced. (If only the challenge is
+dropped, the indexer cannot apply the close or claim, and its view diverges
+instead.) A listed nullifier or deadline that differs from the vault's is shown
+as `indexer.pending_escapes_disagreement` on `/status`, is logged at warn
+level, and warns after `--blocked-warning-seconds`; if it persists, resync the
+indexer.
+
+Per poll the daemon reads the vault for at most 64 listed notes it does not
+track. Each poll starts where the previous one stopped and wraps around, so
+every listed note due for a read is read within ceil(n / 64) polls. A listed
+note that the checkpoint does not track and whose escape the vault does not
+hold, a dead entry, is still read on every poll until reads 60 seconds apart
+have found none: the indexer's head view can be ahead of the daemon's RPC, so
+a fresh escape can read as absent at first. After that it is read again only
+every 16 listings (polls that read the list), so dead entries cannot crowd out
+the escapes listed after them. A later escape of that note that the event scan
+misses is still tracked within about 16 polls, or at once when the list names
+its new nullifier. A dead entry means that the list lags the vault, or that the
+indexer's log source missed how that escape ended (for example, a dropped
+finalization), in which case the indexer keeps the entry until a resync. The
+note is shown in `indexer.pending_escapes_disagreement` as `N listed note(s)
+with no pending escape in the vault: note ID listed with nullifier 0x…`, and
+the same warning to resync the indexer is raised, once two conditions hold:
+
+- reads `--blocked-warning-seconds` apart have found no escape;
+- a list served at a block between two of those reads still names the note:
+  at or above the daemon's RPC head at the poll after the first read, and at
+  or below its head at a later read that finds no escape.
+
+A list served below the first read may only lag the vault, and one served
+beyond the daemon's head may hold an escape that its RPC does not show yet;
+neither is reported. A stalled indexer's dead entry therefore stays unreported
+until its list passes the first read; watch the indexer's own `/health`
+(`stale`) and `head_age_seconds` for that. A list served without
+`block_number` is judged on time alone. The daemon reads such a note again as
+soon as that period has passed and a listing can complete the report, so the
+report waits for a confirming read. A note the checkpoint
+tracks is never reported this way, because its vault record is read on every
+poll. The read position and the dead entries are kept in memory only: after a
+restart every listed note is read again within ceil(n / 64) polls, and a
+report waits another warning period. The check in
+[the Docker guide](../docker/aws/README.md#indexer-resync), step 1, also finds
+dead entries, through another RPC; resync an indexer that lists any. An
+indexer without the endpoint shows a permanent `unsupported` warning, and an
+unavailable list warns after `--blocked-warning-seconds`.
 
 The daemon also reads `pendingWithdrawals(noteId)` for every tracked note on
 every poll. When the vault holds a different escape (the owner escaped again
@@ -486,12 +553,23 @@ RPC, then resync it as described in
 about (head − deployment block) / 1000 log requests at 100 ms each plus
 verification; start it well before the nearest challenge deadline.
 
-This release's indexer also reports a `/health` reason of the form
-`vault pending escape of note N is ...; mirror lists ...` when its RPC's
-`eth_getLogs` missed escape events, for example a challenge and a re-escape of
-the same note. That one clears by itself once the logs are complete; if it
-persists, fix or replace the RPC's log index, or resync. Meanwhile the daemon
-follows the vault's escape for every note it tracks.
+The indexer verifies only its root and next note ID, so escape events its
+RPC's `eth_getLogs` dropped in a pair that leaves the root unchanged, such as a
+challenge and a re-escape of the same note, leave its `/health` `ok`. Its
+pending-escapes list then keeps the challenged escape until the note's next
+challenge or finalization, which the indexer applies, logs (at error level for
+a finalization) and counts in `missed_re_escape_count` and
+`zkapi_indexer_missed_re_escapes_total`. A dropped finalization, or a challenge
+and a later mutual close or expiry claim of the note that were both dropped,
+leave the note listed until a resync. The daemon reports such a note in
+`indexer.pending_escapes_disagreement`, with the resync warning, once reads
+`--blocked-warning-seconds` apart find no escape for it and a list served after
+the first such read still names it (see
+[Escape completeness](#escape-completeness)), and the daily dead-entry check in
+the Docker guide finds it too. If that count
+rises, a dead entry appears, or `indexer.pending_escapes_disagreement`
+persists, fix or replace the indexer RPC's log index, then resync. Meanwhile
+the daemon follows the vault's escape for every note it tracks.
 
 ## Availability
 

@@ -132,11 +132,29 @@ ideally behind a timelock, never a single deployer key:
   `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears`
   and `renounceOwnership`. `challengeEscapeWithdrawal` and
   `finalizeEscapeWithdrawal` stay open, so disputes in flight still resolve, and
-  `transferOwnership` stays open for key rotation. `pause()` and `unpause()`
-  emit `Paused(address)` and `Unpaused(address)` and revert when redundant.
+  `transferOwnership` and `acceptOwnership` stay open for key rotation.
+  `pause()` and `unpause()` emit `Paused(address)` and `Unpaused(address)` and
+  revert when redundant.
+- Ownership transfers are two-step. `transferOwnership(address)` only sets
+  `pendingOwner()` (event `OwnershipTransferStarted(previousOwner, newOwner)`).
+  The new owner, for example the multisig, must then call `acceptOwnership()`
+  from that address (event `OwnershipTransferred`). Until it does, `owner()` is
+  unchanged and the old key keeps every power: it can re-nominate, or cancel
+  with `transferOwnership(address(0))`. When rotating away from a key that may
+  be compromised, never send the nomination alone through the public mempool:
+  whoever holds the old key can re-nominate before the acceptance and then
+  accept from its own address. Submit the nomination and the new owner's
+  `acceptOwnership()` together as one private bundle, so that they land
+  consecutively in the same block; for a Safe, pre-sign its `execTransaction`
+  calling `acceptOwnership()` so that the bundle can carry it. After any
+  transfer, check that `owner()` is the new owner and `pendingOwner()` is zero,
+  and alert on any `OwnershipTransferStarted` you did not send. The `OWNER`
+  passed to `Deploy.s.sol` takes effect at deployment without an acceptance
+  step, so verify it before deploying. See
+  [the owner key rotation runbook](migration-hardened-vault.md#operations-runbooks).
 - A pause has no time limit: the owner, or whoever controls its key, can stop
-  every exit indefinitely. It cannot move deposits. Paused time extends every
-  note's claim time, and after any unpause `claimExpired` waits at least
+  every new exit indefinitely. It cannot move deposits. Paused time extends
+  every note's claim time, and after any unpause `claimExpired` waits at least
   `unpauseClaimGrace()`, the larger of `challengePeriod()` and one day.
   `effectiveExpiry(noteId)` returns the earliest claim time assuming no further
   pause; `notes(noteId)` keeps the nominal expiry. Inference ends at the nominal
@@ -165,9 +183,11 @@ the vault holds funds.
 
 The [Docker guide](../docker/aws/README.md) configures API, indexer, gateway,
 challenger and a restricted private signer. The challenger needs a funded
-exclusive account, EIP-1559 fee caps, and the API server: it challenges only
-with finalized settlements, and owners recover their signed state from the API
-after a challenge. Keep the API running for every challenge window; see
+exclusive account, EIP-1559 fee caps whose bids fit the transaction fee cap of
+the node behind its signer (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH,
+which allows about 132 gwei for a challenge), and the API server: it challenges
+only with finalized settlements, and owners recover their signed state from the
+API after a challenge. Keep the API running for every challenge window; see
 [challenge operation](challenge-service.md).
 
 Every lease settles by a write-once deadline: issuance + TTL + grace +

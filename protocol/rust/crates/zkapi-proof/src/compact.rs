@@ -291,6 +291,11 @@ fn verify_raw(
     );
     ensure_backend(proof)?;
     let proof = proof_from_wire(proof)?;
+    // Like the adapter, which returns false for any word >= SCALAR_MODULUS:
+    // reducing mod r would let N and N + r name the same statement.
+    if !public_inputs.iter().all(is_canonical) {
+        return Ok(false);
+    }
     let inputs = public_inputs.iter().map(field).collect::<Vec<_>>();
     crate::groth16::verify_field_elements(key, &inputs, &proof)
         .map_err(|error| anyhow!("{kind} verification failed: {error}"))
@@ -479,7 +484,8 @@ impl RequestVerifier {
     }
 
     /// Verify against raw public inputs in statement order, as the adapter
-    /// does with its `uint256` values.
+    /// does with its `uint256` values: an input at or above the scalar
+    /// modulus is not reduced but makes the result `false`.
     pub fn verify_field_elements(
         &self,
         public_inputs: &[Felt252],
@@ -488,6 +494,8 @@ impl RequestVerifier {
         verify_raw(&self.key, KeyKind::Request, public_inputs, proof)
     }
 
+    /// Verify a typed statement. A field at or above the scalar modulus, or
+    /// a point off the curve, is an error rather than reduced.
     pub fn verify(&self, public: &RequestPublicInputsV2, proof: &Groth16ProofWire) -> Result<bool> {
         ensure_backend(proof)?;
         let proof = proof_from_wire(proof)?;
@@ -571,7 +579,8 @@ impl WithdrawalVerifier {
     }
 
     /// Verify against raw public inputs in statement order, as the adapter
-    /// does with its `uint256` values.
+    /// does with its `uint256` values: an input at or above the scalar
+    /// modulus is not reduced but makes the result `false`.
     pub fn verify_field_elements(
         &self,
         public_inputs: &[Felt252],
@@ -582,7 +591,9 @@ impl WithdrawalVerifier {
 
     /// Verify a proof of any kind. The caller checks `kind`, `valid_until` and
     /// the zero fields its context requires (the vault accepts kind 0 only in
-    /// escapes and kind 1 only in closes; the server accepts only kind 2).
+    /// escapes and kind 1 only in closes; the server accepts only kind 2). A
+    /// field at or above the scalar modulus, or a point off the curve, is an
+    /// error rather than reduced.
     pub fn verify(
         &self,
         public: &WithdrawalPublicInputsV2C,
@@ -1080,16 +1091,16 @@ fn request_public_from_wire(public: &RequestPublicInputsV2) -> Result<RequestPub
     Ok(RequestPublic {
         protocol_version: public.protocol_version,
         chain_id: public.chain_id,
-        contract_address: field(&public.contract_address),
-        active_root: field(&public.active_root),
+        contract_address: canonical_field(&public.contract_address, "contract_address")?,
+        active_root: canonical_field(&public.active_root, "active_root")?,
         state_signing_key: point_from_wire(&CurvePointWire {
             x: public.state_signing_key_x,
             y: public.state_signing_key_y,
         })?,
         request_time: public.request_time,
         solvency_bound: public.solvency_bound,
-        request_nullifier: field(&public.request_nullifier),
-        authorization_tag: field(&public.authorization_tag),
+        request_nullifier: canonical_field(&public.request_nullifier, "request_nullifier")?,
+        authorization_tag: canonical_field(&public.authorization_tag, "authorization_tag")?,
         anonymous_commitment: point_from_wire(&CurvePointWire {
             x: public.anonymous_commitment_x,
             y: public.anonymous_commitment_y,
@@ -1101,8 +1112,8 @@ fn withdrawal_public_from_wire(public: &WithdrawalPublicInputsV2C) -> Result<Wit
     Ok(WithdrawalPublic {
         protocol_version: public.protocol_version,
         chain_id: public.chain_id,
-        contract_address: field(&public.contract_address),
-        active_root: field(&public.active_root),
+        contract_address: canonical_field(&public.contract_address, "contract_address")?,
+        active_root: canonical_field(&public.active_root, "active_root")?,
         state_signing_key: point_from_wire(&CurvePointWire {
             x: public.state_signing_key_x,
             y: public.state_signing_key_y,
@@ -1114,9 +1125,12 @@ fn withdrawal_public_from_wire(public: &WithdrawalPublicInputsV2C) -> Result<Wit
         note_id: public.note_id,
         final_balance: public.final_balance,
         destination: field(&public.destination_field()),
-        withdrawal_nullifier: field(&public.withdrawal_nullifier),
+        withdrawal_nullifier: canonical_field(
+            &public.withdrawal_nullifier,
+            "withdrawal_nullifier",
+        )?,
         kind: public.kind,
-        next_nullifier: field(&public.next_nullifier),
+        next_nullifier: canonical_field(&public.next_nullifier, "next_nullifier")?,
         conceded: public.conceded,
         valid_until: public.valid_until,
     })
@@ -1351,7 +1365,10 @@ fn signature_to_wire(signature: StateSignature) -> SchnorrSignature {
 }
 
 fn point_from_wire(point: &CurvePointWire) -> Result<EdwardsAffine> {
-    let point = EdwardsAffine::new_unchecked(field(&point.x), field(&point.y));
+    let point = EdwardsAffine::new_unchecked(
+        canonical_field(&point.x, "point coordinate")?,
+        canonical_field(&point.y, "point coordinate")?,
+    );
     if !point.is_on_curve() || !point.is_in_correct_subgroup_assuming_on_curve() {
         return Err(anyhow!("invalid Baby-JubJub point"));
     }
@@ -1367,6 +1384,22 @@ fn point_to_wire(point: EdwardsAffine) -> CurvePointWire {
 
 fn field(value: &Felt252) -> Fr {
     core::felt_to_field(value)
+}
+
+/// Whether `value` is below the BN254 scalar modulus. `Felt252` parsed from
+/// JSON always is, but its bytes are public and may come from raw words.
+fn is_canonical(value: &Felt252) -> bool {
+    Felt252::try_from_bytes_be(value.0).is_ok()
+}
+
+/// A statement field as a field element, refusing a non-canonical encoding
+/// instead of reducing it.
+fn canonical_field(value: &Felt252, name: &str) -> Result<Fr> {
+    ensure!(
+        is_canonical(value),
+        "non-canonical {name}: {value:?} is not below the BN254 scalar modulus"
+    );
+    Ok(field(value))
 }
 
 fn felt(value: &Fr) -> Felt252 {
@@ -1902,6 +1935,42 @@ mod tests {
         // An unknown setup is refused even by development builds.
         let other = encode_compressed(&vk, "mpc-2", KeyKind::Request).unwrap();
         assert!(decode_compressed::<VerifyingKey<Bn254>>(&other, KeyKind::Request).is_err());
+    }
+
+    #[test]
+    fn non_canonical_statement_fields_are_refused() {
+        // r itself, and r + 5: both reduce to small values mod r.
+        let modulus = Felt252(prime_field_bytes_of_modulus());
+        assert!(!is_canonical(&modulus));
+        assert!(canonical_field(&modulus, "x").is_err());
+        assert!(is_canonical(&Felt252::from_u64(5)));
+        let generator = point_to_wire(EdwardsProjective::generator().into_affine());
+        assert!(point_from_wire(&generator).is_ok());
+        let mut aliased = generator.clone();
+        aliased.x = add_modulus(&generator.x);
+        let error = point_from_wire(&aliased).unwrap_err().to_string();
+        assert!(error.contains("non-canonical"), "{error}");
+    }
+
+    fn prime_field_bytes_of_modulus() -> [u8; 32] {
+        let raw = Fr::MODULUS.to_bytes_be();
+        let mut bytes = [0u8; 32];
+        bytes[32 - raw.len()..].copy_from_slice(&raw);
+        bytes
+    }
+
+    /// `value + r` as raw bytes (fits: `value < r < 2^254`).
+    fn add_modulus(value: &Felt252) -> Felt252 {
+        let mut limbs = [0u64; 4];
+        for (i, chunk) in value.0.chunks(8).enumerate() {
+            limbs[3 - i] = u64::from_be_bytes(chunk.try_into().unwrap());
+        }
+        let mut sum = ark_ff::BigInt::new(limbs);
+        assert!(!sum.add_with_carry(&Fr::MODULUS));
+        let raw = sum.to_bytes_be();
+        let mut bytes = [0u8; 32];
+        bytes[32 - raw.len()..].copy_from_slice(&raw);
+        Felt252(bytes)
     }
 
     #[test]

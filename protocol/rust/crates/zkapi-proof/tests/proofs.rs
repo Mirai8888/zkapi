@@ -248,6 +248,78 @@ fn mutating_any_public_input_fails_verification() {
     }
 }
 
+/// `value + r` as raw bytes: the same field element mod r, a different word.
+fn plus_modulus(value: &Felt252) -> Felt252 {
+    use ark_ff::{BigInteger, PrimeField};
+    let mut limbs = [0u64; 4];
+    for (i, chunk) in value.0.chunks(8).enumerate() {
+        limbs[3 - i] = u64::from_be_bytes(chunk.try_into().unwrap());
+    }
+    let mut sum = ark_ff::BigInt::new(limbs);
+    assert!(!sum.add_with_carry(&Fr::MODULUS));
+    let raw = sum.to_bytes_be();
+    let mut bytes = [0u8; 32];
+    bytes[32 - raw.len()..].copy_from_slice(&raw);
+    Felt252(bytes)
+}
+
+/// The verifiers do not reduce public inputs mod r: like the adapter, which
+/// rejects any word >= SCALAR_MODULUS, they refuse `N + r` where the proof is
+/// for `N`, so two different 32-byte nullifiers never verify with one proof.
+#[test]
+fn non_canonical_public_inputs_do_not_verify() {
+    let c = chain();
+    let (public, proof) = prove_request_case(&c.s1, &c.r1);
+    let inputs = public.to_field_elements();
+    let verifier = &keys().request_verifier;
+    for index in [3, 4, 8, 9, 10] {
+        let mut aliased = inputs.to_vec();
+        aliased[index] = plus_modulus(&inputs[index]);
+        assert!(
+            !verifier.verify_field_elements(&aliased, &proof).unwrap(),
+            "request input {index} + r verifies"
+        );
+    }
+    let mut aliased = public.clone();
+    aliased.request_nullifier = plus_modulus(&public.request_nullifier);
+    let error = verifier.verify(&aliased, &proof).unwrap_err().to_string();
+    assert!(error.contains("non-canonical request_nullifier"), "{error}");
+    let mut aliased = public.clone();
+    aliased.anonymous_commitment_x = plus_modulus(&public.anonymous_commitment_x);
+    assert!(verifier.verify(&aliased, &proof).is_err());
+
+    let (public, witness) =
+        c.withdrawal_of(&c.s1, &withdrawal(WithdrawalKind::Escape, DESTINATION, 0));
+    let proof = keys().withdrawal_prover.prove(&public, witness).unwrap();
+    let verifier = &keys().withdrawal_verifier;
+    assert!(verifier.verify(&public, &proof).unwrap());
+    let inputs = public.to_field_elements();
+    for index in [2, 3, 11, 13] {
+        let mut aliased = inputs.to_vec();
+        aliased[index] = plus_modulus(&inputs[index]);
+        assert!(
+            !verifier.verify_field_elements(&aliased, &proof).unwrap(),
+            "withdrawal input {index} + r verifies"
+        );
+    }
+    for mutate in [
+        |p: &mut zkapi_types::WithdrawalPublicInputsV2C| {
+            p.withdrawal_nullifier = plus_modulus(&p.withdrawal_nullifier)
+        },
+        |p: &mut zkapi_types::WithdrawalPublicInputsV2C| {
+            p.next_nullifier = plus_modulus(&p.next_nullifier)
+        },
+        |p: &mut zkapi_types::WithdrawalPublicInputsV2C| {
+            p.active_root = plus_modulus(&p.active_root)
+        },
+    ] {
+        let mut aliased = public.clone();
+        mutate(&mut aliased);
+        let error = verifier.verify(&aliased, &proof).unwrap_err().to_string();
+        assert!(error.contains("non-canonical"), "{error}");
+    }
+}
+
 #[test]
 fn provers_refuse_invalid_statements() {
     let c = chain();

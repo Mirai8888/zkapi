@@ -96,7 +96,8 @@ paths:
             Unknown lease: the server read its store and holds no such lease
             (empty body); or lease_record_unreadable (not retriable): it holds
             a lease row for this ID that it cannot decode (a pending one is not
-            settled) until an operator restores its saved request. Either way,
+            settled) until an operator restores its saved request, or repairs
+            by hand another column that cannot be decoded. Either way,
             GET /v2/nullifiers/{request_nullifier} is authoritative.
           content:
             application/json:
@@ -126,9 +127,11 @@ paths:
           description: >-
             lease_settlement_pending (retriable; retry after Retry-After): the
             lease's receipt or drain interval is still pending, its earlier
-            pending result set a retry time that has not come yet (answered
-            without asking the provider again), or other work on this lease
-            held it for longer than the retirement waits; or lease_pending
+            pending result set a retry time that has not come yet, the OA org
+            rate-limited a usage read and its Retry-After has not passed (both
+            answered without asking the provider again), or other work on this
+            lease held it for longer than the retirement waits; or
+            lease_pending
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -294,7 +297,8 @@ components:
         for this ID that it cannot decode. It never heals by itself: a pending
         lease is not settled, not even at its settlement deadline, until an
         operator restores its saved request (zkapi settlement reopen
-        --saved-request).
+        --saved-request), or repairs by hand another column that cannot be
+        decoded.
         Read GET /v2/nullifiers/{request_nullifier}, which stays
         authoritative, as for an unknown lease.
       content:

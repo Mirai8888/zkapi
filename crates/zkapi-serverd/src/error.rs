@@ -59,7 +59,8 @@ pub enum ServerError {
     /// The store holds a lease row for this ID that it cannot decode. It
     /// never heals by itself (an operator restores its saved request with
     /// `zkapi settlement reopen --saved-request`, also for a pending lease,
-    /// which the settlement sweep skips until then); the request's
+    /// which the settlement sweep skips until then, or repairs another
+    /// undecodable column by hand, which that command names); the request's
     /// nullifier record stays readable and authoritative. The decoding error
     /// is logged, not returned.
     #[error(

@@ -19,6 +19,7 @@
 //! that settles from usage.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,7 +73,8 @@ const RECENT_ROOTS_CAPACITY: usize = 1024;
 const REJECTED_CLEARANCE_CAPACITY: usize = 4096;
 const KEY_CLEANUP_BATCH: usize = 50;
 const KEY_CLEANUP_MAX_BACKOFF_SECONDS: u64 = 3_600;
-/// Longest wait honoured from an org's retry-after for a pending receipt.
+/// Longest wait honoured from an org's retry-after for a pending receipt, or
+/// for a rate-limited (429) usage read.
 const MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS: u64 = 300;
 
 /// Latency bounds of the settler. Every settlement step persists its phase
@@ -329,6 +331,9 @@ pub struct RequestProcessor {
     native_oracle: NativeBillingOracle,
     lease_issue_lock: tokio::sync::Mutex<()>,
     lease_locks: LeaseLocks,
+    /// Unix time before which no OA usage read is started, because the org
+    /// answered one with 429 (`oa_usage_rate_limited`). In memory only.
+    oa_usage_backoff_until: AtomicU64,
     // Keep the database exclusive for this processor's full lifetime, including
     // background tasks that may outlive an HTTP listener.
     _writer_lock: Option<crate::writer_lock::ServerWriterLock>,
@@ -436,6 +441,7 @@ impl RequestProcessor {
             oa_org,
             lease_issue_lock: tokio::sync::Mutex::new(()),
             lease_locks: LeaseLocks::default(),
+            oa_usage_backoff_until: AtomicU64::new(0),
             _writer_lock: writer_lock,
         })
     }
@@ -1023,10 +1029,13 @@ impl RequestProcessor {
             expires_at,
             settle_after,
         )?;
-        if let Err(error) = self
-            .store
-            .activate_openrouter_lease(&request.client_request_id, &key_hash)
-        {
+        // The issuer's identity lets startup refuse another org or API base
+        // while this lease is unsettled.
+        if let Err(error) = self.store.activate_openrouter_lease_from(
+            &request.client_request_id,
+            &key_hash,
+            Some(&lease_config.source.identity()),
+        ) {
             if let (Some(provisioner), OpenRouterLeaseSourceConfig::OpenRouter { .. }) =
                 (&self.openrouter, &lease_config.source)
             {
@@ -1332,7 +1341,9 @@ impl RequestProcessor {
     /// lease nearest its deadline is attempted first, and leases that keep
     /// failing slowly near their deadlines cannot starve the rest (nor the
     /// reverse). A pending result defers its lease (`note_settlement_failure`),
-    /// so it is not polled again on every tick. Each attempt takes only its
+    /// so it is not polled again on every tick. Once the OA org rate-limits a
+    /// usage read, no OA attempt starts before its retry time, in this tick
+    /// or a later one (`oa_usage_rate_limited`). Each attempt takes only its
     /// lease's lock, and skips a lease whose lock is held or awaited (by its
     /// owner's retirement): retirements wait for no other lease's attempt,
     /// and no lease's retirements hold up the others' attempts.
@@ -1380,6 +1391,9 @@ impl RequestProcessor {
     /// the scan. A lease whose lock is held or awaited is left to its owner's
     /// retirement.
     async fn attempt_provider_settlement(&self, scanned: &OpenRouterLeaseRecord) {
+        if scanned.key_source == "oa_org" && self.oa_usage_backoff(current_timestamp()).is_some() {
+            return;
+        }
         let Some(_lease_guard) = self.lease_locks.try_lock(&scanned.client_request_id) else {
             return;
         };
@@ -1418,8 +1432,9 @@ impl RequestProcessor {
     }
 
     fn note_settlement_failure(&self, lease: &OpenRouterLeaseRecord, error: &ServerError) {
-        // Waiting for a drain interval or an OA receipt is not a failure: the
-        // lease is asked again after the retry time it was given.
+        // Waiting for a drain interval, an OA receipt or the end of an OA rate
+        // limit is not a failure: the lease is asked again after the retry
+        // time it was given.
         if let ServerError::LeaseSettlementPending {
             retry_after_seconds,
         } = error
@@ -1457,17 +1472,10 @@ impl RequestProcessor {
     /// before the deadline turns it into a worst-case charge.
     fn defer_pending_settlement(&self, lease: &OpenRouterLeaseRecord, retry_after_seconds: u64) {
         let now = current_timestamp();
-        let poll = self
-            .config
-            .openrouter_leases
-            .as_ref()
-            .map_or(1, |config| config.settlement_poll_seconds.max(1));
         let left = lease
             .settlement_deadline_at
             .map_or(u64::MAX, |deadline| deadline.saturating_sub(now));
-        let delay = retry_after_seconds
-            .clamp(poll, MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS.max(poll))
-            .min(left / 2);
+        let delay = self.pending_retry_delay(retry_after_seconds).min(left / 2);
         if let Err(error) = self.store.defer_openrouter_lease_settlement(
             &lease.client_request_id,
             now.saturating_add(delay),
@@ -1478,6 +1486,49 @@ impl RequestProcessor {
                 error = %error,
                 "could not defer a pending lease settlement; it is asked again next tick"
             );
+        }
+    }
+
+    /// A retry time given for a pending result or a rate limit, bounded: at
+    /// least the poll interval, at most MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS.
+    fn pending_retry_delay(&self, retry_after_seconds: u64) -> u64 {
+        let poll = self
+            .config
+            .openrouter_leases
+            .as_ref()
+            .map_or(1, |config| config.settlement_poll_seconds.max(1));
+        retry_after_seconds.clamp(poll, MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS.max(poll))
+    }
+
+    /// Seconds left before OA usage reads start again, while the org's rate
+    /// limit (`oa_usage_rate_limited`) lasts.
+    fn oa_usage_backoff(&self, now: u64) -> Option<u64> {
+        let until = self.oa_usage_backoff_until.load(Ordering::Acquire);
+        (until > now).then(|| until - now)
+    }
+
+    /// The OA org answered a usage read with 429 (it shares one limit across
+    /// the server's leases): start no other OA usage read, in this tick, a
+    /// later one or a retirement, before its retry time (bounded by
+    /// `pending_retry_delay`). The result is a pending one, so the lease is
+    /// deferred without counting a failure, and a retirement answers
+    /// `lease_settlement_pending`. A lease that reaches its settlement
+    /// deadline meanwhile is finalized as any other.
+    fn oa_usage_rate_limited(&self, reason: &str, retry_after_seconds: u64) -> ServerError {
+        let now = current_timestamp();
+        let until = now.saturating_add(self.pending_retry_delay(retry_after_seconds));
+        let previous = self
+            .oa_usage_backoff_until
+            .fetch_max(until, Ordering::AcqRel);
+        if previous <= now {
+            tracing::warn!(
+                reason,
+                retry_after_seconds = until - now,
+                "the OA org rate-limited a lease usage read; no OA usage read starts before the retry time"
+            );
+        }
+        ServerError::LeaseSettlementPending {
+            retry_after_seconds: until.max(previous) - now,
         }
     }
 
@@ -1622,6 +1673,14 @@ impl RequestProcessor {
                             return Err(ServerError::LeaseSettlementPending {
                                 retry_after_seconds: next_attempt_at - now,
                             });
+                        }
+                        // Nor does it ask a rate-limiting OA org again early.
+                        if lease.key_source == "oa_org" {
+                            if let Some(retry_after_seconds) = self.oa_usage_backoff(now) {
+                                return Err(ServerError::LeaseSettlementPending {
+                                    retry_after_seconds,
+                                });
+                            }
                         }
                         self.settle_with_provider(lease).await
                     }
@@ -2213,7 +2272,7 @@ impl RequestProcessor {
             ));
         }
         let oa_request_id = self.oa_usage_request_id(lease)?;
-        let receipt = provisioner
+        let receipt = match provisioner
             .get_key_usage(
                 &oa_request_id,
                 key_hash,
@@ -2227,7 +2286,14 @@ impl RequestProcessor {
                         .saturating_add(OA_LEASE_EXPIRY_SAFETY_SECONDS),
                 },
             )
-            .await?;
+            .await
+        {
+            Err(ServerError::OaRateLimited {
+                reason,
+                retry_after_seconds,
+            }) => return Err(self.oa_usage_rate_limited(&reason, retry_after_seconds)),
+            other => other?,
+        };
         let receipt = match receipt {
             OaOrgUsage::Finalized(receipt) => receipt,
             OaOrgUsage::Pending {
@@ -4090,6 +4156,35 @@ mod tests {
             let state = state.lock().unwrap();
             assert_eq!(state.creates, 1);
             assert_eq!(state.nullifier_reads, 2);
+            server.abort();
+        }
+    }
+
+    /// Final round (server-fixup2#2): an activated lease records the
+    /// identity of the key source that issued it (the OA org URL or the
+    /// OpenRouter API base), which the startup key-source check compares.
+    #[tokio::test]
+    async fn issued_lease_records_its_issuers_identity() {
+        for oa in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(IssuanceMock::default()));
+            let (processor, request, server) = issuance_processor(oa, state).await;
+            processor.issue_openrouter_lease(&request).await.unwrap();
+            let identity = processor
+                .config
+                .openrouter_leases
+                .as_ref()
+                .unwrap()
+                .source
+                .identity();
+            assert!(identity.starts_with("http://127.0.0.1:"), "{identity}");
+            assert_eq!(
+                processor.store.query_i64_for_test(
+                    "SELECT COUNT(*) FROM openrouter_leases
+                     WHERE client_request_id = ?1 AND key_source_identity = ?2",
+                    rusqlite::params![request.client_request_id, identity],
+                ),
+                1
+            );
             server.abort();
         }
     }
@@ -9717,17 +9812,7 @@ mod tests {
                         tokio::time::sleep(delay).await;
                         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
                     }
-                    let expires_at = body["expires_at_unix"].as_u64().unwrap() - 30;
-                    (
-                        StatusCode::OK,
-                        Json(json!({"source":"oa_org", "version":1, "status":"finalized",
-                            "client_request_id":body["client_request_id"],
-                            "station_request_id":"ab".repeat(32), "key_hash":key,
-                            "usage_credits":1000, "credit_limit_credits":body["credit_limit_credits"],
-                            "expires_at_unix":expires_at, "closed_at_unix":expires_at,
-                            "finalized_at_unix":expires_at + 1, "station_id":"station",
-                            "station_signature":"ab".repeat(64), "org_signature":"cd".repeat(64)})),
-                    )
+                    (StatusCode::OK, Json(finalized_usage_receipt(&body, &key)))
                 }
             }),
         );
@@ -9735,6 +9820,18 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, server, calls)
+    }
+
+    /// A finalized OA usage receipt of 1000 credits for the usage read `body`.
+    fn finalized_usage_receipt(body: &serde_json::Value, key: &str) -> serde_json::Value {
+        let expires_at = body["expires_at_unix"].as_u64().unwrap() - 30;
+        serde_json::json!({"source":"oa_org", "version":1, "status":"finalized",
+            "client_request_id":body["client_request_id"],
+            "station_request_id":"ab".repeat(32), "key_hash":key,
+            "usage_credits":1000, "credit_limit_credits":body["credit_limit_credits"],
+            "expires_at_unix":expires_at, "closed_at_unix":expires_at,
+            "finalized_at_unix":expires_at + 1, "station_id":"station",
+            "station_signature":"ab".repeat(64), "org_signature":"cd".repeat(64)})
     }
 
     /// An OA processor settling against `url`, with a scaled-down tick budget
@@ -9780,6 +9877,121 @@ mod tests {
 
     fn calls_to(calls: &UsageCalls, key: &str) -> usize {
         calls.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+
+    /// Final round (server-fixup2#1): the OA org limits usage reads across
+    /// all of the server's leases. Once it answers one with 429 and a
+    /// Retry-After, no OA usage read starts before that time: not for the
+    /// rest of the tick's leases, not in later ticks, and not for a
+    /// retirement, which answers lease_settlement_pending. The limited lease
+    /// is deferred like a pending receipt, and nothing counts as a failure.
+    /// Afterwards settlement resumes, nearest deadline first.
+    #[tokio::test]
+    async fn rate_limited_usage_reads_wait_for_the_orgs_retry_after() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::atomic::AtomicBool;
+        let calls = UsageCalls::default();
+        let limited = Arc::new(AtomicBool::new(true));
+        let (seen, limit) = (calls.clone(), limited.clone());
+        let app = Router::new().route(
+            "/api/zkapi/key_usage",
+            post(move |Json(body): Json<Value>| {
+                let (seen, limit) = (seen.clone(), limit.clone());
+                async move {
+                    let key = body["key_hash"].as_str().unwrap().to_string();
+                    *seen.lock().unwrap().entry(key.clone()).or_default() += 1;
+                    if limit.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "60")],
+                            Json(json!({"reason": "oa_minute_request_limit"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        [("cache-control", "no-store")],
+                        Json(finalized_usage_receipt(&body, &key)),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_secs(5));
+        let now = current_timestamp();
+        let requests: Vec<ApiRequestV2> = (0..10u64)
+            .map(|i| {
+                add_delivered_oa_lease(
+                    &processor,
+                    &format!("rl-{i}"),
+                    700 + i,
+                    &format!("rl-hash-{i}"),
+                    now + 3_600 + i,
+                    1,
+                )
+            })
+            .collect();
+        let total = |calls: &UsageCalls| calls.lock().unwrap().values().sum::<usize>();
+        for _ in 0..3 {
+            processor.settle_due_openrouter_leases().await;
+        }
+        // One read, of the lease nearest its deadline.
+        assert_eq!(total(&calls), 1);
+        assert_eq!(calls_to(&calls, "rl-hash-0"), 1);
+        assert_eq!(
+            processor.store.query_i64_for_test(
+                "SELECT COALESCE(SUM(settlement_attempts), 0) FROM openrouter_leases",
+                []
+            ),
+            0
+        );
+        assert_eq!(
+            processor.store.query_i64_for_test(
+                "SELECT COUNT(*) FROM openrouter_leases WHERE last_error IS NOT NULL",
+                []
+            ),
+            0
+        );
+        let deferred = processor
+            .store
+            .openrouter_lease_next_attempt_at("rl-0")
+            .unwrap()
+            .unwrap();
+        assert!(deferred >= now + 59 && deferred <= current_timestamp() + 60);
+        assert_eq!(
+            processor.store.query_i64_for_test(
+                "SELECT COUNT(*) FROM openrouter_leases WHERE next_attempt_at IS NOT NULL",
+                []
+            ),
+            1
+        );
+        // Retirements, of the limited lease or another, do not ask either.
+        for request in [&requests[0], &requests[5]] {
+            match processor
+                .retire_openrouter_lease(&request.client_request_id, request)
+                .await
+            {
+                Err(ServerError::LeaseSettlementPending {
+                    retry_after_seconds,
+                }) => assert!((1..=60).contains(&retry_after_seconds)),
+                other => panic!("expected lease_settlement_pending, got {other:?}"),
+            }
+        }
+        assert_eq!(total(&calls), 1);
+        // Once the retry time has come (simulated), every lease settles.
+        limited.store(false, Ordering::SeqCst);
+        processor.oa_usage_backoff_until.store(0, Ordering::SeqCst);
+        processor
+            .store
+            .execute_for_test("UPDATE openrouter_leases SET next_attempt_at = NULL", []);
+        processor.settle_due_openrouter_leases().await;
+        for request in &requests {
+            assert_settled_from_usage(&processor, request);
+        }
+        assert_eq!(total(&calls), 11);
+        server.abort();
     }
 
     fn assert_settled_from_usage(processor: &RequestProcessor, request: &ApiRequestV2) {

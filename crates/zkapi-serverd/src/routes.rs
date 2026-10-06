@@ -42,7 +42,7 @@ use crate::dashboard::{
 };
 use crate::error::ServerError;
 use crate::native_billing::{vault_address_hex, NativeBillingOracle, VaultSigningKeys};
-use crate::nullifier_store::{DeploymentBinding, NullifierStore};
+use crate::nullifier_store::{DeploymentBinding, KeySourceBacklog, NullifierStore};
 use crate::oa_org::IssuedOpenRouterLease;
 use crate::processor::RequestProcessor;
 use crate::signer::ServerSigner;
@@ -473,47 +473,78 @@ fn key_source_setting(source: &str) -> &'static str {
 /// Only the key source that issued a lease can measure its usage, and only
 /// the direct source deletes direct keys. Refuse to start while the database
 /// holds, of a known key source other than the configured one, leases that
-/// only that source can settle (possibly delivered, with no committed charge)
-/// or queued deletions of its direct keys that may still be usable: each such
-/// lease would be finalized at its settlement deadline without a usage
-/// measurement, and those keys would stay usable until they expire. Rows any
-/// configuration finalizes without provider I/O (never delivered, committed
-/// to a zero or conceded charge) do not count, nor do rows of a source this
-/// release does not know, which it never settles or charges (so a rollback
-/// stays safe). `allow_key_source_switch` accepts those charges and starts:
-/// for a database that holds such leases of both sources, which no single
-/// credential can drain, or a source that can no longer be reached.
+/// only that source can settle (possibly delivered, with no committed charge,
+/// before their settlement deadline) or queued deletions of its direct keys
+/// that may still be usable: each such lease would be finalized at its
+/// settlement deadline without a usage measurement, and those keys would stay
+/// usable until they expire. A lease's issuer is its key source and the
+/// identity recorded at activation (the OA org URL or the OpenRouter API
+/// base), so another org or API base counts as another source. A lease
+/// activated by an earlier release records none: it is taken as the
+/// configured issuer's when its key source matches, unless the database
+/// holds such rows recorded under another issuer of that key source, which
+/// has then been running since the upgrade and is taken to own them too (a
+/// start under that issuer takes them as its own, so the two answers agree).
+/// Rows any configuration finalizes without provider I/O (never delivered,
+/// committed to a zero or conceded charge, past their settlement deadline) do
+/// not count, nor do rows of a source this release does not know, which it
+/// never settles or charges (so a rollback stays safe).
+/// `allow_key_source_switch` accepts those charges and starts: for a database
+/// that holds such rows of two or more issuers, which no single credential
+/// can drain, or an issuer that can no longer be reached.
 fn ensure_key_sources_drained(config: &ServerConfig, store: &NullifierStore) -> anyhow::Result<()> {
     let Some(lease) = config.openrouter_leases.as_ref() else {
         return Ok(());
     };
     let configured = lease.source.label();
+    let identity = lease.source.identity();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let backlog = store.key_source_backlog(now)?;
-    let own_leases = backlog
-        .get(configured)
-        .map_or(0, |backlog| backlog.unsettled_leases);
-    let stranded: Vec<String> = backlog
-        .into_iter()
-        .filter(|(source, _)| {
-            source != configured && matches!(source.as_str(), "openrouter" | "oa_org")
-        })
-        .filter_map(|(source, backlog)| {
-            let deletions = if source == "openrouter" {
-                backlog.queued_key_deletions
+    // Deletions count only for direct OpenRouter, the only source that
+    // deletes keys.
+    let deletions = |source: &str, backlog: &KeySourceBacklog| {
+        if source == "openrouter" {
+            backlog.queued_key_deletions
+        } else {
+            0
+        }
+    };
+    let needs_issuer = |source: &str, backlog: &KeySourceBacklog| {
+        matches!(source, "openrouter" | "oa_org")
+            && (backlog.unsettled_leases > 0 || deletions(source, backlog) > 0)
+    };
+    let another_issuer_of_this_source = backlog.iter().any(|((source, recorded), backlog)| {
+        source == configured
+            && recorded
+                .as_deref()
+                .is_some_and(|recorded| recorded != identity)
+            && needs_issuer(source, backlog)
+    });
+    let configured_issuer = |source: &str, recorded: &Option<String>| {
+        source == configured
+            && match recorded.as_deref() {
+                Some(recorded) => recorded == identity,
+                None => !another_issuer_of_this_source,
+            }
+    };
+    let (mut own_recorded, mut own_unrecorded, mut own_deletions) = (0u64, 0u64, 0u64);
+    for ((source, recorded), backlog) in &backlog {
+        if configured_issuer(source, recorded) {
+            if recorded.is_some() {
+                own_recorded += backlog.unsettled_leases;
             } else {
-                0
-            };
-            (backlog.unsettled_leases > 0 || deletions > 0).then(|| {
-                format!(
-                    "{} unsettled lease(s) and {deletions} queued key deletion(s) of key source '{source}' ({})",
-                    backlog.unsettled_leases,
-                    key_source_setting(&source)
-                )
-            })
+                own_unrecorded += backlog.unsettled_leases;
+            }
+            own_deletions += deletions(source, backlog);
+        }
+    }
+    let stranded: Vec<_> = backlog
+        .iter()
+        .filter(|((source, recorded), backlog)| {
+            !configured_issuer(source, recorded) && needs_issuer(source, backlog)
         })
         .collect();
     if stranded.is_empty() {
@@ -524,6 +555,35 @@ fn ensure_key_sources_drained(config: &ServerConfig, store: &NullifierStore) -> 
         }
         return Ok(());
     }
+    // Rows recording no issuer are taken as those of the other issuer of
+    // their key source when there is one, so they add no issuer of their own.
+    let recorded_sources: std::collections::BTreeSet<&str> = stranded
+        .iter()
+        .filter(|((_, recorded), _)| recorded.is_some())
+        .map(|((source, _), _)| source.as_str())
+        .collect();
+    let issuers = stranded
+        .iter()
+        .filter(|((source, recorded), _)| {
+            recorded.is_some() || !recorded_sources.contains(source.as_str())
+        })
+        .count()
+        + usize::from(own_recorded + own_unrecorded + own_deletions > 0);
+    let stranded: Vec<String> = stranded
+        .into_iter()
+        .map(|((source, recorded), backlog)| {
+            let issuer = match recorded {
+                Some(recorded) => format!(" issued through {recorded}"),
+                None => " activated before this release, recording no issuer".to_string(),
+            };
+            format!(
+                "{} unsettled lease(s) and {} queued key deletion(s) of key source '{source}'{issuer} ({})",
+                backlog.unsettled_leases,
+                deletions(source, backlog),
+                key_source_setting(source)
+            )
+        })
+        .collect();
     if config.allow_key_source_switch {
         tracing::warn!(
             configured,
@@ -532,15 +592,47 @@ fn ensure_key_sources_drained(config: &ServerConfig, store: &NullifierStore) -> 
         );
         return Ok(());
     }
-    let remedy = if own_leases > 0 {
+    let remedy = if issuers > 1 {
+        let own = own_recorded + own_unrecorded;
+        let held = if own + own_deletions == 0 {
+            format!("These belong to {issuers} issuers")
+        } else {
+            let rows = [
+                (own > 0).then(|| format!("{own} such lease(s)")),
+                (own_deletions > 0).then(|| format!("{own_deletions} queued key deletion(s)")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ");
+            let unrecorded = if own_unrecorded > 0 {
+                format!(
+                    " ({own_unrecorded} of these lease(s), activated before this release, record no issuer and are taken as its own)"
+                )
+            } else {
+                String::new()
+            };
+            format!("It also holds {rows} of '{configured}' issued through {identity}{unrecorded}")
+        };
+        let (tell, order) = if issuers == 2 {
+            (
+                "a start under the other without the flag refuses while any remain",
+                "and then restart under the other without the flag, before its remaining leases reach their deadlines",
+            )
+        } else {
+            (
+                "a start under another one without the flag lists them while any remain",
+                "and repeat under each of the others in turn, starting the last one without the flag, before their remaining leases reach their deadlines",
+            )
+        };
         format!(
-            "It also holds {own_leases} such lease(s) of '{configured}', so no single credential can drain it: start under one key source with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true), stop routing new requests to the server, and once GET /v1/dashboard/settlement lists no pending lease of that source, restart under the other without the flag, before the remaining leases reach their deadlines."
+            "{held}, so no single credential can drain it: start under one of them with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true), stop routing new requests to the server, wait until that one's leases are settled ({tell}), {order}."
         )
     } else {
-        "Drain the previous key source first: restart with its credential, stop routing new requests to the server, and wait until GET /v1/dashboard/settlement lists no pending lease of that key source (and, for 'openrouter', counts.pending_key_cleanups is 0); then switch. If that source can no longer be reached, start with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true) to accept those charges, and remove it once they are settled.".to_string()
+        "Drain the previous key source first: restart with its credential and URL, stop routing new requests to the server, and wait until GET /v1/dashboard/settlement reports counts.pending 0 (and, for 'openrouter', counts.pending_key_cleanups 0); then switch. If that source can no longer be reached, or still serves those leases at a new URL, start with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true), and remove it once they are settled.".to_string()
     };
     anyhow::bail!(
-        "refusing to start: server database {} holds {}, but this server is configured for key source '{configured}' ({}), which can neither measure nor delete them: each such lease (possibly delivered, with no committed charge) would be finalized at its settlement deadline without a usage measurement, normally at its full solvency bound. {remedy} See docs/native-eth-billing.md, \"Changing the key source\".",
+        "refusing to start: server database {} holds {}, but this server is configured for key source '{configured}' at {identity} ({}), which can neither measure nor delete them: each such lease (possibly delivered, with no committed charge) would be finalized at its settlement deadline without a usage measurement, normally at its full solvency bound. {remedy} See docs/native-eth-billing.md, \"Changing the key source\".",
         config.db_path,
         stranded.join("; "),
         key_source_setting(configured)
@@ -1922,8 +2014,21 @@ mod startup_tests {
         server.abort();
     }
 
-    /// A delivered lease row as issuance leaves it, of `key_source`.
+    /// A delivered lease row as an earlier release's issuance leaves it, of
+    /// `key_source`, with no recorded issuer identity.
     fn stored_lease(store: &NullifierStore, id: &str, nullifier: u64, key_source: &str) {
+        stored_lease_from(store, id, nullifier, key_source, None);
+    }
+
+    /// A delivered lease row as issuance leaves it, of `key_source` and
+    /// issued through `identity`.
+    fn stored_lease_from(
+        store: &NullifierStore,
+        id: &str,
+        nullifier: u64,
+        key_source: &str,
+        identity: Option<&str>,
+    ) {
         let request: ApiRequestV2 = serde_json::from_value(json!({
             "client_request_id": id,
             "payload": "{}",
@@ -1944,7 +2049,7 @@ mod startup_tests {
             .create_openrouter_lease(&request, key_source, 10, 4_000_000_000, 4_000_000_000, 1.0)
             .unwrap();
         store
-            .activate_openrouter_lease(id, &format!("{id}-hash"))
+            .activate_openrouter_lease_from(id, &format!("{id}-hash"), identity)
             .unwrap();
     }
 
@@ -2125,9 +2230,16 @@ mod startup_tests {
             )
         };
         queue_deletion("expired");
+        // Final round (server-fixup2#3): a lease past its settlement deadline,
+        // which any configuration finalizes at once without provider I/O.
+        stored_lease(&store, "past-deadline", 0x67, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET settlement_deadline_at = 100 WHERE client_request_id = ?1",
+            "past-deadline",
+        );
         ensure_key_sources_drained(&config, &store).unwrap();
 
-        // A possibly delivered direct lease needs the direct credential.
+        // A possibly delivered direct lease needs the direct credential...
         stored_lease(&store, "delivered", 0x66, "openrouter");
         let error = ensure_key_sources_drained(&config, &store)
             .unwrap_err()
@@ -2139,6 +2251,17 @@ mod startup_tests {
                 && error.contains("--allow-key-source-switch"),
             "{error}"
         );
+        // ...until its settlement deadline, which it then is finalized at.
+        set(
+            "UPDATE openrouter_leases SET settlement_deadline_at = 4000000000 WHERE client_request_id = ?1",
+            "delivered",
+        );
+        assert!(ensure_key_sources_drained(&config, &store).is_err());
+        set(
+            "UPDATE openrouter_leases SET settlement_deadline_at = 100 WHERE client_request_id = ?1",
+            "delivered",
+        );
+        ensure_key_sources_drained(&config, &store).unwrap();
         // So does the deletion of a key that has not expired.
         set(
             "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
@@ -2157,6 +2280,282 @@ mod startup_tests {
         // The operator's override accepts the charges and starts.
         config.allow_key_source_switch = true;
         ensure_key_sources_drained(&config, &store).unwrap();
+    }
+
+    /// Final round (server-fixup2#2): another OA org, or another OpenRouter
+    /// API base, cannot measure or delete the keys the previous one issued,
+    /// so it counts as another key source. A rotated credential of the same
+    /// org or API base does not. Leases activated by an earlier release
+    /// record no issuer: see
+    /// `key_source_check_takes_unrecorded_leases_as_the_recorded_issuers`.
+    #[test]
+    fn key_source_check_tells_issuers_of_one_source_apart() {
+        use crate::config::OpenRouterLeaseSourceConfig;
+        let store = NullifierStore::in_memory().unwrap();
+        let configured = |source: OpenRouterLeaseSourceConfig, allow_switch: bool| ServerConfig {
+            openrouter_leases: Some(crate::config::OpenRouterLeaseConfig {
+                source,
+                ..crate::test_support::lease_config()
+            }),
+            allow_key_source_switch: allow_switch,
+            ..Default::default()
+        };
+        let org = |url: &str, secret: &str| OpenRouterLeaseSourceConfig::OaOrg {
+            org_base_url: url.into(),
+            shared_secret: secret.into(),
+        };
+        let direct = |base: &str, key: &str| OpenRouterLeaseSourceConfig::OpenRouter {
+            management_key: key.into(),
+            api_base: base.into(),
+        };
+        let check = |source, allow_switch| {
+            ensure_key_sources_drained(&configured(source, allow_switch), &store)
+                .map_err(|error| error.to_string())
+        };
+        let org_a = "https://org-a.example";
+        stored_lease_from(&store, "org-a-lease", 0x71, "oa_org", Some(org_a));
+        // A lease activated before this release records no issuer. Next to
+        // org A's, it is taken as org A's (final round, fixup3): org B is
+        // told to drain org A first, as a start under org A passes.
+        stored_lease(&store, "legacy-lease", 0x72, "oa_org");
+        check(org("https://org-a.example/", "rotated"), false).unwrap();
+        let error = check(org("https://org-b.example", "b"), false).unwrap_err();
+        assert!(
+            error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'oa_org' \
+                 issued through https://org-a.example (OA org"
+            ) && error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'oa_org' \
+                 activated before this release, recording no issuer (OA org"
+            ) && error.contains("configured for key source 'oa_org' at https://org-b.example")
+                && error.contains(
+                    "Drain the previous key source first: restart with its credential and URL"
+                )
+                && !error.contains("It also holds")
+                && !error.contains("no single credential")
+                && error.contains("Changing the key source"),
+            "{error}"
+        );
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+            ["legacy-lease"],
+        );
+        let error = check(org("https://org-b.example", "b"), false).unwrap_err();
+        assert!(
+            error.contains(
+                "Drain the previous key source first: restart with its credential and URL"
+            ),
+            "{error}"
+        );
+        check(org("https://org-b.example", "b"), true).unwrap();
+        // Leases of two orgs: refused under either, started with the flag.
+        stored_lease_from(
+            &store,
+            "org-b-lease",
+            0x73,
+            "oa_org",
+            Some("https://org-b.example"),
+        );
+        for url in [org_a, "https://org-b.example"] {
+            let error = check(org(url, "s"), false).unwrap_err();
+            assert!(
+                error.contains("It also holds 1 such lease(s)")
+                    && error.contains("no single credential can drain it"),
+                "{error}"
+            );
+            check(org(url, "s"), true).unwrap();
+        }
+        for id in ["org-a-lease", "org-b-lease"] {
+            store.execute_for_test(
+                "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+                [id],
+            );
+        }
+        // Direct OpenRouter: the API base, and the deletion of a key it
+        // issued, which another API base cannot delete.
+        let base = "https://openrouter.ai/api";
+        stored_lease_from(&store, "direct-lease", 0x74, "openrouter", Some(base));
+        check(direct("https://openrouter.ai/api/", "rotated-key"), false).unwrap();
+        let other = || direct("https://proxy.example/api", "key");
+        let error = check(other(), false).unwrap_err();
+        assert!(
+            error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'openrouter' \
+                 issued through https://openrouter.ai/api (direct OpenRouter"
+            ),
+            "{error}"
+        );
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+            ["direct-lease"],
+        );
+        check(other(), false).unwrap();
+        store.execute_for_test(
+            "INSERT INTO provider_key_cleanup (client_request_id, key_source, key_hash, key_name,
+                next_attempt_at, created_at)
+             VALUES ('direct-lease', 'openrouter', 'direct-lease-hash', 'zkapi-direct-lease', 0, 0)",
+            [],
+        );
+        let error = check(other(), false).unwrap_err();
+        assert!(
+            error.contains(
+                "0 unsettled lease(s) and 1 queued key deletion(s) of key source 'openrouter' \
+                 issued through https://openrouter.ai/api"
+            ),
+            "{error}"
+        );
+        check(direct(base, "rotated-key"), false).unwrap();
+    }
+
+    /// Final round (fixup3): a lease activated by an earlier release records
+    /// no issuer. It is taken as the configured issuer's when its key source
+    /// matches, unless the database holds rows still to settle recorded under
+    /// another issuer of that key source: that one has been running since the
+    /// upgrade, takes them as its own when started, and settles them. Every
+    /// start then gives the same answer, and the remedy counts issuers, not
+    /// whether the configured one holds any.
+    #[test]
+    fn key_source_check_takes_unrecorded_leases_as_the_recorded_issuers() {
+        use crate::config::OpenRouterLeaseSourceConfig;
+        let store = NullifierStore::in_memory().unwrap();
+        let check = |source: OpenRouterLeaseSourceConfig| {
+            let config = ServerConfig {
+                openrouter_leases: Some(crate::config::OpenRouterLeaseConfig {
+                    source,
+                    ..crate::test_support::lease_config()
+                }),
+                ..Default::default()
+            };
+            ensure_key_sources_drained(&config, &store).map_err(|error| error.to_string())
+        };
+        let org = |url: &str| OpenRouterLeaseSourceConfig::OaOrg {
+            org_base_url: url.into(),
+            shared_secret: "secret".into(),
+        };
+        let base = "https://openrouter.ai/api";
+        let direct = || OpenRouterLeaseSourceConfig::OpenRouter {
+            management_key: "key".into(),
+            api_base: base.into(),
+        };
+        let finalize = |id: &str| {
+            store.execute_for_test(
+                "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+                [id],
+            )
+        };
+        let (org_a, org_b, org_c) = (
+            "https://org-a.example",
+            "https://org-b.example",
+            "https://org-c.example",
+        );
+        let unrecorded = "1 unsettled lease(s) and 0 queued key deletion(s) of key source \
+                          'oa_org' activated before this release, recording no issuer (OA org";
+        // Alone, it is taken as whichever org is configured (which the check
+        // cannot tell apart; the docs say to drain such leases first).
+        stored_lease(&store, "legacy", 0x80, "oa_org");
+        check(org(org_a)).unwrap();
+        check(org(org_b)).unwrap();
+
+        // Next to a lease recorded under org A: org A's. Org A starts, and
+        // org B is told to drain org A first, not that no single credential
+        // can drain the database.
+        stored_lease_from(&store, "org-a", 0x81, "oa_org", Some(org_a));
+        check(org(org_a)).unwrap();
+        let error = check(org(org_b)).unwrap_err();
+        assert!(
+            error.contains(unrecorded)
+                && error.contains("Drain the previous key source first")
+                && !error.contains("It also holds")
+                && !error.contains("no single credential"),
+            "{error}"
+        );
+
+        // Next to leases of orgs A and B: neither's, and no third issuer.
+        stored_lease_from(&store, "org-b", 0x82, "oa_org", Some(org_b));
+        for (url, other) in [(org_a, org_b), (org_b, org_a)] {
+            let error = check(org(url)).unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "of key source 'oa_org' issued through {other} (OA org"
+                )) && error.contains(unrecorded)
+                    && error.contains(&format!(
+                        "It also holds 1 such lease(s) of 'oa_org' issued through {url}, \
+                         so no single credential can drain it"
+                    ))
+                    && error.contains("a start under the other without the flag refuses")
+                    && error.contains("and then restart under the other without the flag"),
+                "{error}"
+            );
+        }
+        // Org C holds none of them: still two issuers.
+        let error = check(org(org_c)).unwrap_err();
+        assert!(
+            error.contains(unrecorded)
+                && error
+                    .contains("These belong to 2 issuers, so no single credential can drain it")
+                && error.contains("and then restart under the other without the flag")
+                && !error.contains("It also holds")
+                && !error.contains("Drain the previous key source first"),
+            "{error}"
+        );
+        // With a lease of org C too: three issuers.
+        stored_lease_from(&store, "org-c", 0x83, "oa_org", Some(org_c));
+        let error = check(org(org_c)).unwrap_err();
+        assert!(
+            error.contains(
+                "It also holds 1 such lease(s) of 'oa_org' issued through https://org-c.example, \
+                 so no single credential can drain it"
+            ) && error.contains("a start under another one without the flag lists them")
+                && error.contains("repeat under each of the others in turn"),
+            "{error}"
+        );
+        for id in ["org-a", "org-b", "org-c"] {
+            finalize(id);
+        }
+
+        // With no other issuer of its source left, it is taken as the
+        // configured org's again, and named so next to another source type.
+        check(org(org_b)).unwrap();
+        stored_lease_from(&store, "direct", 0x84, "openrouter", Some(base));
+        let error = check(org(org_b)).unwrap_err();
+        assert!(
+            error.contains(
+                "It also holds 1 such lease(s) of 'oa_org' issued through https://org-b.example \
+                 (1 of these lease(s), activated before this release, record no issuer and are \
+                 taken as its own), so no single credential can drain it"
+            ),
+            "{error}"
+        );
+        let error = check(direct()).unwrap_err();
+        assert!(
+            error.contains(unrecorded)
+                && error.contains(
+                    "It also holds 1 such lease(s) of 'openrouter' issued through \
+                     https://openrouter.ai/api, so no single credential can drain it"
+                ),
+            "{error}"
+        );
+
+        // A queued deletion of a direct key the configured API base issued
+        // is its own too: another source's lease is then a second issuer.
+        finalize("legacy");
+        finalize("direct");
+        store.execute_for_test(
+            "INSERT INTO provider_key_cleanup (client_request_id, key_source, key_hash, key_name,
+                next_attempt_at, created_at)
+             VALUES ('direct', 'openrouter', 'direct-hash', 'zkapi-direct', 0, 0)",
+            [],
+        );
+        check(direct()).unwrap();
+        stored_lease_from(&store, "org-a-2", 0x85, "oa_org", Some(org_a));
+        let error = check(direct()).unwrap_err();
+        assert!(
+            error.contains(
+                "It also holds 1 queued key deletion(s) of 'openrouter' issued through \
+                 https://openrouter.ai/api, so no single credential can drain it"
+            ),
+            "{error}"
+        );
     }
 }
 

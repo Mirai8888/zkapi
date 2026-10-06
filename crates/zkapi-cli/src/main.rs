@@ -119,13 +119,14 @@ enum Commands {
             hide_env_values = true
         )]
         clearance_root_window_seconds: u64,
-        /// Start although the database holds leases of the other lease key
-        /// source, which this server can neither measure nor delete: each is
-        /// charged at its settlement deadline without a usage measurement,
+        /// Start although the database holds leases of another lease key
+        /// source (the other source type, or another OA org URL or OpenRouter
+        /// API base), which this server can neither measure nor delete: each
+        /// is charged at its settlement deadline without a usage measurement,
         /// normally its full solvency bound. Default off: startup refuses
         /// until the other source drains. For a database holding unsettled
-        /// leases of both sources, or a source that can no longer be reached;
-        /// see docs/native-eth-billing.md, "Changing the key source".
+        /// leases of two or more sources, or a source that can no longer be
+        /// reached; see docs/native-eth-billing.md, "Changing the key source".
         #[arg(
             long,
             env = "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",

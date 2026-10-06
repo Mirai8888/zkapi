@@ -400,10 +400,16 @@ no longer hold its note state reserved indefinitely:
   was given (`retry_after_seconds`; at least the poll interval, at most 300
   seconds, and never more than half of the time left before its deadline).
   The lease also moves behind every other lease in the least recently
-  attempted order. A failed attempt is retried on the next tick. An owner's
-  retirement honours the same retry time: until it comes, the retirement
-  answers `lease_settlement_pending` with the time left, without asking the
-  provider again.
+  attempted order. A usage read that the OA org answers with HTTP 429 is
+  handled the same way, with the org's `Retry-After` (bounded as above) as the
+  retry time and without counting a failure. Because the org limits all of the
+  server's requests together, no other OA usage read starts before that time
+  either: not for the rest of the tick, not in later ticks, and not for a
+  retirement. A lease that reaches its settlement deadline meanwhile is
+  finalized as described above. A failed attempt is retried on the next tick.
+  An owner's retirement honours the same retry times: until they come, the
+  retirement answers `lease_settlement_pending` with the time left, without
+  asking the provider again.
 - Each lease is settled under its own lock. A retirement waits only for work
   on its own lease (and checks the owner's proof before it waits). The tick
   never waits for a lease's lock: it leaves a lease whose lock is held or
@@ -436,15 +442,17 @@ no longer hold its note state reserved indefinitely:
   [reopen the lease](#reopening-a-cancelled-lease) once its binding is
   repaired. Conceding its charge (`--zero-charge`) is a choice of charge within
   that remedy, not a way around the repair.
-- A pending lease row whose saved request (`api_request_json`) cannot be
-  decoded is skipped by every tick: neither provider I/O, nor its settlement
-  deadline, nor a cancellation reaches it, and its nullifier stays reserved,
-  with the same consequences for its owner as a cancellation. Each tick logs
+- A pending lease row that cannot be decoded, normally because its saved
+  request (`api_request_json`) cannot be, is skipped by every tick: neither
+  provider I/O, nor its settlement deadline, nor a cancellation reaches it,
+  and its nullifier stays reserved, with the same consequences for its owner
+  as a cancellation. Each tick logs
   `unreadable OpenRouter lease row cannot be settled` at error level with the
   row's `client_request_id`; alert on that line. Lease routes answer it with
   `lease_record_unreadable`. The dashboard counts include it, but its `pending`
   list does not. The deadline guarantee above applies to it only once the
-  operator [restores its saved request](#restoring-an-unreadable-pending-lease).
+  operator [restores its saved request](#restoring-an-unreadable-pending-lease),
+  or repairs by hand another column that cannot be decoded.
 - Keys of terminal direct leases that may still exist at the provider (worst
   case, never delivered or cancelled) are disabled and then deleted in the
   background, outside every lease lock; a 404 counts as done, and failures
@@ -528,26 +536,55 @@ delivered lease of the previous source at its settlement deadline without a
 usage measurement (normally at its full solvency bound), and would never
 delete the previous source's keys queued for deletion.
 
-The server therefore refuses to start while its database holds, of the other
-key source, a lease that only that source can settle (one that may have been
-delivered and has no committed charge) or, when leaving direct OpenRouter, a
-queued deletion of a key that has not expired yet. Rows any server finalizes
-without provider I/O do not count: never-issued provisioning rows, leases whose
-key was never delivered, and leases committed to a zero or conceded charge. Nor
-do deletions of expired keys, which can no longer be used. The error names the
-counts and this procedure:
+Moving to a different OA org, or to a different OpenRouter API base
+(`--openrouter-api-base`), is a key-source change too: another org or API base
+cannot read or delete the keys the previous one issued. Each lease activated by
+this release records the endpoint of the source that issued its key: the OA org
+URL or the API base, without credentials, query or trailing slash. Rotating the
+org's shared secret or the management key keeps that endpoint and is not a
+change.
+
+The server therefore refuses to start while its database holds, of another key
+source or endpoint, a lease that only that source can settle (one that may have
+been delivered and has no committed charge) or, when leaving direct OpenRouter
+or its API base, a queued deletion of a key that has not expired yet. Rows any
+server finalizes without provider I/O do not count: never-issued provisioning
+rows, leases whose key was never delivered, leases committed to a zero or
+conceded charge, and leases past their settlement deadline, which are finalized
+at once at the same charge whatever the configuration. Nor do deletions of
+expired keys, which can no longer be used. The error names the counts, the
+recorded endpoint, and this procedure:
 
 1. Keep the server running with its current key source, and stop routing new
    requests to it, for example by taking it out of the gateway. Settlement
    continues without clients.
-2. Watch `GET /v1/dashboard/settlement` until `counts.pending` is 0 (or
-   `pending` lists no lease of the current `key_source`) and, when leaving
-   direct OpenRouter, `counts.pending_key_cleanups` is 0. A delivered lease
-   settles once its key has expired and the grace has passed, unless its
-   usage stays unavailable (an OA receipt can stay pending longer); none waits
-   past its settlement deadline.
-3. Stop the server, change the credential, start it with the new key source,
-   and route requests to it again.
+2. Watch `GET /v1/dashboard/settlement` until `counts.pending` is 0 (or, when
+   changing the source type, `pending` lists no lease of the current
+   `key_source`) and, when leaving direct OpenRouter or its API base,
+   `counts.pending_key_cleanups` is 0. A delivered lease settles once its key
+   has expired and the grace has passed, unless its usage stays unavailable
+   (an OA receipt can stay pending longer); none waits past its settlement
+   deadline.
+3. Stop the server, change the credential (and the org URL or API base), start
+   it with the new key source, and route requests to it again.
+
+The check cannot detect two moves, which need the same procedure:
+
+- **Another OpenRouter account behind the same API base.** The server knows
+  the management key, not its account, so the new account's key passes the
+  check. It cannot read or delete the previous account's keys: each of their
+  possibly delivered leases would be charged its solvency bound at its
+  settlement deadline, and a queued deletion of one of their keys would fail
+  until the key expires, or count as done if the provider answers 404.
+- **Leases activated by an earlier release**, which record no endpoint. They
+  are taken to be the configured source's whenever their key source type
+  matches, unless the database also holds, recorded under another endpoint
+  of that type, leases or queued deletions that block startup as above. That
+  endpoint has then been serving since the upgrade, so they are taken to be
+  its own: a start under it passes and settles them, and the error under any
+  other names them as activated before this release. While they are the only
+  such rows, a start under another org or account passes, so drain them
+  before moving to one.
 
 `--allow-key-source-switch` (or `ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true`) starts
 the server anyway and accepts that each such lease of the other source is
@@ -555,15 +592,21 @@ finalized at its settlement deadline without a usage measurement; the server
 logs what it strands. Use it only where the procedure above cannot work, and
 remove it once those leases are settled:
 
-- **A database holding such leases of both sources**, which an earlier release
-  could leave behind (a source switch, at 045b444 or f7c99837, with leases of
-  the previous source outstanding). No single credential drains it, so the
-  server refuses under either source, and the error says so. Start under one
-  source with the flag, stop routing new requests, and wait until its leases
-  are settled as in step 2. Then restart under the other source without the
-  flag, before its remaining leases reach their settlement deadlines (by
-  default 6 hours after their keys expire): they are then still measured.
-  Finally switch to the source you want with the procedure above.
+- **A database holding such leases of two or more sources** (two source types,
+  or two orgs or API bases), which an earlier release could leave behind (a
+  source switch, at 045b444 or f7c99837, with leases of the previous source
+  outstanding), as can an earlier use of this flag. No single credential
+  drains it, so the server refuses under any source, and the error says so.
+  Start under one source with the flag, stop routing new requests, and wait
+  until its leases are settled: for two source types, until `pending` lists
+  none of its `key_source` in step 2; for two orgs or API bases, until a start
+  under the other one without the flag no longer refuses (with more, until
+  that start's error no longer lists them). Then restart under the other
+  source without the flag (with more, under each remaining source in turn the
+  same way, the last one without the flag), before its remaining leases reach
+  their settlement deadlines (by default 6 hours after their keys expire):
+  they are then still measured. Finally switch to the source you want with the
+  procedure above.
 - **A previous key source that can no longer be reached** (its org is gone, or
   its management key was revoked), or an outage of one source that the
   operator decides to fail over from: the flag starts the other source at
@@ -571,6 +614,11 @@ remove it once those leases are settled:
   possibly delivered lease of the unreachable source is then charged its
   solvency bound at its settlement deadline, as any lease whose usage stays
   unavailable.
+- **The same org or OpenRouter account at a new URL**, such as a renamed
+  host: its leases still settle there, so nothing is charged without a
+  measurement.
+  Each restart needs the flag until the leases recorded under the old URL
+  are settled.
 
 Queued deletions of direct keys whose management key was revoked never
 complete, but those keys expired with their leases, and they stop blocking
@@ -751,8 +799,14 @@ reservation recorded at admission, and it shares the lease row's
 `client_request_id` or `request_nullifier`. The lease row and its reservation
 must then agree, or the command refuses and names the field, which `--rebind`
 repairs as for a reopening. A `ClearanceReserved` nullifier is refused. The
-command refuses a pending lease whose saved request can be read: the server
-settles that lease itself, and cancels it if its binding is corrupt.
+command refuses a pending lease whose saved request can be read. When the rest
+of its row can be read too, the server settles that lease itself, and cancels
+it if its binding is corrupt. When another column cannot be decoded, the lease
+is skipped just the same: it still answers `lease_record_unreadable` and the
+log line keeps naming it. The command then refuses with `another column of its
+row cannot be decoded`, naming the column, and that column needs a hand repair
+as described under [Reopening a cancelled lease](#reopening-a-cancelled-lease)
+before the server settles the lease.
 
 The restored lease keeps its status, its write-once deadline and any charge
 already committed, and the command prints `"result": "restored"` with the same

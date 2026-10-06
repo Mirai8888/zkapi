@@ -454,7 +454,8 @@ impl NullifierStore {
                 first_error_at INTEGER,
                 charge_basis TEXT,
                 delivered INTEGER,
-                next_attempt_at INTEGER
+                next_attempt_at INTEGER,
+                key_source_identity TEXT
             );
             CREATE TABLE IF NOT EXISTS deployment_binding (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -527,6 +528,8 @@ impl NullifierStore {
             // Read only by the settlement scan, never by a row decoder, so
             // that read-only readers accept databases from before it.
             ("openrouter_leases", "next_attempt_at", "INTEGER"),
+            // Read only by the startup key-source check, likewise.
+            ("openrouter_leases", "key_source_identity", "TEXT"),
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
@@ -1190,6 +1193,18 @@ impl NullifierStore {
         client_request_id: &str,
         key_hash: &str,
     ) -> Result<(), ServerError> {
+        self.activate_openrouter_lease_from(client_request_id, key_hash, None)
+    }
+
+    /// Activate a lease with the key `key_hash`, recording the identity of
+    /// the key source that issued it (`OpenRouterLeaseSourceConfig::identity`)
+    /// for the startup key-source check. None keeps the recorded identity.
+    pub(crate) fn activate_openrouter_lease_from(
+        &self,
+        client_request_id: &str,
+        key_hash: &str,
+        key_source_identity: Option<&str>,
+    ) -> Result<(), ServerError> {
         let conn = self
             .conn
             .lock()
@@ -1198,10 +1213,16 @@ impl NullifierStore {
         let rows = conn
             .execute(
                 "UPDATE openrouter_leases
-                 SET status = 'active', key_hash = ?1, updated_at = ?2
+                 SET status = 'active', key_hash = ?1, updated_at = ?2,
+                     key_source_identity = COALESCE(?4, key_source_identity)
                  WHERE client_request_id = ?3 AND status = 'provisioning'
                    AND charge_basis IS NULL",
-                params![key_hash, current_timestamp() as i64, client_request_id],
+                params![
+                    key_hash,
+                    current_timestamp() as i64,
+                    client_request_id,
+                    key_source_identity
+                ],
             )
             .map_err(|error| ServerError::Database(format!("lease activation failed: {error}")))?;
         if rows != 1 {
@@ -1843,6 +1864,13 @@ impl NullifierStore {
         } else if !restoring_pending
             && !(options.zero_charge && pending && reviewed("binding_reopened")?)
         {
+            // Another undecodable column keeps a pending row with a readable
+            // saved request from every scan too: name it instead.
+            if pending && saved_request_readable(&transaction, client_request_id)? {
+                if let Some(detail) = lease_row_undecodable(&transaction, client_request_id)? {
+                    return Err(ReopenRefusal::RowUndecodable { status, detail });
+                }
+            }
             // A possibly delivered direct lease is reviewed when its binding
             // is found corrupt, and cancelled once its key's usage is
             // captured.
@@ -2258,12 +2286,15 @@ impl NullifierStore {
         Ok(())
     }
 
-    /// Per key source, what only its credential can still settle or delete
+    /// Per key source and recorded identity of its issuer (None for a lease
+    /// activated by an earlier release, or a deletion queued without a
+    /// lease), what only that issuer's credential can still settle or delete
     /// (`KeySourceBacklog`), at `now`. Read-only.
     pub(crate) fn key_source_backlog(
         &self,
         now: u64,
-    ) -> Result<std::collections::BTreeMap<String, KeySourceBacklog>, ServerError> {
+    ) -> Result<std::collections::BTreeMap<(String, Option<String>), KeySourceBacklog>, ServerError>
+    {
         let conn = self
             .conn
             .lock()
@@ -2271,40 +2302,44 @@ impl NullifierStore {
         let failed = |error: rusqlite::Error| {
             ServerError::Database(format!("key source backlog scan failed: {error}"))
         };
-        let mut backlog = std::collections::BTreeMap::<String, KeySourceBacklog>::new();
+        let mut backlog =
+            std::collections::BTreeMap::<(String, Option<String>), KeySourceBacklog>::new();
         let now = sql_time(now);
-        let no_params: &[&dyn rusqlite::ToSql] = &[];
-        for (sql, parameters, leases) in [
+        for (sql, leases) in [
+            // A lease past its settlement deadline does not count: any
+            // configuration finalizes it without provider I/O, at the same
+            // charge.
             (
-                "SELECT key_source, COUNT(*) FROM openrouter_leases
+                "SELECT key_source, key_source_identity, COUNT(*) FROM openrouter_leases
                  WHERE status IN ('active', 'retiring', 'disabled', 'revoking')
                    AND COALESCE(delivered, 1) != 0 AND charge_basis IS NULL
-                 GROUP BY key_source",
-                no_params,
+                   AND (settlement_deadline_at IS NULL OR settlement_deadline_at > ?1)
+                 GROUP BY key_source, key_source_identity",
                 true,
             ),
             (
-                "SELECT cleanup.key_source, COUNT(*) FROM provider_key_cleanup AS cleanup
+                "SELECT cleanup.key_source, lease.key_source_identity, COUNT(*)
+                 FROM provider_key_cleanup AS cleanup
                  LEFT JOIN openrouter_leases AS lease
                    ON lease.client_request_id = cleanup.client_request_id
                  WHERE lease.expires_at IS NULL OR lease.expires_at > ?1
-                 GROUP BY cleanup.key_source",
-                &[&now as &dyn rusqlite::ToSql][..],
+                 GROUP BY cleanup.key_source, lease.key_source_identity",
                 false,
             ),
         ] {
             let mut statement = conn.prepare(sql).map_err(failed)?;
             let rows = statement
-                .query_map(parameters, |row| {
+                .query_map(params![now], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?.max(0) as u64,
                     ))
                 })
                 .map_err(failed)?;
             for row in rows {
-                let (source, count) = row.map_err(failed)?;
-                let entry = backlog.entry(source).or_default();
+                let (source, identity, count) = row.map_err(failed)?;
+                let entry = backlog.entry((source, identity)).or_default();
                 if leases {
                     entry.unsettled_leases = count;
                 } else {
@@ -2477,6 +2512,16 @@ pub enum ReopenRefusal {
          lease's saved request is restored (--saved-request) only when it cannot be read"
     )]
     NotCancelled(String),
+    /// A pending lease whose saved request can be read, but whose row
+    /// another column keeps undecodable.
+    #[error(
+        "the lease is {status} and its saved request can be read, but another column of its \
+         row cannot be decoded ({detail}): every settlement tick skips the lease, its settlement \
+         deadline included, and lease routes answer lease_record_unreadable, until that column \
+         is repaired by hand from a backup (see \"Reopening a cancelled lease\" in \
+         docs/native-eth-billing.md); --saved-request cannot repair it"
+    )]
+    RowUndecodable { status: String, detail: String },
     #[error(
         "the lease is {0}, not cancelled yet: its binding_corrupt review was recorded while the \
          usage of its direct key is still being captured; start the server again, and reopen \
@@ -2594,6 +2639,25 @@ fn saved_request_readable(conn: &Connection, client_request_id: &str) -> Result<
         },
     )
     .map_err(|error| ServerError::Database(format!("saved request read failed: {error}")))
+}
+
+/// Why the lease row cannot be decoded as `row_to_openrouter_lease` decodes
+/// it (and as the settlement scan reads it), if it cannot.
+fn lease_row_undecodable(
+    conn: &Connection,
+    client_request_id: &str,
+) -> Result<Option<String>, ServerError> {
+    match conn.query_row(
+        "SELECT * FROM openrouter_leases WHERE client_request_id = ?1",
+        params![client_request_id],
+        row_to_openrouter_lease,
+    ) {
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error @ rusqlite::Error::SqliteFailure(..)) => Err(ServerError::Database(format!(
+            "lease row read failed: {error}"
+        ))),
+        Err(error) => Ok(Some(error.to_string())),
+    }
 }
 
 /// The lease-row columns that `lease_binding_mismatch` compares with the
@@ -6044,6 +6108,83 @@ mod tests {
             .map(|lease| lease.client_request_id)
             .collect();
         assert_eq!(due.len(), 3, "{due:?}");
+    }
+
+    /// Final round (server-fixup2#4): a pending row whose saved request can
+    /// be read, but whose other column cannot be decoded, is skipped by every
+    /// scan just the same. The reopen command names that column instead of
+    /// saying the server settles the lease itself, with or without
+    /// --saved-request, and changes nothing.
+    #[test]
+    fn reopen_names_another_undecodable_column_of_a_pending_lease() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = consistent_request("garbled", 1);
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease(&request, "oa_org", 10, 20, 21, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease("garbled", "hash-1")
+            .unwrap();
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET expires_at = 'soon', settlement_deadline_at = 1000
+             WHERE client_request_id = ?1",
+            params!["garbled"],
+        );
+        assert!(store.due_openrouter_leases(1_500).is_empty());
+        let verify = |_: &ApiRequestV2| None;
+        for saved_request in [None, Some(&request)] {
+            let refusal = store
+                .reopen_cancelled_lease(
+                    "garbled",
+                    ReopenOptions {
+                        zero_charge: false,
+                        rebind: false,
+                        saved_request,
+                    },
+                    &verify,
+                    500,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &refusal,
+                    ReopenRefusal::RowUndecodable { status, detail }
+                        if status == "active" && detail.contains("expires_at")
+                ),
+                "{refusal}"
+            );
+            let message = refusal.to_string();
+            assert!(
+                message.contains("repaired by hand from a backup")
+                    && message.contains("--saved-request cannot repair it"),
+                "{message}"
+            );
+        }
+        assert!(matches!(
+            store.try_lookup_openrouter_lease("garbled"),
+            Err(ServerError::LeaseRecordUnreadable)
+        ));
+        assert!(store.settlement_reviews(10).unwrap().is_empty());
+        // Repaired by hand, the lease is readable, and the command again
+        // leaves it to the server.
+        store.execute_for_test(
+            "UPDATE openrouter_leases SET expires_at = 20 WHERE client_request_id = ?1",
+            params!["garbled"],
+        );
+        assert!(matches!(
+            store.reopen_cancelled_lease(
+                "garbled",
+                ReopenOptions {
+                    zero_charge: false,
+                    rebind: false,
+                    saved_request: None,
+                },
+                &verify,
+                500,
+            ),
+            Err(ReopenRefusal::NotCancelled(status)) if status == "active"
+        ));
     }
 
     /// Review regression (usage capture of a corrupt direct lease): a corrupt

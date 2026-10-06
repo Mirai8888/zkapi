@@ -68,7 +68,8 @@ the lease row's `request_nullifier`, or with `404 lease_record_unreadable`
 (not retriable) when the lease row cannot be decoded, for example a saved
 request that is not a readable request. A pending lease whose row cannot be
 decoded is not settled either, not even at its settlement deadline, and its
-nullifier reads `reserved`, until the operator restores its saved request
+nullifier reads `reserved`, until the operator restores its saved request, or
+repairs by hand another column that cannot be decoded
 ([restoring an unreadable pending lease](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#restoring-an-unreadable-pending-lease)).
 The server refuses to start unless TTL, grace, settlement deadline and polling
 slack fit within half of the vault's `challengePeriod()`. See

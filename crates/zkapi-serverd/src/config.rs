@@ -41,6 +41,30 @@ impl OpenRouterLeaseSourceConfig {
             Self::OaOrg { .. } => "oa_org",
         }
     }
+
+    /// The endpoint that issues and measures this source's keys, recorded
+    /// with each lease it activates: the OA org base URL, or the direct
+    /// OpenRouter API base, without user info, query, fragment or trailing
+    /// slash. A credential (shared secret or management key) is not part of
+    /// it, so rotating one keeps the identity; nor, therefore, is the
+    /// OpenRouter account behind an API base.
+    pub fn identity(&self) -> String {
+        let endpoint = match self {
+            Self::OpenRouter { api_base, .. } => api_base,
+            Self::OaOrg { org_base_url, .. } => org_base_url,
+        }
+        .trim();
+        match reqwest::Url::parse(endpoint) {
+            Ok(mut url) => {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url.as_str().trim_end_matches('/').to_string()
+            }
+            Err(_) => endpoint.trim_end_matches('/').to_string(),
+        }
+    }
 }
 
 impl std::fmt::Debug for OpenRouterLeaseSourceConfig {
@@ -334,6 +358,39 @@ mod tests {
             assert!(output.contains("chain_id"));
             assert!(output.contains("0x694aa1769357215de4fac081bf1f309adc325306"));
         }
+    }
+
+    #[test]
+    fn key_source_identity_is_the_endpoint_without_its_credentials() {
+        let oa = |url: &str, secret: &str| OpenRouterLeaseSourceConfig::OaOrg {
+            org_base_url: url.into(),
+            shared_secret: secret.into(),
+        };
+        let direct = |base: &str, key: &str| OpenRouterLeaseSourceConfig::OpenRouter {
+            management_key: key.into(),
+            api_base: base.into(),
+        };
+        assert_eq!(
+            oa("https://Org.Example/zkapi/", "a").identity(),
+            "https://org.example/zkapi"
+        );
+        // A rotated credential keeps the identity; another org does not.
+        assert_eq!(
+            oa("https://org.example", "a").identity(),
+            oa("https://org.example/", "b").identity()
+        );
+        assert_ne!(
+            oa("https://org.example", "a").identity(),
+            oa("https://other-org.example", "a").identity()
+        );
+        assert_eq!(
+            direct("https://user:pass@openrouter.ai/api/?x=1#f", "sk").identity(),
+            "https://openrouter.ai/api"
+        );
+        assert_eq!(
+            direct("https://openrouter.ai/api", "sk-1").identity(),
+            direct("https://openrouter.ai/api", "sk-2").identity()
+        );
     }
 
     #[test]

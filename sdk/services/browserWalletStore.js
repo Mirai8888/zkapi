@@ -477,6 +477,49 @@ export async function readBrowserWalletHoldings() {
     return browserWalletHoldings(await readBrowserWalletSnapshot());
 }
 
+/**
+ * Whether a withdrawal record is a closed escape whose payout the vault only
+ * credited (EscapePayoutDeferred) and that this browser has not seen
+ * delivered. Once its close is final it holds no note, so it does not keep its
+ * deployment in browserWalletHoldings and does not block a deposit elsewhere;
+ * what remains is claimEscapePayout(destination) on its vault.
+ */
+export function isUnclaimedPayoutCredit(record) {
+    return record?.payoutCredited === true && record.payoutClaimed !== true
+        && ['closed_unconfirmed', 'closed'].includes(record.phase);
+}
+
+/** The public identity of an unclaimed payout credit: where it can be claimed. */
+function payoutCreditHolding(record) {
+    return {
+        deploymentId: record.deploymentId || null,
+        recordId: record.recordId,
+        noteId: record.noteId == null ? null : Number(record.noteId),
+        chainId: record.chainId == null ? null : Number(record.chainId),
+        contractAddress: record.contractAddress || null,
+        destination: record.destination || null,
+        creditedAmount: record.creditedAmount ?? null
+    };
+}
+
+/**
+ * The unclaimed escape payout credits of every deployment in one
+ * readBrowserWalletSnapshot(), newest first:
+ * [{ deploymentId, recordId, noteId, chainId, contractAddress, destination,
+ * creditedAmount }]. creditedAmount (vault units) is null when the credit was
+ * read from the vault's balance rather than from the finalization receipt.
+ */
+export function browserWalletPayoutCredits(snapshot) {
+    return (snapshot?.withdrawals || []).filter(isUnclaimedPayoutCredit)
+        .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+        .map(payoutCreditHolding);
+}
+
+/** browserWalletPayoutCredits of the current stored wallet (every deployment). */
+export async function readBrowserWalletPayoutCredits() {
+    return browserWalletPayoutCredits(await readBrowserWalletSnapshot());
+}
+
 export async function readBrowserWallet() {
     const database = await openDatabase();
     const transaction = database.transaction(RUNTIME_STORE, 'readonly');
@@ -529,6 +572,13 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
             ? records.filter(record => record.deploymentId !== deploymentId && isOpenBrowserWithdrawal(record))
                 .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
                 .map(record => ({ deploymentId: record.deploymentId || null, ...withdrawalHolding(record) }))
+            : [],
+        // Unclaimed escape payout credits of other deployments. They hold no
+        // note, but only their own deployment's runtime offers the claim.
+        otherDeploymentCredits: deploymentId
+            ? browserWalletPayoutCredits({
+                withdrawals: records.filter(record => record.deploymentId !== deploymentId)
+            })
             : [],
         requestArchive: requestArchiveRecords(requestArchive, deploymentId)
     };

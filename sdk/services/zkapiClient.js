@@ -1,5 +1,5 @@
 import walletCodec from '../wallet.js';
-import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits } from './zkapiNativeEth.mjs';
+import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros, nativeDepositValue, parseUnits, formatUnits, NATIVE_WEI_PER_UNIT } from './zkapiNativeEth.mjs';
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
 import { contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
@@ -22,18 +22,105 @@ const walletProviders = new WeakMap();
 
 const {
     ABI,
+    ESCAPE_PAYOUT_GAS,
     abiWord,
     addressWord,
     callData,
+    encodeClaimEscapePayout,
     encodeDeposit,
+    encodeEscapePayoutCredits,
     encodeFinalizeEscape,
     encodeWithdrawal,
     escapePeriodBadge,
     escapePeriodLabel,
     escapePeriodPhrase,
+    parseEscapePayoutClaim,
     parseNoteDeposited,
     parseWithdrawalReceipt
 } = walletCodec;
+
+// A hardened vault (vault_revision 2) closes an escape even when its push to
+// the destination fails (the destination rejects ETH or needs more than
+// ESCAPE_PAYOUT_GAS): the balance is then credited to
+// escapePayoutCredits(destination) and reaches it only through
+// claimEscapePayout(destination), which anyone may call.
+const ESCAPE_PAYOUT_CREDITED_MESSAGE = 'The escape closed, but the destination did not accept the payout. The vault holds it for that address until it is claimed; anyone can claim it for that address once it accepts ETH.';
+const ESCAPE_PAYOUT_STILL_REJECTED_MESSAGE = 'The destination still does not accept ETH, so the vault keeps its payout. Try the claim again once the address can receive ETH.';
+// A top-level call pays 21,000 intrinsic gas before its target runs, and the
+// vault's value-bearing push adds the 2,300 call stipend. This budget gives
+// the destination the same execution gas as the vault's push.
+const ESCAPE_DESTINATION_CHECK_GAS = 21_000 + ESCAPE_PAYOUT_GAS + 2_300;
+const ESCAPE_DESTINATION_CREDIT_WARNING = 'This address did not accept a plain ETH transfer within the vault’s 100,000-gas payout limit. An escape to it still closes, but the vault would only hold the payout for this address until someone claims it. An escape destination cannot be changed later, so prefer an ordinary account.';
+const ESCAPE_DESTINATION_LOCK_WARNING = 'This address did not accept a plain ETH transfer. On this vault an escape to it could never be finalized, and an escape destination cannot be changed later. Choose an ordinary account.';
+
+// A failed eth_call whose provider reports an EVM failure (a revert, out of
+// gas or an invalid instruction), as opposed to an RPC, network or account error.
+// Geth words halts ("out of gas", "invalid jump destination"); anvil reports
+// them as "EVM error <HaltReason>" ("EVM error OutOfGas") with code -32603,
+// and uses that prefix only for halts. Account and validation failures
+// ("insufficient funds", "header not found") match neither.
+const EXECUTION_FAILURE = /revert|out\s*of\s*gas|gas required exceeds allowance|invalid\s*(?:fe\s*)?opcode|invalid\s*jump|stack\s*(?:under|over)flow|opcode\s*not\s*found|\bEVM error\b/i;
+
+function executionFailure(error) {
+    const queue = [error];
+    const seen = new Set();
+    while (queue.length) {
+        const value = queue.shift();
+        if (value == null) continue;
+        if (typeof value === 'string') {
+            if (EXECUTION_FAILURE.test(value)) return true;
+            continue;
+        }
+        if (typeof value !== 'object' || seen.has(value)) continue;
+        seen.add(value);
+        if (Number(value.code) === 3) return true;
+        for (const field of ['message', 'shortMessage', 'reason', 'error', 'cause', 'originalError', 'data']) {
+            queue.push(value[field]);
+        }
+    }
+    return false;
+}
+
+// The payout reading of a close that a reorganization removed.
+const REOPENED_PAYOUT_FIELDS = Object.freeze({
+    payoutVerified: false,
+    payoutCredited: false,
+    creditedAmount: null,
+    payoutCreditEvidence: null,
+    payoutClaimed: false,
+    payoutClaimEvidence: null,
+    payoutClaimTransactionHash: null,
+    payoutClaimBlockNumber: null,
+    payoutClaimedAmount: null
+});
+
+function rpcQuantity(value) {
+    return `0x${BigInt(value).toString(16)}`;
+}
+
+// The payout fields of a closed withdrawal record, from this pass's receipt
+// evidence (payoutVerified: a receipt proved the payout; payoutCredit: the
+// vault only credited it) and the record's earlier reading. Receipt and claim
+// evidence is kept: a pass that cannot read the receipt again never undoes a
+// proven payout, and a credited escape payout is never reported as paid
+// (payoutVerified) until a claim for its destination is proven. Only a credit
+// inferred from the vault's balance (evidence 'vault_credit') yields, to this
+// escape's own receipt proving that the push was paid.
+function closedWithdrawalPayout(record, payoutVerified, payoutCredit) {
+    const credited = record.payoutCredited === true;
+    if (!payoutCredit && credited && payoutVerified === true && record.payoutCreditEvidence === 'vault_credit') {
+        return { payoutVerified: true, payoutCredited: false, creditedAmount: null, payoutCreditEvidence: null };
+    }
+    if (!payoutCredit && !credited) return { payoutVerified: payoutVerified === true || record.payoutVerified === true };
+    const receiptCredit = payoutCredit?.evidence === 'receipt' ? payoutCredit : null;
+    return {
+        payoutCredited: true,
+        creditedAmount: receiptCredit ? receiptCredit.amount : (record.creditedAmount ?? null),
+        payoutCreditEvidence: receiptCredit ? 'receipt'
+            : (record.payoutCreditEvidence || payoutCredit?.evidence || 'receipt'),
+        payoutVerified: record.payoutClaimed === true
+    };
+}
 
 function readStoredWithdrawal() {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined') return null;
@@ -114,6 +201,7 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     withdrawal_submission_pending: 'A withdrawal transaction for this balance is still unresolved. Check its status first.',
     unknown_root: 'The vault no longer accepts this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
     invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
+    escape_destination_unpayable: ESCAPE_DESTINATION_LOCK_WARNING,
     vault_paused: 'The vault is paused by its owner. Withdrawals resume when it is unpaused.',
     testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.'
 });
@@ -1155,7 +1243,7 @@ class ZkapiClient extends EventTarget {
     async resumeExternalTransaction({ transaction, hash, context }) {
 
         if (this.depositPromise || this.withdrawPromise || this.finalizePromise
-            || this.backgroundWithdrawalPromises?.size) {
+            || this.payoutClaimPromise || this.backgroundWithdrawalPromises?.size) {
             throw new Error('The original wallet action is still running. Return its transaction ID to that action.');
         }
         const funding = this.config?.funding;
@@ -1164,7 +1252,7 @@ class ZkapiClient extends EventTarget {
             || Number(context.chainId) !== Number(funding?.chain_id)
             || !sameAddress(context.contractAddress, funding?.contract_address)
             || !['deposit', 'withdrawal', 'background-withdrawal',
-                'background-replacement', 'finalization'].includes(context.kind)) {
+                'background-replacement', 'finalization', 'escape-payout-claim'].includes(context.kind)) {
             throw new Error('The saved external transaction belongs to a different payment deployment.');
         }
         await this.assertFundingChain();
@@ -1277,6 +1365,16 @@ class ZkapiClient extends EventTarget {
                     throw new Error('The external transaction no longer matches its saved finalization.');
                 }
                 await browserWalletRuntime.rememberWithdrawalFinalization(record.recordId, hash, reference, metadata);
+            } else if (context.kind === 'escape-payout-claim') {
+                // A claim moves no private state and anyone may send it; keep
+                // its hash so claimEscapePayout can prove the delivery.
+                const record = records.find(entry => entry.recordId === context.recordId);
+                if (!record || record.payoutCredited !== true
+                    || !sameAddress(context.destination, record.destination)
+                    || !sameData(encodeClaimEscapePayout(record.destination))) {
+                    throw new Error('The external transaction no longer matches its saved escape payout claim.');
+                }
+                if (record.payoutClaimed !== true) await this.rememberEscapePayoutClaim(record.recordId, hash);
             } else {
                 throw new Error('The external transaction has an unsupported recovery kind.');
             }
@@ -1968,7 +2066,11 @@ class ZkapiClient extends EventTarget {
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
     }
 
-    async withdraw(mode, onStatus = () => {}, { destination, overrideUnsettledRequest = false } = {}) {
+    async withdraw(mode, onStatus = () => {}, {
+        destination,
+        overrideUnsettledRequest = false,
+        overrideDestinationCheck = false
+    } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
         const expectedNoteId = this.note?.note_id;
@@ -1982,12 +2084,20 @@ class ZkapiClient extends EventTarget {
         // The escape-only override is an explicit, separately keyed action.
         const acknowledgement = escapeOverrideAcknowledgement(mode, overrideUnsettledRequest);
         const override = acknowledgement != null;
-        const operationKey = `${mode}:${requestedDestination || ''}${override ? `:override:${acknowledgement}` : ''}`;
+        // So is an escape to a destination that a vault without payout
+        // credits could never pay.
+        const destinationOverride = mode === 'escape' && overrideDestinationCheck === true;
+        const operationKey = `${mode}:${requestedDestination || ''}${override ? `:override:${acknowledgement}` : ''}`
+            + (destinationOverride ? ':destination-override' : '');
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = { destination, ...(override ? { overrideUnsettledRequest: acknowledgement } : {}) };
+        const options = {
+            destination,
+            ...(override ? { overrideUnsettledRequest: acknowledgement } : {}),
+            ...(destinationOverride ? { overrideDestinationCheck: true } : {})
+        };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -2023,7 +2133,8 @@ class ZkapiClient extends EventTarget {
 
     async performWithdrawal(mode, onStatus = () => {}, {
         destination: requested,
-        overrideUnsettledRequest = false
+        overrideUnsettledRequest = false,
+        overrideDestinationCheck = false
     } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
@@ -2089,6 +2200,34 @@ class ZkapiClient extends EventTarget {
         const withdrawalAttempts = 4;
         let reprove = false;
         let rootRejections = 0;
+        // An escape's destination is fixed once its proof exists. Before
+        // proving, check the vault's payout push to it.
+        let destinationWarning = null;
+        if (mode === 'escape' && !submittedHash) {
+            let destinationCheck = null;
+            try {
+                // A zero balance is never pushed. Otherwise a nominal value
+                // keeps the balance out of this read.
+                destinationCheck = await this.checkEscapeDestination(destination, {
+                    finalBalance: Number(note.current_balance) > 0 ? 1 : 0
+                });
+            } catch (error) {
+                if (error?.code === 'wrong_network') throw error;
+            }
+            destinationWarning = destinationCheck?.warning || null;
+            // A hardened vault credits a payout its destination rejects, and
+            // anyone can claim it later. An older vault cannot finalize such
+            // an escape at all: the note would stay PendingWithdrawal, which
+            // expiry cannot claim either. Refuse unless acknowledged.
+            if (destinationCheck?.accepts === false && overrideDestinationCheck !== true
+                && browserWalletRuntime.vaultCapabilities?.().hardenedVault !== true) {
+                throw Object.assign(new Error(ESCAPE_DESTINATION_LOCK_WARNING), {
+                    code: 'escape_destination_unpayable',
+                    data: { destination, override_option: 'overrideDestinationCheck' }
+                });
+            }
+            if (destinationWarning) onStatus(destinationWarning);
+        }
         try {
             if (submittedHash) {
                 // A broadcast hash owns recovery. Never read a new root or
@@ -2277,13 +2416,16 @@ class ZkapiClient extends EventTarget {
         });
         this.rememberWithdrawal(null);
         await this.refresh();
-        onStatus('Escape started. You can add a new private balance while the safety window runs.');
+        onStatus(destinationWarning
+            ? `Escape started. ${destinationWarning}`
+            : 'Escape started. You can add a new private balance while the safety window runs.');
         return {
             status: 'pending_withdrawal',
             deadline,
             event,
             receipt,
-            recordId: record.recordId
+            recordId: record.recordId,
+            ...(destinationWarning ? { destinationWarning } : {})
         };
         this.rememberWithdrawal({ ...withdrawal, phase: 'pending', challengeDeadline: deadline });
         await this.refresh();
@@ -4007,6 +4149,7 @@ class ZkapiClient extends EventTarget {
         const results = [];
         let changed = false;
         let failures = 0;
+        let creditedPayouts = 0;
         for (const listedRecord of records) {
             // Reconciliation needs the retained prepared plan to decide
             // whether a missing hash can be replaced by that exact proof. The
@@ -4017,6 +4160,9 @@ class ZkapiClient extends EventTarget {
             try {
                 let status = await this.readBrowserWithdrawalStatus(record.noteId);
                 let payoutVerified = false;
+                // A matching finalization receipt that also carries the
+                // vault's EscapePayoutDeferred log: closed, but only credited.
+                let payoutCredit = null;
                 let minimumObservedBlock = Math.max(
                     Number(record.startBlockNumber || 0),
                     Number(record.lastObservedBlock || 0)
@@ -4340,7 +4486,12 @@ class ZkapiClient extends EventTarget {
                         if (Number(status.observed_block || 0) >= receiptBlock
                             && status.status === 'closed') {
                             successfulFinalizeHashes.push(hash);
-                            payoutVerified = true;
+                            if (event.payoutCredited) {
+                                payoutCredit = {
+                                    amount: Number(event.creditedAmount),
+                                    evidence: 'receipt'
+                                };
+                            } else payoutVerified = true;
                         }
                     }
                 }
@@ -4364,7 +4515,37 @@ class ZkapiClient extends EventTarget {
                     ) || record;
                     if (Number(record.revision || 0) !== previousRevision) changed = true;
                 }
-                results.push({ ...status, recordId: record.recordId });
+                if (status.status !== 'closed' && Number(status.observed_block || 0) >= minimumObservedBlock
+                    && (record.payoutVerified === true || record.payoutCredited === true
+                        || record.payoutClaimed === true)) {
+                    // The note reads open again at or after the block where
+                    // it was seen Closed (minimumObservedBlock): that close
+                    // was reorganized away, and its payout reading with it.
+                    await browserWalletRuntime.updateWithdrawal(record.recordId, REOPENED_PAYOUT_FIELDS, {
+                        expectedRevision: record.revision
+                    });
+                    changed = true;
+                    record = await browserWalletRuntime.currentWithdrawal(record.recordId) || record;
+                }
+                if (status.status === 'closed' && record.mode === 'escape'
+                    && !payoutVerified && !payoutCredit && record.payoutCredited !== true
+                    && record.payoutVerified !== true) {
+                    // Another device or a third party may have finalized this
+                    // escape. Without its receipt, a credit the hardened vault
+                    // holds for the destination is the conservative reading.
+                    // (A push an earlier pass proved is not re-read.)
+                    payoutCredit = await this.observedEscapePayoutCredit(record, status);
+                }
+                const payout = closedWithdrawalPayout(record, payoutVerified, payoutCredit);
+                if (payoutCredit && record.payoutCredited !== true) {
+                    creditedPayouts += 1;
+                    onStatus(ESCAPE_PAYOUT_CREDITED_MESSAGE);
+                }
+                results.push({
+                    ...status,
+                    recordId: record.recordId,
+                    ...(status.status === 'closed' && payout.payoutCredited ? { payout_credited: true } : {})
+                });
                 if (status.status === 'closed') {
                     try {
                         const finalizeReceiptBlocks = [];
@@ -4393,7 +4574,7 @@ class ZkapiClient extends EventTarget {
                             const patch = {
                                 phase: 'closed_unconfirmed',
                                 chainStatus: 'closed',
-                                payoutVerified,
+                                ...payout,
                                 closedAt: Number(record.closedAt || Date.now()),
                                 closeBlockNumber,
                                 lastObservedBlock: Math.max(
@@ -4420,7 +4601,7 @@ class ZkapiClient extends EventTarget {
                         await browserWalletRuntime.updateWithdrawal(record.recordId, {
                             phase: 'closed',
                             chainStatus: 'closed',
-                            payoutVerified,
+                            ...payout,
                             closedAt: Date.now(),
                             closeBlockNumber,
                             finalizedBlockNumber: Number(finality.checkedBlock),
@@ -4639,6 +4820,8 @@ class ZkapiClient extends EventTarget {
                 : `Checked ${records.length} withdrawals; ${failures} need attention.`;
             onStatus(message);
             if (recordId) throw new Error(results.find(entry => entry.status === 'error')?.error || message);
+        } else if (creditedPayouts) {
+            onStatus(ESCAPE_PAYOUT_CREDITED_MESSAGE);
         } else if (records.length) {
             onStatus('Withdrawal status is up to date.');
         }
@@ -4999,18 +5182,353 @@ class ZkapiClient extends EventTarget {
         if (confirmed.status !== 'closed') {
             throw new Error(`The vault reports ${confirmed.status} after finalization.`);
         }
+        // EscapeWithdrawalFinalized alone does not prove the payout arrived:
+        // with an EscapePayoutDeferred log the vault only credited it.
+        const credited = event.payoutCredited === true;
+        // A background pass may have read this close first, without the receipt.
+        const current = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal;
         await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
             phase: 'closed_unconfirmed',
             chainStatus: 'closed',
-            payoutVerified: true,
+            ...closedWithdrawalPayout(current, !credited, credited ? {
+                amount: Number(event.creditedAmount),
+                evidence: 'receipt'
+            } : null),
             closedAt: Date.now(),
             closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
             lastObservedBlock: Number(confirmed.observed_block || 0),
             error: null
         });
         await this.refresh();
-        onStatus('Escape withdrawal returned. Finality is being checked safely in the background.');
-        return { status: 'closed', event, receipt };
+        onStatus(credited
+            ? `${ESCAPE_PAYOUT_CREDITED_MESSAGE} Finality is being checked safely in the background.`
+            : 'Escape withdrawal returned. Finality is being checked safely in the background.');
+        return { status: 'closed', event, receipt, ...(credited ? { payoutCredited: true } : {}) };
+    }
+
+    /** Credited escape payouts this browser has not yet seen delivered. */
+    get creditedEscapePayouts() {
+        return this.withdrawals.filter(record => record.payoutCredited === true
+            && record.payoutClaimed !== true
+            && ['closed_unconfirmed', 'closed'].includes(record.phase));
+    }
+
+    /**
+     * escapePayoutCredits(destination) on the hardened vault: the escape
+     * payouts (in vault units) that it holds for `destination`.
+     */
+    async readEscapePayoutCredit(destination, blockTag = 'latest') {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before reading escape payouts.');
+        await this.assertFundingChain();
+        const word = await this.ethereum.request({
+            method: 'eth_call',
+            params: [{
+                to: vault,
+                data: encodeEscapePayoutCredits(destination)
+            }, blockTag]
+        });
+        if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) {
+            throw Object.assign(new Error('The vault did not return an escape payout credit. Only a vault_revision 2 vault holds escape payouts.'), {
+                code: 'vault_value_invalid'
+            });
+        }
+        return BigInt(word);
+    }
+
+    // A closed escape without its own finalization receipt: a nonzero credit
+    // for the destination on a hardened vault is reported as credited (the
+    // claim delivers it either way). Read failures leave the record unchanged.
+    async observedEscapePayoutCredit(record, status) {
+        if (Number(record.finalBalance || 0) <= 0
+            || !browserWalletRuntime.vaultCapabilities?.().hardenedVault
+            || !/^0x[0-9a-fA-F]{40}$/.test(record.destination || '')) return null;
+        const observedBlock = Number(status.observed_block || 0);
+        try {
+            const credit = await this.readEscapePayoutCredit(record.destination,
+                observedBlock > 0 ? rpcQuantity(observedBlock) : 'latest');
+            return credit > 0n ? { amount: null, evidence: 'vault_credit' } : null;
+        } catch (error) {
+            if (error?.code === 'wrong_network') throw error;
+            return null;
+        }
+    }
+
+    /**
+     * Delivers the escape payout a hardened vault holds for a credited
+     * withdrawal record's destination: reads escapePayoutCredits(destination)
+     * and sends claimEscapePayout(destination), which pays that address all
+     * its credits. Only an EscapePayoutClaimed log for the destination (or a
+     * zero credit once the note is closed) marks the payout delivered. The
+     * connected account only pays gas; it receives nothing.
+     */
+    async claimEscapePayout(recordId, onStatus = () => {}) {
+        if (this.payoutClaimPromise) {
+            if (this.payoutClaimPromiseKey === recordId) return this.payoutClaimPromise;
+            throw new Error('A different escape payout claim is already running.');
+        }
+        const operation = this.performClaimEscapePayout(recordId, onStatus);
+        this.payoutClaimPromise = operation;
+        this.payoutClaimPromiseKey = recordId;
+        try {
+            return await operation;
+        } finally {
+            if (this.payoutClaimPromise === operation) {
+                this.payoutClaimPromise = null;
+                this.payoutClaimPromiseKey = null;
+            }
+        }
+    }
+
+    async creditedEscapePayoutRecord(recordId) {
+        const record = await browserWalletRuntime.currentWithdrawal(recordId);
+        if (!record || record.payoutCredited !== true
+            || !['closed_unconfirmed', 'closed'].includes(record.phase)
+            || !/^0x[0-9a-fA-F]{40}$/.test(record.destination || '')) {
+            throw new Error('The vault holds no escape payout for this withdrawal.');
+        }
+        return record;
+    }
+
+    async performClaimEscapePayout(recordId, onStatus = () => {}) {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before claiming an escape payout.');
+        const record = await this.creditedEscapePayoutRecord(recordId);
+        const destination = record.destination.toLowerCase();
+        const delivered = () => ({ status: 'claimed', recordId, destination,
+            transactionHash: record.payoutClaimTransactionHash || null });
+        if (record.payoutClaimed === true) {
+            onStatus('This escape payout was already delivered to its destination.');
+            return delivered();
+        }
+
+        // Claims sent earlier for this destination: before a reload, by a
+        // manual signer, or from another credited record of the same address
+        // (one claim pays all of the destination's credits).
+        const sentHashes = [...new Set((await this.unclaimedEscapeCredits(destination))
+            .flatMap(entry => entry.payoutClaimTransactionHashes || [])
+            .map(hash => String(hash).toLowerCase()))];
+        for (const hash of sentHashes) {
+            let receipt = null;
+            try {
+                receipt = await this.ethereum.request({ method: 'eth_getTransactionReceipt', params: [hash] });
+            } catch {
+                // An unreadable receipt proves nothing; the vault is read below.
+            }
+            const claim = receipt && BigInt(receipt.status || '0x0') === 1n
+                ? parseEscapePayoutClaim(receipt, vault, destination) : null;
+            if (claim) {
+                const settled = await this.recordEscapePayoutClaim(destination, receipt, claim);
+                if (settled.includes(recordId)) {
+                    return this.escapePayoutClaimed(recordId, destination, receipt, claim, onStatus);
+                }
+                // That claim was mined before this record's credit existed.
+                continue;
+            }
+            if (!receipt) {
+                // Still in the mempool: it pays this credit too once mined,
+                // and a second claim would only revert. A transaction the
+                // node no longer knows was dropped.
+                const transaction = await this.ethereum.request({
+                    method: 'eth_getTransactionByHash',
+                    params: [hash]
+                }).catch(() => null);
+                if (transaction) {
+                    onStatus(`The payout claim ${this.compact(hash)} is still pending. Check again after it confirms.`);
+                    return { status: 'pending', recordId, destination, transactionHash: hash };
+                }
+            }
+        }
+
+        onStatus('Checking the payout the vault holds for this address…');
+        await this.assertFundingChain();
+        const blockTag = await this.ethereum.request({ method: 'eth_blockNumber' });
+        if (!/^0x[0-9a-fA-F]+$/.test(String(blockTag || ''))) {
+            throw new Error('The wallet provider returned an invalid block number.');
+        }
+        if (await this.readEscapePayoutCredit(destination, blockTag) === 0n) {
+            return this.recordClearedEscapePayout(recordId, destination, blockTag, onStatus);
+        }
+
+        onStatus('Connecting to MetaMask to deliver the payout…');
+        const from = await this.connectWallet();
+        let receipt;
+        try {
+            onStatus('Confirm the payout claim in MetaMask. Your account pays only gas; the vault pays the destination.');
+            receipt = await this.sendContractTransaction(
+                from,
+                vault,
+                encodeClaimEscapePayout(destination),
+                async hash => {
+                    await this.rememberEscapePayoutClaim(recordId, hash);
+                    onStatus(`Payout claim submitted ${this.compact(hash)} · waiting for confirmation…`);
+                },
+                null,
+                null,
+                {
+                    kind: 'escape-payout-claim',
+                    submission: { recordId, noteId: Number(record.noteId), destination }
+                }
+            );
+        } catch (error) {
+            // Someone else delivered the credit first: the vault holds nothing
+            // more for this destination (ZeroAmount, or a reverted claim).
+            if (['zero_amount'].includes(error?.code) || error?.transactionReceipt) {
+                const latest = await this.ethereum.request({ method: 'eth_blockNumber' }).catch(() => null);
+                const remaining = /^0x[0-9a-fA-F]+$/.test(String(latest || ''))
+                    ? await this.readEscapePayoutCredit(destination, latest).catch(() => null) : null;
+                if (remaining === 0n) {
+                    return this.recordClearedEscapePayout(recordId, destination, latest, onStatus);
+                }
+            }
+            if (error?.code === 'native_transfer_failed') {
+                error.shortMessage = ESCAPE_PAYOUT_STILL_REJECTED_MESSAGE;
+            } else if (error?.transactionReceipt) {
+                error.shortMessage = 'The payout claim reverted, so the vault keeps the payout for its destination. If it reverts again, the address still does not accept ETH.';
+            } else if (isWalletRejection(error)) {
+                error.shortMessage = 'MetaMask canceled the payout claim. The vault still holds the payout for its destination.';
+            }
+            throw error;
+        }
+        const claim = parseEscapePayoutClaim(receipt, vault, destination);
+        if (!claim) {
+            throw new Error('The claim transaction succeeded, but it did not pay this destination.');
+        }
+        const settled = await this.recordEscapePayoutClaim(destination, receipt, claim);
+        if (!settled.includes(recordId)) {
+            // Only a record without a usable close block gets here. A zero
+            // credit at the claim's block settles it instead.
+            const claimBlock = /^0x[0-9a-fA-F]+$/.test(String(receipt.blockNumber || ''))
+                ? receipt.blockNumber : await this.ethereum.request({ method: 'eth_blockNumber' });
+            if (await this.readEscapePayoutCredit(destination, claimBlock) === 0n) {
+                return this.recordClearedEscapePayout(recordId, destination, claimBlock, onStatus);
+            }
+            throw new Error('The claim was mined, but the vault still holds a payout for this address. Claim again.');
+        }
+        return this.escapePayoutClaimed(recordId, destination, receipt, claim, onStatus);
+    }
+
+    // The credited records of `destination` whose payout this browser has not
+    // seen delivered, re-read from storage.
+    async unclaimedEscapeCredits(destination) {
+        return (await browserWalletRuntime.currentWithdrawals()).filter(entry => entry.payoutCredited === true
+            && entry.payoutClaimed !== true
+            && ['closed_unconfirmed', 'closed'].includes(entry.phase)
+            && sameAddress(entry.destination, destination));
+    }
+
+    async rememberEscapePayoutClaim(recordId, hash) {
+        if (!/^0x[0-9a-fA-F]{64}$/.test(hash || '')) {
+            throw new Error('MetaMask returned an invalid payout claim transaction hash.');
+        }
+        const current = await this.creditedEscapePayoutRecord(recordId);
+        const hashes = [...new Set([...(current.payoutClaimTransactionHashes || []), hash.toLowerCase()])];
+        await browserWalletRuntime.updateWithdrawal(recordId, { payoutClaimTransactionHashes: hashes });
+    }
+
+    // A mined claim pays the destination every credit the vault holds when it
+    // executes. It therefore delivered each credited record of the destination
+    // whose close, and so its credit, is in an earlier block. closeBlockNumber
+    // is never earlier than the close (a receipt's block, or the block where
+    // the note was first seen Closed). A record credited in the claim's block
+    // or later keeps its credit for a later claim. Returns the settled ids.
+    async recordEscapePayoutClaim(destination, receipt, claim) {
+        const claimBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+        const settled = (await this.unclaimedEscapeCredits(destination))
+            .filter(entry => Number(entry.closeBlockNumber) > 0 && Number(entry.closeBlockNumber) < claimBlock)
+            .map(entry => entry.recordId);
+        await this.markEscapePayoutsClaimed(settled, {
+            payoutClaimed: true,
+            payoutVerified: true,
+            payoutClaimEvidence: 'claim_receipt',
+            payoutClaimTransactionHash: String(receipt.transactionHash || '').toLowerCase() || null,
+            payoutClaimBlockNumber: claimBlock,
+            payoutClaimedAmount: Number(claim.amount)
+        });
+        return settled;
+    }
+
+    escapePayoutClaimed(recordId, destination, receipt, claim, onStatus) {
+        onStatus(`Escape payout delivered to ${this.compact(destination)}.`);
+        return { status: 'claimed', recordId, destination,
+            transactionHash: String(receipt.transactionHash || '').toLowerCase() || null,
+            amount: claim.amount, receipt };
+    }
+
+    // The vault holds nothing for the destination at blockTag. Credits only
+    // leave the vault through a claim that pays the destination, so each
+    // credited record whose note reads Closed at that block was delivered.
+    async recordClearedEscapePayout(recordId, destination, blockTag, onStatus) {
+        const observedBlock = Number(BigInt(blockTag));
+        const settled = [];
+        for (const entry of await this.unclaimedEscapeCredits(destination)) {
+            const status = await this.readBrowserWithdrawalStatus(entry.noteId, blockTag);
+            if (status.status === 'closed') settled.push(entry.recordId);
+        }
+        if (!settled.includes(recordId)) {
+            throw new Error('The vault does not show this escape as closed at the latest block yet. Check again shortly.');
+        }
+        await this.markEscapePayoutsClaimed(settled, {
+            payoutClaimed: true,
+            payoutVerified: true,
+            payoutClaimEvidence: 'credit_cleared',
+            payoutClaimBlockNumber: observedBlock
+        });
+        onStatus('The vault no longer holds this payout: it was already delivered to its destination.');
+        return { status: 'claimed', recordId, transactionHash: null, observedBlock };
+    }
+
+    async markEscapePayoutsClaimed(recordIds, evidence) {
+        for (const id of recordIds) {
+            try {
+                await browserWalletRuntime.updateWithdrawal(id, { ...evidence, payoutClaimTransactionHashes: [] }, {
+                    expectedPhase: ['closed_unconfirmed', 'closed']
+                });
+            } catch (error) {
+                if (!/not found|different phase/i.test(error?.message || '')) throw error;
+            }
+        }
+        await this.refresh({ quiet: true });
+    }
+
+    /**
+     * Simulates the vault's escape payout push to `destination`: a plain ETH
+     * transfer from the vault, limited to the payout gas on a hardened vault.
+     * `accepts` is false when the destination would not be paid at
+     * finalization (a hardened vault then only credits it; an older vault
+     * cannot finalize the escape) and null when the RPC cannot tell. The
+     * simulated value is `finalBalance` vault units, 1 by default, so the
+     * check does not disclose the balance to the RPC.
+     */
+    async checkEscapeDestination(destination, { finalBalance = 1 } = {}) {
+        const vault = this.config?.funding?.contract_address;
+        if (!vault) throw new Error('Initialize the wallet before checking an escape destination.');
+        const normalized = normalizeWithdrawalDestination(destination, this.config.funding);
+        if (!normalized) throw new TypeError('Choose a valid nonzero Ethereum withdrawal address.');
+        const units = BigInt(finalBalance);
+        if (units <= 0n) return { destination: normalized, accepts: true, warning: null };
+        const hardened = browserWalletRuntime.vaultCapabilities?.().hardenedVault === true;
+        await this.assertFundingChain();
+        try {
+            await this.ethereum.request({
+                method: 'eth_call',
+                params: [{
+                    from: vault,
+                    to: normalized,
+                    value: rpcQuantity(units * NATIVE_WEI_PER_UNIT),
+                    ...(hardened ? { gas: rpcQuantity(ESCAPE_DESTINATION_CHECK_GAS) } : {})
+                }, 'latest']
+            });
+            return { destination: normalized, accepts: true, warning: null };
+        } catch (error) {
+            if (error?.code === 'wrong_network') throw error;
+            if (!executionFailure(error)) return { destination: normalized, accepts: null, warning: null };
+            return {
+                destination: normalized,
+                accepts: false,
+                warning: hardened ? ESCAPE_DESTINATION_CREDIT_WARNING : ESCAPE_DESTINATION_LOCK_WARNING
+            };
+        }
     }
 
     async confirmMinedWithdrawalStatus(noteId, receipt) {

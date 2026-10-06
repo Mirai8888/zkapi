@@ -14,7 +14,20 @@ const ABI = Object.freeze({
   escapeFinalizedEvent: "0x163f2e46c4004f0ed9682e2db8c84efac31310720266b17ea9904ba348c26504",
   // EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 restoredRoot)
   escapeChallengedEvent: "0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581",
+  // Hardened vault (vault_revision 2) only. A finalized escape whose push to
+  // the destination failed credits it instead:
+  // EscapePayoutDeferred(uint32 indexed noteId, address indexed destination, uint128 amount)
+  // precedes EscapeWithdrawalFinalized in the same receipt.
+  escapePayoutDeferredEvent: "0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942",
+  // EscapePayoutClaimed(address indexed destination, uint128 amount)
+  escapePayoutClaimedEvent: "0x6bf75371d42e9753c0913bf8fcecb651e8db173d99d7da0e4d836e91512bbe27",
+  claimEscapePayout: "88c10aee",
+  escapePayoutCredits: "91f6e93a",
 });
+
+// Execution gas the hardened vault forwards when it pushes an escape payout
+// (ESCAPE_PAYOUT_GAS()). A destination that needs more is only credited.
+const ESCAPE_PAYOUT_GAS = 100_000;
 
 function abiWord(value) {
   const hex = typeof value === "string" ? value.replace(/^0x/, "") : BigInt(value).toString(16);
@@ -29,6 +42,13 @@ function addressWord(address) {
     throw new Error("MetaMask returned an invalid account address.");
   }
   return abiWord(address);
+}
+
+function destinationWord(destination) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(destination || "")) {
+    throw new Error("The escape payout destination is not a valid address.");
+  }
+  return abiWord(destination);
 }
 
 function callData(selector, words) {
@@ -170,6 +190,74 @@ function encodeFinalizeEscape(noteId) {
   return callData(ABI.finalizeEscapeWithdrawal, [abiWord(noteId)]);
 }
 
+function encodeClaimEscapePayout(destination) {
+  return callData(ABI.claimEscapePayout, [destinationWord(destination)]);
+}
+
+function encodeEscapePayoutCredits(destination) {
+  return callData(ABI.escapePayoutCredits, [destinationWord(destination)]);
+}
+
+function vaultLog(log, vaultAddress) {
+  return log?.removed !== true
+    && String(log?.address || "").toLowerCase() === String(vaultAddress || "").toLowerCase();
+}
+
+// The low 20 bytes of an indexed address topic.
+function topicAddress(topic) {
+  const hex = String(topic || "").replace(/^0x/, "");
+  return /^[0-9a-fA-F]{40,64}$/.test(hex) ? `0x${hex.slice(-40)}`.toLowerCase() : null;
+}
+
+function firstWord(data) {
+  const hex = String(data || "").replace(/^0x/, "");
+  return /^[0-9a-fA-F]{64}/.test(hex) ? BigInt(`0x${hex.slice(0, 64)}`) : null;
+}
+
+/**
+ * The EscapePayoutDeferred log of a finalization receipt: the vault closed
+ * the escape but could not push its balance to the destination, so it
+ * credited escapePayoutCredits(destination) instead. Matching is deliberately
+ * lenient (any non-removed vault log with this topic, note and destination),
+ * so a doubtful receipt is reported as credited, never as paid.
+ */
+function escapePayoutDeferred(receipt, vaultAddress, noteId, destination) {
+  for (const log of receipt?.logs || []) {
+    const topics = log?.topics;
+    if (!vaultLog(log, vaultAddress) || !Array.isArray(topics) || topics.length !== 3
+        || String(topics[0]).toLowerCase() !== ABI.escapePayoutDeferredEvent) continue;
+    let loggedNoteId;
+    try {
+      loggedNoteId = BigInt(topics[1]);
+    } catch (_) {
+      continue;
+    }
+    if (loggedNoteId !== BigInt(noteId)
+        || topicAddress(topics[2]) !== String(destination || "").toLowerCase()) continue;
+    return { amount: firstWord(log.data) };
+  }
+  return null;
+}
+
+/**
+ * The EscapePayoutClaimed log that proves claimEscapePayout paid `destination`.
+ * Matching is strict: the indexed word must be exactly that address.
+ */
+function parseEscapePayoutClaim(receipt, vaultAddress, destination) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(destination || "")) return null;
+  for (const log of receipt?.logs || []) {
+    const topics = log?.topics;
+    if (!vaultLog(log, vaultAddress) || !Array.isArray(topics) || topics.length !== 2
+        || String(topics[0]).toLowerCase() !== ABI.escapePayoutClaimedEvent
+        || !/^0x[0-9a-fA-F]{64}$/.test(topics[1] || "")
+        || BigInt(topics[1]) !== BigInt(destination)) continue;
+    const amount = firstWord(log.data);
+    if (amount == null || amount === 0n) continue;
+    return { destination: destination.toLowerCase(), amount };
+  }
+  return null;
+}
+
 function parseWithdrawalReceipt(receipt, vaultAddress, mode) {
   const expectedTopic = mode === "mutual" ? ABI.mutualCloseEvent
     : mode === "escape" ? ABI.escapeInitiatedEvent
@@ -188,6 +276,13 @@ function parseWithdrawalReceipt(receipt, vaultAddress, mode) {
     };
     if (mode === "escape") {
       result.challengeDeadline = BigInt(`0x${data.slice(192, 256)}`);
+    }
+    if (mode === "finalize") {
+      // EscapeWithdrawalFinalized alone does not prove the destination was
+      // paid: on a hardened vault a failed push is credited instead.
+      const credit = escapePayoutDeferred(receipt, vaultAddress, result.noteId, result.destination);
+      result.payoutCredited = Boolean(credit);
+      if (credit) result.creditedAmount = credit.amount ?? result.finalBalance;
     }
     return result;
   }
@@ -214,18 +309,22 @@ function parseNoteDeposited(receipt, vaultAddress) {
 
 const walletCodec = Object.freeze({
   ABI,
+  ESCAPE_PAYOUT_GAS,
   abiWord,
   addressWord,
   callData,
+  encodeClaimEscapePayout,
   encodeDeposit,
+  encodeEscapePayoutCredits,
   encodeFinalizeEscape,
   encodeWithdrawal,
   escapePeriodBadge,
   escapePeriodLabel,
   escapePeriodPhrase,
+  parseEscapePayoutClaim,
   parseNoteDeposited,
   parseWithdrawalReceipt,
 });
 
 export default walletCodec;
-export { ABI, abiWord, addressWord, callData, encodeDeposit, encodeFinalizeEscape, encodeWithdrawal, escapePeriodBadge, escapePeriodLabel, escapePeriodPhrase, parseNoteDeposited, parseWithdrawalReceipt };
+export { ABI, ESCAPE_PAYOUT_GAS, abiWord, addressWord, callData, encodeClaimEscapePayout, encodeDeposit, encodeEscapePayoutCredits, encodeFinalizeEscape, encodeWithdrawal, escapePeriodBadge, escapePeriodLabel, escapePeriodPhrase, parseEscapePayoutClaim, parseNoteDeposited, parseWithdrawalReceipt };

@@ -120,3 +120,47 @@ test('the runtime-state rule is the one the deployment guard applies', async () 
         else await other.reload();
     }
 });
+
+test('an unclaimed escape payout credit is reported without keeping its deployment listed', async () => {
+    indexedDB.clear();
+    const recordId = `${LEGACY}:11155111:${VAULT}:7`;
+    const credited = { recordId, deploymentId: LEGACY, chainId: 11155111, contractAddress: VAULT, mode: 'escape',
+        phase: 'closed', chainStatus: 'closed', noteId: 7, destination: DESTINATION, finalBalance: 5_000_000,
+        payoutCredited: true, payoutVerified: false, creditedAmount: 5_000_000, payoutCreditEvidence: 'receipt',
+        closeBlockNumber: 100 };
+    await store.putBrowserWithdrawal(credited);
+    const credit = { deploymentId: LEGACY, recordId, noteId: 7, chainId: 11155111, contractAddress: VAULT,
+        destination: DESTINATION, creditedAmount: 5_000_000 };
+    assert.deepEqual(await store.readBrowserWalletHoldings(), [], 'a final credited escape holds no note');
+    assert.deepEqual(await store.readBrowserWalletPayoutCredits(), [credit]);
+    assert.deepEqual(store.browserWalletPayoutCredits(await store.readBrowserWalletSnapshot()), [credit]);
+
+    // A runtime pinned to the newer deployment reports it, and deposits stay open there.
+    const runtime = hardenedRuntime();
+    await runtime.reload();
+    const { config } = runtime.snapshot();
+    assert.deepEqual(config.other_deployment_withdrawals, []);
+    assert.deepEqual(config.other_deployment_credits, [{
+        deployment_id: LEGACY, record_id: recordId, note_id: 7, chain_id: 11155111, contract_address: VAULT,
+        destination: DESTINATION, credited_amount: 5_000_000
+    }]);
+    // Its own deployment lists it with its withdrawals, not as another's.
+    const legacy = createHarness(BrowserWalletRuntime);
+    await legacy.runtime.reload();
+    assert.deepEqual(legacy.runtime.snapshot().config.other_deployment_credits, []);
+    assert.equal(legacy.runtime.snapshot().withdrawals[0].payoutCredited, true);
+
+    // A delivered, verified or never-credited close is not a credit.
+    for (const changes of [{ payoutClaimed: true, payoutVerified: true }, { payoutCredited: false },
+        { payoutCredited: undefined, payoutVerified: true }]) {
+        await store.putBrowserWithdrawal({ ...credited, ...changes });
+        assert.deepEqual(await store.readBrowserWalletPayoutCredits(), [], JSON.stringify(changes));
+        await runtime.reload();
+        assert.deepEqual(runtime.snapshot().config.other_deployment_credits, [], JSON.stringify(changes));
+    }
+    // A close still awaiting finality is both an open record and a credit.
+    await store.putBrowserWithdrawal({ ...credited, phase: 'closed_unconfirmed' });
+    assert.equal((await store.readBrowserWalletHoldings())[0].withdrawals[0].phase, 'closed_unconfirmed');
+    assert.equal((await store.readBrowserWalletPayoutCredits()).length, 1);
+    assert.equal(store.isUnclaimedPayoutCredit({ ...credited, phase: 'pending' }), false);
+});

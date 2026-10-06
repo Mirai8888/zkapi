@@ -102,7 +102,18 @@ withdrawal gas. By default it is also the destination of a newly prepared
 withdrawal. To choose an independent payout address, call
 `client.withdraw(mode, onStatus, { destination })`, where `mode` is `mutual` or
 `escape`. The destination must be a nonzero Ethereum address, distinct from the
-configured vault. The host must confirm the intended address
+configured vault. An escape's destination cannot change after initiation. On a
+vault with `vault_revision` 2, finalization pushes the payout with at most
+100,000 gas; a destination that rejects it or needs more gas is only credited
+in the vault (`escapePayoutCredits`, `EscapePayoutDeferred`) until someone calls
+`claimEscapePayout(destination)`. The SDK then reports that escape as credited,
+not returned, and offers the claim (see
+[Credited escape payouts](#credited-escape-payouts)). On an older vault an
+escape to a destination that rejects ETH cannot finalize, so the SDK refuses
+to start one unless the caller overrides that check. Steer users to a
+destination that accepts a plain ETH transfer within 100,000 gas, such as an
+ordinary account; `client.checkEscapeDestination(destination)` simulates the
+vault's push to it. The host must confirm the intended address
 and network with the user. The SDK binds it into the durable proof; an explicit
 different destination on a later call is rejected. Omitting the option when
 resuming always retains the saved destination, even if the gas-paying account
@@ -410,6 +421,92 @@ its legacy clearance on; ownership is then verified outside the protocol. On a
 revision-2 vault this also works after a challenged escape, because a
 challenge does not burn the nullifier.
 
+## Credited escape payouts
+
+On a `vault_revision` 2 vault, `finalizeEscapeWithdrawal` closes the note and
+pays the treasury even when its push to the destination fails. The balance is
+then added to `escapePayoutCredits(destination)`, and the receipt carries
+`EscapePayoutDeferred(noteId, destination, amount)` before
+`EscapeWithdrawalFinalized`. `EscapeWithdrawalFinalized` alone therefore does
+not prove that the destination was paid.
+
+The SDK reads that receipt wherever it finalizes an escape (`finalizeEscape`,
+and the background check of a submitted finalization). When it carries the
+vault's credit log for the note and destination, the withdrawal record gets
+`payoutCredited: true`, `payoutVerified: false`, `creditedAmount` (vault units)
+and `payoutCreditEvidence: "receipt"`. The status message says that the escape
+closed but the destination did not accept the payout, which the vault holds for
+it, and `finalizeEscape` also returns `payoutCredited: true`. Show such a
+withdrawal as credited, never as returned. The fields survive finality, when
+the record's recovery material is removed. An escape that another device or a
+third party finalized has no receipt in this browser, and a receipt can also be
+unreadable for a while. On a `vault_revision` 2 vault the SDK then reads
+`escapePayoutCredits(destination)` at the block where the note reads Closed. A
+nonzero credit marks the record credited, with
+`payoutCreditEvidence: "vault_credit"` and `creditedAmount: null`, because that
+credit can also hold other escapes' payouts to the same address. This is the
+only reading that later evidence replaces: when this browser's own
+finalization receipt is read and shows the push was paid, the record becomes
+`payoutCredited: false`, `payoutVerified: true`. Receipt and claim evidence is
+kept: a pass that cannot read the receipt again does not undo a proven push or
+credit. If the note reads open again at or after the block where it was seen
+Closed, a reorganization removed that close, and the SDK resets the record's
+payout, credit and claim fields. `payoutVerified: true` means that a receipt
+proved the push or, together with `payoutClaimed: true`, that the credit was
+delivered (below). `client.creditedEscapePayouts` lists the credited records
+not yet seen delivered.
+
+Anyone can deliver a credit, also while the vault is paused.
+`await client.claimEscapePayout(recordId, onStatus)` reads
+`escapePayoutCredits(destination)` and sends `claimEscapePayout(destination)`
+from the connected account. That account pays only gas; the vault pays the
+destination all of its credits. Only an `EscapePayoutClaimed` log for that
+destination proves the delivery. A claim pays the credits the vault holds when
+it executes, so the SDK marks a credited record of that destination delivered
+only when the record's `closeBlockNumber` (its finalization block, or a later
+block where the note was first seen Closed) is lower than the claim's block. It
+sets `payoutClaimed: true`, `payoutVerified: true`,
+`payoutClaimEvidence: "claim_receipt"`, `payoutClaimTransactionHash`,
+`payoutClaimBlockNumber` and `payoutClaimedAmount` on those records, and
+returns `{ status: "claimed" }`. A record credited in the claim's block or later
+keeps its credit, and a later claim delivers it. Credits leave the vault only
+through such a claim. So a zero credit, read at a block where the note reads
+Closed, means someone else already delivered it; the records whose note reads
+Closed there are then marked the same way with
+`payoutClaimEvidence: "credit_cleared"` and no transaction. While the
+destination still rejects ETH, the claim fails its gas estimate with
+`native_transfer_failed` before the wallet is asked to sign, and the credit
+stays. Claims already sent from any credited record of that destination are
+checked first. While one is still pending, the call returns
+`{ status: "pending" }` instead of sending another, because the pending claim
+also pays this record's credit. A manual signer's claim carries
+`zkapiRecovery.kind: "escape-payout-claim"`; `resumeExternalTransaction`
+accepts it, and the next `claimEscapePayout` checks it.
+`client.readEscapePayoutCredit(destination)` reads the credit directly.
+
+Before proving a new escape, the SDK simulates the vault's push: a plain
+transfer of one vault unit from the vault to the destination. On a
+`vault_revision` 2 vault the call gets the payout gas (21,000 intrinsic gas,
+100,000, and the 2,300 call stipend); on older vaults it gets all gas. A
+revert or another EVM halt (for example geth's `out of gas` or anvil's
+`EVM error OutOfGas`) counts as a failed transfer. On a `vault_revision` 2
+vault the escape then still proceeds, because the payout is credited, but
+`onStatus` shows a warning first and the result carries `destinationWarning`.
+On an older vault such an escape could never be finalized: the note would
+stay pending, and expiry cannot claim it either. `withdraw("escape")` therefore
+refuses before proving, with error code `escape_destination_unpayable` and
+`error.data.override_option: "overrideDestinationCheck"`. Only after the user
+has confirmed that address anyway, call `client.withdraw("escape", onStatus,
+{ destination, overrideDestinationCheck: true })`; the warning is still shown.
+A host can run the same check before the user confirms the address:
+`client.checkEscapeDestination(destination, { finalBalance })` returns
+`{ destination, accepts, warning }`, where `accepts` is `null` when the RPC
+cannot tell. Such an unknown result never refuses an escape.
+
+Withdrawal records written by earlier builds have no `payoutCredited` field and
+keep their meaning. SDK builds before this one report a credited escape as
+returned and offer no claim.
+
 ## Moving to a newly pinned deployment
 
 The runtime holds one selected note per origin, and it lists and acts only on
@@ -444,6 +541,23 @@ loaded runtime also reports what it cannot reach:
 records of other deployments (`deployment_id`, `record_id`, `note_id`, `mode`,
 `phase`; no note state). A host should not offer a deposit while it is
 non-empty. Never clear site data to get past these checks.
+
+A finalized escape whose payout the vault only credited
+([Credited escape payouts](#credited-escape-payouts)) holds no note. It does
+not keep its deployment listed and does not block a deposit elsewhere, but the
+user still has a payout to claim there. `readBrowserWalletPayoutCredits()`
+lists the unclaimed credits of every deployment as
+`[{ deploymentId, recordId, noteId, chainId, contractAddress, destination,
+creditedAmount }]`. `browserWalletPayoutCredits(snapshot)` and
+`isUnclaimedPayoutCredit(record)` apply the same rule to a snapshot the host
+already read. A loaded runtime reports other deployments' credits in
+`snapshot().config.other_deployment_credits` (`deployment_id`, `record_id`,
+`note_id`, `chain_id`, `contract_address`, `destination`, `credited_amount`).
+This SDK's claim action needs that deployment's profile, which loads while
+the runtime slot holds no other deployment's state. Anyone can also call
+`claimEscapePayout(destination)` on that vault directly; the SDK recognises
+that delivery from the zero credit the next time that profile's claim action
+runs.
 
 ## Native ETH deployments
 

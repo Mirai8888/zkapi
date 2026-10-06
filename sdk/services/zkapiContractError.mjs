@@ -64,6 +64,11 @@ const CONTRACT_ERRORS = Object.freeze({
     '0x151f07fe': {
         code: 'challenge_not_expired',
         message: 'The escape safety window has not finished yet.'
+    },
+    // ZeroAmount(): for claimEscapePayout, the vault holds nothing for that address.
+    '0x1f2a2005': {
+        code: 'zero_amount',
+        message: 'The vault has nothing to pay for this request.'
     }
 });
 

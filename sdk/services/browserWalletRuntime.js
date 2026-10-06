@@ -461,6 +461,7 @@ class BrowserWalletRuntime extends EventTarget {
         this.withdrawals = [];
         this.deposits = [];
         this.otherDeploymentWithdrawals = [];
+        this.otherDeploymentCredits = [];
         // Transmitted-request archive cache. Decisions use it only after
         // reload() under the global wallet lock.
         this.requestArchive = [];
@@ -881,6 +882,17 @@ class BrowserWalletRuntime extends EventTarget {
                 mode: record.mode,
                 phase: record.phase
             })),
+            // Escape payouts another deployment's vault only credited. They
+            // do not block a deposit here; the claim needs that profile.
+            other_deployment_credits: (this.otherDeploymentCredits || []).map(credit => ({
+                deployment_id: credit.deploymentId,
+                record_id: credit.recordId,
+                note_id: credit.noteId,
+                chain_id: credit.chainId,
+                contract_address: credit.contractAddress,
+                destination: credit.destination,
+                credited_amount: credit.creditedAmount
+            })),
             active_lease: active,
             late_withdrawal_attempts: (this.runtime?.lateWithdrawalAttempts || [])
                 .filter(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status))
@@ -1077,6 +1089,7 @@ class BrowserWalletRuntime extends EventTarget {
         // Only another deployment's runtime can finish these; the snapshot
         // reports them so a host can switch profiles before funding here.
         this.otherDeploymentWithdrawals = snapshot.otherDeploymentWithdrawals || [];
+        this.otherDeploymentCredits = snapshot.otherDeploymentCredits || [];
         this.deposits = snapshot.deposits;
         this.requestArchive = snapshot.requestArchive || [];
         return this.runtime;
@@ -4841,6 +4854,15 @@ class BrowserWalletRuntime extends EventTarget {
             await this.reload();
             const record = this.withdrawals.find(entry => entry.recordId === recordId);
             return record ? structuredClone(record) : null;
+        });
+    }
+
+    /** Every withdrawal record of this deployment, re-read under the wallet lock. */
+    async currentWithdrawals() {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            return structuredClone(this.withdrawals);
         });
     }
 

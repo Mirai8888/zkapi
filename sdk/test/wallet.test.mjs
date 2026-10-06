@@ -113,3 +113,124 @@ test("withdrawal events expose note, destination, balance, and escape deadline",
     challengeDeadline: 1_900_000_000n,
   });
 });
+
+// The two receipt layouts pinned by the vault's
+// test_finalizeReceiptTellsPaidFromCreditedPayout: a paid finalization emits
+// only EscapeWithdrawalFinalized; a credited one emits EscapePayoutDeferred
+// (topics [topic0, noteId, destination], data abi.encode(uint128 amount))
+// before the identical EscapeWithdrawalFinalized.
+const PAYOUT_VAULT = "0x590df9abbfb21074016daa486c771ae0af729ee2";
+const PAYOUT_DESTINATION = "0x5615deb798bb3e4dfa0139dfa1b3d433cc23b72f";
+const word = (value) => `0x${wallet.abiWord(value)}`;
+
+function finalizedLog(destination = PAYOUT_DESTINATION, noteId = 0n) {
+  return {
+    address: PAYOUT_VAULT,
+    topics: [wallet.ABI.escapeFinalizedEvent, word(noteId)],
+    data: `0x${wallet.abiWord(99n)}${wallet.abiWord(700_000n)}${wallet.abiWord(destination)}`,
+  };
+}
+
+function deferredLog({ noteId = 0n, destination = PAYOUT_DESTINATION, amount = 700_000n, ...overrides } = {}) {
+  return {
+    address: PAYOUT_VAULT,
+    topics: [wallet.ABI.escapePayoutDeferredEvent, word(noteId), word(destination)],
+    data: word(amount),
+    removed: false,
+    ...overrides,
+  };
+}
+
+test("payout-credit selectors and topics match the hardened vault", () => {
+  assert.equal(wallet.ABI.claimEscapePayout, "88c10aee");
+  assert.equal(wallet.ABI.escapePayoutCredits, "91f6e93a");
+  assert.equal(wallet.ABI.escapePayoutDeferredEvent,
+    "0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942");
+  assert.equal(wallet.ABI.escapePayoutClaimedEvent,
+    "0x6bf75371d42e9753c0913bf8fcecb651e8db173d99d7da0e4d836e91512bbe27");
+  assert.equal(wallet.ESCAPE_PAYOUT_GAS, 100_000);
+  assert.equal(wallet.encodeClaimEscapePayout(PAYOUT_DESTINATION),
+    `0x88c10aee${"0".repeat(24)}${PAYOUT_DESTINATION.slice(2)}`);
+  assert.equal(wallet.encodeEscapePayoutCredits(PAYOUT_DESTINATION),
+    `0x91f6e93a${"0".repeat(24)}${PAYOUT_DESTINATION.slice(2)}`);
+  assert.throws(() => wallet.encodeClaimEscapePayout("0x1234"), /destination/);
+});
+
+test("a credited escape finalization is reported as credited, never as paid", () => {
+  const paid = wallet.parseWithdrawalReceipt({ status: "0x1", logs: [finalizedLog()] }, PAYOUT_VAULT, "finalize");
+  assert.deepEqual(paid, {
+    noteId: 0n,
+    finalBalance: 700_000n,
+    destination: PAYOUT_DESTINATION,
+    payoutCredited: false,
+  });
+
+  const credited = wallet.parseWithdrawalReceipt({ status: "0x1", logs: [deferredLog(), finalizedLog()] },
+    PAYOUT_VAULT, "finalize");
+  assert.deepEqual(credited, {
+    noteId: 0n,
+    finalBalance: 700_000n,
+    destination: PAYOUT_DESTINATION,
+    payoutCredited: true,
+    creditedAmount: 700_000n,
+  });
+  assert.equal(credited.payoutVerified, undefined);
+
+  // Checksummed or upper-case addresses and topics still match.
+  const mixedCase = deferredLog();
+  mixedCase.address = PAYOUT_VAULT.toUpperCase().replace("0X", "0x");
+  mixedCase.topics = mixedCase.topics.map((topic) => topic.toUpperCase().replace("0X", "0x"));
+  assert.equal(wallet.parseWithdrawalReceipt({ logs: [finalizedLog(), mixedCase] }, PAYOUT_VAULT, "finalize")
+    .payoutCredited, true);
+});
+
+test("only the vault's own non-removed credit for this note and destination counts", () => {
+  const other = "0x1111111111111111111111111111111111111111";
+  for (const log of [
+    deferredLog({ removed: true }),
+    deferredLog({ address: other }),
+    deferredLog({ noteId: 1n }),
+    deferredLog({ destination: other }),
+    { ...deferredLog(), topics: deferredLog().topics.slice(0, 2) },
+    { ...deferredLog(), topics: [wallet.ABI.escapePayoutClaimedEvent, word(PAYOUT_DESTINATION), word(0n)] },
+  ]) {
+    const parsed = wallet.parseWithdrawalReceipt({ logs: [log, finalizedLog()] }, PAYOUT_VAULT, "finalize");
+    assert.equal(parsed.payoutCredited, false);
+    assert.equal(parsed.creditedAmount, undefined);
+  }
+  // Doubtful data still reports a credit (with the finalized balance).
+  const noData = wallet.parseWithdrawalReceipt({ logs: [deferredLog({ data: "0x" }), finalizedLog()] },
+    PAYOUT_VAULT, "finalize");
+  assert.equal(noData.payoutCredited, true);
+  assert.equal(noData.creditedAmount, 700_000n);
+  // A start or mutual-close receipt never carries the credit flag.
+  assert.equal(wallet.parseWithdrawalReceipt({ logs: [deferredLog()] }, PAYOUT_VAULT, "finalize"), null);
+});
+
+test("only an exact EscapePayoutClaimed log for the destination proves a claim", () => {
+  const claimed = (overrides = {}) => ({
+    address: PAYOUT_VAULT,
+    topics: [wallet.ABI.escapePayoutClaimedEvent, word(PAYOUT_DESTINATION)],
+    data: word(700_000n),
+    ...overrides,
+  });
+  assert.deepEqual(wallet.parseEscapePayoutClaim({ logs: [claimed()] }, PAYOUT_VAULT, PAYOUT_DESTINATION), {
+    destination: PAYOUT_DESTINATION,
+    amount: 700_000n,
+  });
+  assert.deepEqual(wallet.parseEscapePayoutClaim({ logs: [claimed()] }, PAYOUT_VAULT,
+    PAYOUT_DESTINATION.toUpperCase().replace("0X", "0x")).amount, 700_000n);
+  const other = "0x1111111111111111111111111111111111111111";
+  for (const log of [
+    claimed({ removed: true }),
+    claimed({ address: other }),
+    claimed({ topics: [wallet.ABI.escapePayoutClaimedEvent, word(other)] }),
+    // Dirty upper bytes are not an exact address word.
+    claimed({ topics: [wallet.ABI.escapePayoutClaimedEvent, `0x${"ff".repeat(12)}${PAYOUT_DESTINATION.slice(2)}`] }),
+    claimed({ topics: [wallet.ABI.escapePayoutDeferredEvent, word(0n), word(PAYOUT_DESTINATION)] }),
+    claimed({ data: "0x" }),
+    claimed({ data: word(0n) }),
+  ]) {
+    assert.equal(wallet.parseEscapePayoutClaim({ logs: [log] }, PAYOUT_VAULT, PAYOUT_DESTINATION), null);
+  }
+});

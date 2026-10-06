@@ -240,8 +240,10 @@ struct PendingChallenge {
     /// The withdrawal was gone at a head before its challenge deadline, when
     /// finalization is impossible: a challenge (or a reorganized initiation)
     /// ended it, so it is shown resolved rather than as a possible payout.
-    /// Cleared when the withdrawal is seen pending again. Retirement past
-    /// the deadline still reads how the escape ended.
+    /// Also set when an obligation behind a blocked queue is read at
+    /// confirmation depth to have ended so. Cleared when the withdrawal is
+    /// seen pending again. Retirement past the deadline still reads how the
+    /// escape ended.
     #[serde(default)]
     ended_before_deadline: bool,
     #[serde(flatten)]
@@ -1643,7 +1645,7 @@ impl ChallengeService {
         head: &HeadInfo,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
-        let state = self.withdrawal_state(note, None).await?;
+        let state = self.current_withdrawal(note, &pending, head).await?;
         if state.exists && state.nullifier != pending.nullifier {
             // Re-checked every poll, so a tip reorg back to the tracked escape
             // restores it with its reservation.
@@ -1691,6 +1693,27 @@ impl ChallengeService {
         }
     }
 
+    /// The tracked escape's withdrawal at the latest block. When that shows
+    /// it pending at a head past its deadline, which makes it a missed
+    /// deadline, the withdrawal is read again at the head block itself: a
+    /// backend of a load-balanced RPC behind the head can answer a
+    /// latest-block read with an escape that a challenge mined just before
+    /// the deadline ended. A backend without the head block fails that read
+    /// instead of answering stale, and the poll is retried.
+    async fn current_withdrawal(
+        &self,
+        note: u32,
+        pending: &PendingChallenge,
+        head: &HeadInfo,
+    ) -> anyhow::Result<WithdrawalState> {
+        let state = self.withdrawal_state(note, None).await?;
+        if state.exists && state.nullifier == pending.nullifier && head.timestamp >= state.deadline
+        {
+            return self.withdrawal_state(note, Some(head.number)).await;
+        }
+        Ok(state)
+    }
+
     /// Do not discard an obligation due to an unconfirmed challenge or
     /// finalization that a tip reorg could remove without changing the
     /// event-scan checkpoint block. An escape gone at confirmation depth
@@ -1716,27 +1739,13 @@ impl ChallengeService {
         // the poll as it does for a pending escape.
         let unconfirmed = match &unreadable {
             Some(error) if !ended_early => evidence_unreadable(error),
-            _ => disappeared(evidence.as_ref(), ended_early),
+            _ => disappeared(evidence.as_ref(), ended_early, self.miss_reported(pending)),
         };
-        let latest = quantity(&self.rpc("eth_blockNumber", json!([])).await?)?;
-        let Some(confirmed) = latest.checked_sub(self.config.confirmations) else {
+        let Some(confirmed) = self.gone_at_confirmed(note, pending).await? else {
             self.record(note, unconfirmed);
             return unreadable.filter(|_| !ended_early).map_or(Ok(()), Err);
         };
-        let confirmed_state = self.withdrawal_state(note, Some(confirmed)).await?;
-        if confirmed_state.exists && confirmed_state.nullifier == pending.nullifier {
-            self.note_seen(note, confirmed, 1)?;
-            self.record(note, unconfirmed);
-            return unreadable.filter(|_| !ended_early).map_or(Ok(()), Err);
-        }
-        // No block up to the head is at the deadline, which finalization needs.
-        let before_deadline = confirmed <= head.number
-            && pending
-                .challenge_deadline
-                .is_some_and(|deadline| head.timestamp < deadline);
-        let mut paid_out = false;
-        let mut counted_before = false;
-        let evidence = if before_deadline || self.miss_reported(pending) {
+        let evidence = if !self.payout_undecided(pending, head, confirmed) {
             None
         } else if let Some(error) = unreadable {
             // Whether a payout was a missed deadline is decided once the
@@ -1746,33 +1755,18 @@ impl ChallengeService {
         } else {
             evidence
         };
+        let mut paid_out = false;
         if let Some(evidence) = evidence {
-            match self.escape_outcome(note, pending, confirmed).await? {
+            match self
+                .record_payout(note, pending, confirmed, &evidence)
+                .await?
+            {
                 None => {
                     self.record(note, unconfirmed);
                     return Ok(());
                 }
                 Some(EscapeOutcome::NotPaidOut) => {}
-                Some(EscapeOutcome::PaidOut { .. }) if self.counted_before_upgrade(pending) => {
-                    self.checkpoint.missed_nullifiers.push(pending.nullifier);
-                    counted_before = true;
-                }
-                Some(EscapeOutcome::PaidOut { inferred }) => {
-                    let reason = if inferred {
-                        format!(
-                            "{}; the note is closed and no challenge of the escape is logged",
-                            evidence.reason
-                        )
-                    } else {
-                        evidence.reason.to_string()
-                    };
-                    self.record_missed(
-                        note,
-                        pending.challenge_deadline.unwrap_or_default(),
-                        &reason,
-                    )?;
-                    paid_out = true;
-                }
+                Some(EscapeOutcome::PaidOut { .. }) => paid_out = true,
             }
         }
         // A nonce no attempt was broadcast on is released rather than kept.
@@ -1783,12 +1777,84 @@ impl ChallengeService {
         self.persist()?;
         if paid_out {
             tracing::warn!(note_id = note, nullifier = %pending.nullifier, "escape obligation retired: the escape was paid out after its challenge deadline");
-        } else if counted_before {
-            tracing::warn!(note_id = note, nullifier = %pending.nullifier, "escape obligation retired: the escape was paid out after its challenge deadline; taken for a miss the earlier release counted in missed_total without its nullifier, so not counted again");
         } else {
             tracing::info!(note_id = note, nullifier = %pending.nullifier, "escape obligation resolved at confirmation depth");
         }
         Ok(())
+    }
+
+    /// The confirmed block (the latest less the confirmations) when the
+    /// tracked withdrawal, gone at the latest block, is gone there too; None
+    /// while it is pending there or no block is that deep.
+    async fn gone_at_confirmed(
+        &mut self,
+        note: u32,
+        pending: &PendingChallenge,
+    ) -> anyhow::Result<Option<u64>> {
+        let latest = quantity(&self.rpc("eth_blockNumber", json!([])).await?)?;
+        let Some(confirmed) = latest.checked_sub(self.config.confirmations) else {
+            return Ok(None);
+        };
+        let state = self.withdrawal_state(note, Some(confirmed)).await?;
+        if state.exists && state.nullifier == pending.nullifier {
+            self.note_seen(note, confirmed, 1)?;
+            return Ok(None);
+        }
+        Ok(Some(confirmed))
+    }
+
+    /// Whether how an escape gone at `confirmed` ended still decides a
+    /// missed deadline: a block up to the head is at its deadline, which
+    /// finalization needs, and its miss is not counted yet.
+    fn payout_undecided(
+        &self,
+        pending: &PendingChallenge,
+        head: &HeadInfo,
+        confirmed: u64,
+    ) -> bool {
+        let before_deadline = confirmed <= head.number
+            && pending
+                .challenge_deadline
+                .is_some_and(|deadline| head.timestamp < deadline);
+        !before_deadline && !self.miss_reported(pending)
+    }
+
+    /// Read how an escape with `evidence`, gone at the `confirmed` block past
+    /// its deadline, ended, and record a payout as a missed deadline, or take
+    /// it for a miss an earlier release counted without its nullifier (see
+    /// `legacy_miss_bound`). None while the log search has more to read.
+    async fn record_payout(
+        &mut self,
+        note: u32,
+        pending: &PendingChallenge,
+        confirmed: u64,
+        evidence: &MissEvidence,
+    ) -> anyhow::Result<Option<EscapeOutcome>> {
+        let outcome = self.escape_outcome(note, pending, confirmed).await?;
+        match outcome {
+            None | Some(EscapeOutcome::NotPaidOut) => {}
+            Some(EscapeOutcome::PaidOut { .. }) if self.counted_before_upgrade(pending) => {
+                self.checkpoint.missed_nullifiers.push(pending.nullifier);
+                self.persist()?;
+                tracing::warn!(note_id = note, nullifier = %pending.nullifier, "the escape was paid out after its challenge deadline; taken for a miss the earlier release counted in missed_total without its nullifier, so not counted again");
+            }
+            Some(EscapeOutcome::PaidOut { inferred }) => {
+                let reason = if inferred {
+                    format!(
+                        "{}; the note is closed and no challenge of the escape is logged",
+                        evidence.reason
+                    )
+                } else {
+                    evidence.reason.to_string()
+                };
+                self.record_missed(
+                    note,
+                    pending.challenge_deadline.unwrap_or_default(),
+                    &reason,
+                )?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// The evidence of an obligation whose withdrawal is gone, when losing
@@ -1981,6 +2047,43 @@ impl ChallengeService {
         Ok(())
     }
 
+    /// How an escape with evidence, gone past its deadline behind a blocked
+    /// queue, ended, once that is known at confirmation depth: a payout is
+    /// recorded as a missed deadline when found, not once the queue moves.
+    /// An escape a challenge ended (or whose initiation was reorganized out)
+    /// is marked as ended before its deadline, so it is shown resolved and
+    /// not read again. Returns whether it ended without a payout.
+    async fn observe_payout(
+        &mut self,
+        note: u32,
+        pending: &PendingChallenge,
+        head: &HeadInfo,
+        evidence: &MissEvidence,
+    ) -> anyhow::Result<bool> {
+        if self.miss_reported(pending) {
+            return Ok(false);
+        }
+        let Some(confirmed) = self.gone_at_confirmed(note, pending).await? else {
+            return Ok(false);
+        };
+        if !self.payout_undecided(pending, head, confirmed) {
+            return Ok(false);
+        }
+        let outcome = self
+            .record_payout(note, pending, confirmed, evidence)
+            .await?;
+        if outcome != Some(EscapeOutcome::NotPaidOut) {
+            return Ok(false);
+        }
+        self.checkpoint
+            .pending
+            .get_mut(&note)
+            .unwrap()
+            .ended_before_deadline = true;
+        self.persist()?;
+        Ok(true)
+    }
+
     /// In-memory observations belong to one obligation, not to its note.
     fn forget_observations(&mut self, note: u32) {
         self.evaluations.remove(&note);
@@ -1990,9 +2093,12 @@ impl ChallengeService {
         self.logged.remove(&note);
     }
 
-    /// Read-only evaluation for an obligation the poll loop did not reach. It
-    /// still records missed deadlines, so a note that expires entirely behind
-    /// a blocked nonce is counted.
+    /// Evaluation for an obligation the poll loop did not reach, which
+    /// neither sends nor retires it. It still records missed deadlines, so
+    /// a note that expires entirely behind a blocked nonce is counted, as is
+    /// a payout found at confirmation depth (the escaper can finalize in the
+    /// first block at the deadline): the obligation and its nonce stay for
+    /// the loop to retire.
     async fn observe_only(
         &mut self,
         note: u32,
@@ -2000,16 +2106,25 @@ impl ChallengeService {
         blocked: Option<(BlockedReason, String)>,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
-        let state = self.withdrawal_state(note, None).await?;
+        let state = self.current_withdrawal(note, &pending, head).await?;
         if state.exists && state.nullifier != pending.nullifier {
             return self.follow_vault_escape(note, pending.nullifier, &state);
         }
         if !state.exists {
-            let ended_early = self.ended_before_deadline(note, head).await?;
-            let evaluation = match self.payout_evidence(&pending) {
+            let mut ended_early = self.ended_before_deadline(note, head).await?;
+            let evidence = self.payout_evidence(&pending);
+            if let (false, Ok(Some(evidence))) = (ended_early, &evidence) {
+                ended_early = self.observe_payout(note, &pending, head, evidence).await?;
+            }
+            let missed = self.miss_reported(&self.checkpoint.pending[&note]);
+            let mut evaluation = match evidence {
                 Err(error) if !ended_early => evidence_unreadable(&error),
-                evidence => disappeared(evidence.ok().flatten().as_ref(), ended_early),
+                evidence => disappeared(evidence.ok().flatten().as_ref(), ended_early, missed),
             };
+            if let (None, Some((reason, detail))) = (evaluation.blocked, blocked) {
+                // Its retirement waits for the queue.
+                evaluation = evaluation.blocked(reason, detail);
+            }
             self.record(note, evaluation);
             return Ok(());
         }
@@ -3634,12 +3749,19 @@ fn miss_reason(
 /// An obligation whose withdrawal is gone at the latest block. With evidence
 /// it may have been paid out, so it keeps its deadline severity until the
 /// outcome is known at confirmation depth, unless it ended before the
-/// deadline (`ended_early`), when it cannot have been.
-fn disappeared(evidence: Option<&MissEvidence>, ended_early: bool) -> Evaluation {
+/// deadline (`ended_early`), when it cannot have been. Once its miss is
+/// counted (`missed`) it is shown missed until it retires.
+fn disappeared(evidence: Option<&MissEvidence>, ended_early: bool, missed: bool) -> Evaluation {
     match evidence {
         _ if ended_early => Evaluation::new(ObligationState::ResolvedUnconfirmed, None).detail(
             "withdrawal ended before its challenge deadline, so it was not paid out; retirement waits for confirmations",
         ),
+        Some(evidence) if missed => {
+            let mut evaluation = Evaluation::new(ObligationState::Missed, Some(evidence.kind))
+                .detail("missed challenge deadline recorded; the withdrawal is no longer pending, and the obligation retires at confirmation depth");
+            evaluation.settlement = evidence.settlement.clone();
+            evaluation
+        }
         Some(evidence) => {
             let mut evaluation =
                 Evaluation::new(ObligationState::ResolvedUnconfirmed, Some(evidence.kind)).detail(
@@ -4165,6 +4287,12 @@ mod tests {
         null_blocks: BTreeSet<u64>,
         /// Numbered block reads answered with another fork's hash.
         forked_block_reads: u32,
+        /// A load-balanced RPC's backend behind the head answers latest-block
+        /// pendingWithdrawals reads of the default escape with this activity.
+        latest_active: Option<bool>,
+        /// pendingWithdrawals reads of the default escape at the head block
+        /// fail: the backend serving them lacks it.
+        head_block_unknown: bool,
     }
 
     impl MockChain {
@@ -4221,6 +4349,8 @@ mod tests {
                 end_logs: Vec::new(),
                 null_blocks: BTreeSet::new(),
                 forked_block_reads: 0,
+                latest_active: None,
+                head_block_unknown: false,
             }
         }
 
@@ -4370,17 +4500,24 @@ mod tests {
                         ])
                     } else {
                         // A read at the head block sees the latest state.
-                        let at_head = *block == "latest"
+                        let latest = *block == "latest";
+                        let at_head = latest
                             || block
                                 .as_str()
                                 .and_then(|block| u64::from_str_radix(&block[2..], 16).ok())
                                 .is_some_and(|block| block >= state.head_number);
+                        if at_head && !latest && state.head_block_unknown {
+                            return rpc_error(-32000, "header not found");
+                        }
+                        let active = if latest {
+                            state.latest_active.unwrap_or(state.active)
+                        } else if at_head {
+                            state.active
+                        } else {
+                            state.confirmed_active
+                        };
                         encoded(&[
-                            Felt252::from_u64(if at_head {
-                                state.active as u64
-                            } else {
-                                state.confirmed_active as u64
-                            }),
+                            Felt252::from_u64(active as u64),
                             Felt252::from_u64(8),
                             state.nullifier,
                             Felt252::from_u64(100),
@@ -7102,6 +7239,17 @@ mod tests {
         pending: Value,
         recorded_at: u64,
     ) {
+        write_legacy_checkpoint_with_deadline(fixture, cursor, pending, recorded_at, 1);
+    }
+
+    /// `write_legacy_checkpoint` whose last miss had `last_deadline`.
+    fn write_legacy_checkpoint_with_deadline(
+        fixture: &Fixture,
+        cursor: Option<(u64, &str)>,
+        pending: Value,
+        recorded_at: u64,
+        last_deadline: u64,
+    ) {
         let (next_block, hash) = cursor.map_or((0, None), |(next, hash)| (next, Some(hash)));
         std::fs::write(
             &fixture.config.checkpoint,
@@ -7111,7 +7259,8 @@ mod tests {
                 "from_block": 0, "next_block": next_block, "last_block_hash": hash,
                 "pending": pending, "detached_nonces": {}, "missed_total": 2,
                 "last_missed": { "note_id": 7, "nullifier": Felt252::from_u64(77),
-                    "challenge_deadline": 1, "reason": "challenge not mined before the deadline",
+                    "challenge_deadline": last_deadline,
+                    "reason": "challenge not mined before the deadline",
                     "recorded_at": recorded_at }
             }))
             .unwrap(),
@@ -7122,9 +7271,6 @@ mod tests {
     #[tokio::test]
     async fn a_replay_never_counts_again_a_miss_an_earlier_release_counted() {
         let day_ago = unix_now() - 86_400;
-        let legacy = |fixture: &Fixture, pending: Value| {
-            write_legacy_checkpoint(fixture, None, pending, day_ago);
-        };
         let missed_note = |status: &ChallengeStatus| status.last_missed.as_ref().unwrap().note_id;
         // Note 0's escape is that other miss: its deadline two days ago, paid
         // out and retired before the upgrade, tracked again by a replay, from
@@ -7159,47 +7305,98 @@ mod tests {
             assert_eq!(service.status().missed_total, 2);
         }
 
-        // An escape pending at the upgrade, whose deadline passed while the
-        // daemon was down, is a miss of its own.
-        let fixture = Fixture::new().await;
-        let (nullifier, deadline) = {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.head_timestamp = chain.deadline + 600;
-            chain.pay_out(2);
-            (chain.nullifier, chain.deadline)
-        };
-        legacy(
-            &fixture,
-            json!({ "0": { "nullifier": nullifier, "challenge_deadline": deadline,
-                "deadline_reported": false } }),
-        );
-        let mut service = fixture.service();
-        service.poll_once().await.unwrap();
-        assert!(service.checkpoint.pending.is_empty());
-        let status = service.status();
-        assert_eq!(status.missed_total, 3);
-        assert_eq!(missed_note(&status), 0);
-        assert_eq!(status.status, Severity::Critical);
-
-        // So is an escape whose deadline passes after the upgrade.
-        let fixture = Fixture::new().await;
-        fixture.chain.lock().unwrap().path_unavailable = u32::MAX;
-        legacy(&fixture, json!({}));
-        let mut service = fixture.service();
-        assert!(service.poll_once().await.is_err());
-        assert!(service.checkpoint.pending.contains_key(&0));
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.head_number += 3;
-            chain.head_timestamp = chain.deadline + 60;
-            let block = chain.head_number - 2;
-            chain.pay_out(block);
+        // The earlier release can have counted an escape whose deadline came
+        // up to LEGACY_MISS_CLOCK_MARGIN_SECONDS after its last miss was
+        // recorded (a chain clock ahead of its own), or up to that miss's
+        // own deadline if later: such a payout, tracked again by a replay
+        // from a cursor reset for one, is not counted again.
+        let now = unix_now();
+        for (recorded_at, last_deadline, deadline) in [
+            (now - 600, now - 700, now - 400),
+            (now - 5_000, now - 1_000, now - 2_000),
+        ] {
+            let fixture = Fixture::new().await;
+            let nullifier = {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.deadline = deadline;
+                chain.head_timestamp = now;
+                chain.pay_out(2);
+                chain.nullifier
+            };
+            write_legacy_checkpoint_with_deadline(
+                &fixture,
+                None,
+                json!({}),
+                recorded_at,
+                last_deadline,
+            );
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            let case = format!("recorded {recorded_at} last {last_deadline} deadline {deadline}");
+            assert!(service.checkpoint.pending.is_empty(), "{case}");
+            let status = service.status();
+            assert_eq!(status.missed_total, 2, "{case}");
+            assert_eq!(missed_note(&status), 7, "{case}");
+            assert!(
+                service.checkpoint.missed_nullifiers.contains(&nullifier),
+                "{case}"
+            );
         }
-        service.poll_once().await.unwrap();
-        assert!(service.checkpoint.pending.is_empty());
-        let status = service.status();
-        assert_eq!(status.missed_total, 3);
-        assert_eq!(missed_note(&status), 0);
+
+        // An escape pending at the upgrade, whose deadline passed while the
+        // daemon was down, is a miss of its own, also when its deadline is
+        // within that bound: the earlier release's last miss was recorded
+        // minutes before the upgrade.
+        for (recorded_at, deadline) in [(day_ago, None), (now - 600, Some(now - 300))] {
+            let fixture = Fixture::new().await;
+            let (nullifier, deadline) = {
+                let mut chain = fixture.chain.lock().unwrap();
+                if let Some(deadline) = deadline {
+                    chain.deadline = deadline;
+                }
+                chain.head_timestamp = chain.deadline + 600;
+                chain.pay_out(2);
+                (chain.nullifier, chain.deadline)
+            };
+            write_legacy_checkpoint(
+                &fixture,
+                None,
+                json!({ "0": { "nullifier": nullifier, "challenge_deadline": deadline,
+                    "deadline_reported": false } }),
+                recorded_at,
+            );
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            assert!(service.checkpoint.pending.is_empty());
+            let status = service.status();
+            assert_eq!(status.missed_total, 3, "recorded {recorded_at}");
+            assert_eq!(missed_note(&status), 0);
+            assert_eq!(status.status, Severity::Critical);
+        }
+
+        // So is an escape whose deadline passes after the upgrade, also when
+        // the last miss was recorded within the margin before it: the bound
+        // is at most the first head's timestamp.
+        for recorded_at in [day_ago, now - 60] {
+            let fixture = Fixture::new().await;
+            fixture.chain.lock().unwrap().path_unavailable = u32::MAX;
+            write_legacy_checkpoint(&fixture, None, json!({}), recorded_at);
+            let mut service = fixture.service();
+            assert!(service.poll_once().await.is_err());
+            assert!(service.checkpoint.pending.contains_key(&0));
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_number += 3;
+                chain.head_timestamp = chain.deadline + 60;
+                let block = chain.head_number - 2;
+                chain.pay_out(block);
+            }
+            service.poll_once().await.unwrap();
+            assert!(service.checkpoint.pending.is_empty());
+            let status = service.status();
+            assert_eq!(status.missed_total, 3, "recorded {recorded_at}");
+            assert_eq!(missed_note(&status), 0);
+        }
     }
 
     #[tokio::test]
@@ -7460,6 +7657,194 @@ mod tests {
         let status = service.status();
         assert_eq!(status.missed_total, 0);
         assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
+    }
+
+    /// Note 9 holds nonce 5, reserved without a known hash, for a live
+    /// escape without evidence: every poll stops there, so note 0 is only
+    /// observed.
+    fn block_queue(fixture: &Fixture, service: &mut ChallengeService) {
+        let blocker = Felt252::from_u64(12345);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            let deadline = chain.deadline + 10_000;
+            chain.withdrawals.insert(9, (true, blocker, deadline));
+        }
+        service.checkpoint.pending.insert(
+            9,
+            PendingChallenge {
+                nullifier: blocker,
+                nonce: Some(5),
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_payout_behind_a_blocked_queue_is_recorded_missed_when_found() {
+        for legacy in [false, true] {
+            let fixture = Fixture::new().await;
+            let mut service = fixture.service();
+            block_queue(&fixture, &mut service);
+            let (nullifier, deadline) = {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.legacy_vault = legacy;
+                chain.head_timestamp = chain.deadline - 5;
+                (chain.nullifier, chain.deadline)
+            };
+            service.poll_once().await.unwrap();
+            let queued = obligation(&service.status(), 0);
+            assert_eq!(queued.state, ObligationState::Ready);
+            assert_eq!(queued.blocked_reason, Some(BlockedReason::NonceBlocked));
+            // The escaper is paid out in the first block at the deadline, so
+            // no poll sees the escape pending past it.
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_number += 1;
+                chain.head_timestamp = deadline;
+                let block = chain.head_number;
+                chain.pay_out(block);
+                chain.confirmed_active = true;
+            }
+            service.poll_once().await.unwrap();
+            let status = service.status();
+            assert_eq!(status.missed_total, 0, "legacy {legacy}: unconfirmed");
+            assert_eq!(
+                obligation(&status, 0).state,
+                ObligationState::ResolvedUnconfirmed
+            );
+            // At confirmation depth the payout is recorded missed while the
+            // queue still waits for note 9's nonce; the obligation stays for
+            // the loop to retire.
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_number += 2;
+                chain.confirmed_active = false;
+            }
+            for _ in 0..2 {
+                service.poll_once().await.unwrap();
+                assert!(service.checkpoint.pending.contains_key(&0));
+                let status = service.status();
+                assert_missed_once(&status, nullifier, deadline);
+                assert_eq!(
+                    status.last_missed.as_ref().unwrap().reason,
+                    "challenge not mined before the deadline",
+                    "legacy {legacy}"
+                );
+                let missed = obligation(&status, 0);
+                assert_eq!(missed.state, ObligationState::Missed);
+                assert_eq!(missed.blocked_reason, Some(BlockedReason::NonceBlocked));
+                fixture.chain.lock().unwrap().head_number += 1;
+            }
+            drop(service);
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            assert_missed_once(&service.status(), nullifier, deadline);
+            // Note 9's escape ends with its nonce unmined, which blocks the
+            // queue until the signer consumes it; then note 0 retires.
+            fixture
+                .chain
+                .lock()
+                .unwrap()
+                .withdrawals
+                .insert(9, (false, Felt252::from_u64(12345), deadline + 10_000));
+            for _ in 0..2 {
+                let _ = service.poll_once().await;
+                assert_missed_once(&service.status(), nullifier, deadline);
+            }
+            assert!(service.checkpoint.pending.contains_key(&0));
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.mined_nonce = 6;
+                chain.confirmed_nonce = Some(6);
+            }
+            service.poll_once().await.unwrap();
+            assert!(service.checkpoint.pending.is_empty());
+            assert_missed_once(&service.status(), nullifier, deadline);
+            assert!(fixture.sends().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_latest_read_behind_the_head_never_records_a_challenge_missed() {
+        // Our challenge, or behind a blocked queue a third party's, mines in
+        // the last block before the deadline. The next head, the first block
+        // at the deadline, comes from a backend of a load-balanced RPC that
+        // has it; one behind it answers the latest-block read with the
+        // escape still pending.
+        for (legacy, blocked) in [(false, false), (true, false), (false, true), (true, true)] {
+            let case = format!("legacy {legacy} blocked {blocked}");
+            let fixture = Fixture::new().await;
+            let mut service = fixture.service();
+            if blocked {
+                block_queue(&fixture, &mut service);
+            }
+            let deadline = {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.legacy_vault = legacy;
+                chain.head_timestamp = chain.deadline - 13;
+                chain.deadline
+            };
+            service.poll_once().await.unwrap();
+            assert_eq!(fixture.sends().len(), usize::from(!blocked), "{case}");
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_number += 2;
+                chain.head_timestamp = deadline;
+                if !blocked {
+                    chain.mined_nonce = 4;
+                }
+                let (block, nullifier) = (chain.head_number - 1, chain.nullifier);
+                chain.challenged.insert(nullifier);
+                chain.end_logs.push((block, 0, nullifier, false));
+                chain.active = false;
+                chain.latest_active = Some(true);
+            }
+            // A read at the head that the backend cannot serve fails; it is
+            // never taken for a pending escape.
+            for head_known in [false, true] {
+                fixture.chain.lock().unwrap().head_block_unknown = !head_known;
+                let result = service.poll_once().await;
+                assert_eq!(result.is_ok(), head_known || blocked, "{case}: {result:?}");
+                let status = service.status();
+                assert_eq!(status.missed_total, 0, "{case}");
+                assert!(status.last_missed.is_none(), "{case}");
+                assert_ne!(
+                    obligation(&status, 0).state,
+                    ObligationState::Missed,
+                    "{case}"
+                );
+            }
+            // The backend catches up, and the challenge reaches confirmation
+            // depth.
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.latest_active = None;
+                chain.confirmed_active = false;
+                if !blocked {
+                    chain.confirmed_nonce = Some(4);
+                }
+                chain.head_number += 3;
+                chain.head_timestamp += 36;
+            }
+            for _ in 0..2 {
+                service.poll_once().await.unwrap();
+                fixture.chain.lock().unwrap().head_number += 1;
+            }
+            let status = service.status();
+            assert_eq!(status.missed_total, 0, "{case}");
+            assert!(status.last_missed.is_none(), "{case}");
+            if blocked {
+                // Known not paid out, it waits for the queue to retire it.
+                let ended = obligation(&status, 0);
+                assert_eq!(ended.state, ObligationState::ResolvedUnconfirmed);
+                assert_eq!(ended.severity, Severity::Ok, "{case}");
+                assert!(service.checkpoint.pending[&0].ended_before_deadline);
+            } else {
+                assert!(service.checkpoint.pending.is_empty(), "{case}");
+                assert_eq!(status.status, Severity::Ok, "{case}: {:?}", status.alarms);
+            }
+        }
     }
 
     #[tokio::test]

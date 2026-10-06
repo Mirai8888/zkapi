@@ -403,7 +403,11 @@ vault a finalized escape whose destination rejected the payout was credited to
 `escapePayoutCredits(destination)` instead, which changes nothing for the
 challenger. A payout is recorded as a missed deadline before the obligation
 retires. While the evidence database cannot be read, the obligation stays
-tracked, blocked by `evidence_db_error`, and the poll fails.
+tracked, blocked by `evidence_db_error`, and the poll fails. An obligation
+queued behind an unresolved nonce, which the poll loop does not reach, is read
+the same way: a payout is recorded as a missed deadline when found, and an
+escape a challenge ended is shown resolved (severity ok); the obligation and its
+nonce retire once the queue reaches it.
 
 Nonce reconciliation runs before checking a withdrawal's deadline, evidence or
 continued existence. A reserved nonce consumed in the latest block no longer
@@ -544,17 +548,22 @@ stall. Each obligation has a `state`: `unevaluated`, `no_evidence`,
 `resolved_unconfirmed`, `missed` or `expired_without_evidence`. Its `severity`
 is:
 
-- critical for `missed`;
+- critical for `missed`. An obligation whose miss is recorded is still shown
+  `missed` once its withdrawal is gone, until it retires (detail `missed
+  challenge deadline recorded; the withdrawal is no longer pending, and the
+  obligation retires at confirmation depth`), unless the evidence database
+  cannot be read;
 - for `resolved_unconfirmed` (the withdrawal is gone at the latest block):
-  - ok when it was already gone at a head before its deadline, so no payout is
-    possible (detail `withdrawal ended before its challenge deadline, so it was
-    not paid out; retirement waits for confirmations`), also for an obligation
-    only observed behind a blocked queue, and ok without evidence;
+  - ok when no payout is possible (detail `withdrawal ended before its
+    challenge deadline, so it was not paid out; retirement waits for
+    confirmations`): it was already gone at a head before its deadline, or,
+    while it waits behind a blocked queue to retire, the read at confirmation
+    depth found that a challenge ended it. Also ok without evidence;
   - otherwise, with evidence or expected evidence, the severity it had by
-    remaining time, until the daemon knows at confirmation depth whether the
-    escape was paid out (detail `withdrawal no longer pending at the latest
-    block; at confirmation depth it is retired, or recorded missed if it was
-    paid out`);
+    remaining time (behind a blocked queue, also by its blocked reason), until
+    the daemon knows at confirmation depth whether the escape was paid out
+    (detail `withdrawal no longer pending at the latest block; at confirmation
+    depth it is retired, or recorded missed if it was paid out`);
   - critical, blocked by `evidence_db_error`, while the evidence database
     cannot be read: the obligation stays tracked until a read decides whether
     a payout was a missed deadline;
@@ -584,10 +593,16 @@ restarts. State changes are logged as
 `challenge obligation status changed` at info, warn or error level, and critical
 items are logged again every 300 seconds. A deadline that passes while evidence
 existed or was expected logs `MISSED escape challenge deadline` once and
-increments `missed_total`. So does an escape with such evidence that the daemon
-finds paid out past its deadline at confirmation depth, including one it first
-sees after the payout (for example after downtime longer than the challenge
-period); see [Recovery and verification](#recovery-and-verification). Each
+increments `missed_total`. Whether the escape was still pending at its deadline
+is read at the head block (`pendingWithdrawals` at the head's number), not at
+`latest`: behind a load-balanced RPC, a backend behind the head could still show
+an escape that a challenge mined just before the deadline ended. A backend
+without the head block fails that read, and the next poll reads again. An
+escape with such evidence that the daemon finds paid out past its deadline at
+confirmation depth is also recorded as missed. That includes one it first sees
+after the payout (for example after downtime longer than the challenge period)
+and one queued behind an unresolved nonce; see
+[Recovery and verification](#recovery-and-verification). Each
 escape's miss is counted once, keyed by its nullifier, also across replays and
 restarts. The latest miss (`last_missed`) stays a critical alarm,
 `missed challenge deadline of note N (reason)`, on `/status` and `/health` for

@@ -1136,3 +1136,223 @@ func TestRebindRequiresFinalizedVaultAndIndexerAgreement(t *testing.T) {
 		})
 	}
 }
+
+// expiryAt is the expiry the vault assigns to a deposit mined at chain time at.
+func expiryAt(at int64) uint64 {
+	return (uint64(at) + 2592000 + vaultExpiryBucket - 1) / vaultExpiryBucket * vaultExpiryBucket
+}
+
+// Closure regression (unpinned-rpc #1): the search for an earlier deposit
+// follows the block time of the indexer view it searches, never the device
+// clock. Here the device clock runs days behind the chain while the payment
+// RPC fakes its head time to match it (the fixture's "latest" block carries
+// the device time), withholds the first deposit and relays it after its
+// forged revert was retired. A retry is never signed: approval refuses the
+// clock before the deposit lands, and its leaf is found after.
+func TestDepositSearchFollowsChainTimeNotTheDeviceClock(t *testing.T) {
+	for _, days := range []int64{2, 3, 10} {
+		t.Run(fmt.Sprintf("device clock %d days behind", days), func(t *testing.T) {
+			f, _, commitment := retiredWithheldDeposit(t)
+			chainNow := time.Now().Unix() + days*vaultExpiryBucket
+			f.setChainTime(chainNow)
+			quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+			if err != nil {
+				t.Fatalf("a retry with no landed deposit was not quoted: %v", err)
+			}
+			status, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID)
+			if err == nil || !strings.Contains(err.Error(), "clock") || len(f.accepted) != 1 {
+				t.Fatalf("a deposit was signed with the device clock %d days off: %+v %v (accepted %d)", days, status, err, len(f.accepted))
+			}
+			f.mu.Lock()
+			f.registerDeposit(12, commitment, 100000, expiryAt(chainNow))
+			f.mu.Unlock()
+			if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "at note 12") {
+				t.Fatalf("the deposit that landed at chain time was not found: %v", err)
+			}
+			if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "verification_conflict" {
+				t.Fatalf("the landed deposit was not a conflict: %+v %v", status, err)
+			}
+			if len(f.accepted) != 1 {
+				t.Fatal("a second deposit was signed for the same note")
+			}
+		})
+	}
+}
+
+// The search is refused rather than run at an unverified time: a header the
+// RPC withholds or that does not hash to the indexer view's block signs
+// nothing.
+func TestDepositSearchRequiresTheIndexerViewsVerifiedBlockTime(t *testing.T) {
+	for name, tamper := range map[string]func(f *addressFixture){
+		"withheld": func(f *addressFixture) { delete(f.headers, strings.ToLower(f.indexerHash)) },
+		"forged time": func(f *addressFixture) {
+			forged := *f.headers[strings.ToLower(f.indexerHash)]
+			forged.Time -= 3 * vaultExpiryBucket
+			f.headers[strings.ToLower(f.indexerHash)] = &forged
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, _, _ := retiredWithheldDeposit(t)
+			quote, err := f.h.QuoteAddressDeposit(context.Background(), 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.mu.Lock()
+			tamper(f)
+			f.mu.Unlock()
+			if _, err := f.h.ApproveAddressDeposit(context.Background(), quote.ID); err == nil || !strings.Contains(err.Error(), "block header") || len(f.accepted) != 1 {
+				t.Fatalf("a retry was signed without the view's verified block time: %v (accepted %d)", err, len(f.accepted))
+			}
+		})
+	}
+}
+
+// A reported revert is not retired, and no retry quoted, while the device
+// clock is days off chain time. (retiredWithheldDeposit retires one when
+// the clocks agree.)
+func TestRevertIsNotRetiredWhileTheDeviceClockIsOff(t *testing.T) {
+	f := newAddressFixture(t, true)
+	first, err := f.fundNative(t, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.setChainTime(time.Now().Unix() - 2*vaultExpiryBucket)
+	f.mine(t, first.TransactionHash, true)
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("revert not recorded: %+v %v", status, err)
+	}
+	for range 2 {
+		if _, err := f.h.FundAddress(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "clock") {
+			t.Fatalf("the revert was retired with the device clock off: %v", err)
+		}
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), "clock") {
+		t.Fatalf("a retry was quoted with the device clock off: %v", err)
+	}
+	if record := f.savedAddress(t); record.Pending == nil || record.Pending.Hash != first.TransactionHash || len(record.History) != 0 || len(f.accepted) != 1 {
+		t.Fatal("the revert was retired with the device clock off")
+	}
+}
+
+// seam:tests-ci #4: a block mined just before a UTC day boundary has the
+// earlier expiry bucket even when the deposit's preparation, by chain or by
+// device clock, falls just after it. A slot from an earlier build has only
+// the device's preparation time, which can be days off chain time.
+func TestDepositLeafSearchToleratesTheDayBoundaryAndOldDeviceTimes(t *testing.T) {
+	commitment := fieldValue("0x1234")
+	boundary := (time.Now().Unix()/vaultExpiryBucket + 1) * vaultExpiryBucket
+	prepared, mined := boundary+30, boundary-30
+	leaves := make([]string, 0, 13)
+	for i := range 12 {
+		leaves = append(leaves, fmt.Sprintf("0x%x", 0x1000+i))
+	}
+	leaves = append(leaves, fmt.Sprintf("0x%x", noteLeaf(12, commitment, 100000, expiryAt(mined))))
+	snapshot := &treeSnapshot{NextNoteID: 13, Leaves: leaves}
+	path := "0x" + strings.Repeat("f", 64)
+	for name, search := range map[string]struct {
+		slot depositSlot
+		now  int64
+	}{
+		"chain time":  {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared, PreparedChainAt: prepared}, boundary + 120},
+		"device time": {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared}, boundary + 120},
+		// Saved by an earlier build on a device clock 6 days fast, and
+		// searched 10 days later.
+		"device 6 days ahead": {depositSlot{NoteID: 12, PathSHA256: path, PreparedAt: prepared + 6*vaultExpiryBucket}, boundary + 10*vaultExpiryBucket},
+	} {
+		if id, found := findDepositLeaf(snapshot, &search.slot, commitment, 100000, 2592000, search.now); !found || id != 12 {
+			t.Fatalf("%s: a deposit mined just before the day boundary was not found: %d %v", name, id, found)
+		}
+	}
+	if expiryAt(mined) == expiryAt(prepared) {
+		t.Fatal("the fixture does not cross a bucket boundary")
+	}
+}
+
+// seam:tests-ci #3: every signed slot is searched, not only the earliest,
+// and two signings for the same note ID from different empty runs are both
+// searched.
+func TestSignedDepositSearchCoversEverySlotAndEmptyRun(t *testing.T) {
+	commitment, now := fieldValue("0x1234"), time.Now().Unix()
+	path := "0x" + strings.Repeat("f", 64)
+	search := func(leaves []string, slots ...depositSlot) (uint32, bool) {
+		return findSignedDepositLeaf(&treeSnapshot{NextNoteID: uint32(len(leaves)), Leaves: leaves}, slots, commitment, 100000, 2592000, now)
+	}
+	ours := func(id int) string {
+		return fmt.Sprintf("0x%x", noteLeaf(uint32(id), commitment, 100000, expiryAt(now)))
+	}
+
+	// A later slot's landing, 150 occupied leaves past the earliest slot.
+	leaves := make([]string, 200)
+	for i := range leaves {
+		leaves[i] = fmt.Sprintf("0x%x", 0x5000+i)
+	}
+	leaves[150] = ours(150)
+	for _, slots := range [][]depositSlot{
+		{{NoteID: 0, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}, {NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}},
+		{{NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now}, {NoteID: 0, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}},
+	} {
+		if id, found := search(leaves, slots...); !found || id != 150 {
+			t.Fatalf("the later signed slot was not searched: %d %v", id, found)
+		}
+	}
+
+	// Slot 100 signed twice: once from a view with no empty run, once from a
+	// view in which slots [20, 100) were empty. The second lands at 30.
+	leaves = make([]string, 0, 100+depositRevertScanSlots)
+	for i := range 100 + depositRevertScanSlots {
+		leaf := fmt.Sprintf("0x%x", 0x5000+i)
+		if i >= 20 && i < 100 {
+			leaf = "0x0"
+		}
+		leaves = append(leaves, leaf)
+	}
+	leaves[30] = ours(30)
+	for _, slots := range [][]depositSlot{
+		{{NoteID: 100, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}, {NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now, EmptyBefore: 80}},
+		{{NoteID: 100, PathSHA256: path, PreparedAt: now, PreparedChainAt: now, EmptyBefore: 80}, {NoteID: 100, PathSHA256: path, PreparedAt: now - 60, PreparedChainAt: now - 60}},
+	} {
+		if id, found := search(leaves, slots...); !found || id != 30 {
+			t.Fatalf("the same note ID's other empty run was not searched: %d %v", id, found)
+		}
+	}
+}
+
+// seam:tests-ci #3, approval path: after two forged reverts, the second
+// deposit is relayed and lands at its own slot, far more than
+// depositRevertScanSlots occupied leaves after the first deposit's slot. No
+// third deposit of the note is quoted or signed.
+func TestRetryAfterTwoForgedRevertsSearchesTheLaterSlot(t *testing.T) {
+	f, _, commitment := retiredWithheldDeposit(t)
+	f.mu.Lock()
+	for id := uint32(addressTestFirstNote); id < addressTestFirstNote+100; id++ {
+		f.setLeaf(id, big.NewInt(int64(0x7000+id))) // Other users' deposits.
+	}
+	f.mu.Unlock()
+	second, err := f.fundNative(t, 100000)
+	if err != nil || len(f.accepted) != 2 {
+		t.Fatalf("the genuine retry was not signed: %+v %v", second, err)
+	}
+	if slot := f.savedDeposit(t).Slot; slot == nil || slot.NoteID != addressTestFirstNote+100 {
+		t.Fatalf("the retry was not built for the next slot: %+v", slot)
+	}
+	f.mine(t, second.TransactionHash, true) // Forged again; withheld.
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "reverted" {
+		t.Fatalf("second revert not recorded: %+v %v", status, err)
+	}
+	_, _ = f.h.FundAddress(context.Background(), 100000)
+	if record := f.savedAddress(t); record.Pending != nil || len(record.History) != 2 {
+		t.Fatalf("the second withheld deposit was not retired: %+v", record)
+	}
+	f.mu.Lock()
+	f.registerDeposit(addressTestFirstNote+100, commitment, 100000, bucketedExpiry())
+	f.mu.Unlock()
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 100000); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at note %d", addressTestFirstNote+100)) {
+		t.Fatalf("a third deposit was quoted after the second landed: %v", err)
+	}
+	if status, err := f.h.FundAddress(context.Background(), 100000); err != nil || status.Phase != "verification_conflict" {
+		t.Fatalf("the landed second deposit was not a conflict: %+v %v", status, err)
+	}
+	if len(f.accepted) != 2 {
+		t.Fatal("a third deposit was signed for the same note")
+	}
+}

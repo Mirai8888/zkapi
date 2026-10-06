@@ -46,6 +46,21 @@ func fundingNetwork(chain uint64) string {
 	return "Ethereum Mainnet"
 }
 
+// managementError is the daemon's message for a failed management request,
+// with the machine-readable code it forwards for refusals a guided flow acts
+// on (for example unsettled_request_state).
+type managementError struct{ message, code string }
+
+func (e *managementError) Error() string { return "wallet: " + e.message }
+
+func managementErrorCode(err error) string {
+	var failed *managementError
+	if errors.As(err, &failed) {
+		return failed.code
+	}
+	return ""
+}
+
 func requestManagementJSON(ctx context.Context, c config.Config, method, path string, body, result any) error {
 	var payload []byte
 	var err error
@@ -83,9 +98,10 @@ func requestManagementJSON(ctx context.Context, c config.Config, method, path st
 	if response.StatusCode != http.StatusOK {
 		var failed struct {
 			Error string `json:"error"`
+			Code  string `json:"code"`
 		}
 		if json.Unmarshal(raw, &failed) == nil && failed.Error != "" {
-			return fmt.Errorf("wallet: %s", failed.Error)
+			return &managementError{message: failed.Error, code: failed.Code}
 		}
 		return errors.New("local wallet request failed; check saved status before retrying")
 	}

@@ -87,12 +87,17 @@ type depositRebind struct {
 // the exact 32 sibling words in that transaction's calldata. EmptyBefore
 // counts the empty slots right below NoteID in that tree: the calldata can
 // land below NoteID only in that run (see findDepositLeaf). Records written
-// before it was kept have none.
+// before it was kept have none. PreparedAt is the device clock's time of
+// preparation; PreparedChainAt is the block time of the indexer view the
+// path was built from (see snapshotChainTime). Slots saved by 0.1.6, by
+// earlier builds of this version, or rewritten by them, have no
+// PreparedChainAt.
 type depositSlot struct {
-	NoteID      uint32 `json:"note_id"`
-	PathSHA256  string `json:"path_sha256"`
-	PreparedAt  int64  `json:"prepared_at"`
-	EmptyBefore uint32 `json:"empty_before,omitempty"`
+	NoteID          uint32 `json:"note_id"`
+	PathSHA256      string `json:"path_sha256"`
+	PreparedAt      int64  `json:"prepared_at"`
+	PreparedChainAt int64  `json:"prepared_chain_at,omitempty"`
+	EmptyBefore     uint32 `json:"empty_before,omitempty"`
 }
 
 // NewFundingHandler manages local custody through the authenticated CLI admin API.

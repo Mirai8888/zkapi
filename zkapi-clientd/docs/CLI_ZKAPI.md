@@ -162,6 +162,20 @@ private state:
   63 days before the search. A deposit lands after its slot only when every
   slot in between is empty, and before it only inside that run, when the
   indexer's view it was built from was a short fork that was then orphaned.
+  The expiry days come from chain time, not from this device's clock. The
+  vault derives a deposit's expiry from its block's time, so the search runs
+  from the block time of the indexer view each slot was built from to the
+  block time of the view it searches, with one day of tolerance on each side.
+  Each of those times comes from the payment RPC's header for the indexer
+  view's block, and is accepted only when that header hashes to the block
+  hash the indexer names. While the RPC does not serve that header
+  (`eth_getBlockByHash`), or serves one this release cannot hash (a header
+  format introduced by a later network upgrade), nothing is signed and a
+  reported revert waits. A slot saved before this release, or rewritten by
+  one, has only the device clock's preparation time, and its search starts
+  7 days before it. Nothing is signed, and no reported revert is retired,
+  while this device's clock is more than a day from that chain time: correct
+  the system clock and retry.
   So a landed deposit is missed only in two cases. After it lands, challenges
   restore 64 or more escaped notes between the slot it was built for (or the
   start of the run) and the slot it landed in. Or it landed about 63 or more
@@ -169,7 +183,9 @@ private state:
   vault pauses extended it by more than 33 days. (A slot saved by a
   pre-release build of this version records no run and is never searched
   below, so a deposit signed for such a slot from a view that was then
-  orphaned is also missed when it landed below the slot.) If the note is
+  orphaned is also missed when it landed below the slot. A slot saved by an
+  earlier release on a device clock more than 6 days fast is also missed
+  when its deposit landed within that much of its preparation.) If the note is
   found, the deposit is reported as a `verification_conflict` and no
   replacement is signed. Running
   `zkapi-clientd config` again checks once more; **repair** (below) binds
@@ -221,6 +237,65 @@ manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
 later requires a wallet companion whose `/oa/v1/status` reports
 `clearance_ownership_proof_version`; an older companion is refused before any
 note is reserved.
+
+The exception is a note state from which a chat request was sent but never
+settled: the companion set the request aside into its request archive (see
+[privacy boundaries](PRIVACY.md)). On a vault without `vault_revision` 2,
+which includes both packaged deployments, an ownership proof is also a valid
+escape, and whoever kept that unsettled request could challenge the escape
+with it, which consumes the note's only nullifier. So before a withdrawal at
+such a state, the companion first asks the server whether the earlier
+request settled after all, and installs its signed response when it
+verifies; the withdrawal then closes the resulting state as usual.
+Otherwise it asks for a clearance without an ownership proof. A server that
+still allows legacy clearance grants it and the withdrawal continues. If the
+server refuses, the withdrawal stops with "zkAPI withdrawal waits for a
+settled note state". When the server reports the note state's nullifier
+unknown or owned by a request, the reservation is released and the note
+stays usable: send one chat request (its settlement moves the note to a new
+state), or wait until the earlier request settles, then choose **withdraw**
+again. The message names the note's expiry: do this before then. A chat
+request needs a note whose expiry is not yet past, so after expiry nothing
+can settle the state, and the vault's owner can claim the expired balance
+(`claimExpired`) at any time. For an expired note, **withdraw** therefore
+explains the challenge risk and asks you to type `send`: only then is the
+ownership proof sent anyway (the reservation remembers that answer for the
+rest of the withdrawal). If whoever kept the unsettled request starts the
+escape and challenges it with that request, the note's nullifier is
+consumed and the balance can no longer be withdrawn. Without the proof, the
+withdrawal waits for the earlier request to settle, if it ever does, while
+the note can be claimed. Any other answer stops without sending it. The
+acknowledgement is not offered before expiry (by this device's clock), and
+it does not help when the server reports the nullifier used by a request.
+
+If the server instead already holds a clearance for that state (an earlier
+withdrawal reserved it, or the operator released a stuck state) and allows
+no legacy clearance, no chat request can settle the state either. The
+withdrawal stays reserved, and **withdraw** offers the same acknowledgement
+before expiry too. Type `send` there only if you started that earlier
+withdrawal or asked the operator to release the note. A damaged file in the
+companion's `request_archive/` (one named like a record that cannot be read)
+also counts as an unsettled request; files not named like records
+(`<milliseconds>-<sequence>.json`) are ignored.
+
+A request that a release before this one discarded left no archive record,
+so its state is not recognized. If an earlier release discarded a request
+that the server had in fact admitted, the note is stuck at that state: the
+server refuses chat requests from it as replays, and chats and **withdraw**
+stop with `receipt_journal_missing` and the state's nullifier. (A dishonest
+server could claim the same.) Only the zkAPI operator can help with such a
+state (see "Receipt journal missing" in the
+[migration guide](../../docs/migration-hardened-vault.md)); contact them
+before the note expires and give them that nullifier, the note ID and the
+withdrawal destination, which tells them which of their requests was yours.
+Once the operator has released it, the server
+holds a withdrawal clearance for that state and refuses every chat request
+from it, so chats stop with `clearance_reserved_state` ("reserved for
+withdrawal") and send nothing new from that state. Choose **withdraw**: it
+first sets aside the retry the server refused (into `request_archive/`;
+the vault's root is not consulted for this, since a clearance blocks every
+request at that state whatever the root), then, when the server requires an
+ownership proof, asks for the acknowledgement described above.
 
 ## Withdrawals
 

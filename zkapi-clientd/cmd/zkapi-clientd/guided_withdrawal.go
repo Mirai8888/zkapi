@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
@@ -16,7 +18,9 @@ import (
 // is used only after the journal has an identified signed transaction.
 type guidedWithdrawalService interface {
 	Status(context.Context) (zkapi.AddressWithdrawalStatus, error)
-	Quote(context.Context, string, uint64, string) (zkapi.AddressPaymentQuote, error)
+	// The final argument is the owner's acknowledgement for an expired note
+	// at a state with an unsettled request (see confirmUnsettledWithdrawal).
+	Quote(context.Context, string, uint64, string, bool) (zkapi.AddressPaymentQuote, error)
 	Approve(context.Context, string) (zkapi.AddressWithdrawalStatus, error)
 	Resume(context.Context, string, uint64) (zkapi.AddressWithdrawalStatus, error)
 	Confirm(context.Context, string, uint64, string) (zkapi.AddressWithdrawalStatus, error)
@@ -27,10 +31,13 @@ type localGuidedWithdrawal struct{ config config.Config }
 func (s localGuidedWithdrawal) Status(ctx context.Context) (zkapi.AddressWithdrawalStatus, error) {
 	return requestWithdrawal(ctx, s.config, http.MethodGet, nil)
 }
-func (s localGuidedWithdrawal) Quote(ctx context.Context, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
+func (s localGuidedWithdrawal) Quote(ctx context.Context, destination string, note uint64, retry string, acceptUnsettledRequestRisk bool) (zkapi.AddressPaymentQuote, error) {
 	body := map[string]any{"destination": destination, "note_id": note}
 	if retry != "" {
 		body["retry_transaction_hash"] = retry
+	}
+	if acceptUnsettledRequestRisk {
+		body["accept_unsettled_request_risk"] = true
 	}
 	return requestPaymentQuote(ctx, s.config, http.MethodPost, "/admin/withdrawal/quote", "withdrawal", body)
 }
@@ -141,13 +148,31 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 	defer clearSetupProgress(ui)
 	var frozen *zkapi.AddressPaymentQuote
 	var displayedPayment *zkapi.AddressPaymentQuote
-	approved, retrying, settling := false, false, false
+	approved, retrying, settling, acceptedUnsettled := false, false, false, false
 	ceiling, lastProgress := "", ""
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		quote, err := service.Quote(ctx, destination, initial.NoteID, retryHash)
+		quote, err := service.Quote(ctx, destination, initial.NoteID, retryHash, acceptedUnsettled)
+		if managementErrorCode(err) == "receipt_journal_missing" {
+			// Waiting cannot help; the message names the nullifier the
+			// operator needs.
+			return err
+		}
+		if code := managementErrorCode(err); err != nil && (code == "unsettled_request_state" || code == "unsettled_clearance_reserved") {
+			// Waiting cannot settle this state by itself: stop with the
+			// remedy, or, for an expired note, ask for the acknowledgement.
+			if acceptedUnsettled {
+				return err
+			}
+			if err := confirmUnsettledWithdrawal(ctx, service, ui, err, time.Now()); err != nil {
+				return err
+			}
+			acceptedUnsettled, retrying, settling, lastProgress = true, false, false, ""
+			setupProgress(ui, "Preparing withdrawal with the ownership proof; this can take a few minutes.")
+			continue
+		}
 		if err != nil {
 			state, statusErr := service.Status(ctx)
 			if statusErr == nil {
@@ -266,6 +291,40 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 		}
 		return finishGuidedWithdrawal(ctx, service, state, ui, wait)
 	}
+}
+
+// confirmUnsettledWithdrawal handles the companion's refusal at a note state
+// with an unsettled request. Before the note expires, one chat request settles
+// that state (unsettled_request_state), so it stops with that remedy and the
+// expiry time. After expiry no chat request can, and the vault's owner may
+// claim the note at any time; nor can one when the server already holds a
+// clearance for the state (unsettled_clearance_reserved). Then it asks for the
+// owner's explicit acknowledgement before the ownership proof is sent; nil
+// means the owner gave it.
+func confirmUnsettledWithdrawal(ctx context.Context, service guidedWithdrawalService, ui setupPrompter, refusal error, now time.Time) error {
+	clearSetupProgress(ui)
+	if managementErrorCode(refusal) == "unsettled_clearance_reserved" {
+		ui.Printf("A chat request sent from this note's current state never settled, and the server already holds a withdrawal clearance for that state, for example because the zkAPI operator released it for you. No chat request can settle it, and the server grants the clearance only with an ownership proof. If you did not ask the operator to release this note and did not start this withdrawal earlier, stop here.\n")
+	} else {
+		state, err := service.Status(ctx)
+		if err != nil || state.NoteExpiry == 0 {
+			return refusal
+		}
+		expiry := time.Unix(int64(state.NoteExpiry), 0).UTC()
+		if !now.After(expiry) {
+			return fmt.Errorf("%w. This note expires at %s; after that no chat request can settle its state", refusal, expiry.Format(time.RFC3339))
+		}
+		ui.Printf("This note expired at %s, and a chat request sent from its current state never settled. No chat request can settle that state now, and the server grants no withdrawal clearance without an ownership proof.\n", expiry.Format(time.RFC3339))
+	}
+	ui.Printf("On this vault an ownership proof is also a valid escape. Whoever kept the unsettled request (the zkAPI operator, or anyone who intercepted it) could start that escape and challenge it with the request, which burns the note's nullifier: the balance could then never be withdrawn. Without the proof, the vault owner can claim the expired balance at any time.\n")
+	answer, err := ui.Ask(ctx, "Type send to send the ownership proof anyway, or press Enter to stop", "")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(answer) != "send" {
+		return errors.New("withdrawal stopped; no ownership proof was sent and no transaction was authorized")
+	}
+	return nil
 }
 
 func withdrawalPaymentNeedsRefresh(current, displayed zkapi.AddressPaymentQuote) bool {

@@ -9,7 +9,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"time"
 )
 
 // RebindDeposit repairs a saved deposit's note binding from finalized vault
@@ -130,8 +129,8 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 				return AddressFundingStatus{}, err
 			}
 			slots := append(signedDepositSlots(deposit, record), *deposit.Slot)
-			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil {
-				candidate, found = findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, time.Now().Unix())
+			if snapshot, err := h.indexerSnapshot(ctx, config); err == nil && h.snapshotChainTime(ctx, config, snapshot) == nil {
+				candidate, found = findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, snapshot.Time)
 			}
 		}
 		if !found {

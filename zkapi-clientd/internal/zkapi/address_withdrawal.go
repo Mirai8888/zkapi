@@ -37,6 +37,9 @@ type AddressWithdrawalStatus struct {
 	Phase           string `json:"phase"`
 	TransactionHash string `json:"transaction_hash,omitempty"`
 	Message         string `json:"message"`
+	// NoteExpiry is the active note's expiry (Unix seconds). After it no
+	// chat request can move the note to a new state.
+	NoteExpiry uint64 `json:"note_expiry,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -58,6 +61,7 @@ type withdrawalWallet struct {
 	Note    *struct {
 		NoteID  uint64 `json:"note_id"`
 		Balance uint64 `json:"current_balance"`
+		Expiry  uint64 `json:"expiry_ts"`
 	} `json:"note"`
 }
 
@@ -132,6 +136,22 @@ func (h *FundingHandler) requireClearanceOwnershipCapability(ctx context.Context
 	return nil
 }
 
+// requireUnsettledRequestOverride refuses to forward the owner's
+// acknowledgement to a companion that does not understand it.
+func (h *FundingHandler) requireUnsettledRequestOverride(ctx context.Context) error {
+	raw, err := h.client.request(ctx, http.MethodGet, "/oa/v1/status", nil)
+	if err != nil {
+		return err
+	}
+	var capability struct {
+		Version *int `json:"unsettled_request_override_version"`
+	}
+	if json.Unmarshal(raw, &capability) != nil || capability.Version == nil || *capability.Version < 1 {
+		return errors.New("this zkAPI native bundle cannot send an acknowledged ownership proof; update the native bundle (no ownership proof was sent)")
+	}
+	return nil
+}
+
 // NormalizeWithdrawalDestination rejects zero and bad mixed-case checksums.
 // Lower/upper-case addresses remain accepted, as with standard Ethereum tools.
 func NormalizeWithdrawalDestination(value string) (string, error) {
@@ -180,6 +200,7 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 	status.Phase = "no_note"
 	if *wallet.HasNote {
 		status.NoteID, status.PrivateBalance, status.Amount = wallet.Note.NoteID, wallet.Note.Balance, wallet.Note.Balance
+		status.NoteExpiry = wallet.Note.Expiry
 		status.Phase = "ready"
 		if wallet.Pending {
 			status.Phase = "waiting_settlement"
@@ -444,7 +465,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			return update(), err
 		}
 	}
-	body, _ := json.Marshal(map[string]string{"destination": destination})
+	prepare := map[string]any{"destination": destination}
+	if mode := quoteMode(ctx); mode != nil && mode.AcceptUnsettledRequestRisk {
+		if err := h.requireUnsettledRequestOverride(ctx); err != nil {
+			return update(), err
+		}
+		prepare["accept_unsettled_request_risk"] = true
+	}
+	body, _ := json.Marshal(prepare)
 	raw, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/prepare", body)
 	if err != nil {
 		var bridge *Error

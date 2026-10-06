@@ -100,6 +100,18 @@ func (e *Error) Error() string {
 	if e.Code == "withdrawal_conflict" || e.Code == "withdrawal_pending" {
 		return "zkAPI withdrawal is reserved; run zkapi-clientd config --menu and choose withdraw to resume the saved destination"
 	}
+	if e.Code == "unsettled_request_state" {
+		return "zkAPI withdrawal waits for a settled note state: a chat request sent from the note's current state never settled, so the wallet sends no ownership proof from that state, and the server refused a clearance without one. Before the note expires, send one chat request through zkapi-clientd, or wait for the earlier request to settle, then run zkapi-clientd config --menu and choose withdraw again. After the note expires no chat request can settle it: choose withdraw in zkapi-clientd config --menu to send the ownership proof with an explicit acknowledgement. If the private balance stays reserved for withdrawal, contact the zkAPI operator"
+	}
+	if e.Code == "receipt_journal_missing" {
+		return "zkAPI receipt_journal_missing: the server reports the note's current state settled by a request this wallet has no record of, usually one an earlier zkapi-clientd release discarded, so neither chat requests nor a withdrawal can continue from that state (a dishonest server could claim the same). Contact the zkAPI operator before the note expires"
+	}
+	if e.Code == "unsettled_clearance_reserved" {
+		return "zkAPI withdrawal needs your acknowledgement: a chat request sent from the note's current state never settled, and the server already holds a withdrawal clearance for that state (for example because the zkAPI operator released it), so no chat request can settle it and the clearance is granted only with an ownership proof. Run zkapi-clientd config --menu and choose withdraw to review the risk and send the proof"
+	}
+	if e.Code == "clearance_reserved_state" {
+		return "zkAPI note state is reserved for withdrawal: the server holds a withdrawal clearance for the note's current state (for example because the zkAPI operator released it) and refuses every chat request from it, so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance"
+	}
 	if e.Status == http.StatusPaymentRequired {
 		return "zkAPI private balance needs funding; run zkapi-clientd config to add funding"
 	}
@@ -107,6 +119,38 @@ func (e *Error) Error() string {
 		return "zkAPI wallet has a pending lease; wait for settlement or recover it"
 	}
 	return "zkAPI " + e.Code
+}
+
+// ReceiptJournalMissingError is the companion's receipt_journal_missing: the
+// server reports the note's current state settled by a request this wallet
+// holds no journal or archive record of, usually one an earlier release
+// discarded. It unwraps to the *Error with that code.
+type ReceiptJournalMissingError struct {
+	Status int
+	// Nullifier is the note state's nullifier in the server's form
+	// (lowercase 0x hex without leading zeros), for the operator.
+	Nullifier string
+}
+
+func (e *ReceiptJournalMissingError) Error() string {
+	return (&Error{e.Status, "receipt_journal_missing"}).Error() + " and give them this nullifier: " + e.Nullifier
+}
+
+func (e *ReceiptJournalMissingError) Unwrap() error {
+	return &Error{e.Status, "receipt_journal_missing"}
+}
+
+func validNullifierText(value string) bool {
+	digits, ok := strings.CutPrefix(value, "0x")
+	if !ok || digits == "" || len(digits) > 64 || (len(digits) > 1 && digits[0] == '0') {
+		return false
+	}
+	for _, digit := range digits {
+		if !strings.ContainsRune("0123456789abcdef", digit) {
+			return false
+		}
+	}
+	return true
 }
 
 func New(config Config) (*Client, error) {
@@ -221,14 +265,23 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			// allowlisted codes cross this boundary; its diagnostic message may
 			// contain private protocol state and is never forwarded.
 			var nested struct {
-				Code string `json:"code"`
+				Code      string `json:"code"`
+				Nullifier string `json:"nullifier"`
 			}
 			_ = json.Unmarshal(failure.Error, &nested)
 			var flat string
 			_ = json.Unmarshal(failure.Error, &flat)
+			if nested.Code == "receipt_journal_missing" {
+				// The nullifier is what the operator needs; it crosses only
+				// in its canonical form.
+				if validNullifierText(nested.Nullifier) {
+					return nil, &ReceiptJournalMissingError{Status: response.StatusCode, Nullifier: nested.Nullifier}
+				}
+				return nil, &Error{response.StatusCode, nested.Code}
+			}
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
-				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required":
+				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state":
 					return nil, &Error{response.StatusCode, code}
 				}
 			}

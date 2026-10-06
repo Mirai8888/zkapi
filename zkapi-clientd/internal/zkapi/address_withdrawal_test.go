@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -31,18 +33,27 @@ type withdrawalFixture struct {
 	*addressFixture
 	prepareCalls, confirmCalls int
 	pending                    bool
-	confirmFailure             bool
-	capability                 bool
-	planMutation               func(map[string]any)
-	reservedDestination        string
-	completedHash              string
-	walletBalance              uint64
-	planBalance                uint64
-	reservedBalance            uint64
-	noteID                     uint64
-	reservedNoteID             uint64
-	reservedNullifier          string
-	ownershipProofVersion      int
+	// unsettled makes prepare answer as the companion does at a note state
+	// with an unsettled request on a legacy vault.
+	unsettled bool
+	// unsettledCode replaces unsettled_request_state when set.
+	unsettledCode string
+	// overrideVersion is the companion's unsettled_request_override_version.
+	overrideVersion int
+	// prepareBodies records every withdrawal prepare request body.
+	prepareBodies         []map[string]any
+	confirmFailure        bool
+	capability            bool
+	planMutation          func(map[string]any)
+	reservedDestination   string
+	completedHash         string
+	walletBalance         uint64
+	planBalance           uint64
+	reservedBalance       uint64
+	noteID                uint64
+	reservedNoteID        uint64
+	reservedNullifier     string
+	ownershipProofVersion int
 }
 
 func withdrawalJSONResponse(r *http.Request, status int, value any) *http.Response {
@@ -92,6 +103,9 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			if w.ownershipProofVersion != 0 {
 				policy["clearance_ownership_proof_version"] = w.ownershipProofVersion
 			}
+			if w.overrideVersion != 0 {
+				policy["unsettled_request_override_version"] = w.overrideVersion
+			}
 			return withdrawalJSONResponse(r, 200, policy), nil
 		case "/wallet/status":
 			return withdrawalJSONResponse(r, 200, map[string]any{"has_note": f.active, "pending_request": w.pending, "note": map[string]any{"note_id": w.noteID, "deposit_amount": 100000, "current_balance": w.walletBalance, "expiry_ts": 2000000000, "current_anchor": "0x55", "current_commitment_x": "0x66", "current_commitment_y": "0x77"}}), nil
@@ -122,8 +136,22 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 		case "/oa/v1/withdraw/status":
 			return withdrawalJSONResponse(r, 200, w.bridgeStatus()), nil
 		case "/oa/v1/withdraw/prepare":
+			raw, _ := io.ReadAll(r.Body)
+			var recorded map[string]any
+			if json.Unmarshal(raw, &recorded) != nil {
+				t.Error("invalid withdrawal prepare request")
+			}
+			w.prepareBodies = append(w.prepareBodies, recorded)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
 			if w.pending {
 				return withdrawalJSONResponse(r, 409, map[string]any{"error": map[string]string{"code": "pending_settlement", "message": "private companion diagnostics"}}), nil
+			}
+			if w.unsettled {
+				code := "unsettled_request_state"
+				if w.unsettledCode != "" {
+					code = w.unsettledCode
+				}
+				return withdrawalJSONResponse(r, 409, map[string]any{"error": map[string]string{"code": code, "message": "private companion diagnostics", "nullifier": "0x1234ab"}}), nil
 			}
 			w.prepareCalls++
 			var body struct {
@@ -228,7 +256,7 @@ func (f *withdrawalFixture) withdraw(t *testing.T, retryHash ...string) string {
 		if len(retryHash) > 0 {
 			retry = retryHash[0]
 		}
-		quote, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, retry)
+		quote, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, retry, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -900,6 +928,99 @@ func TestAddressWithdrawalWaitsForOutstandingInferenceSettlement(t *testing.T) {
 	f.withdraw(t)
 	if f.prepareCalls != 1 || len(f.accepted) != 3 {
 		t.Fatal("settled inference could not resume saved withdrawal")
+	}
+}
+
+// The owner's acknowledgement for an expired note at an unsettled state
+// reaches the companion only with the quote that carries it, and only a
+// companion that understands it receives it. Its refusal code crosses the
+// management boundary, so the guided withdrawal can act on it.
+func TestUnsettledRequestAcknowledgementIsForwardedOnlyWhenGiven(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.unsettled = true
+	_, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", false)
+	var refused *Error
+	if !errors.As(err, &refused) || refused.Code != "unsettled_request_state" {
+		t.Fatalf("refusal: %v", err)
+	}
+	if len(f.prepareBodies) != 1 || f.prepareBodies[0]["accept_unsettled_request_risk"] != nil {
+		t.Fatalf("an unrequested acknowledgement was sent: %+v", f.prepareBodies)
+	}
+	r := httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	var failure struct{ Error, Code string }
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "unsettled_request_state" || !strings.Contains(failure.Error, "After the note expires") || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = "unsettled_clearance_reserved"
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "unsettled_clearance_reserved" || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("clearance-reserved management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = "receipt_journal_missing"
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal/quote", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	f.h.ServeAdminHTTP(recorder, r)
+	if json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != "receipt_journal_missing" || !strings.Contains(failure.Error, "0x1234ab") || strings.Contains(failure.Error, "private companion") {
+		t.Fatalf("missing receipt journal management refusal: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.unsettledCode = ""
+
+	// A companion that cannot take the acknowledgement never receives it.
+	before := len(f.prepareBodies)
+	if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", true); err == nil || !strings.Contains(err.Error(), "update the native bundle") {
+		t.Fatalf("old companion: %v", err)
+	}
+	if len(f.prepareBodies) != before {
+		t.Fatal("the acknowledgement reached a companion without the capability")
+	}
+	f.overrideVersion, f.unsettled = 1, false
+	if _, err := f.h.QuoteAddressWithdrawal(context.Background(), withdrawalTestDestination, f.noteID, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if last := f.prepareBodies[len(f.prepareBodies)-1]; last["accept_unsettled_request_risk"] != true || last["destination"] == nil {
+		t.Fatalf("acknowledged prepare: %+v", last)
+	}
+	// Approval and the plain withdrawal route never carry it.
+	r = httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/withdrawal", strings.NewReader(fmt.Sprintf(`{"destination":%q,"note_id":%d,"accept_unsettled_request_risk":true}`, withdrawalTestDestination, f.noteID)))
+	r.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	before = len(f.prepareBodies)
+	f.h.ServeAdminHTTP(recorder, r)
+	if recorder.Code != http.StatusBadGateway || len(f.prepareBodies) != before {
+		t.Fatalf("plain withdrawal took the acknowledgement: %d %s", recorder.Code, recorder.Body.String())
+	}
+	status, err := f.h.AddressWithdrawal(context.Background())
+	if err != nil || status.NoteExpiry != 2000000000 {
+		t.Fatalf("note expiry: %+v %v", status, err)
+	}
+}
+
+// At a note state with an unsettled request on a legacy vault the companion
+// refuses to prepare (closure:journal-discard #1). The saved intent stays
+// resumable, nothing is signed, and the user is told how to settle the state.
+func TestAddressWithdrawalAtAnUnsettledNoteStateSignsNothingAndResumes(t *testing.T) {
+	f := newWithdrawalFixture(t)
+	f.unsettled = true
+	_, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+	var refused *Error
+	if !errors.As(err, &refused) || refused.Code != "unsettled_request_state" || !strings.Contains(err.Error(), "send one chat request") || strings.Contains(err.Error(), "private companion") {
+		t.Fatalf("the unsettled-state refusal was hidden or leaked: %v", err)
+	}
+	record := f.journal(t)
+	if record.Pending != nil || record.Withdrawal == nil || record.Withdrawal.Binding != "" || len(f.accepted) != 2 {
+		t.Fatalf("a refused preparation bound or signed a withdrawal: %+v", record.Withdrawal)
+	}
+	f.unsettled = false
+	f.withdraw(t)
+	if len(f.accepted) != 3 {
+		t.Fatal("the withdrawal did not resume once the note state settled")
 	}
 }
 

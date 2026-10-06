@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
@@ -18,6 +21,7 @@ type withdrawalWizardFixture struct {
 	approve                                                          func(string) (zkapi.AddressWithdrawalStatus, error)
 	resume                                                           func(int, string, uint64) (zkapi.AddressWithdrawalStatus, error)
 	confirm                                                          func(string, uint64, string) (zkapi.AddressWithdrawalStatus, error)
+	acceptances                                                      []bool
 }
 
 func withdrawalWizardQuote() zkapi.AddressPaymentQuote {
@@ -52,8 +56,9 @@ func (f *withdrawalWizardFixture) Status(context.Context) (zkapi.AddressWithdraw
 	}
 	return withdrawalWizardState("ready"), nil
 }
-func (f *withdrawalWizardFixture) Quote(_ context.Context, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
+func (f *withdrawalWizardFixture) Quote(_ context.Context, destination string, note uint64, retry string, accept bool) (zkapi.AddressPaymentQuote, error) {
 	f.quoteCalls++
+	f.acceptances = append(f.acceptances, accept)
 	if f.quote != nil {
 		return f.quote(f.quoteCalls, destination, note, retry)
 	}
@@ -521,5 +526,153 @@ func TestGuidedWithdrawalConfirmSeparatePayoutPreservesBinding(t *testing.T) {
 	}
 	if f.confirmCalls != 1 || f.quoteCalls != 0 || f.approveCalls != 0 || f.resumeCalls != 0 {
 		t.Fatal("receipt confirmation must not sign another transaction")
+	}
+}
+
+func unsettledRequestRefusal() error {
+	return &managementError{message: "zkAPI withdrawal waits for a settled note state", code: "unsettled_request_state"}
+}
+
+func withdrawalWizardExpiry(expiry time.Time) func(int) (zkapi.AddressWithdrawalStatus, error) {
+	return func(int) (zkapi.AddressWithdrawalStatus, error) {
+		state := withdrawalWizardState("ready")
+		state.NoteExpiry = uint64(expiry.Unix())
+		return state, nil
+	}
+}
+
+// The companion's unsettled_request_state refusal used to disappear into the
+// fee-refresh retry loop ("Could not refresh withdrawal fees"), so the user
+// never saw the remedy. Before the note expires the guided withdrawal stops
+// with it, and with the expiry after which no chat request can settle the
+// state; it never asks to send the ownership proof.
+func TestGuidedWithdrawalStopsWithTheRemedyBeforeTheNoteExpires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	expiry := time.Now().Add(72 * time.Hour)
+	f := &withdrawalWizardFixture{status: withdrawalWizardExpiry(expiry)}
+	f.quote = func(call int, _ string, _ uint64, _ string) (zkapi.AddressPaymentQuote, error) {
+		if call > 2 {
+			cancel()
+		}
+		return zkapi.AddressPaymentQuote{}, unsettledRequestRefusal()
+	}
+	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
+	err := guidedWithdrawal(ctx, f, u, immediateWizardPoll)
+	if managementErrorCode(err) != "unsettled_request_state" || !strings.Contains(err.Error(), "waits for a settled note state") || !strings.Contains(err.Error(), expiry.UTC().Format(time.RFC3339)) {
+		t.Fatalf("remedy not shown: %v", err)
+	}
+	if f.quoteCalls != 1 || u.asks != 1 || len(f.acceptances) != 1 || f.acceptances[0] || f.approveCalls != 0 {
+		t.Fatalf("unexpected calls: ui=%+v service=%+v", u, f)
+	}
+}
+
+// After expiry no chat request can settle the state. The guided withdrawal
+// explains the challenge risk and sends the ownership proof only when the
+// owner types "send"; anything else stops without it, and a second refusal
+// after the acknowledgement is not retried.
+func TestGuidedWithdrawalAsksBeforeSendingTheOwnershipProofForAnExpiredNote(t *testing.T) {
+	for _, answer := range []string{"send", "", "yes"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		f := &withdrawalWizardFixture{status: withdrawalWizardExpiry(time.Now().Add(-time.Hour))}
+		f.quote = func(call int, _ string, _ uint64, _ string) (zkapi.AddressPaymentQuote, error) {
+			if call > 4 {
+				cancel()
+			}
+			if call == 1 {
+				return zkapi.AddressPaymentQuote{}, unsettledRequestRefusal()
+			}
+			q := withdrawalWizardQuote()
+			q.ID = fmt.Sprintf("%064x", call)
+			return q, nil
+		}
+		u := &fundingWizardUI{answers: []string{withdrawalTestDestination, answer}, confirmations: []bool{true}}
+		err := guidedWithdrawal(ctx, f, u, immediateWizardPoll)
+		cancel()
+		if !strings.Contains(u.String(), "burns the note's nullifier") || u.asks != 2 {
+			t.Fatalf("%q: the risk was not explained before asking: %s", answer, u.String())
+		}
+		if answer != "send" {
+			if err == nil || !strings.Contains(err.Error(), "no ownership proof was sent") || f.quoteCalls != 1 || f.approveCalls != 0 {
+				t.Fatalf("%q: declined acknowledgement: %v %+v", answer, err, f)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.quoteCalls != 3 || f.approveCalls != 1 || len(f.acceptances) != 3 || f.acceptances[0] || !f.acceptances[1] || !f.acceptances[2] {
+			t.Fatalf("acknowledged withdrawal: %+v", f)
+		}
+	}
+
+	f := &withdrawalWizardFixture{status: withdrawalWizardExpiry(time.Now().Add(-time.Hour))}
+	f.quote = func(call int, _ string, _ uint64, _ string) (zkapi.AddressPaymentQuote, error) {
+		return zkapi.AddressPaymentQuote{}, unsettledRequestRefusal()
+	}
+	u := &fundingWizardUI{answers: []string{withdrawalTestDestination, "send"}}
+	err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
+	if managementErrorCode(err) != "unsettled_request_state" || f.quoteCalls != 2 || u.asks != 2 {
+		t.Fatalf("a refusal after the acknowledgement: %v %+v", err, f)
+	}
+}
+
+// The management client keeps a forwarded refusal code next to the
+// daemon's message.
+func TestManagementErrorsKeepTheirForwardedCode(t *testing.T) {
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "zkAPI withdrawal waits for a settled note state", "code": "unsettled_request_state"})
+	}))
+	defer s.Close()
+	_, err := requestPaymentQuote(context.Background(), fundingTestConfig(s), http.MethodPost, "/admin/withdrawal/quote", "withdrawal", map[string]any{"destination": withdrawalTestDestination, "note_id": 1})
+	if managementErrorCode(err) != "unsettled_request_state" || err.Error() != "wallet: zkAPI withdrawal waits for a settled note state" {
+		t.Fatalf("management refusal: %v", err)
+	}
+}
+
+// A state the server already holds a clearance for can never be settled by a
+// chat request, before expiry too: the guided withdrawal explains that and
+// asks for the acknowledgement without waiting for expiry.
+func TestGuidedWithdrawalAsksForTheAcknowledgementAtAClearanceReservedState(t *testing.T) {
+	for _, answer := range []string{"send", ""} {
+		f := &withdrawalWizardFixture{status: withdrawalWizardExpiry(time.Now().Add(72 * time.Hour))}
+		f.quote = func(call int, _ string, _ uint64, _ string) (zkapi.AddressPaymentQuote, error) {
+			if call == 1 {
+				return zkapi.AddressPaymentQuote{}, &managementError{message: "zkAPI withdrawal needs your acknowledgement", code: "unsettled_clearance_reserved"}
+			}
+			q := withdrawalWizardQuote()
+			q.ID = fmt.Sprintf("%064x", call)
+			return q, nil
+		}
+		u := &fundingWizardUI{answers: []string{withdrawalTestDestination, answer}, confirmations: []bool{true}}
+		err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll)
+		if !strings.Contains(u.String(), "already holds a withdrawal clearance") || !strings.Contains(u.String(), "burns the note's nullifier") || u.asks != 2 {
+			t.Fatalf("%q: %s", answer, u.String())
+		}
+		if answer == "" {
+			if err == nil || f.quoteCalls != 1 || f.approveCalls != 0 {
+				t.Fatalf("declined: %v %+v", err, f)
+			}
+			continue
+		}
+		if err != nil || f.approveCalls != 1 || !f.acceptances[1] {
+			t.Fatalf("acknowledged: %v %+v", err, f)
+		}
+	}
+}
+
+// A note state settled by a request whose journal is gone can never move:
+// the guided withdrawal stops at once with the operator's nullifier instead
+// of waiting for settlement.
+func TestGuidedWithdrawalStopsAtAMissingReceiptJournal(t *testing.T) {
+	f := &withdrawalWizardFixture{}
+	f.quote = func(int, string, uint64, string) (zkapi.AddressPaymentQuote, error) {
+		return zkapi.AddressPaymentQuote{}, &managementError{message: "zkAPI receipt_journal_missing: ... give them this nullifier: 0x1234ab", code: "receipt_journal_missing"}
+	}
+	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
+	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") })
+	if managementErrorCode(err) != "receipt_journal_missing" || !strings.Contains(err.Error(), "0x1234ab") || f.quoteCalls != 1 {
+		t.Fatalf("%v %+v", err, f)
 	}
 }

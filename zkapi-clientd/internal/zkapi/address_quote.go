@@ -54,6 +54,10 @@ type addressQuoteMode struct {
 	Capture   *AddressPaymentQuote
 	Approval  *AddressPaymentQuote
 	RetryHash string
+	// AcceptUnsettledRequestRisk carries the owner's acknowledgement for an
+	// expired note whose current state has an unsettled request: the
+	// companion may then send the ownership proof the server requires.
+	AcceptUnsettledRequestRisk bool
 }
 
 func quoteMode(ctx context.Context) *addressQuoteMode {
@@ -195,9 +199,14 @@ func (h *FundingHandler) ApproveAddressDeposit(ctx context.Context, id string) (
 	}
 	return h.fundAddressLocked(context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote}), quote.Amount)
 }
-func (h *FundingHandler) QuoteAddressWithdrawal(ctx context.Context, destination string, noteID uint64, retryHash string) (AddressPaymentQuote, error) {
+
+// QuoteAddressWithdrawal reserves the note and returns a fee quote.
+// acceptUnsettledRequestRisk is the owner's explicit acknowledgement for an
+// expired note at a state with an unsettled request (see the companion's
+// unsettled_request_state); it is only forwarded when given.
+func (h *FundingHandler) QuoteAddressWithdrawal(ctx context.Context, destination string, noteID uint64, retryHash string, acceptUnsettledRequestRisk bool) (AddressPaymentQuote, error) {
 	var quote AddressPaymentQuote
-	mode := &addressQuoteMode{Capture: &quote, RetryHash: retryHash}
+	mode := &addressQuoteMode{Capture: &quote, RetryHash: retryHash, AcceptUnsettledRequestRisk: acceptUnsettledRequestRisk}
 	status, err := h.WithdrawAddress(context.WithValue(ctx, addressQuoteContextKey{}, mode), destination, noteID, retryHash)
 	if err == nil && quote.ID == "" {
 		err = fmt.Errorf("withdrawal cannot be quoted while its status is %s; resume the saved operation", status.Phase)

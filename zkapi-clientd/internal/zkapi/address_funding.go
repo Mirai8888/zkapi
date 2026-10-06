@@ -598,11 +598,11 @@ func validDepositRecovery(record depositRecord) bool {
 	if r := record.Rebind; r != nil && r.ExpiryTs == 0 {
 		return false
 	}
-	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.EmptyBefore > s.NoteID) {
+	if s := record.Slot; s != nil && (!isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0 || s.EmptyBefore > s.NoteID) {
 		return false
 	}
 	for _, s := range record.SignedSlots {
-		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.EmptyBefore > s.NoteID {
+		if !isHex(s.PathSHA256, 32) || s.PreparedAt <= 0 || s.PreparedChainAt < 0 || s.EmptyBefore > s.NoteID {
 			return false
 		}
 	}

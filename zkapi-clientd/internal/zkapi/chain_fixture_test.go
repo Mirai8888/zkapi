@@ -5,7 +5,15 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/core/types"
 )
+
+// fixtureHeader is a minimal post-London block header at number with block
+// time at. Its Hash is what an indexer view of that block names.
+func fixtureHeader(number uint64, at int64) *types.Header {
+	return &types.Header{Number: new(big.Int).SetUint64(number), Time: uint64(at), Difficulty: new(big.Int), Extra: []byte{}, BaseFee: big.NewInt(1_000_000_000)}
+}
 
 // fixtureNote is one vault notes(uint32) entry served by a test RPC.
 type fixtureNote struct {

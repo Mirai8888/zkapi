@@ -26,10 +26,10 @@ index 7b7750c..45aa47c 100644
   "zkapi-types",
  ]
 diff --git a/crates/zkapi-cli/src/main.rs b/crates/zkapi-cli/src/main.rs
-index 594cbe6..eefe04e 100644
+index 594cbe6..87dd8dc 100644
 --- a/crates/zkapi-cli/src/main.rs
 +++ b/crates/zkapi-cli/src/main.rs
-@@ -312,6 +312,18 @@ struct DeploymentManifest {
+@@ -312,6 +312,20 @@ struct DeploymentManifest {
      contract_address: String,
      billing_token_address: Option<String>,
      #[serde(default)]
@@ -45,19 +45,22 @@ index 594cbe6..eefe04e 100644
 +    #[serde(default)]
 +    native_price_max_age_seconds: u64,
 +    #[serde(default)]
++    vault_revision: u32,
++    #[serde(default)]
      demo_mint_enabled: bool,
      protocol_server_url: String,
      indexer_url: String,
-@@ -684,6 +696,8 @@ fn build_auth_service_with_mode(
+@@ -684,6 +698,9 @@ fn build_auth_service_with_mode(
      request_mode: RequestMode,
  ) -> anyhow::Result<Arc<AuthService>> {
      AuthService::new(AuthConfig {
 +        deployment_id: String::new(), billing_asset: "erc20".into(), billing_unit: "micro_usdc".into(), native_asset_wei_per_unit: "0".into(),
 +        native_price_feed_address: String::new(), native_price_feed_decimals: 8, native_price_max_age_seconds: 3600,
++        vault_revision: 0,
          protocol_version: cli.protocol_version,
          chain_id: cli.chain_id,
          contract_address: parse_felt("contract address", &cli.contract_address)?,
-@@ -768,8 +782,14 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
+@@ -768,8 +785,14 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
          openrouter_inference_base,
          require_oa_org_key_source,
      } = options;
@@ -72,7 +75,7 @@ index 594cbe6..eefe04e 100644
 
      let state_dir =
          requested_state_dir.unwrap_or_else(|| default_client_state_dir(&manifest.deployment_id));
-@@ -817,10 +837,10 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
+@@ -817,10 +840,10 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
              .await?;
          }
      } else if let Some(note) = status.note {
@@ -85,7 +88,7 @@ index 594cbe6..eefe04e 100644
                      note.note_id, note.current_balance, manifest.request_charge_cap
                  );
              } else {
-@@ -863,6 +883,20 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
+@@ -863,6 +886,20 @@ async fn run_one_command_client(options: OneCommandClientOptions<'_>) -> anyhow:
      run(service, listen).await
  }
 
@@ -106,7 +109,7 @@ index 594cbe6..eefe04e 100644
  async fn load_deployment_manifest(source: &str) -> anyhow::Result<DeploymentManifest> {
      let bytes = if source.starts_with("https://") || source.starts_with("http://") {
          reqwest::get(source)
-@@ -931,11 +965,18 @@ fn auth_service_from_manifest(
+@@ -931,11 +968,19 @@ fn auth_service_from_manifest(
          require_oa_org_key_source,
      } = policy;
      let models = if manifest.models.is_empty() {
@@ -123,10 +126,11 @@ index 594cbe6..eefe04e 100644
 +        native_price_feed_address: manifest.native_price_feed_address.clone(),
 +        native_price_feed_decimals: manifest.native_price_feed_decimals,
 +        native_price_max_age_seconds: manifest.native_price_max_age_seconds,
++        vault_revision: manifest.vault_revision,
          protocol_version: manifest.protocol_version,
          chain_id: manifest.chain_id,
          contract_address: parse_felt("deployment contract address", &manifest.contract_address)?,
-@@ -951,12 +992,12 @@ fn auth_service_from_manifest(
+@@ -951,12 +996,12 @@ fn auth_service_from_manifest(
          suggested_deposit_amount,
          demo_rpc_url: Some(manifest.rpc_url.clone()),
          demo_billing_token_address: manifest.billing_token_address.clone(),
@@ -141,12 +145,13 @@ index 594cbe6..eefe04e 100644
          state_signing_key: parse_curve_point(
              "deployment state signing key",
              &manifest.state_signing_key.x,
-@@ -2396,6 +2437,8 @@ mod tests {
+@@ -2396,6 +2441,9 @@ mod tests {
      fn deployment_manifest_rejects_non_v2_backends() {
          let manifest = DeploymentManifest {
              deployment_id: "test".to_string(),
 +            billing_asset: "erc20".into(), billing_unit: "micro_usdc".into(), native_asset_wei_per_unit: "0".into(),
 +            native_price_feed_address: String::new(), native_price_feed_decimals: 8, native_price_max_age_seconds: 3600,
++            vault_revision: 0,
              protocol_version: 1,
              chain_id: 11155111,
              rpc_url: "https://rpc.example".to_string(),
@@ -173,10 +178,10 @@ index c52ce9f..dc2ed84 100644
  tokio = { workspace = true }
  tower = { workspace = true }
 diff --git a/crates/zkapi-clientd/src/config.rs b/crates/zkapi-clientd/src/config.rs
-index ebde330..bcfc691 100644
+index ebde330..13450d3 100644
 --- a/crates/zkapi-clientd/src/config.rs
 +++ b/crates/zkapi-clientd/src/config.rs
-@@ -35,6 +35,15 @@ impl ModelDescriptor {
+@@ -35,6 +35,18 @@ impl ModelDescriptor {
 
  #[derive(Debug, Clone)]
  pub struct AuthConfig {
@@ -187,12 +192,15 @@ index ebde330..bcfc691 100644
 +    pub native_price_feed_address: String,
 +    pub native_price_feed_decimals: u8,
 +    pub native_price_max_age_seconds: u64,
-+
++    /// The manifest's `vault_revision`. Below 2 (every packaged deployment)
++    /// the vault burns a challenged escape's nullifier, so an escape-form
++    /// ownership proof is never sent at a state with an unsettled request.
++    pub vault_revision: u32,
 +
      pub protocol_version: u16,
      pub chain_id: u64,
      pub contract_address: Felt252,
-@@ -88,6 +97,11 @@ impl AuthConfig {
+@@ -88,6 +100,12 @@ impl AuthConfig {
  impl Default for AuthConfig {
      fn default() -> Self {
          Self {
@@ -201,14 +209,19 @@ index ebde330..bcfc691 100644
 +            billing_unit: "micro_usdc".into(),
 +            native_asset_wei_per_unit: "0".into(),
 +            native_price_feed_address: String::new(), native_price_feed_decimals: 8, native_price_max_age_seconds: 3600,
++            vault_revision: 0,
              protocol_version: 2,
              chain_id: 1,
              contract_address: Felt252::ZERO,
 diff --git a/crates/zkapi-clientd/src/error.rs b/crates/zkapi-clientd/src/error.rs
-index 6f82083..3e4fa50 100644
+index 6f82083..595bd28 100644
 --- a/crates/zkapi-clientd/src/error.rs
 +++ b/crates/zkapi-clientd/src/error.rs
-@@ -4,6 +4,14 @@ use zkapi_client::error::ClientError;
+@@ -1,9 +1,18 @@
+ use axum::http::StatusCode;
+ use thiserror::Error;
+ use zkapi_client::error::ClientError;
++use zkapi_types::Felt252;
 
  #[derive(Debug, Error)]
  pub enum AuthError {
@@ -223,17 +236,37 @@ index 6f82083..3e4fa50 100644
      #[error("wallet is busy in another process")]
      WalletBusy,
      #[error("wallet has no active note; fund it first")]
-@@ -42,7 +50,8 @@ pub enum AuthError {
+@@ -37,12 +46,28 @@ pub enum AuthError {
+     Indexer(String),
+     #[error("serialization error: {0}")]
+     Serialization(String),
++    #[error("withdrawal waits for a settled note state ({0}): a chat request sent from this note state never settled, and on this vault an escape-form withdrawal proof sent from it could be challenged with that request, which burns the note's nullifier; send one chat request so the note reaches a settled state, or wait for that request to settle, then withdraw again")]
++    UnsettledRequestState(String),
++    #[error("withdrawal at a note state with an unsettled request ({0}): the server already holds a clearance for this state, so no chat request can settle it, and it grants that clearance only with an ownership proof; on this vault that proof could be challenged with the unsettled request, which burns the note's nullifier. Send it only with the owner's acknowledgement, for example after the operator released this state")]
++    UnsettledStateClearanceReserved(String),
++    #[error("receipt journal missing: the server reports this note state's nullifier {0} settled by a request this wallet holds no journal or archive record of, so its receipt cannot be installed and neither chat requests nor a withdrawal can continue from this state; an earlier release deleted that request's journal (a lying server could claim the same). Contact the zkAPI operator with this nullifier")]
++    ReceiptJournalMissing(Felt252),
++    #[error("this note state is reserved for a withdrawal: the server holds a clearance for its nullifier (an earlier withdrawal reserved it, or the operator released a stuck state) and refuses every request at it as a replay, so no chat request can settle this state; withdraw the balance by mutual close (in zkapi-clientd: config --menu, then withdraw), which sets the refused request aside first")]
++    ClearanceReservedState,
+ }
+
  impl AuthError {
      pub fn status_code(&self) -> StatusCode {
          match self {
 -            Self::WalletBusy => StatusCode::CONFLICT,
 +            Self::TestnetPasswordRequired => StatusCode::UNAUTHORIZED,
-+            Self::WalletBusy | Self::PendingSettlement | Self::OaWithdrawalPending | Self::WithdrawalConflict => StatusCode::CONFLICT,
++            Self::WalletBusy
++            | Self::PendingSettlement
++            | Self::OaWithdrawalPending
++            | Self::WithdrawalConflict
++            | Self::UnsettledRequestState(_)
++            | Self::UnsettledStateClearanceReserved(_)
++            | Self::ReceiptJournalMissing(_)
++            | Self::ClearanceReservedState => StatusCode::CONFLICT,
              Self::NoActiveNote | Self::InsufficientBalance => StatusCode::PAYMENT_REQUIRED,
              Self::PendingRequest
              | Self::LeasePending(_)
-@@ -58,7 +67,11 @@ impl AuthError {
+@@ -58,7 +83,11 @@ impl AuthError {
 
      pub fn code(&self) -> &'static str {
          match self {
@@ -245,7 +278,27 @@ index 6f82083..3e4fa50 100644
              Self::NoActiveNote => "no_active_note",
              Self::InsufficientBalance => "insufficient_balance",
              Self::PendingRequest => "pending_request",
-@@ -82,6 +95,7 @@ impl AuthError {
+@@ -71,6 +100,19 @@ impl AuthError {
+             Self::Wallet(_) => "wallet_error",
+             Self::Indexer(_) => "indexer_error",
+             Self::Serialization(_) => "serialization_error",
++            Self::UnsettledRequestState(_) => "unsettled_request_state",
++            Self::UnsettledStateClearanceReserved(_) => "unsettled_clearance_reserved",
++            Self::ReceiptJournalMissing(_) => "receipt_journal_missing",
++            Self::ClearanceReservedState => "clearance_reserved_state",
++        }
++    }
++
++    /// The note state's nullifier the owner gives the operator, for
++    /// `receipt_journal_missing` only.
++    pub fn nullifier(&self) -> Option<String> {
++        match self {
++            Self::ReceiptJournalMissing(nullifier) => Some(nullifier.to_string()),
++            _ => None,
+         }
+     }
+
+@@ -82,6 +124,7 @@ impl AuthError {
  impl From<ClientError> for AuthError {
      fn from(value: ClientError) -> Self {
          match value {
@@ -253,7 +306,7 @@ index 6f82083..3e4fa50 100644
              ClientError::NoActiveNote => Self::NoActiveNote,
              ClientError::InsufficientBalance { .. } => Self::InsufficientBalance,
              ClientError::PendingRequest => Self::PendingRequest,
-@@ -94,6 +108,14 @@ impl From<ClientError> for AuthError {
+@@ -94,6 +137,14 @@ impl From<ClientError> for AuthError {
  mod tests {
      use super::*;
 
@@ -339,15 +392,16 @@ index 2cbde2c..05ce3d3 100644
 +
 +mod oa_station_trust;
 diff --git a/crates/zkapi-clientd/src/main.rs b/crates/zkapi-clientd/src/main.rs
-index 3b94253..2709888 100644
+index 3b94253..ca9391a 100644
 --- a/crates/zkapi-clientd/src/main.rs
 +++ b/crates/zkapi-clientd/src/main.rs
-@@ -99,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
+@@ -99,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
 
      let args = Args::parse();
      let service = AuthService::new(AuthConfig {
 +        deployment_id: String::new(), billing_asset: "erc20".into(), billing_unit: "micro_usdc".into(), native_asset_wei_per_unit: "0".into(),
 +        native_price_feed_address: String::new(), native_price_feed_decimals: 8, native_price_max_age_seconds: 3600,
++        vault_revision: 0,
          protocol_version: args.protocol_version,
          chain_id: args.chain_id,
          contract_address: Felt252::from_hex(&args.contract_address)
@@ -1210,10 +1264,10 @@ index 0000000..1756288
 +}
 diff --git a/crates/zkapi-clientd/src/oa_withdrawal.rs b/crates/zkapi-clientd/src/oa_withdrawal.rs
 new file mode 100644
-index 0000000..f01a644
+index 0000000..5971570
 --- /dev/null
 +++ b/crates/zkapi-clientd/src/oa_withdrawal.rs
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,872 @@
 +//! Durable OA withdrawal reservation. Every call runs under the wallet lock.
 +//! The snapshot is local recovery material and is never returned over HTTP.
 +use std::fs::{self, File, OpenOptions};
@@ -1243,6 +1297,11 @@ index 0000000..f01a644
 +    pub plan: Option<WithdrawalPlan>,
 +    pub complete: bool,
 +    pub transaction_hash: Option<String>,
++    /// The owner acknowledged sending an ownership proof from this expired
++    /// note's unsettled state (see `AuthService::oa_prepare_withdrawal`).
++    /// Every later clearance request for this reservation carries the proof.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub unsettled_request_risk_accepted: bool,
 +}
 +
 +fn storage_error() -> AuthError {
@@ -1366,6 +1425,7 @@ index 0000000..f01a644
 +        plan: None,
 +        complete: false,
 +        transaction_hash: None,
++        unsettled_request_risk_accepted: false,
 +    };
 +    save(config, &record)?;
 +    Ok(record)
@@ -2081,7 +2141,7 @@ index 0000000..f01a644
 +    }
 +}
 diff --git a/crates/zkapi-clientd/src/routes.rs b/crates/zkapi-clientd/src/routes.rs
-index bebd5c4..71dcf8e 100644
+index bebd5c4..c63b904 100644
 --- a/crates/zkapi-clientd/src/routes.rs
 +++ b/crates/zkapi-clientd/src/routes.rs
 @@ -18,7 +18,8 @@ use std::io;
@@ -2094,13 +2154,19 @@ index bebd5c4..71dcf8e 100644
  use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
  use axum::response::{Html, IntoResponse, Response};
  use axum::routing::{get, post};
-@@ -50,11 +51,40 @@ struct WithdrawBody {
+@@ -50,11 +51,46 @@ struct WithdrawBody {
      destination: String,
  }
 
 +#[derive(Deserialize)]
 +#[serde(deny_unknown_fields)]
-+struct OaWithdrawalBody { destination: String }
++struct OaWithdrawalBody {
++    destination: String,
++    /// The owner's acknowledgement that an expired note at a state with an
++    /// unsettled request may send its ownership proof anyway.
++    #[serde(default)]
++    accept_unsettled_request_risk: bool,
++}
 +
 +#[derive(Deserialize)]
 +#[serde(deny_unknown_fields)]
@@ -2135,7 +2201,7 @@ index bebd5c4..71dcf8e 100644
          .route("/healthz", get(healthz))
          .route("/request", post(core_request))
          .route("/status", get(wallet_status))
-@@ -92,9 +122,102 @@ pub fn build_router(service: Arc<AuthService>) -> Router {
+@@ -92,9 +128,106 @@ pub fn build_router(service: Arc<AuthService>) -> Router {
          .route("/zkapi/v1/inference", post(zkapi_inference))
          .route("/funding/{*path}", get(funding_asset))
          .layer(local_cors_layer())
@@ -2210,8 +2276,12 @@ index bebd5c4..71dcf8e 100644
 +    let destination = match crate::oa_withdrawal::destination(&body.destination) {
 +        Ok(value) => value, Err(error) => return generic_error(error),
 +    };
-+    match service.oa_prepare_withdrawal(destination).await {
-+        Ok(value) => Json(value).into_response(), Err(error) => generic_error(error),
++    match service
++        .oa_prepare_withdrawal(destination, body.accept_unsettled_request_risk)
++        .await
++    {
++        Ok(value) => Json(value).into_response(),
++        Err(error) => generic_error(error),
 +    }
 +}
 +
@@ -2238,7 +2308,64 @@ index bebd5c4..71dcf8e 100644
  /// A deliberately narrow CORS policy.
  ///
  /// The funding UI is served by this same daemon, so it is same-origin and does
-@@ -703,6 +826,175 @@ fn openai_error(err: AuthError) -> Response {
+@@ -670,39 +803,226 @@ fn add_local_asset_headers(response: &mut Response) {
+ fn generic_error(err: AuthError) -> Response {
+     let status = err.status_code();
+     let funding_url = err.funding_url();
+-    (
+-        status,
+-        Json(json!({
+-            "error": {
+-                "code": err.code(),
+-                "message": err.to_string(),
+-                "funding_url": funding_url,
+-            }
+-        })),
+-    )
+-        .into_response()
++    let mut body = json!({
++        "error": {
++            "code": err.code(),
++            "message": err.to_string(),
++            "funding_url": funding_url,
++        }
++    });
++    if let Some(nullifier) = err.nullifier() {
++        body["error"]["nullifier"] = json!(nullifier);
++    }
++    (status, Json(body)).into_response()
+ }
+
+ fn openai_error(err: AuthError) -> Response {
+     let status = err.status_code();
+     let funding_url = err.funding_url();
+-    (
+-        status,
+-        Json(json!({
+-            "error": {
+-                "message": err.to_string(),
+-                "type": err.code(),
+-                "param": Value::Null,
+-                "code": err.code(),
+-                "funding_url": funding_url,
+-            }
+-        })),
+-    )
+-        .into_response()
++    let mut body = json!({
++        "error": {
++            "message": err.to_string(),
++            "type": err.code(),
++            "param": Value::Null,
++            "code": err.code(),
++            "funding_url": funding_url,
++        }
++    });
++    if let Some(nullifier) = err.nullifier() {
++        body["error"]["nullifier"] = json!(nullifier);
++    }
++    (status, Json(body)).into_response()
+ }
 
  #[cfg(test)]
  mod tests {
@@ -2335,8 +2462,26 @@ index bebd5c4..71dcf8e 100644
 +        let body = response.into_body().collect().await.unwrap().to_bytes();
 +        let value: Value = serde_json::from_slice(&body).unwrap();
 +        assert_eq!(value["clearance_ownership_proof_version"], 1);
++        assert_eq!(value["unsettled_request_override_version"], 1);
 +        assert_eq!(value["withdrawal_bridge_version"], 1);
 +        assert_eq!(value["bridge_version"], 4);
++    }
++
++    #[test]
++    fn withdrawal_preparation_takes_an_explicit_unsettled_request_acknowledgement() {
++        let destination = "0x2222222222222222222222222222222222222222";
++        let plain: super::OaWithdrawalBody =
++            serde_json::from_value(serde_json::json!({ "destination": destination })).unwrap();
++        assert!(!plain.accept_unsettled_request_risk);
++        let accepted: super::OaWithdrawalBody = serde_json::from_value(
++            serde_json::json!({ "destination": destination, "accept_unsettled_request_risk": true }),
++        )
++        .unwrap();
++        assert!(accepted.accept_unsettled_request_risk);
++        assert!(serde_json::from_value::<super::OaWithdrawalBody>(
++            serde_json::json!({ "destination": destination, "override": true })
++        )
++        .is_err());
 +    }
 +
 +    #[tokio::test]
@@ -2414,7 +2559,37 @@ index bebd5c4..71dcf8e 100644
      use axum::body::Body;
      use axum::http::StatusCode;
      use http_body_util::BodyExt;
-@@ -738,12 +1030,12 @@ mod tests {
+@@ -711,6 +1031,29 @@ mod tests {
+     use super::*;
+     use crate::config::{AuthConfig, ModelDescriptor};
+
++    #[tokio::test]
++    async fn receipt_journal_missing_carries_the_nullifier_for_the_operator() {
++        let nullifier = zkapi_types::Felt252::from_u64(0x1234);
++        for response in [
++            generic_error(AuthError::ReceiptJournalMissing(nullifier)),
++            openai_error(AuthError::ReceiptJournalMissing(nullifier)),
++        ] {
++            assert_eq!(response.status(), StatusCode::CONFLICT);
++            let body = response.into_body().collect().await.unwrap().to_bytes();
++            let value: Value = serde_json::from_slice(&body).unwrap();
++            assert_eq!(value["error"]["code"], "receipt_journal_missing");
++            assert_eq!(value["error"]["nullifier"], nullifier.to_string());
++        }
++        let body = generic_error(AuthError::PendingSettlement)
++            .into_body()
++            .collect()
++            .await
++            .unwrap()
++            .to_bytes();
++        let value: Value = serde_json::from_slice(&body).unwrap();
++        assert!(value["error"].get("nullifier").is_none());
++    }
++
+     #[tokio::test]
+     async fn openai_errors_preserve_upstream_status_without_wallet_funding_hint() {
+         let response = openai_error(AuthError::UpstreamResponse {
+@@ -738,12 +1081,12 @@ mod tests {
              ..Default::default()
          })
          .unwrap();
@@ -2429,7 +2604,7 @@ index bebd5c4..71dcf8e 100644
                      .uri("/funding")
                      .body(Body::empty())
                      .unwrap(),
-@@ -770,7 +1062,7 @@ mod tests {
+@@ -770,7 +1113,7 @@ mod tests {
              let stylesheet = router
                  .clone()
                  .oneshot(
@@ -2438,7 +2613,7 @@ index bebd5c4..71dcf8e 100644
                          .uri("/funding/styles.css")
                          .body(Body::empty())
                          .unwrap(),
-@@ -797,7 +1089,7 @@ mod tests {
+@@ -797,7 +1140,7 @@ mod tests {
                  let response = router
                      .clone()
                      .oneshot(
@@ -2447,7 +2622,7 @@ index bebd5c4..71dcf8e 100644
                              .uri(path)
                              .body(Body::empty())
                              .unwrap(),
-@@ -811,7 +1103,7 @@ mod tests {
+@@ -811,7 +1154,7 @@ mod tests {
              let response = router
                  .clone()
                  .oneshot(
@@ -2456,7 +2631,7 @@ index bebd5c4..71dcf8e 100644
                          .uri(path)
                          .body(Body::empty())
                          .unwrap(),
-@@ -831,7 +1123,7 @@ mod tests {
+@@ -831,7 +1174,7 @@ mod tests {
          let models = router
              .clone()
              .oneshot(
@@ -2465,7 +2640,7 @@ index bebd5c4..71dcf8e 100644
                      .uri("/v1/models")
                      .body(Body::empty())
                      .unwrap(),
-@@ -845,7 +1137,7 @@ mod tests {
+@@ -845,7 +1188,7 @@ mod tests {
          let health = router
              .clone()
              .oneshot(
@@ -2474,7 +2649,7 @@ index bebd5c4..71dcf8e 100644
                      .uri("/health")
                      .body(Body::empty())
                      .unwrap(),
-@@ -857,7 +1149,7 @@ mod tests {
+@@ -857,7 +1200,7 @@ mod tests {
          let settled = router
              .clone()
              .oneshot(
@@ -2483,7 +2658,7 @@ index bebd5c4..71dcf8e 100644
                      .method("POST")
                      .uri("/wallet/settle")
                      .body(Body::empty())
-@@ -870,7 +1162,7 @@ mod tests {
+@@ -870,7 +1213,7 @@ mod tests {
          let config = router
              .clone()
              .oneshot(
@@ -2492,7 +2667,7 @@ index bebd5c4..71dcf8e 100644
                      .uri("/funding/config")
                      .body(Body::empty())
                      .unwrap(),
-@@ -883,7 +1175,7 @@ mod tests {
+@@ -883,7 +1226,7 @@ mod tests {
          assert_eq!(value["chain_id"], 1);
          assert_eq!(value["demo_rpc_url"], "http://127.0.0.1:48654");
          assert_eq!(value["demo_billing_token_address"], "0xabc");
@@ -2501,7 +2676,7 @@ index bebd5c4..71dcf8e 100644
          assert_eq!(value["suggested_deposit_amount"], 2468);
          assert!(value.get("demo_private_key").is_none());
          assert_eq!(value["demo_note_ttl_seconds"], 1234);
-@@ -892,7 +1184,7 @@ mod tests {
+@@ -892,7 +1235,7 @@ mod tests {
              let removed = router
                  .clone()
                  .oneshot(
@@ -2510,7 +2685,7 @@ index bebd5c4..71dcf8e 100644
                          .method("POST")
                          .uri(path)
                          .body(Body::empty())
-@@ -906,7 +1198,7 @@ mod tests {
+@@ -906,7 +1249,7 @@ mod tests {
          let withdrawal_confirm = router
              .clone()
              .oneshot(
@@ -2519,7 +2694,7 @@ index bebd5c4..71dcf8e 100644
                      .method("POST")
                      .uri("/wallet/withdraw/confirm")
                      .body(Body::empty())
-@@ -918,7 +1210,7 @@ mod tests {
+@@ -918,7 +1261,7 @@ mod tests {
 
          let demo = router
              .oneshot(
@@ -2529,7 +2704,7 @@ index bebd5c4..71dcf8e 100644
                      .body(Body::empty())
                      .unwrap(),
 diff --git a/crates/zkapi-clientd/src/service.rs b/crates/zkapi-clientd/src/service.rs
-index 6b0305d..d55ed4c 100644
+index 6b0305d..5a8f52e 100644
 --- a/crates/zkapi-clientd/src/service.rs
 +++ b/crates/zkapi-clientd/src/service.rs
 @@ -12,6 +12,7 @@
@@ -2540,7 +2715,7 @@ index 6b0305d..d55ed4c 100644
  use std::collections::BTreeMap;
  use std::fs::OpenOptions;
  use std::io;
-@@ -35,6 +36,71 @@ use zkapi_types::wire::{
+@@ -35,6 +36,86 @@ use zkapi_types::wire::{
  };
  use zkapi_types::{EpochRoots, Felt252, WithdrawalPublicInputsV2};
 
@@ -2548,6 +2723,21 @@ index 6b0305d..d55ed4c 100644
 +// hand the same provider key to two calls, including after a lost reply or a
 +// daemon restart. A consumed lease remains reserved until server settlement
 +// allows the wallet to create a different lease.
++/// Waits before resending a byte-identical lease request that the server
++/// called stale while the pinned vault still has its root.
++#[cfg(not(test))]
++const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [
++    Duration::from_secs(2),
++    Duration::from_secs(4),
++    Duration::from_secs(8),
++    Duration::from_secs(16),
++];
++#[cfg(test)]
++const STALE_ROOT_RESEND_DELAYS: [Duration; 4] = [Duration::from_millis(1); 4];
++
++/// `currentRoot()` of the vault.
++const VAULT_CURRENT_ROOT_SELECTOR: &str = "0xfdab463d";
++
 +fn reserve_oa_bridge_lease(state_dir: &Path, lease_id: &str) -> Result<(), AuthError> {
 +    use sha3::{Digest, Keccak256};
 +    #[cfg(unix)]
@@ -2612,7 +2802,7 @@ index 6b0305d..d55ed4c 100644
  fn compute_payload_hash(payload: impl AsRef<[u8]>) -> Felt252 {
      // Must match the protocol's canonical request-payload binding; the wallet
      // re-derives and rejects on mismatch (`request_flow`), and the value feeds
-@@ -117,6 +183,15 @@ pub struct RetiredNote {
+@@ -117,6 +198,15 @@ pub struct RetiredNote {
 
  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
  pub struct FundingConfig {
@@ -2628,7 +2818,7 @@ index 6b0305d..d55ed4c 100644
      pub contract_address: Felt252,
      pub chain_id: u64,
      pub indexer_url: String,
-@@ -320,6 +395,7 @@ struct ActiveOpenRouterLease {
+@@ -320,9 +410,21 @@ struct ActiveOpenRouterLease {
      settle_after: u64,
      verification: Option<OaKeyVerificationEvidence>,
      verified: bool,
@@ -2636,7 +2826,21 @@ index 6b0305d..d55ed4c 100644
      requests_served: u32,
  }
 
-@@ -371,12 +447,16 @@ struct OpenRouterLeaseExtensions {
++/// What withdrawal settlement found for a pending lease request that has no
++/// live key in this daemon.
++enum PendingLease {
++    /// The server's record of the lease.
++    Lease(OpenRouterLeaseStatusResponse),
++    /// The server never admitted the request and never will, or recovery
++    /// already settled the state: set the journal aside, if still pending,
++    /// into the request archive with this disposition.
++    SetAside(&'static str),
++}
++
+ /// An upstream response whose body owns the local inference lock.
+ ///
+ /// The time-bounded OpenRouter lease remains in memory after EOF and can serve
+@@ -371,12 +473,16 @@ struct OpenRouterLeaseExtensions {
      key_source: String,
      #[serde(default)]
      verification: Option<OaKeyVerificationEvidence>,
@@ -2653,7 +2857,7 @@ index 6b0305d..d55ed4c 100644
      #[serde(default)]
      station_recently_attested: bool,
      key_valid_till: u64,
-@@ -396,8 +476,7 @@ fn validate_oa_key_evidence(
+@@ -396,8 +502,7 @@ fn validate_oa_key_evidence(
              "OA key evidence omitted the station ID".to_string(),
          ));
      }
@@ -2663,7 +2867,7 @@ index 6b0305d..d55ed4c 100644
          return Err(AuthError::KeyVerification(format!(
              "OA key evidence expiry {} does not safely cover lease expiry {expires_at}",
              evidence.key_valid_till
-@@ -421,6 +500,76 @@ fn validate_oa_key_evidence(
+@@ -421,6 +526,76 @@ fn validate_oa_key_evidence(
      Ok(())
  }
 
@@ -2740,7 +2944,7 @@ index 6b0305d..d55ed4c 100644
  fn default_openrouter_key_source() -> String {
      "openrouter".to_string()
  }
-@@ -476,10 +625,11 @@ pub struct AuthService {
+@@ -476,10 +651,11 @@ pub struct AuthService {
      config: AuthConfig,
      wallet_mutex: Arc<Mutex<()>>,
      indexer: IndexerClient,
@@ -2753,7 +2957,7 @@ index 6b0305d..d55ed4c 100644
  }
 
  impl AuthService {
-@@ -491,17 +641,268 @@ impl AuthService {
+@@ -491,17 +667,395 @@ impl AuthService {
              indexer: IndexerClient::new(config.indexer_url.clone()),
              config,
              wallet_mutex: Arc::new(Mutex::new(())),
@@ -2784,6 +2988,8 @@ index 6b0305d..d55ed4c 100644
 +            "withdrawal_bridge_version": 1,
 +            // Clearance requests carry an escape-form ownership proof.
 +            "clearance_ownership_proof_version": 1,
++            // /oa/v1/withdraw/prepare accepts accept_unsettled_request_risk.
++            "unsettled_request_override_version": 1,
 +            "chain_id": self.config.chain_id,
 +            "mode": self.config.request_mode,
 +            "require_oa_org_key_source": self.config.require_oa_org_key_source,
@@ -2815,8 +3021,35 @@ index 6b0305d..d55ed4c 100644
 +        }).await
 +    }
 +
-+    pub async fn oa_prepare_withdrawal(&self, destination: [u8; 20]) -> Result<WithdrawalPlan, AuthError> {
++    /// `accept_unsettled_request_risk` is the owner's acknowledgement for a
++    /// note state with an unsettled request (see `unsettled_legacy_state`)
++    /// that no chat request can settle any more: the note has expired, or the
++    /// server holds a clearance for the state. After a refused proof-less
++    /// clearance the ownership proof is then sent anyway. Otherwise it is
++    /// ignored: one chat request settles the state without that risk.
++    pub async fn oa_prepare_withdrawal(
++        &self,
++        destination: [u8; 20],
++        accept_unsettled_request_risk: bool,
++    ) -> Result<WithdrawalPlan, AuthError> {
 +        if destination == [0; 20] { return Err(AuthError::InvalidInput("withdrawal destination cannot be zero".into())); }
++        // A lease journal without a live key in this daemon (after a restart,
++        // or one the server can no longer admit, as after the operator
++        // released a stuck state) was otherwise settled only by the next
++        // chat, so the withdrawal waited for it indefinitely. Settle it first,
++        // exactly as /wallet/settle does; when it does not settle, the
++        // pending check below reports it as before.
++        if self.config.request_mode == RequestMode::DirectOpenrouter
++            && self.direct_lease.lock().await.is_none()
++            && self
++                .status()
++                .await
++                .is_ok_and(|status| status.pending_request)
++        {
++            if let Err(error) = self.settle_for_withdrawal().await {
++                tracing::debug!(%error, "the pending lease did not settle before withdrawal preparation");
++            }
++        }
 +        // Same order as issuance: lease mutex, wallet mutex, then filesystem lock.
 +        // Hold all three through clearance so no inference can race the snapshot.
 +        let mut lease = self.direct_lease.lock().await;
@@ -2851,10 +3084,43 @@ index 6b0305d..d55ed4c 100644
 +                    if let Some(response) = wallet.recover().await? {
 +                        session_events.settled(&response, wallet.state().map(|state| state.current_balance));
 +                    }
-+                    if wallet.get_pending_journal()?.is_some() { return Err(AuthError::PendingSettlement); }
++                    if let Some(pending) = wallet.get_pending_journal()? {
++                        // A pending request that the server refused because
++                        // another request, whose journal is gone, settled
++                        // this state can never settle.
++                        if receipt_journal_missing(&config, &pending.nullifier, Some(&pending.client_request_id)).await
++                            && wallet.state().is_some_and(|state| {
++                                core_v2::nullifier(&state.secret_s, &state.current_anchor) == pending.nullifier
++                            })
++                        {
++                            return Err(AuthError::ReceiptJournalMissing(pending.nullifier));
++                        }
++                        return Err(AuthError::PendingSettlement);
++                    }
++                } else if existing.as_ref().is_none_or(|record| record.complete)
++                    && !wallet.archive_at_current_state()?.is_empty()
++                {
++                    // A request set aside at this state may since have been
++                    // finalized: install its verified receipt first, so the
++                    // withdrawal closes the note's settled successor state.
++                    // Never under a reservation, which freezes this state.
++                    if let Some(response) = wallet.recover().await? {
++                        session_events
++                            .settled(&response, wallet.state().map(|state| state.current_balance));
++                    }
 +                }
 +                let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
++                // An ownership proof is a submittable escape. On a vault below
++                // revision 2 a challenged escape burns its nullifier for good,
++                // and a request proof sent from this state that never settled
++                // (an archived request) is challenge evidence in the hands of
++                // whoever kept it. At such a state only a clearance without
++                // an ownership proof is asked for.
++                let unsettled_state = unsettled_legacy_state(&config, &wallet)?;
++                let expired = now_seconds() > state.expiry_ts;
 +                let mut record = crate::oa_withdrawal::reserve(&config, state, destination)?;
++                let mut send_ownership_proof =
++                    !unsettled_state || record.unsettled_request_risk_accepted;
 +                if record.complete { return record.plan.ok_or(AuthError::WithdrawalConflict); }
 +                // Clearance is idempotent for this reserved nullifier. Rebuild a
 +                // proof against the current Merkle root on every explicit retry.
@@ -2864,13 +3130,78 @@ index 6b0305d..d55ed4c 100644
 +                let (public_inputs, proof, siblings) = loop {
 +                    let root = indexer.root().await?;
 +                    let siblings = indexer.note_path(state.note_id).await?;
-+                    match wallet
-+                        .withdrawal_mutual_close(destination, root, siblings.clone())
-+                        .await
-+                    {
++                    let closed = if !send_ownership_proof {
++                        wallet
++                            .withdrawal_mutual_close_without_ownership_proof(
++                                destination,
++                                root,
++                                siblings.clone(),
++                            )
++                            .await
++                    } else {
++                        wallet
++                            .withdrawal_mutual_close(destination, root, siblings.clone())
++                            .await
++                    };
++                    match closed {
 +                        Ok((public_inputs, proof)) => break (public_inputs, proof, siblings),
 +                        Err(zkapi_client::error::ClientError::StaleRoot) if !reproved => {
 +                            reproved = true
++                        }
++                        Err(zkapi_client::error::ClientError::ClearanceRefused(code))
++                            if !send_ownership_proof =>
++                        {
++                            // The refusal reserved nothing. Ask what the server
++                            // holds for this state's nullifier.
++                            let recovery = nullifier_recovery(&config, &record.nullifier).await.ok();
++                            let clearance_reserved = recovery
++                                .as_ref()
++                                .is_some_and(|recovery| recovery.nullifier_status == "clearance_reserved");
++                            // No chat request can settle this state once the
++                            // note expired (request proofs need its expiry to
++                            // be at least their request time), or once the
++                            // server holds a clearance for it (as after the
++                            // operator released a stuck state). Only then may
++                            // the owner's acknowledgement send the ownership
++                            // proof anyway; never for a nullifier a request owns.
++                            if accept_unsettled_request_risk
++                                && code != "nullifier_used"
++                                && (expired || clearance_reserved)
++                            {
++                                tracing::warn!(%code, clearance_reserved, "sending an acknowledged ownership proof from a note state with an unsettled request");
++                                // Recorded before the proof leaves, for every
++                                // later request of this reservation.
++                                record.unsettled_request_risk_accepted = true;
++                                crate::oa_withdrawal::save(&config, &record)?;
++                                send_ownership_proof = true;
++                                continue;
++                            }
++                            // When the server reports the nullifier unknown, or
++                            // owned by a request (so no clearance can exist for
++                            // it), release the local reservation so the note can
++                            // reach a settled state: by a new chat request, or by
++                            // recovery installing the earlier request's receipt.
++                            if let Some(recovery) = recovery {
++                                if (recovery.status == "not_found"
++                                    && recovery.nullifier_status == "unknown")
++                                    || matches!(
++                                        recovery.nullifier_status.as_str(),
++                                        "reserved" | "finalized"
++                                    )
++                                {
++                                    crate::oa_withdrawal::release(&config, &record, state)?;
++                                }
++                            }
++                            if clearance_reserved {
++                                return Err(AuthError::UnsettledStateClearanceReserved(code));
++                            }
++                            return Err(AuthError::UnsettledRequestState(code));
++                        }
++                        Err(zkapi_client::error::ClientError::ClearanceRefused(code))
++                            if code == "nullifier_used"
++                                && receipt_journal_missing(&config, &record.nullifier, None).await =>
++                        {
++                            return Err(AuthError::ReceiptJournalMissing(record.nullifier));
 +                        }
 +                        Err(error) => return Err(error.into()),
 +                    }
@@ -3027,7 +3358,7 @@ index 6b0305d..d55ed4c 100644
      pub fn default_model(&self) -> &str {
          self.config
              .models
-@@ -551,7 +952,7 @@ impl AuthService {
+@@ -551,7 +1105,7 @@ impl AuthService {
              } else {
                  config.request_charge_cap
              };
@@ -3036,7 +3367,7 @@ index 6b0305d..d55ed4c 100644
                  return Ok(None);
              }
              // The wallet normally removes this file after settlement. Treat
-@@ -596,6 +997,7 @@ impl AuthService {
+@@ -596,6 +1150,7 @@ impl AuthService {
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let wallet = load_wallet(&config, Vec::new())?;
@@ -3044,7 +3375,7 @@ index 6b0305d..d55ed4c 100644
              if wallet.state().is_some() {
                  return Err(AuthError::InvalidInput(
                      "wallet already has an active note".to_string(),
-@@ -634,6 +1036,8 @@ impl AuthService {
+@@ -634,6 +1189,8 @@ impl AuthService {
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, Vec::new())?;
@@ -3053,28 +3384,47 @@ index 6b0305d..d55ed4c 100644
              wallet.confirm_deposit(
                  request.secret,
                  request.note_id,
-@@ -648,6 +1052,7 @@ impl AuthService {
+@@ -645,9 +1202,21 @@ impl AuthService {
+         .await
+     }
+
++    /// Install a finalized response for the pending request, or else for a
++    /// request archived at the note's current state.
      pub async fn recover(&self) -> Result<RecoverResult, AuthError> {
++        self.recover_with_archive(true).await
++    }
++
++    /// `archive` false asks only about the pending request, and sends
++    /// nothing when none is pending: the periodic reconcile must not poll the
++    /// server's record of the note's current nullifier while the note is
++    /// idle. Explicit recovery, chats, settlement and withdrawal preparation
++    /// still consult the archive.
++    async fn recover_with_archive(&self, archive: bool) -> Result<RecoverResult, AuthError> {
          let config = self.config.clone();
          let wallet_mutex = self.wallet_mutex.clone();
 +        let session_events = self.oa_session_events.clone();
          let trusted_roots = self.trusted_roots();
          spawn_blocking(move || {
              let _guard = wallet_mutex
-@@ -655,8 +1060,12 @@ impl AuthService {
+@@ -655,8 +1224,16 @@ impl AuthService {
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, trusted_roots)?;
 +            crate::oa_withdrawal::check_spending(&config, wallet.state().map(|state| state.note_id))?;
              let runtime = current_thread_runtime()?;
-             let recovered = runtime.block_on(wallet.recover())?;
+-            let recovered = runtime.block_on(wallet.recover())?;
++            let recovered = if archive {
++                runtime.block_on(wallet.recover())?
++            } else {
++                runtime.block_on(wallet.recover_pending())?
++            };
 +            if let Some(response) = recovered.as_ref() {
 +                session_events.settled(response, wallet.state().map(|state| state.current_balance));
 +            }
              let request = recovered.as_ref().map(|response| {
                  core_response(response, wallet.state().map(|state| state.current_balance))
              });
-@@ -780,6 +1189,8 @@ impl AuthService {
+@@ -780,6 +1357,8 @@ impl AuthService {
                  .lock()
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
@@ -3083,7 +3433,28 @@ index 6b0305d..d55ed4c 100644
              let state_path = config.state_dir.join("note_state.json");
              let journal_path = config.state_dir.join("pending_journal.json");
              let prepared_path = prepared_withdrawal_path(&config.state_dir);
-@@ -806,6 +1217,13 @@ impl AuthService {
+@@ -793,7 +1372,19 @@ impl AuthService {
+                 }
+                 let _ = std::fs::remove_file(&state_path);
+             }
+-            let _ = std::fs::remove_file(&journal_path);
++            // A readable request journal may belong to a transmitted request:
++            // it moves into the request archive, never the bin. Only one too
++            // damaged to parse (and so never installable) is removed.
++            match zkapi_client::journal::PendingRequestJournal::read(&journal_path) {
++                Ok(Some(_)) => zkapi_client::journal::PendingRequestJournal::archive(
++                    &journal_path,
++                    &config.state_dir.join("request_archive"),
++                    "wallet_reset",
++                )?,
++                _ => {
++                    let _ = std::fs::remove_file(&journal_path);
++                }
++            }
+             let _ = std::fs::remove_file(&prepared_path);
+             let wallet = load_wallet(&config, Vec::new())?;
+             Ok(wallet_status(&wallet))
+@@ -806,6 +1397,13 @@ impl AuthService {
 
      pub fn funding_config(&self) -> FundingConfig {
          FundingConfig {
@@ -3097,7 +3468,7 @@ index 6b0305d..d55ed4c 100644
              contract_address: self.config.contract_address,
              chain_id: self.config.chain_id,
              indexer_url: self.config.indexer_url.clone(),
-@@ -814,7 +1232,7 @@ impl AuthService {
+@@ -814,7 +1412,7 @@ impl AuthService {
              suggested_deposit_amount: self.config.suggested_deposit_amount,
              demo_rpc_url: self.config.demo_rpc_url.clone(),
              demo_billing_token_address: self.config.demo_billing_token_address.clone(),
@@ -3106,7 +3477,7 @@ index 6b0305d..d55ed4c 100644
              demo_note_ttl_seconds: self.config.demo_note_ttl_seconds,
          }
      }
-@@ -835,6 +1253,7 @@ impl AuthService {
+@@ -835,6 +1433,7 @@ impl AuthService {
          request: CoreRequest,
          session_id: Option<&str>,
      ) -> Result<CoreResponse, AuthError> {
@@ -3114,7 +3485,7 @@ index 6b0305d..d55ed4c 100644
          if let Some(plan) = self.prepared_withdrawal.lock().await.as_ref() {
              return Err(AuthError::WithdrawalPending(format!(
                  "{} withdrawal for note {} is prepared; finish it before sending more requests",
-@@ -868,6 +1287,7 @@ impl AuthService {
+@@ -868,6 +1467,7 @@ impl AuthService {
          request: CoreRequest,
          session_id: Option<&str>,
      ) -> Result<StreamingCoreResponse, AuthError> {
@@ -3122,17 +3493,46 @@ index 6b0305d..d55ed4c 100644
          if let Some(plan) = self.prepared_withdrawal.lock().await.as_ref() {
              return Err(AuthError::WithdrawalPending(format!(
                  "{} withdrawal for note {} is prepared; finish it before sending more requests",
-@@ -937,7 +1357,7 @@ impl AuthService {
+@@ -899,7 +1499,7 @@ impl AuthService {
+         let Ok(_request_guard) = self.direct_request_mutex.try_write() else {
+             return;
+         };
+-        match self.recover().await {
++        match self.recover_with_archive(false).await {
+             Ok(result) if result.recovered => {
+                 let mut lease = self.direct_lease.lock().await;
+                 *lease = None;
+@@ -937,21 +1537,28 @@ impl AuthService {
                  // the retryable prompt-free proof remains in the wallet
                  // journal. Use it to retire or recover the authoritative
                  // server-side lease.
 -                let request = self.prepare_direct_lease_request().await?;
+-                let Some(lease) = self.find_direct_lease_for_withdrawal(&request).await? else {
+-                    tracing::warn!(
+-                        client_request_id = %request.client_request_id,
+-                        "clearing an orphaned local lease proof that the server never accepted"
+-                    );
+-                    self.clear_pending_request().await?;
+-                    let status = self.status().await?;
+-                    if status.pending_request {
+-                        return Err(AuthError::PendingRequest);
 +                let request = self.prepare_direct_lease_request(None).await?;
-                 let Some(lease) = self.find_direct_lease_for_withdrawal(&request).await? else {
-                     tracing::warn!(
-                         client_request_id = %request.client_request_id,
-@@ -951,7 +1371,10 @@ impl AuthService {
-                     return Ok(status);
++                let lease = match self.find_direct_lease_for_withdrawal(&request).await? {
++                    PendingLease::Lease(lease) => lease,
++                    PendingLease::SetAside(disposition) => {
++                        tracing::warn!(
++                            client_request_id = %request.client_request_id,
++                            disposition,
++                            "setting aside a local lease proof that the server never accepted"
++                        );
++                        self.clear_pending_request(disposition).await?;
++                        let status = self.status().await?;
++                        if status.pending_request {
++                            return Err(AuthError::PendingRequest);
++                        }
++                        return Ok(status);
+                     }
+-                    return Ok(status);
                  };
                  match lease.status.as_str() {
 -                    "active" => {
@@ -3143,7 +3543,109 @@ index 6b0305d..d55ed4c 100644
                          self.retire_direct_openrouter_lease(&request.client_request_id)
                              .await?;
                      }
-@@ -1091,6 +1514,7 @@ impl AuthService {
+@@ -988,12 +1595,12 @@ impl AuthService {
+
+     /// Resolve an interrupted lease issuance without guessing. A missing
+     /// lease is considered safely orphaned only when the current request is
+-    /// unknown and its nullifier is either also unknown or already reserved
+-    /// by an idempotently retryable mutual withdrawal.
++    /// unknown and its nullifier is either also unknown (once the vault's
++    /// root moved) or reserved for a clearance.
+     async fn find_direct_lease_for_withdrawal(
+         &self,
+         request: &ApiRequestV2,
+-    ) -> Result<Option<OpenRouterLeaseStatusResponse>, AuthError> {
++    ) -> Result<PendingLease, AuthError> {
+         const ATTEMPTS: usize = 3;
+         let client_request_id = &request.client_request_id;
+         for attempt in 0..ATTEMPTS {
+@@ -1001,13 +1608,13 @@ impl AuthService {
+                 .fetch_optional_direct_lease_status(client_request_id)
+                 .await?
+             {
+-                return Ok(Some(lease));
++                return Ok(PendingLease::Lease(lease));
+             }
+             let recovery = self.fetch_request_recovery(client_request_id).await?;
+             if recovery.request_response.is_some() || recovery.nullifier_status == "finalized" {
+                 let recovered = self.recover().await?;
+                 if recovered.recovered || !recovered.wallet.pending_request {
+-                    return Ok(None);
++                    return Ok(PendingLease::SetAside("discarded_unknown_to_server"));
+                 }
+                 return Err(AuthError::LeasePending(format!(
+                     "request {client_request_id} is finalized but not yet recoverable"
+@@ -1022,12 +1629,33 @@ impl AuthService {
+             let nullifier_recovery = self
+                 .fetch_nullifier_recovery(&request.public_inputs.request_nullifier)
+                 .await?;
++            if nullifier_recovery.request_response.is_some() {
++                // The server finalized another request at this state, for
++                // example one set aside into the archive after an unsigned
++                // rejection. Recovery installs its receipt when it verifies.
++                let recovered = self.recover().await?;
++                if recovered.recovered || !recovered.wallet.pending_request {
++                    return Ok(PendingLease::SetAside("discarded_unknown_to_server"));
++                }
++                return Err(AuthError::LeasePending(format!(
++                    "request {client_request_id} is unknown, but its nullifier is finalized for a request that is not recoverable yet"
++                )));
++            }
+             if nullifier_recovery.nullifier_status == "clearance_reserved" {
+-                // A previously prepared mutual withdrawal intentionally owns
+-                // this deterministic state nullifier. The rejected lease was
+-                // never accepted, so clearing only its local journal is safe
+-                // and lets withdrawal preparation resume idempotently.
+-                return Ok(None);
++                // A clearance owns this deterministic state nullifier: an
++                // earlier mutual withdrawal, or the operator's release of a
++                // stuck state. Reservations are permanent, and the server
++                // refuses every request at such a nullifier as a replay,
++                // before any root check, so this request can never be
++                // admitted and no request can settle the state. The vault's
++                // root says nothing about that, so it is not asked: on a
++                // quiet vault it may never move, and the withdrawal would
++                // wait forever. The reading is unsigned, but setting the
++                // journal aside only moves it into the archive, from where
++                // a later finalized receipt still installs; on a vault below
++                // revision 2 the state then sends no ownership proof without
++                // the owner's acknowledgement.
++                return Ok(PendingLease::SetAside("discarded_clearance_reserved"));
+             }
+             if nullifier_recovery.status != "not_found"
+                 || nullifier_recovery.nullifier_status != "unknown"
+@@ -1041,7 +1669,29 @@ impl AuthService {
+                 tokio::time::sleep(Duration::from_millis(500)).await;
+             }
+         }
+-        Ok(None)
++        // Unsigned 'unknown' readings alone never set a journal aside, here
++        // or after stale_root: the pinned vault is the first witness.
++        self.require_moved_vault_root(request).await?;
++        Ok(PendingLease::SetAside("discarded_unknown_to_server"))
++    }
++
++    /// The vault-root witness before a transmitted request is set aside on
++    /// unsigned readings. While the pinned vault still has the request's
++    /// root, the request may still be admitted (a lagging server, or a
++    /// forged reply), so it stays pending and the next lease attempt resends
++    /// it unchanged. An unreadable root keeps it too.
++    async fn require_moved_vault_root(&self, request: &ApiRequestV2) -> Result<(), AuthError> {
++        match self.vault_current_root().await {
++            Ok(root) if root != request.public_inputs.active_root => Ok(()),
++            Ok(_) => Err(AuthError::LeasePending(format!(
++                "request {} is unknown to the server, but the vault still has its root; the saved authorization is preserved and the next request resends it",
++                request.client_request_id
++            ))),
++            Err(error) => Err(AuthError::LeasePending(format!(
++                "request {} is unknown to the server, but the vault root could not be read ({error}); the saved authorization is preserved",
++                request.client_request_id
++            ))),
++        }
+     }
+
+     async fn execute_direct_openrouter(
+@@ -1091,6 +1741,7 @@ impl AuthService {
          &self,
          lease_slot: &mut Option<ActiveOpenRouterLease>,
          session_id: &str,
@@ -3151,7 +3653,7 @@ index 6b0305d..d55ed4c 100644
      ) -> Result<(), AuthError> {
          if lease_slot
              .as_ref()
-@@ -1123,7 +1547,7 @@ impl AuthService {
+@@ -1123,7 +1774,7 @@ impl AuthService {
          // explicit settlement, credit exhaustion, or a key rejection.
          let _ = self.recover().await?;
          *lease_slot = Some(
@@ -3160,7 +3662,7 @@ index 6b0305d..d55ed4c 100644
                  .await?,
          );
          Ok(())
-@@ -1197,7 +1621,7 @@ impl AuthService {
+@@ -1197,7 +1848,7 @@ impl AuthService {
          loop {
              let request_guard = self.direct_request_mutex.clone().read_owned().await;
              let mut lease_slot = self.direct_lease.lock().await;
@@ -3169,7 +3671,7 @@ index 6b0305d..d55ed4c 100644
                  .await?;
              let lease = lease_slot
                  .as_mut()
-@@ -1208,15 +1632,17 @@ impl AuthService {
+@@ -1208,15 +1859,17 @@ impl AuthService {
                          "OA lease lost its verification evidence".to_string(),
                      )
                  })?;
@@ -3189,7 +3691,7 @@ index 6b0305d..d55ed4c 100644
              let client_request_id = lease.client_request_id.clone();
              let mut reserved_lease = lease.clone();
              lease.requests_served = lease.requests_served.saturating_add(1);
-@@ -1290,24 +1716,39 @@ impl AuthService {
+@@ -1290,24 +1943,39 @@ impl AuthService {
          }
      }
 
@@ -3231,7 +3733,7 @@ index 6b0305d..d55ed4c 100644
          }
          let url = format!(
              "{}{}",
-@@ -1326,8 +1767,7 @@ impl AuthService {
+@@ -1326,8 +1994,7 @@ impl AuthService {
          expires_at: u64,
      ) -> Result<reqwest::Response, AuthError> {
          for attempt in 1..=DIRECT_REMOTE_MAX_ATTEMPTS {
@@ -3241,13 +3743,14 @@ index 6b0305d..d55ed4c 100644
                  .post(url)
                  .bearer_auth(api_key)
                  .header("content-type", "application/json")
-@@ -1387,94 +1827,81 @@ impl AuthService {
+@@ -1387,94 +2054,131 @@ impl AuthService {
      async fn issue_direct_openrouter_lease(
          &self,
          session_id: String,
 +        request_limit_micro_usd: Option<u128>,
      ) -> Result<ActiveOpenRouterLease, AuthError> {
          let mut retried_stale_root = false;
++        let mut stale_root_resends = STALE_ROOT_RESEND_DELAYS.iter();
          let mut reconciled_lost_key = false;
 +        let mut refreshed_native_quote = false;
          loop {
@@ -3283,67 +3786,21 @@ index 6b0305d..d55ed4c 100644
 -                    return Err(AuthError::Wallet(
 -                        "server returned an unusable OpenRouter lease".to_string(),
 -                    ));
--                }
++                return self.parse_direct_openrouter_lease(&request, session_id, &body);
++            }
++            if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
++                if !refreshed_native_quote && self.config.billing_asset == "native_eth"
++                    && matches!(error.error_code.as_str(), "native_quote_expired" | "native_quote_superseded") {
++                    self.refresh_unaccepted_native_request(request.clone()).await?;
++                    refreshed_native_quote = true;
++                    continue;
+                 }
 -                let expected_inference = &self.config.openrouter_inference_base;
 -                if !matches_trusted_url(&lease.openrouter_api_base, expected_inference) {
 -                    return Err(AuthError::KeyVerification(
 -                        "lease inference origin does not match the client's trusted OpenRouter origin"
 -                            .to_string(),
 -                    ));
--                }
--                let (verification, verified) = match extensions.key_source.as_str() {
--                    "openrouter" => {
--                        enforce_required_key_source(
--                            self.config.require_oa_org_key_source,
--                            "openrouter",
--                        )?;
--                        if extensions.verification.is_some() {
--                            return Err(AuthError::KeyVerification(
--                                "direct OpenRouter lease included unexpected OA evidence"
--                                    .to_string(),
--                            ));
--                        }
--                        (None, true)
--                    }
--                    "oa_org" => {
--                        let evidence = extensions.verification.ok_or_else(|| {
--                            AuthError::KeyVerification(
--                                "OA org lease omitted verification evidence".to_string(),
--                            )
--                        })?;
--                        (Some(evidence), false)
--                    }
--                    source => {
--                        return Err(AuthError::KeyVerification(format!(
--                            "server returned unsupported key source {source}"
--                        )))
--                    }
--                };
--                tracing::info!(
--                    client_request_id = %lease.client_request_id,
--                    expires_at = lease.expires_at,
--                    "opened prompt-private OpenRouter lease"
--                );
--                return Ok(ActiveOpenRouterLease {
--                    session_id,
--                    client_request_id: lease.client_request_id,
--                    api_key: lease.api_key,
--                    openrouter_api_base: lease.openrouter_api_base,
--                    expires_at: lease.expires_at,
--                    settle_after: lease.settle_after,
--                    verification,
--                    verified,
--                    requests_served: 0,
--                });
-+                return self.parse_direct_openrouter_lease(&request, session_id, &body);
-             }
-             if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
-+                if !refreshed_native_quote && self.config.billing_asset == "native_eth"
-+                    && matches!(error.error_code.as_str(), "native_quote_expired" | "native_quote_superseded") {
-+                    self.refresh_unaccepted_native_request(request.clone()).await?;
-+                    refreshed_native_quote = true;
-+                    continue;
-+                }
 +                if !refreshed_native_quote
 +                    && self.config.billing_asset == "native_eth"
 +                    && error.error_code == "invalid_request"
@@ -3365,12 +3822,77 @@ index 6b0305d..d55ed4c 100644
 +                            "server did not confirm that a request quoted under earlier native-price pins expired unaccepted; keeping it"
 +                        ),
 +                    }
-+                }
-                 if error.error_code == "stale_root" && !retried_stale_root {
--                    self.clear_pending_request().await?;
+                 }
+-                let (verification, verified) = match extensions.key_source.as_str() {
+-                    "openrouter" => {
+-                        enforce_required_key_source(
+-                            self.config.require_oa_org_key_source,
+-                            "openrouter",
+-                        )?;
+-                        if extensions.verification.is_some() {
+-                            return Err(AuthError::KeyVerification(
+-                                "direct OpenRouter lease included unexpected OA evidence"
+-                                    .to_string(),
+-                            ));
++                if error.error_code == "stale_root" && !retried_stale_root {
 +                    // The proof has been transmitted and this error body is
-+                    // unsigned. Discard it only when the server also reports
-+                    // its nullifier as unknown; otherwise keep it for recovery.
++                    // unsigned. The pinned vault is the first witness: while
++                    // it still has this proof's root, the server lags or the
++                    // reply was forged, so the byte-identical request is sent
++                    // again. Only once the vault's root moved is the server's
++                    // nullifier record consulted, and only an unknown reading
++                    // sets the journal aside, into the request archive.
++                    let chain_root = self.vault_current_root().await.map_err(|error| {
++                        AuthError::LeasePending(format!(
++                            "request {} was rejected as stale, but the vault root could not be read ({error}); the saved authorization is preserved",
++                            request.client_request_id
++                        ))
++                    })?;
++                    if chain_root == request.public_inputs.active_root {
++                        if let Some(delay) = stale_root_resends.next() {
++                            tokio::time::sleep(*delay).await;
++                            continue;
+                         }
+-                        (None, true)
+-                    }
+-                    "oa_org" => {
+-                        let evidence = extensions.verification.ok_or_else(|| {
+-                            AuthError::KeyVerification(
+-                                "OA org lease omitted verification evidence".to_string(),
+-                            )
+-                        })?;
+-                        (Some(evidence), false)
+-                    }
+-                    source => {
+-                        return Err(AuthError::KeyVerification(format!(
+-                            "server returned unsupported key source {source}"
+-                        )))
++                        return Err(AuthError::LeasePending(format!(
++                            "request {} was rejected as stale, but the vault still has its root; the saved authorization is preserved",
++                            request.client_request_id
++                        )));
+                     }
+-                };
+-                tracing::info!(
+-                    client_request_id = %lease.client_request_id,
+-                    expires_at = lease.expires_at,
+-                    "opened prompt-private OpenRouter lease"
+-                );
+-                return Ok(ActiveOpenRouterLease {
+-                    session_id,
+-                    client_request_id: lease.client_request_id,
+-                    api_key: lease.api_key,
+-                    openrouter_api_base: lease.openrouter_api_base,
+-                    expires_at: lease.expires_at,
+-                    settle_after: lease.settle_after,
+-                    verification,
+-                    verified,
+-                    requests_served: 0,
+-                });
+-            }
+-            if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
+-                if error.error_code == "stale_root" && !retried_stale_root {
+-                    self.clear_pending_request().await?;
 +                    self.clear_unadmitted_request(&request).await?;
                      retried_stale_root = true;
                      continue;
@@ -3385,11 +3907,40 @@ index 6b0305d..d55ed4c 100644
 +                        reconciled_lost_key = true;
 +                        continue;
 +                    }
++                    if error.error_code == "replay"
++                        && recovered.wallet.pending_request
++                        && receipt_journal_missing(
++                            &self.config,
++                            &request.public_inputs.request_nullifier,
++                            Some(&request.client_request_id),
++                        )
++                        .await
++                    {
++                        return Err(AuthError::ReceiptJournalMissing(
++                            request.public_inputs.request_nullifier,
++                        ));
++                    }
++                    // A clearance owns this state's nullifier (as after the
++                    // operator released a stuck state): every request at it
++                    // is a replay, so no chat can settle the state. The
++                    // retry stays pending, so later chats resend these same
++                    // bytes instead of proving new requests from this state;
++                    // withdrawal settlement sets it aside.
++                    if error.error_code == "replay"
++                        && recovered.wallet.pending_request
++                        && nullifier_clearance_reserved(
++                            &self.config,
++                            &request.public_inputs.request_nullifier,
++                        )
++                        .await
++                    {
++                        return Err(AuthError::ClearanceReservedState);
++                    }
 +                }
                  if error.error_code == "lease_pending" {
                      let lease_status = self
                          .fetch_direct_lease_status(&request.client_request_id)
-@@ -1530,131 +1957,216 @@ impl AuthService {
+@@ -1530,122 +2234,206 @@ impl AuthService {
          }
      }
 
@@ -3682,12 +4233,8 @@ index 6b0305d..d55ed4c 100644
 +            return Err(AuthError::KeyVerification("verifier response binding mismatch".into()));
 +        }
 +        oa_verifier_outage(Some(status), &result, expires_at, evidence, api_key, expected_verifier, trust)
-     }
-
--    async fn prepare_direct_lease_request(&self) -> Result<ApiRequestV2, AuthError> {
--        let config = self.config.clone();
--        let wallet_mutex = self.wallet_mutex.clone();
--        let indexer = self.indexer.clone();
++    }
++
 +    fn check_request_budget(&self, request: &ApiRequestV2, limit: u128) -> Result<(), AuthError> {
 +        if let Some(quote) = crate::oa_native::saved_quote(&self.config, &request.payload)? {
 +            let expected = quote.budget_units(limit)?.max(self.config.request_charge_cap);
@@ -3696,15 +4243,14 @@ index 6b0305d..d55ed4c 100644
 +            }
 +        }
 +        Ok(())
-+    }
-+
+     }
+
+-    async fn prepare_direct_lease_request(&self) -> Result<ApiRequestV2, AuthError> {
 +    async fn prepare_direct_lease_request(&self, request_limit_micro_usd: Option<u128>) -> Result<ApiRequestV2, AuthError> {
-+        let config = self.config.clone();
-+        let wallet_mutex = self.wallet_mutex.clone();
-+        let indexer = self.indexer.clone();
-         spawn_blocking(move || {
-             let _guard = wallet_mutex
-                 .lock()
+         let config = self.config.clone();
+         let wallet_mutex = self.wallet_mutex.clone();
+         let indexer = self.indexer.clone();
+@@ -1655,6 +2443,7 @@ impl AuthService {
                  .map_err(|error| AuthError::Wallet(error.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, Vec::new())?;
@@ -3712,7 +4258,7 @@ index 6b0305d..d55ed4c 100644
              let authorization = serde_json::to_string(&OpenRouterLeaseAuthorization::default())
                  .map_err(|error| AuthError::Serialization(error.to_string()))?;
              if wallet.has_pending_request() {
-@@ -1663,7 +2175,7 @@ impl AuthService {
+@@ -1663,7 +2452,7 @@ impl AuthService {
                          "an older pending request has no retryable request body".to_string(),
                      )
                  })?;
@@ -3721,7 +4267,7 @@ index 6b0305d..d55ed4c 100644
                      return Err(AuthError::LeasePending(
                          "a non-lease zkAPI request is still pending".to_string(),
                      ));
-@@ -1676,6 +2188,13 @@ impl AuthService {
+@@ -1676,6 +2465,13 @@ impl AuthService {
              let (active_root, siblings) = runtime.block_on(async move {
                  Ok::<_, AuthError>((indexer.root().await?, indexer.note_path(note_id).await?))
              })?;
@@ -3735,10 +4281,11 @@ index 6b0305d..d55ed4c 100644
              let payload_hash = compute_payload_hash(authorization.as_bytes());
              wallet
                  .prepare_request(&authorization, payload_hash, active_root, siblings)
-@@ -1684,6 +2203,42 @@ impl AuthService {
+@@ -1684,16 +2480,107 @@ impl AuthService {
          .await
      }
 
+-    async fn clear_pending_request(&self) -> Result<(), AuthError> {
 +    async fn refresh_unaccepted_native_request(&self, request: ApiRequestV2) -> Result<(), AuthError> {
 +        let config = self.config.clone(); let wallet_mutex = self.wallet_mutex.clone();
 +        spawn_blocking(move || {
@@ -3767,50 +4314,69 @@ index 6b0305d..d55ed4c 100644
 +                    || serde_json::from_value::<Felt252>(value["payload_hash"].clone()).ok() != Some(request.payload_hash) {
 +                    return Err(AuthError::PendingRequest);
 +                }
-+                // The server's atomic issuance check proved the old request can
-+                // no longer be admitted. Only now may its quote be replaced.
-+                wallet.clear_pending_request()?;
++                // The server's atomic issuance check attested that the old
++                // request can no longer be admitted. Only now may its quote be
++                // replaced. The answer is unsigned and only echoes the
++                // request's own identifiers, so the journal is archived, from
++                // where a later finalized receipt still installs.
++                wallet.archive_pending_request("discarded_expired_unaccepted")?;
 +                Ok(())
 +            })
 +        }).await
 +    }
 +
-     async fn clear_pending_request(&self) -> Result<(), AuthError> {
-         let config = self.config.clone();
-         let wallet_mutex = self.wallet_mutex.clone();
-@@ -1693,6 +2248,45 @@ impl AuthService {
-                 .map_err(|error| AuthError::Wallet(error.to_string()))?;
-             let _lockfile = acquire_wallet_lock(&config.state_dir)?;
-             let wallet = load_wallet(&config, Vec::new())?;
-+            crate::oa_withdrawal::check_spending(&config, wallet.state().map(|state| state.note_id))?;
-+            wallet.clear_pending_request()?;
-+            Ok(())
-+        })
-+        .await
-+    }
-+
-+    /// Discard a transmitted lease request after an unsigned rejection only
-+    /// when the server also reports its nullifier as unknown, and only while
-+    /// the journal still holds that exact request. Anything else keeps it.
-+    async fn clear_unadmitted_request(&self, request: &ApiRequestV2) -> Result<(), AuthError> {
-+        let recovery = self
-+            .fetch_nullifier_recovery(&request.public_inputs.request_nullifier)
-+            .await?;
-+        if recovery.status != "not_found" || recovery.nullifier_status != "unknown" {
-+            return Err(AuthError::LeasePending(format!(
-+            "request {} was rejected as stale, but its nullifier status is {}; the saved authorization is preserved",
-+            request.client_request_id, recovery.nullifier_status
-+        )));
-+        }
++    async fn clear_pending_request(&self, disposition: &'static str) -> Result<(), AuthError> {
 +        let config = self.config.clone();
 +        let wallet_mutex = self.wallet_mutex.clone();
-+        let request = request.clone();
 +        spawn_blocking(move || {
 +            let _guard = wallet_mutex
 +                .lock()
 +                .map_err(|error| AuthError::Wallet(error.to_string()))?;
 +            let _lockfile = acquire_wallet_lock(&config.state_dir)?;
 +            let wallet = load_wallet(&config, Vec::new())?;
++            crate::oa_withdrawal::check_spending(&config, wallet.state().map(|state| state.note_id))?;
++            // The server reported the request unknown, and its nullifier
++            // unknown or reserved for a clearance; the unsigned answer only
++            // moves the journal into the archive.
++            wallet.archive_pending_request(disposition)?;
++            Ok(())
++        })
++        .await
++    }
++
++    /// Set aside a transmitted lease request after an unsigned stale_root,
++    /// once the vault's root moved, only when the server also reports its
++    /// nullifier as unknown, and only while the journal still holds that
++    /// exact request. It moves into the request archive, where a later
++    /// finalized receipt still installs. Anything else keeps it; a nullifier
++    /// reserved for a clearance is reported as `ClearanceReservedState`.
++    async fn clear_unadmitted_request(&self, request: &ApiRequestV2) -> Result<(), AuthError> {
++        let recovery = self
++            .fetch_nullifier_recovery(&request.public_inputs.request_nullifier)
++            .await?;
++        if recovery.nullifier_status == "clearance_reserved" && recovery.request_response.is_none()
++        {
++            // No request at this nullifier can be admitted; only withdrawal
++            // can close the state. The journal stays for withdrawal
++            // settlement to set aside.
++            return Err(AuthError::ClearanceReservedState);
++        }
++        if recovery.status != "not_found" || recovery.nullifier_status != "unknown" {
++            return Err(AuthError::LeasePending(format!(
++            "request {} was rejected as stale, but its nullifier status is {}; the saved authorization is preserved",
++            request.client_request_id, recovery.nullifier_status
++        )));
++        }
+         let config = self.config.clone();
+         let wallet_mutex = self.wallet_mutex.clone();
++        let request = request.clone();
+         spawn_blocking(move || {
+             let _guard = wallet_mutex
+                 .lock()
+                 .map_err(|error| AuthError::Wallet(error.to_string()))?;
+             let _lockfile = acquire_wallet_lock(&config.state_dir)?;
+             let wallet = load_wallet(&config, Vec::new())?;
+-            wallet.clear_pending_request()?;
 +            crate::oa_withdrawal::check_spending(
 +                &config,
 +                wallet.state().map(|state| state.note_id),
@@ -3821,10 +4387,11 @@ index 6b0305d..d55ed4c 100644
 +            if serde_json::to_value(&saved).ok() != serde_json::to_value(&request).ok() {
 +                return Err(AuthError::PendingRequest);
 +            }
-             wallet.clear_pending_request()?;
++            wallet.archive_pending_request("discarded_stale_root")?;
              Ok(())
          })
-@@ -1703,16 +2297,15 @@ impl AuthService {
+         .await
+@@ -1703,16 +2590,15 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<OpenRouterLeaseStatusResponse, AuthError> {
@@ -3844,7 +4411,7 @@ index 6b0305d..d55ed4c 100644
              .json()
              .await
              .map_err(|error| AuthError::Serialization(error.to_string()))
-@@ -1722,12 +2315,10 @@ impl AuthService {
+@@ -1722,12 +2608,10 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<Option<OpenRouterLeaseStatusResponse>, AuthError> {
@@ -3859,7 +4426,7 @@ index 6b0305d..d55ed4c 100644
              .send()
              .await
              .map_err(|error| AuthError::Wallet(error.to_string()))?;
-@@ -1736,7 +2327,7 @@ impl AuthService {
+@@ -1736,7 +2620,7 @@ impl AuthService {
          }
          let response = response
              .error_for_status()
@@ -3868,7 +4435,7 @@ index 6b0305d..d55ed4c 100644
          response
              .json()
              .await
-@@ -1748,16 +2339,15 @@ impl AuthService {
+@@ -1748,16 +2632,15 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<RecoveryResponseV2, AuthError> {
@@ -3888,7 +4455,7 @@ index 6b0305d..d55ed4c 100644
              .json()
              .await
              .map_err(|error| AuthError::Serialization(error.to_string()))
-@@ -1767,44 +2357,44 @@ impl AuthService {
+@@ -1767,44 +2650,44 @@ impl AuthService {
          &self,
          nullifier: &Felt252,
      ) -> Result<RecoveryResponseV2, AuthError> {
@@ -3952,7 +4519,7 @@ index 6b0305d..d55ed4c 100644
              let http_status = response.status();
              let body = response
                  .text()
-@@ -1815,15 +2405,13 @@ impl AuthService {
+@@ -1815,15 +2698,13 @@ impl AuthService {
                      .map_err(|error| AuthError::Serialization(error.to_string()))?;
              }
              if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
@@ -3970,7 +4537,7 @@ index 6b0305d..d55ed4c 100644
                  }
                  return Err(AuthError::Wallet(format!(
                      "{}: {}",
-@@ -1832,18 +2420,22 @@ impl AuthService {
+@@ -1832,18 +2713,22 @@ impl AuthService {
              }
              return Err(AuthError::Wallet(format!("HTTP {http_status}: {body}")));
          };
@@ -3995,7 +4562,7 @@ index 6b0305d..d55ed4c 100644
      }
 
      async fn finish_direct_openrouter_lease(&self, client_request_id: String) {
-@@ -1903,6 +2495,7 @@ impl AuthService {
+@@ -1903,6 +2788,7 @@ impl AuthService {
          self.ensure_scheme_agreement().await?;
          let config = self.config.clone();
          let wallet_mutex = self.wallet_mutex.clone();
@@ -4003,7 +4570,7 @@ index 6b0305d..d55ed4c 100644
          let indexer = self.indexer.clone();
          let trusted_roots = self.trusted_roots();
          spawn_blocking(move || {
-@@ -1911,6 +2504,7 @@ impl AuthService {
+@@ -1911,6 +2797,7 @@ impl AuthService {
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, trusted_roots)?;
@@ -4011,7 +4578,7 @@ index 6b0305d..d55ed4c 100644
              let payload = serde_json::to_string(&request)
                  .map_err(|err| AuthError::Serialization(err.to_string()))?;
              let payload_hash = hash_payload(&payload);
-@@ -1918,7 +2512,9 @@ impl AuthService {
+@@ -1918,7 +2805,9 @@ impl AuthService {
 
              runtime.block_on(async move {
                  if wallet.has_pending_request() {
@@ -4022,15 +4589,78 @@ index 6b0305d..d55ed4c 100644
                  }
 
                  let note_id = wallet.state().ok_or(AuthError::NoActiveNote)?.note_id;
-@@ -2033,6 +2629,7 @@ impl AuthService {
+@@ -2027,20 +2916,54 @@ impl AuthService {
+         let wallet_mutex = self.wallet_mutex.clone();
+         let indexer = self.indexer.clone();
+         let trusted_roots = self.trusted_roots();
++        let session_events = self.oa_session_events.clone();
+         let plan = spawn_blocking(move || {
+             let _guard = wallet_mutex
+                 .lock()
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
-             let wallet = load_wallet(&config, trusted_roots)?;
+-            let wallet = load_wallet(&config, trusted_roots)?;
++            let mut wallet = load_wallet(&config, trusted_roots)?;
 +            crate::oa_withdrawal::check_spending(&config, wallet.state().map(|state| state.note_id))?;
              let runtime = current_thread_runtime()?;
 
              runtime.block_on(async move {
-@@ -2164,8 +2761,7 @@ impl AuthService {
++                // As in oa_prepare_withdrawal: a request set aside at this
++                // state may since have been finalized; install its verified
++                // receipt before the gate below.
++                if wallet.get_pending_journal()?.is_none()
++                    && !wallet.archive_at_current_state()?.is_empty()
++                {
++                    if let Some(response) = wallet.recover().await? {
++                        session_events
++                            .settled(&response, wallet.state().map(|state| state.current_balance));
++                    }
++                }
+                 let note_id = wallet.state().ok_or(AuthError::NoActiveNote)?.note_id;
++                // As in oa_prepare_withdrawal: at a state with an unsettled
++                // request on a vault below revision 2, no escape-form proof
++                // leaves the wallet, neither as an ownership proof nor as an
++                // escape.
++                let unsettled_state = unsettled_legacy_state(&config, &wallet)?;
++                if unsettled_state && mode == WithdrawalMode::Escape {
++                    return Err(AuthError::UnsettledRequestState("escape refused".into()));
++                }
+                 let root = indexer.root().await?;
+                 let siblings = indexer.note_path(note_id).await?;
+                 let plan_siblings = siblings.clone();
+                 let (public_inputs, proof) = match mode {
++                    WithdrawalMode::Mutual if unsettled_state => wallet
++                        .withdrawal_mutual_close_without_ownership_proof(
++                            destination,
++                            root,
++                            siblings,
++                        )
++                        .await
++                        .map_err(|error| match error {
++                            zkapi_client::error::ClientError::ClearanceRefused(code) => {
++                                AuthError::UnsettledRequestState(code)
++                            }
++                            other => other.into(),
++                        })?,
+                     WithdrawalMode::Mutual => {
+                         wallet
+                             .withdrawal_mutual_close(destination, root, siblings)
+@@ -2158,14 +3081,22 @@ impl AuthService {
+         }
+     }
+
++    /// The pinned vault's `currentRoot()`, read over the deployment's RPC.
++    async fn vault_current_root(&self) -> Result<Felt252, AuthError> {
++        let word = self.vault_eth_call(VAULT_CURRENT_ROOT_SELECTOR).await?;
++        word.strip_prefix("0x")
++            .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
++            .and_then(|hex| Felt252::from_hex(hex).ok())
++            .ok_or_else(|| AuthError::Wallet("invalid vault root".into()))
++    }
++
+     async fn vault_eth_call(&self, data: &str) -> Result<String, AuthError> {
+         let rpc_url = self.config.demo_rpc_url.as_ref().ok_or_else(|| {
+             AuthError::InvalidInput(
                  "deployment does not advertise an RPC URL for withdrawal confirmation".to_string(),
              )
          })?;
@@ -4040,7 +4670,7 @@ index 6b0305d..d55ed4c 100644
              .post(rpc_url)
              .json(&serde_json::json!({
                  "jsonrpc": "2.0",
-@@ -2397,7 +2993,7 @@ fn hash_payload(payload: &str) -> Felt252 {
+@@ -2397,7 +3328,7 @@ fn hash_payload(payload: &str) -> Felt252 {
      compute_payload_hash(payload.as_bytes())
  }
 
@@ -4049,7 +4679,7 @@ index 6b0305d..d55ed4c 100644
      SystemTime::now()
          .duration_since(UNIX_EPOCH)
          .unwrap_or_default()
-@@ -2674,7 +3270,18 @@ fn load_wallet(
+@@ -2674,7 +3605,18 @@ fn load_wallet(
      config: &AuthConfig,
      trusted_epoch_roots: Vec<EpochRoots>,
  ) -> Result<Wallet, AuthError> {
@@ -4069,10 +4699,70 @@ index 6b0305d..d55ed4c 100644
  }
 
  fn acquire_wallet_lock(state_dir: &Path) -> Result<std::fs::File, AuthError> {
-@@ -2698,6 +3305,30 @@ fn current_thread_runtime() -> Result<tokio::runtime::Runtime, AuthError> {
+@@ -2698,6 +3640,90 @@ fn current_thread_runtime() -> Result<tokio::runtime::Runtime, AuthError> {
          .map_err(|err| AuthError::Wallet(err.to_string()))
  }
 
++/// On a vault below revision 2, true when a request proof sent from the
++/// wallet's current state was set aside without settling (an archived
++/// request). An ownership proof there is a submittable escape that whoever
++/// kept that request proof could have challenged, burning the nullifier.
++/// Whether the server reports `nullifier` settled by a request this wallet
++/// holds neither as its pending journal (`pending_id`) nor in its request
++/// archive: an earlier release deleted that request's journal, so its receipt
++/// can never be installed here and the state can never move. Only a readable
++/// archive counts as holding no such record. A lying server can make the same
++/// claim; only the operator's records settle it (receipt_journal_missing).
++async fn receipt_journal_missing(
++    config: &AuthConfig,
++    nullifier: &Felt252,
++    pending_id: Option<&str>,
++) -> bool {
++    let Ok(recovery) = nullifier_recovery(config, nullifier).await else {
++        return false;
++    };
++    let Some(response) = recovery.request_response else {
++        return false;
++    };
++    if pending_id == Some(response.client_request_id.as_str()) {
++        return false;
++    }
++    zkapi_client::journal::read_archive(&config.state_dir.join("request_archive"), nullifier)
++        .is_ok_and(|listing| {
++            listing.unreadable.is_empty()
++                && !listing
++                    .records
++                    .iter()
++                    .any(|record| record.journal.client_request_id == response.client_request_id)
++        })
++}
++
++/// Whether the server reports `nullifier` reserved for a clearance (an
++/// earlier mutual withdrawal, or the operator's release of a stuck state).
++/// The server then refuses every request at it as a replay. A failed read is
++/// no such report.
++async fn nullifier_clearance_reserved(config: &AuthConfig, nullifier: &Felt252) -> bool {
++    nullifier_recovery(config, nullifier)
++        .await
++        .is_ok_and(|recovery| {
++            recovery.nullifier_status == "clearance_reserved" && recovery.request_response.is_none()
++        })
++}
++
++/// A state with an archived request on a vault below revision 2. A record
++/// that cannot be read still counts: something was archived at this state,
++/// and it may be a transmitted request.
++fn unsettled_legacy_state(config: &AuthConfig, wallet: &Wallet) -> Result<bool, AuthError> {
++    if config.vault_revision >= 2 {
++        return Ok(false);
++    }
++    let listing = wallet.archive_at_current_state()?;
++    for path in &listing.unreadable {
++        tracing::warn!(path = %path.display(), "an unreadable request archive record marks the note state unsettled");
++    }
++    Ok(!listing.is_empty())
++}
++
 +async fn nullifier_recovery(
 +    config: &AuthConfig,
 +    nullifier: &Felt252,
@@ -4100,7 +4790,7 @@ index 6b0305d..d55ed4c 100644
  async fn fetch_json<T>(url: &str) -> Result<T, String>
  where
      T: DeserializeOwned,
-@@ -2917,7 +3548,7 @@ mod wallet_lifecycle_tests {
+@@ -2917,7 +3943,7 @@ mod wallet_lifecycle_tests {
 
      #[tokio::test]
      async fn low_balance_note_is_preserved_and_active_slot_is_cleared() {
@@ -4109,7 +4799,7 @@ index 6b0305d..d55ed4c 100644
 
          let retired = service
              .retire_low_balance_note()
-@@ -2926,22 +3557,22 @@ mod wallet_lifecycle_tests {
+@@ -2926,22 +3952,22 @@ mod wallet_lifecycle_tests {
              .expect("low-balance note should be retired");
 
          assert_eq!(retired.note_id, 18);
@@ -4136,7 +4826,7 @@ index 6b0305d..d55ed4c 100644
          PendingRequestJournal::write(
              &pending_directory.path().join("pending_journal.json"),
              &PendingRequestJournal {
-@@ -3346,3 +3977,1521 @@ mod tests {
+@@ -3346,3 +4372,3562 @@ mod tests {
          assert!(!commitment.is_zero());
      }
  }
@@ -4151,15 +4841,18 @@ index 6b0305d..d55ed4c 100644
 +        let (_directory, config, note) = fixture();
 +        let service = AuthService::new(config.clone()).unwrap();
 +        // The indexer fixture is unreachable. Persistence must happen first.
-+        assert!(service.oa_prepare_withdrawal([1;20]).await.is_err());
-+        assert_eq!(service.oa_withdrawal_status().await.unwrap()["phase"], "reserved");
++        assert!(service.oa_prepare_withdrawal([1; 20], false).await.is_err());
++        assert_eq!(
++            service.oa_withdrawal_status().await.unwrap()["phase"],
++            "reserved"
++        );
 +        drop(service);
 +        let service = AuthService::new(config.clone()).unwrap();
 +        for result in [service.prepare_deposit(1).await.map(|_| ()),
 +            service.confirm_deposit(ConfirmDepositRequest { secret: Felt252::ONE, note_id: note.note_id+1, amount: 1, expiry_ts: 4_000_000_000 }).await.map(|_| ()),
 +            service.reset_wallet().await.map(|_| ()), service.recover().await.map(|_| ()),
 +            service.prepare_direct_lease_request(None).await.map(|_| ()),
-+            service.clear_pending_request().await,
++            service.clear_pending_request("discarded_unknown_to_server").await,
 +            service.create_withdrawal(WithdrawalMode::Mutual, [2;20]).await.map(|_| ()),
 +            service.execute_request_demo(CoreRequest::post_json("/chat", serde_json::json!({}))).await.map(|_| ())] {
 +            assert!(matches!(result, Err(AuthError::WithdrawalConflict)), "{result:?}");
@@ -4169,8 +4862,14 @@ index 6b0305d..d55ed4c 100644
 +            openrouter_api_base: "https://openrouter.ai/api/v1".into(), expires_at: now_seconds()+300,
 +            settle_after: now_seconds()+360, verified: true, verification: None,
 +        });
-+        assert!(matches!(service.ready_direct_lease(1_000_000).await, Err(AuthError::WithdrawalConflict)));
-+        assert!(matches!(service.oa_prepare_withdrawal([2;20]).await, Err(AuthError::WithdrawalConflict)));
++        assert!(matches!(
++            service.ready_direct_lease(1_000_000).await,
++            Err(AuthError::WithdrawalConflict)
++        ));
++        assert!(matches!(
++            service.oa_prepare_withdrawal([2; 20], false).await,
++            Err(AuthError::WithdrawalConflict)
++        ));
 +        assert!(config.state_dir.join("note_state.json").exists());
 +    }
 +
@@ -4193,11 +4892,14 @@ index 6b0305d..d55ed4c 100644
 +            payload_hash: Felt252::ONE, user_rerandomization: Felt252::ONE, created_at_ms: 1, prepared_request: None,
 +        }).unwrap();
 +        let service = AuthService::new(config.clone()).unwrap();
-+        assert!(matches!(service.oa_prepare_withdrawal([1;20]).await, Err(AuthError::PendingSettlement)));
++        assert!(matches!(
++            service.oa_prepare_withdrawal([1; 20], false).await,
++            Err(AuthError::PendingSettlement)
++        ));
 +        assert_eq!(attempts.load(Ordering::SeqCst), 1);
 +        assert!(oa_withdrawal::load(&config).unwrap().is_none());
 +        std::fs::write(&journal_path, "malformed").unwrap();
-+        assert!(service.oa_prepare_withdrawal([1;20]).await.is_err());
++        assert!(service.oa_prepare_withdrawal([1; 20], false).await.is_err());
 +        assert_eq!(attempts.load(Ordering::SeqCst), 1);
 +        assert!(oa_withdrawal::load(&config).unwrap().is_none());
 +        server.abort();
@@ -4212,9 +4914,14 @@ index 6b0305d..d55ed4c 100644
 +        let hash = format!("0x{}", "ab".repeat(32));
 +        oa_withdrawal::complete(&config, &mut record, &hash).unwrap();
 +        let service = AuthService::new(config.clone()).unwrap();
-+        assert_eq!(service.oa_prepare_withdrawal([1;20]).await.unwrap(), record.plan.clone().unwrap());
-+        let mut next = note.clone(); next.note_id += 1;
-+        next.save(&config.state_dir.join("note_state.json")).unwrap();
++        assert_eq!(
++            service.oa_prepare_withdrawal([1; 20], false).await.unwrap(),
++            record.plan.clone().unwrap()
++        );
++        let mut next = note.clone();
++        next.note_id += 1;
++        next.save(&config.state_dir.join("note_state.json"))
++            .unwrap();
 +        *service.direct_lease.lock().await = Some(ActiveOpenRouterLease {
 +            session_id: "oa-single-use".into(), requests_served: 0, verification_detail: None, client_request_id: "new-note-lease".into(), api_key: "fixture-key".into(),
 +            openrouter_api_base: "https://openrouter.ai/api/v1".into(), expires_at: now_seconds()+300,
@@ -4304,7 +5011,10 @@ index 6b0305d..d55ed4c 100644
 +        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 +        let service = AuthService::new(config.clone()).unwrap();
 +        let destination = [0x22; 20];
-+        let plan = service.oa_prepare_withdrawal(destination).await.unwrap();
++        let plan = service
++            .oa_prepare_withdrawal(destination, false)
++            .await
++            .unwrap();
 +        assert!(plan.mode == WithdrawalMode::Mutual && plan.public_inputs.has_clearance);
 +
 +        let bodies = bodies.lock().unwrap().clone();
@@ -4351,6 +5061,783 @@ index 6b0305d..d55ed4c 100644
 +            }
 +        }
 +        server.abort();
++    }
++
++    /// How the clearance fixture answers.
++    #[derive(Clone, Copy, PartialEq, Debug)]
++    enum Clearance {
++        Grant,
++        OwnershipRequired,
++        LegacyCapacity,
++        NullifierUsed,
++        /// A server without legacy clearance: grants only a request that
++        /// carries an ownership proof.
++        RequireProof,
++    }
++
++    /// What the starting state's request archive holds.
++    #[derive(Clone, Copy, PartialEq, Debug)]
++    enum Archive {
++        Empty,
++        /// A lease request sent from this state, set aside unsettled.
++        Record,
++        /// Only a damaged record, beside a file that is not a record.
++        Unreadable,
++    }
++
++    /// One fixture run's setup; see `prepare_with`.
++    #[derive(Clone, Copy, Debug)]
++    struct Setup {
++        route: Route,
++        vault_revision: u32,
++        archive: Archive,
++        clearance: Clearance,
++        nullifier_status: &'static str,
++        expiry_ts: u64,
++        accept_unsettled_request_risk: bool,
++        /// Prepare once more, without the acknowledgement, as approving the
++        /// quote does.
++        again: bool,
++        /// Direct mode with a pending lease journal "retry" from the starting
++        /// state that the server reports unknown, and no live key in the
++        /// daemon.
++        pending_retry: bool,
++        /// Whether the vault's root moved past the retry's since it was
++        /// proved; otherwise the vault still has it.
++        vault_root_moved: bool,
++    }
++
++    impl Setup {
++        fn new(archive: Archive, clearance: Clearance, nullifier_status: &'static str) -> Self {
++            Self {
++                route: Route::Oa,
++                vault_revision: 0,
++                archive,
++                clearance,
++                nullifier_status,
++                expiry_ts: 4_000_000_000,
++                accept_unsettled_request_risk: false,
++                again: false,
++                pending_retry: false,
++                vault_root_moved: true,
++            }
++        }
++    }
++
++    /// The withdrawal route used.
++    #[derive(Clone, Copy, PartialEq, Debug)]
++    enum Route {
++        /// `/oa/v1/withdraw/prepare`, the route zkapi-clientd uses.
++        Oa,
++        /// The generic `/wallet/withdraw`, mutual close or escape.
++        Generic(WithdrawalMode),
++    }
++
++    /// What one fixture run observed.
++    struct Prepared {
++        result: Result<WithdrawalPlan, AuthError>,
++        /// Every clearance request body.
++        requests: Vec<zkapi_types::wire::ClearanceRequest>,
++        /// The reservation phase afterwards.
++        phase: Value,
++        /// Reads of the server's record for the starting state's nullifier.
++        reads: usize,
++        /// That nullifier.
++        nullifier: Felt252,
++        /// The repeated preparation's result, with `Setup::again`.
++        again: Option<Result<WithdrawalPlan, AuthError>>,
++        /// Whether a request journal is still pending afterwards.
++        pending: bool,
++        /// The dispositions of the requests archived at the starting state.
++        archived: Vec<String>,
++    }
++
++    /// Prepare a withdrawal against a mock server and indexer with the real
++    /// withdrawal setup. `archived` sets aside a lease request sent from the
++    /// starting state; the server's record for that state's nullifier reads
++    /// `nullifier_status`, and "finalized" carries a valid signed receipt for
++    /// the archived request.
++    async fn prepare_with(
++        route: Route,
++        vault_revision: u32,
++        archived: bool,
++        clearance: Clearance,
++        nullifier_status: &'static str,
++    ) -> Prepared {
++        let archive = if archived {
++            Archive::Record
++        } else {
++            Archive::Empty
++        };
++        prepare_with_setup(Setup {
++            route,
++            vault_revision,
++            ..Setup::new(archive, clearance, nullifier_status)
++        })
++        .await
++    }
++
++    async fn prepare_with_setup(setup: Setup) -> Prepared {
++        let Setup {
++            route,
++            vault_revision,
++            archive,
++            clearance,
++            nullifier_status,
++            expiry_ts,
++            accept_unsettled_request_risk,
++            again,
++            pending_retry,
++            vault_root_moved,
++        } = setup;
++        use axum::{
++            extract::State,
++            http::StatusCode,
++            routing::{get, post},
++            Json, Router,
++        };
++        use zkapi_proof::compact::{rerandomize, server_update, CompactSigner, WithdrawalVerifier};
++        let directory = tempfile::tempdir().unwrap();
++        let setup_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocol/setup/v2");
++        let clearance_signer = CompactSigner::from_seed(&Felt252::from_u64(12));
++        let state_signer = CompactSigner::from_seed(&Felt252::from_u64(11));
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            contract_address: Felt252::from_u64(0xdeadbeef),
++            protocol_server_url: url.clone(),
++            indexer_url: url.clone(),
++            proof_setup_dir: setup_dir.into(),
++            state_signing_key: state_signer.public_key(),
++            clearance_signing_key: clearance_signer.public_key(),
++            vault_revision,
++            request_mode: if pending_retry {
++                RequestMode::DirectOpenrouter
++            } else {
++                RequestMode::default()
++            },
++            demo_rpc_url: Some(format!("{url}/rpc")),
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 0, 1_500_000, expiry_ts)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        if archive == Archive::Unreadable {
++            // A torn record and a file another program left beside it.
++            let directory = config.state_dir.join("request_archive").join(
++                nullifier
++                    .0
++                    .iter()
++                    .map(|byte| format!("{byte:02x}"))
++                    .collect::<String>(),
++            );
++            std::fs::create_dir_all(&directory).unwrap();
++            std::fs::write(directory.join("1700000000000-0.json"), b"").unwrap();
++            std::fs::write(directory.join(".DS_Store"), b"\0\0\0\x01Bud1").unwrap();
++        }
++        if pending_retry {
++            let payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
++            let retry = ApiRequestV2 {
++                client_request_id: "retry".into(),
++                payload_hash: compute_payload_hash(payload.as_bytes()),
++                payload,
++                public_inputs: zkapi_types::RequestPublicInputsV2 {
++                    protocol_version: 2,
++                    chain_id: 1,
++                    contract_address: config.contract_address,
++                    active_root: Felt252::ONE,
++                    state_signing_key_x: config.state_signing_key.x,
++                    state_signing_key_y: config.state_signing_key.y,
++                    request_time: 1,
++                    solvency_bound: 1_000,
++                    request_nullifier: nullifier,
++                    authorization_tag: Felt252::ONE,
++                    anonymous_commitment_x: Felt252::ONE,
++                    anonymous_commitment_y: Felt252::ONE,
++                },
++                proof: Groth16ProofWire {
++                    backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
++                    proof: "retry-proof".into(),
++                },
++            };
++            zkapi_client::journal::PendingRequestJournal::write(
++                &config.state_dir.join("pending_journal.json"),
++                &zkapi_client::journal::PendingRequestJournal {
++                    exists: true,
++                    client_request_id: "retry".into(),
++                    nullifier,
++                    payload_hash: retry.payload_hash,
++                    user_rerandomization: Felt252::from_u64(3),
++                    created_at_ms: 2,
++                    prepared_request: Some(retry),
++                },
++            )
++            .unwrap();
++        }
++        if archive == Archive::Record {
++            // A lease request sent from this state, set aside unsettled.
++            zkapi_client::journal::PendingRequestJournal::write(
++                &config.state_dir.join("pending_journal.json"),
++                &zkapi_client::journal::PendingRequestJournal {
++                    exists: true,
++                    client_request_id: "withheld".into(),
++                    nullifier,
++                    payload_hash: Felt252::ONE,
++                    user_rerandomization: Felt252::ONE,
++                    created_at_ms: 1,
++                    prepared_request: None,
++                },
++            )
++            .unwrap();
++            wallet
++                .archive_pending_request("discarded_unknown_to_server")
++                .unwrap();
++        }
++        // The server's finalized receipt for the archived request.
++        let anonymous = rerandomize(
++            &zkapi_types::wire::CurvePointWire {
++                x: note.current_commitment_x,
++                y: note.current_commitment_y,
++            },
++            &Felt252::ONE,
++        )
++        .unwrap();
++        let next_commitment = server_update(&anonymous, 0, &Felt252::ONE).unwrap();
++        let next_anchor = Felt252::from_u64(123);
++        let payload = serde_json::json!({"type":"openrouter_lease_settlement"}).to_string();
++        let next_state_signature = state_signer.sign(&core_v2::state_message(
++            2,
++            1,
++            &config.contract_address,
++            &next_commitment.x,
++            &next_commitment.y,
++            &next_anchor,
++        ));
++        let receipt = RequestResponseV2 {
++            status: "finalized".into(),
++            client_request_id: "withheld".into(),
++            request_nullifier: nullifier,
++            response_code: 200,
++            response_hash: zkapi_types::canonical_response_hash(payload.as_bytes()),
++            response_payload: payload,
++            charge_applied: 0,
++            next_commitment,
++            next_anchor,
++            blind_delta_srv: Felt252::ONE,
++            next_state_signature,
++            policy_reason_code: None,
++            policy_evidence_hash: None,
++        };
++        let leaf = core_v2::note_leaf(
++            0,
++            &core_v2::registration_commitment(&note.secret_s),
++            note.deposit_amount,
++            note.expiry_ts,
++        );
++        let siblings = core_v2::zero_hashes()[..zkapi_types::MERKLE_DEPTH].to_vec();
++        let root = core_v2::merkle_root(0, &leaf, &siblings.clone().try_into().unwrap());
++        let contract = config.contract_address;
++        type Seen = Arc<Mutex<(Vec<Value>, usize)>>;
++        let seen: Seen = Arc::default();
++        let router = Router::new()
++            .route("/v2/openrouter/leases/retry", get(|| async { StatusCode::NOT_FOUND }))
++            .route("/v2/requests/retry", get(|| async {
++                Json(serde_json::json!({"status":"not_found","nullifier_status":"unknown"}))
++            }))
++            .route("/rpc", post(move || async move {
++                // The retry was proved at root 1.
++                let root = if vault_root_moved { 5 } else { 1 };
++                Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":format!("0x{root:064x}")}))
++            }))
++            .route("/v1/tree/root", get(move || async move { Json(serde_json::json!({"root": root})) }))
++            .route("/v1/tree/notes/0/path", get({
++                let siblings = siblings.clone();
++                move || { let siblings = siblings.clone(); async move { Json(serde_json::json!({"siblings": siblings})) } }
++            }))
++            .route("/v2/withdraw/clearance", post(move |State(seen): State<Seen>, Json(body): Json<Value>| {
++                let requested: Felt252 = serde_json::from_value(body["withdrawal_nullifier"].clone()).unwrap();
++                let proved = !body["ownership_proof"].is_null();
++                seen.lock().unwrap().0.push(body);
++                let granted = zkapi_types::wire::ClearanceResponseV2 {
++                    status: "ok".into(),
++                    withdrawal_nullifier: requested,
++                    signature: clearance_signer.sign(&core_v2::clearance_message(2, 1, &contract, &requested)),
++                };
++                async move {
++                    let refusal = |status: StatusCode, code: &str| (status, Json(serde_json::json!({"status":"error",
++                        "client_request_id":"","error_code":code,"error_message":"refused","retriable":false})));
++                    match clearance {
++                        Clearance::Grant => (StatusCode::OK, Json(serde_json::to_value(granted).unwrap())),
++                        Clearance::RequireProof if proved => (StatusCode::OK, Json(serde_json::to_value(granted).unwrap())),
++                        Clearance::RequireProof => refusal(StatusCode::BAD_REQUEST, "clearance_ownership_required"),
++                        Clearance::OwnershipRequired => refusal(StatusCode::BAD_REQUEST, "clearance_ownership_required"),
++                        Clearance::LegacyCapacity => refusal(StatusCode::SERVICE_UNAVAILABLE, "legacy_clearance_capacity"),
++                        Clearance::NullifierUsed => refusal(StatusCode::CONFLICT, "nullifier_used"),
++                    }
++                }
++            }))
++            .route(&format!("/v2/nullifiers/{nullifier}"), get(move |State(seen): State<Seen>| {
++                seen.lock().unwrap().1 += 1;
++                let receipt = receipt.clone();
++                async move {
++                    Json(match nullifier_status {
++                        "unknown" => serde_json::json!({"status":"not_found","nullifier_status":"unknown"}),
++                        "finalized" => serde_json::json!({"status":"ok","nullifier_status":"finalized","request_response":receipt}),
++                        status => serde_json::json!({"status":"ok","nullifier_status":status}),
++                    })
++                }
++            }))
++            .with_state(seen.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config.clone()).unwrap();
++        let result = match route {
++            Route::Oa => {
++                service
++                    .oa_prepare_withdrawal([0x22; 20], accept_unsettled_request_risk)
++                    .await
++            }
++            Route::Generic(mode) => service.create_withdrawal(mode, [0x22; 20]).await,
++        };
++        let again = if again {
++            Some(service.oa_prepare_withdrawal([0x22; 20], false).await)
++        } else {
++            None
++        };
++        let phase = service.oa_withdrawal_status().await.unwrap()["phase"].clone();
++        let (bodies, reads) = seen.lock().unwrap().clone();
++        let requests: Vec<zkapi_types::wire::ClearanceRequest> = bodies
++            .into_iter()
++            .map(|body| serde_json::from_value(body).unwrap())
++            .collect();
++        if let Ok(plan) = &result {
++            let verifier = WithdrawalVerifier::load(setup_dir).unwrap();
++            assert!(verifier.verify(&plan.public_inputs, &plan.proof).unwrap());
++            assert_eq!(
++                plan.public_inputs.has_clearance,
++                plan.mode == WithdrawalMode::Mutual
++            );
++        }
++        let pending = config.state_dir.join("pending_journal.json").exists();
++        let archived = zkapi_client::journal::read_archive(
++            &config.state_dir.join("request_archive"),
++            &nullifier,
++        )
++        .unwrap()
++        .records
++        .into_iter()
++        .map(|record| record.disposition)
++        .collect();
++        server.abort();
++        Prepared {
++            result,
++            requests,
++            phase,
++            reads,
++            nullifier,
++            again,
++            pending,
++            archived,
++        }
++    }
++
++    /// closure:journal-discard #1 for clientd: on a vault below revision 2 a
++    /// state with an unsettled transmitted request never releases an
++    /// escape-form ownership proof. A legacy server's proof-less clearance
++    /// still closes the note. A refusal that reserved nothing releases the
++    /// local reservation when the server reports the nullifier unknown or
++    /// owned by a request, and asks the user to settle the state first.
++    #[tokio::test]
++    async fn a_state_with_an_unsettled_request_never_sends_an_ownership_proof_on_a_legacy_vault() {
++        let run = prepare_with(Route::Oa, 0, true, Clearance::Grant, "unknown").await;
++        assert!(run.result.is_ok(), "{:?}", run.result);
++        assert_eq!(run.requests.len(), 1);
++        assert!(
++            run.requests[0].ownership_proof.is_none(),
++            "an ownership proof left a transmitted state"
++        );
++        assert_eq!(run.requests[0].withdrawal_nullifier, run.nullifier);
++        assert_eq!(run.phase, "reserved");
++        // The recovery attempt before the gate found nothing to install.
++        assert_eq!(run.reads, 1);
++
++        for (clearance, status, released) in [
++            (Clearance::OwnershipRequired, "unknown", true),
++            (Clearance::LegacyCapacity, "unknown", true),
++            (Clearance::NullifierUsed, "reserved", true),
++            (Clearance::OwnershipRequired, "clearance_reserved", false),
++        ] {
++            let run = prepare_with(Route::Oa, 0, true, clearance, status).await;
++            let case = format!("{clearance:?}/{status}");
++            // A clearance the server already holds for this state is reported
++            // apart: no chat request can settle that state.
++            let expected = if released {
++                "unsettled_request_state"
++            } else {
++                "unsettled_clearance_reserved"
++            };
++            assert!(
++                matches!(
++                    &run.result,
++                    Err(AuthError::UnsettledRequestState(_)
++                        | AuthError::UnsettledStateClearanceReserved(_))
++                ),
++                "{case}: {:?}",
++                run.result
++            );
++            assert_eq!(run.result.unwrap_err().code(), expected, "{case}");
++            assert_eq!(run.requests.len(), 1, "{case}");
++            assert!(
++                run.requests[0].ownership_proof.is_none(),
++                "{case}: an ownership proof left a transmitted state"
++            );
++            assert_eq!(run.reads, 2, "{case}");
++            assert_eq!(
++                run.phase,
++                if released { "none" } else { "reserved" },
++                "{case}"
++            );
++        }
++
++        // Without an unsettled request, or on a hardened vault, the ownership
++        // proof is sent as before.
++        for (vault_revision, archived) in [(0, false), (2, true)] {
++            let run = prepare_with(
++                Route::Oa,
++                vault_revision,
++                archived,
++                Clearance::Grant,
++                "unknown",
++            )
++            .await;
++            assert!(run.result.is_ok(), "{:?}", run.result);
++            assert!(run.requests.len() == 1 && run.requests[0].ownership_proof.is_some());
++            assert_eq!(run.reads, usize::from(archived));
++        }
++    }
++
++    /// When the request set aside at this state was finalized after all,
++    /// preparation installs its verified receipt first and closes the settled
++    /// successor state, which has no unsettled request: its ownership proof
++    /// is for a nullifier no withheld request proof can match.
++    #[tokio::test]
++    async fn a_finalized_archived_request_is_installed_before_the_withdrawal_gate() {
++        let run = prepare_with(Route::Oa, 0, true, Clearance::Grant, "finalized").await;
++        let plan = run.result.expect("withdrawal at the settled state");
++        assert_eq!(run.reads, 1);
++        assert_eq!(run.requests.len(), 1);
++        assert!(run.requests[0].ownership_proof.is_some());
++        assert_ne!(run.requests[0].withdrawal_nullifier, run.nullifier);
++        assert_eq!(
++            plan.public_inputs.withdrawal_nullifier,
++            run.requests[0].withdrawal_nullifier
++        );
++        assert_eq!(run.phase, "reserved");
++    }
++
++    /// The generic withdrawal route keeps the same rule: no ownership proof
++    /// and no escape leave a state with an unsettled request on a legacy
++    /// vault.
++    #[tokio::test]
++    async fn the_generic_withdrawal_route_applies_the_same_gate() {
++        let run = prepare_with(
++            Route::Generic(WithdrawalMode::Mutual),
++            0,
++            true,
++            Clearance::Grant,
++            "unknown",
++        )
++        .await;
++        assert!(run.result.is_ok(), "{:?}", run.result);
++        assert!(run.requests.len() == 1 && run.requests[0].ownership_proof.is_none());
++        let run = prepare_with(
++            Route::Generic(WithdrawalMode::Mutual),
++            0,
++            true,
++            Clearance::OwnershipRequired,
++            "unknown",
++        )
++        .await;
++        assert!(
++            matches!(run.result, Err(AuthError::UnsettledRequestState(_))),
++            "{:?}",
++            run.result
++        );
++        assert!(run
++            .requests
++            .iter()
++            .all(|request| request.ownership_proof.is_none()));
++        let run = prepare_with(
++            Route::Generic(WithdrawalMode::Escape),
++            0,
++            true,
++            Clearance::Grant,
++            "unknown",
++        )
++        .await;
++        assert!(
++            matches!(run.result, Err(AuthError::UnsettledRequestState(_))),
++            "{:?}",
++            run.result
++        );
++        // Without an unsettled request both modes work as before.
++        let run = prepare_with(
++            Route::Generic(WithdrawalMode::Mutual),
++            0,
++            false,
++            Clearance::Grant,
++            "unknown",
++        )
++        .await;
++        assert!(
++            run.result.is_ok() && run.requests[0].ownership_proof.is_some(),
++            "{:?}",
++            run.result
++        );
++        let run = prepare_with(
++            Route::Generic(WithdrawalMode::Escape),
++            0,
++            false,
++            Clearance::Grant,
++            "unknown",
++        )
++        .await;
++        assert!(
++            run.result.is_ok() && run.requests.is_empty(),
++            "{:?}",
++            run.result
++        );
++    }
++
++    /// A damaged archive record, or a file another program left in the
++    /// archive, neither fails the withdrawal with an opaque wallet error nor
++    /// hides the state's archive: the damaged record still marks the state
++    /// unsettled, so no ownership proof leaves it, and the stray file is
++    /// ignored.
++    #[tokio::test]
++    async fn an_unreadable_archive_record_keeps_the_gate_without_failing_the_withdrawal() {
++        let run =
++            prepare_with_setup(Setup::new(Archive::Unreadable, Clearance::Grant, "unknown")).await;
++        assert!(run.result.is_ok(), "{:?}", run.result);
++        assert_eq!(run.requests.len(), 1);
++        assert!(run.requests[0].ownership_proof.is_none());
++        assert_eq!(run.phase, "reserved");
++        let run = prepare_with_setup(Setup::new(
++            Archive::Unreadable,
++            Clearance::OwnershipRequired,
++            "unknown",
++        ))
++        .await;
++        assert!(
++            matches!(&run.result, Err(AuthError::UnsettledRequestState(_))),
++            "{:?}",
++            run.result
++        );
++        assert!(run
++            .requests
++            .iter()
++            .all(|request| request.ownership_proof.is_none()));
++    }
++
++    /// No chat request can move an expired note, so the gate would hold it
++    /// until claimExpired. The owner's explicit acknowledgement then sends
++    /// the ownership proof after a refused proof-less clearance. Before
++    /// expiry the acknowledgement changes nothing, and it never overrides a
++    /// nullifier a request owns.
++    #[tokio::test]
++    async fn an_expired_note_sends_its_ownership_proof_only_with_the_owners_acknowledgement() {
++        let expired = |accept, clearance| Setup {
++            expiry_ts: 1_000_000_000,
++            accept_unsettled_request_risk: accept,
++            ..Setup::new(Archive::Record, clearance, "unknown")
++        };
++        let run = prepare_with_setup(Setup {
++            again: true,
++            ..expired(true, Clearance::RequireProof)
++        })
++        .await;
++        assert!(run.result.is_ok(), "{:?}", run.result);
++        // Approval prepares again without the acknowledgement: the
++        // reservation remembers it, and the clearance request carries the
++        // proof at once.
++        assert!(matches!(run.again, Some(Ok(_))), "{:?}", run.again);
++        assert_eq!(run.requests.len(), 3);
++        assert!(
++            run.requests[0].ownership_proof.is_none(),
++            "the proof-less request comes first"
++        );
++        assert!(run.requests[1].ownership_proof.is_some());
++        assert!(run.requests[2].ownership_proof.is_some());
++        assert_eq!(run.phase, "reserved");
++        // A legacy server's proof-less clearance needs no override.
++        let run = prepare_with_setup(expired(true, Clearance::Grant)).await;
++        assert!(
++            run.result.is_ok()
++                && run.requests.len() == 1
++                && run.requests[0].ownership_proof.is_none()
++        );
++
++        for (setup, case) in [
++            (
++                expired(false, Clearance::RequireProof),
++                "expired, not acknowledged",
++            ),
++            (
++                Setup {
++                    accept_unsettled_request_risk: true,
++                    ..Setup::new(Archive::Record, Clearance::RequireProof, "unknown")
++                },
++                "acknowledged before expiry",
++            ),
++            (
++                expired(true, Clearance::NullifierUsed),
++                "nullifier owned by a request",
++            ),
++        ] {
++            let run = prepare_with_setup(setup).await;
++            assert!(
++                matches!(&run.result, Err(AuthError::UnsettledRequestState(_))),
++                "{case}: {:?}",
++                run.result
++            );
++            assert_eq!(run.requests.len(), 1, "{case}");
++            assert!(run.requests[0].ownership_proof.is_none(), "{case}");
++        }
++    }
++
++    /// The operator's release of a state stuck by an earlier release's
++    /// discarded journal turns its nullifier into a clearance reservation.
++    /// The companion's own retry at that state, refused as a replay and never
++    /// admitted, used to stay pending with no live key, so withdrawal waited
++    /// for its settlement forever. Preparation now settles it first: the
++    /// server reports the retry unknown and its nullifier reserved for a
++    /// clearance, so the retry is archived, whether or not the vault's root
++    /// moved since it was proved (on a quiet vault it may never move), and
++    /// the withdrawal proceeds to the owner's acknowledgement.
++    #[tokio::test]
++    async fn withdrawal_settles_a_stranded_retry_and_reaches_the_released_state() {
++        for vault_root_moved in [true, false] {
++            let released = |accept| Setup {
++                pending_retry: true,
++                vault_root_moved,
++                accept_unsettled_request_risk: accept,
++                ..Setup::new(
++                    Archive::Empty,
++                    Clearance::RequireProof,
++                    "clearance_reserved",
++                )
++            };
++            let case = format!("vault root moved: {vault_root_moved}");
++            let run = prepare_with_setup(released(false)).await;
++            assert!(
++                matches!(
++                    &run.result,
++                    Err(AuthError::UnsettledStateClearanceReserved(_))
++                ),
++                "{case}: {:?}",
++                run.result
++            );
++            assert!(
++                run.requests.len() == 1 && run.requests[0].ownership_proof.is_none(),
++                "{case}"
++            );
++            assert!(!run.pending, "{case}");
++            assert_eq!(run.archived, ["discarded_clearance_reserved"], "{case}");
++            let run = prepare_with_setup(released(true)).await;
++            assert!(run.result.is_ok(), "{case}: {:?}", run.result);
++            assert_eq!(run.requests.len(), 2, "{case}");
++            assert!(run.requests[0].ownership_proof.is_none(), "{case}");
++            assert!(run.requests[1].ownership_proof.is_some(), "{case}");
++            assert_eq!(run.phase, "reserved", "{case}");
++            assert_eq!(run.archived, ["discarded_clearance_reserved"], "{case}");
++        }
++    }
++
++    /// A note state settled by a request whose journal an earlier release
++    /// deleted can never move: its receipt cannot be installed, and the
++    /// retry stays refused. Withdrawal reports receipt_journal_missing with
++    /// the nullifier the operator needs, whether a refused retry is pending
++    /// or the ownership-proof clearance is refused as nullifier_used,
++    /// instead of waiting for settlement forever or failing opaquely.
++    #[tokio::test]
++    async fn a_state_settled_by_a_request_without_a_journal_reports_receipt_journal_missing() {
++        for setup in [
++            Setup {
++                pending_retry: true,
++                ..Setup::new(Archive::Empty, Clearance::RequireProof, "finalized")
++            },
++            Setup::new(Archive::Empty, Clearance::NullifierUsed, "finalized"),
++        ] {
++            let run = prepare_with_setup(setup).await;
++            let case = format!("{setup:?}");
++            match &run.result {
++                Err(error @ AuthError::ReceiptJournalMissing(nullifier)) => {
++                    assert_eq!(*nullifier, run.nullifier, "{case}");
++                    assert_eq!(error.code(), "receipt_journal_missing", "{case}");
++                    assert_eq!(
++                        error.status_code(),
++                        axum::http::StatusCode::CONFLICT,
++                        "{case}"
++                    );
++                    assert_eq!(error.nullifier(), Some(run.nullifier.to_string()), "{case}");
++                }
++                other => panic!("{case}: {other:?}"),
++            }
++            assert!(
++                run.requests
++                    .iter()
++                    .all(|request| request.ownership_proof.is_some()),
++                "{case}"
++            );
++        }
++    }
++
++    /// A server that already holds a clearance for the state (for example
++    /// after the operator released a stuck state, or an earlier proof-less
++    /// clearance) and now requires an ownership proof leaves a state no chat
++    /// request can settle, before expiry too. It is reported apart, keeps the
++    /// reservation, and the owner's acknowledgement sends the proof.
++    #[tokio::test]
++    async fn a_clearance_reserved_state_sends_its_ownership_proof_only_with_the_owners_acknowledgement(
++    ) {
++        let reserved = |accept| Setup {
++            accept_unsettled_request_risk: accept,
++            again: accept,
++            ..Setup::new(
++                Archive::Record,
++                Clearance::RequireProof,
++                "clearance_reserved",
++            )
++        };
++        let run = prepare_with_setup(reserved(false)).await;
++        assert!(
++            matches!(
++                &run.result,
++                Err(AuthError::UnsettledStateClearanceReserved(_))
++            ),
++            "{:?}",
++            run.result
++        );
++        assert_eq!(
++            run.result.as_ref().unwrap_err().code(),
++            "unsettled_clearance_reserved"
++        );
++        assert_eq!(run.phase, "reserved");
++        assert!(run.requests.len() == 1 && run.requests[0].ownership_proof.is_none());
++
++        let run = prepare_with_setup(reserved(true)).await;
++        assert!(run.result.is_ok(), "{:?}", run.result);
++        assert!(matches!(run.again, Some(Ok(_))), "{:?}", run.again);
++        assert_eq!(run.requests.len(), 3);
++        assert!(run.requests[0].ownership_proof.is_none());
++        assert!(run.requests[1..]
++            .iter()
++            .all(|request| request.ownership_proof.is_some()));
 +    }
 +
 +    #[tokio::test]
@@ -4507,15 +5994,27 @@ index 6b0305d..d55ed4c 100644
 +
 +    type Events = Arc<Mutex<Vec<&'static str>>>;
 +
++    /// What the pinned vault answers for `currentRoot()`.
++    #[derive(Clone, Copy, PartialEq, Debug)]
++    enum Chain {
++        RootMoved,
++        StillHasRoot,
++        Unreadable,
++    }
++
 +    #[tokio::test]
-+    async fn stale_root_discards_a_transmitted_lease_only_when_its_nullifier_is_unknown() {
-+        for answer in [
-+            "reserved",
-+            "finalized",
-+            "clearance_reserved",
-+            "unavailable",
-+            "unknown",
-+        ] {
++    async fn stale_root_sets_a_transmitted_lease_aside_only_after_the_vault_root_moved_and_an_unknown_reading(
++    ) {
++        let cases = [
++            (Chain::RootMoved, "reserved"),
++            (Chain::RootMoved, "finalized"),
++            (Chain::RootMoved, "clearance_reserved"),
++            (Chain::RootMoved, "unavailable"),
++            (Chain::RootMoved, "unknown"),
++            (Chain::StillHasRoot, "unknown"),
++            (Chain::Unreadable, "unknown"),
++        ];
++        for (chain, answer) in cases {
 +            let directory = tempfile::tempdir().unwrap();
 +            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 +            let url = format!("http://{}", listener.local_addr().unwrap());
@@ -4524,7 +6023,8 @@ index 6b0305d..d55ed4c 100644
 +                protocol_version: 2,
 +                chain_id: 1,
 +                protocol_server_url: url.clone(),
-+                indexer_url: url,
++                indexer_url: url.clone(),
++                demo_rpc_url: Some(format!("{url}/rpc")),
 +                request_mode: RequestMode::DirectOpenrouter,
 +                ..Default::default()
 +            };
@@ -4559,19 +6059,16 @@ index 6b0305d..d55ed4c 100644
 +                },
 +            };
 +            let journal_path = config.state_dir.join("pending_journal.json");
-+            PendingRequestJournal::write(
-+                &journal_path,
-+                &PendingRequestJournal {
-+                    exists: true,
-+                    client_request_id: request.client_request_id.clone(),
-+                    nullifier,
-+                    payload_hash: request.payload_hash,
-+                    user_rerandomization: Felt252::ONE,
-+                    created_at_ms: 1,
-+                    prepared_request: Some(request.clone()),
-+                },
-+            )
-+            .unwrap();
++            let saved = PendingRequestJournal {
++                exists: true,
++                client_request_id: request.client_request_id.clone(),
++                nullifier,
++                payload_hash: request.payload_hash,
++                user_rerandomization: Felt252::from_u64(77),
++                created_at_ms: 1,
++                prepared_request: Some(request.clone()),
++            };
++            PendingRequestJournal::write(&journal_path, &saved).unwrap();
 +            let journal = std::fs::read(&journal_path).unwrap();
 +            let events = Events::default();
 +            let transmitted = serde_json::to_value(&request).unwrap();
@@ -4581,6 +6078,17 @@ index 6b0305d..d55ed4c 100644
 +                    assert_eq!(body, transmitted);
 +                    (StatusCode::CONFLICT, Json(json!({"status":"error","client_request_id":"transmitted",
 +                        "error_code":"stale_root","error_message":"stale root","retriable":true,"latest_root":"0x5"})))
++                }))
++                .route("/rpc", post(move |State(events): State<Events>, Json(body): Json<Value>| async move {
++                    events.lock().unwrap().push("rpc");
++                    assert_eq!(body["method"], "eth_call");
++                    assert_eq!(body["params"][0]["data"], VAULT_CURRENT_ROOT_SELECTOR);
++                    let root = match chain {
++                        Chain::Unreadable => return (StatusCode::BAD_GATEWAY, Json(json!({}))),
++                        Chain::StillHasRoot => format!("0x{:064x}", 1),
++                        Chain::RootMoved => format!("0x{:064x}", 5),
++                    };
++                    (StatusCode::OK, Json(json!({"jsonrpc":"2.0","id":1,"result":root})))
 +                }))
 +                .route(&format!("/v2/nullifiers/{nullifier}"), get(move |State(events): State<Events>| async move {
 +                    events.lock().unwrap().push("nullifier");
@@ -4596,29 +6104,1229 @@ index 6b0305d..d55ed4c 100644
 +                }))
 +                .with_state(events.clone());
 +            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-+            let service = AuthService::new(config).unwrap();
++            let service = AuthService::new(config.clone()).unwrap();
 +            let result = service
 +                .issue_direct_openrouter_lease("chat".into(), None)
 +                .await;
 +            let events = events.lock().unwrap().clone();
-+            if answer == "unknown" {
-+                // Corroborated: only now is the journal discarded, and the next
-+                // attempt proves afresh at the indexer's current root.
-+                assert!(matches!(result, Err(AuthError::Indexer(_))));
-+                assert!(!journal_path.exists());
-+                assert_eq!(events, ["lease", "nullifier", "indexer"]);
-+            } else {
-+                // An unsigned stale_root never discards a possibly admitted proof.
-+                assert!(result.is_err(), "{answer}");
-+                assert!(
-+                    answer == "unavailable" || matches!(result, Err(AuthError::LeasePending(_))),
-+                    "{answer}"
-+                );
-+                assert_eq!(std::fs::read(&journal_path).unwrap(), journal, "{answer}");
-+                assert_eq!(events, ["lease", "nullifier"], "{answer}");
++            let archived = zkapi_client::journal::archived_requests(
++                &config.state_dir.join("request_archive"),
++                &nullifier,
++            )
++            .unwrap();
++            let case = format!("{chain:?}/{answer}");
++            match (chain, answer) {
++                (Chain::RootMoved, "unknown") => {
++                    // Corroborated by the chain and the server: the journal is
++                    // set aside into the archive, whole, and the next attempt
++                    // proves afresh at the indexer's current root.
++                    assert!(matches!(result, Err(AuthError::Indexer(_))), "{case}");
++                    assert!(!journal_path.exists(), "{case}");
++                    assert_eq!(events, ["lease", "rpc", "nullifier", "indexer"], "{case}");
++                    assert_eq!(archived.len(), 1, "{case}");
++                    assert_eq!(archived[0].disposition, "discarded_stale_root");
++                    assert_eq!(
++                        serde_json::to_value(&archived[0].journal).unwrap(),
++                        serde_json::to_value(&saved).unwrap(),
++                        "the archive keeps the rerandomization and the proved request"
++                    );
++                }
++                (Chain::StillHasRoot, _) => {
++                    // The vault contradicts the reply: the byte-identical
++                    // request is resent, never discarded, and the server's
++                    // nullifier record is not consulted.
++                    assert!(matches!(result, Err(AuthError::LeasePending(_))), "{case}");
++                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal, "{case}");
++                    let mut expected = Vec::new();
++                    for _ in 0..=STALE_ROOT_RESEND_DELAYS.len() {
++                        expected.extend(["lease", "rpc"]);
++                    }
++                    assert_eq!(events, expected, "{case}");
++                    assert!(archived.is_empty(), "{case}");
++                }
++                (Chain::Unreadable, _) => {
++                    assert!(matches!(result, Err(AuthError::LeasePending(_))), "{case}");
++                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal, "{case}");
++                    assert_eq!(events, ["lease", "rpc"], "{case}");
++                    assert!(archived.is_empty(), "{case}");
++                }
++                _ => {
++                    // An unsigned stale_root never sets aside a possibly
++                    // admitted proof. A nullifier held by a clearance is
++                    // reported as such: no chat can settle that state.
++                    assert!(result.is_err(), "{case}");
++                    match answer {
++                        "unavailable" => {}
++                        "clearance_reserved" => assert!(
++                            matches!(result, Err(AuthError::ClearanceReservedState)),
++                            "{case}: {:?}",
++                            result.as_ref().err()
++                        ),
++                        _ => assert!(
++                            matches!(result, Err(AuthError::LeasePending(_))),
++                            "{case}: {:?}",
++                            result.as_ref().err()
++                        ),
++                    }
++                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal, "{case}");
++                    assert_eq!(events, ["lease", "rpc", "nullifier"], "{case}");
++                    assert!(archived.is_empty(), "{case}");
++                }
 +            }
 +            server.abort();
 +        }
++    }
++    /// The vault-root witness holds end to end. zkapi-clientd answers the
++    /// stale_root path's lease_pending with /wallet/settle, which must not
++    /// set the same journal aside on the same unsigned 'unknown' readings
++    /// while the vault still has the request's root, or while that root
++    /// cannot be read. Once the root moved, settlement archives it as
++    /// before. A nullifier reserved for a clearance is different: the server
++    /// refuses every request at it, before any root check, so the root is
++    /// not asked and settlement archives the request whatever it is (a quiet
++    /// vault's root may never move).
++    #[tokio::test]
++    async fn withdrawal_settlement_applies_the_vault_root_witness_too() {
++        let directory = tempfile::tempdir().unwrap();
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            protocol_server_url: url.clone(),
++            indexer_url: url.clone(),
++            demo_rpc_url: Some(format!("{url}/rpc")),
++            request_mode: RequestMode::DirectOpenrouter,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
++        let request = ApiRequestV2 {
++            client_request_id: "transmitted".into(),
++            payload_hash: compute_payload_hash(payload.as_bytes()),
++            payload,
++            public_inputs: zkapi_types::RequestPublicInputsV2 {
++                protocol_version: 2,
++                chain_id: 1,
++                contract_address: config.contract_address,
++                active_root: Felt252::ONE,
++                state_signing_key_x: config.state_signing_key.x,
++                state_signing_key_y: config.state_signing_key.y,
++                request_time: 1,
++                solvency_bound: 1_000_000,
++                request_nullifier: nullifier,
++                authorization_tag: Felt252::ONE,
++                anonymous_commitment_x: Felt252::ONE,
++                anonymous_commitment_y: Felt252::ONE,
++            },
++            proof: Groth16ProofWire {
++                backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
++                proof: "transmitted-proof".into(),
++            },
++        };
++        let journal_path = config.state_dir.join("pending_journal.json");
++        PendingRequestJournal::write(
++            &journal_path,
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: request.client_request_id.clone(),
++                nullifier,
++                payload_hash: request.payload_hash,
++                user_rerandomization: Felt252::from_u64(77),
++                created_at_ms: 1,
++                prepared_request: Some(request.clone()),
++            },
++        )
++        .unwrap();
++        let journal = std::fs::read(&journal_path).unwrap();
++        type Answers = Arc<Mutex<(Chain, &'static str, Vec<&'static str>)>>;
++        let answers: Answers = Arc::new(Mutex::new((Chain::StillHasRoot, "unknown", Vec::new())));
++        let router = Router::new()
++            .route(
++                "/v2/openrouter/leases",
++                post(|State(answers): State<Answers>| async move {
++                    answers.lock().unwrap().2.push("lease");
++                    (
++                        StatusCode::CONFLICT,
++                        Json(json!({"status":"error","client_request_id":"transmitted",
++                    "error_code":"stale_root","error_message":"stale root","retriable":true})),
++                    )
++                }),
++            )
++            .route(
++                "/v2/openrouter/leases/transmitted",
++                get(|State(answers): State<Answers>| async move {
++                    answers.lock().unwrap().2.push("lease_status");
++                    StatusCode::NOT_FOUND
++                }),
++            )
++            .route(
++                "/v2/requests/transmitted",
++                get(|State(answers): State<Answers>| async move {
++                    answers.lock().unwrap().2.push("request");
++                    Json(json!({"status":"not_found","nullifier_status":"unknown"}))
++                }),
++            )
++            .route(
++                "/rpc",
++                post(|State(answers): State<Answers>| async move {
++                    let chain = {
++                        let mut answers = answers.lock().unwrap();
++                        answers.2.push("rpc");
++                        answers.0
++                    };
++                    let root = match chain {
++                        Chain::Unreadable => return (StatusCode::BAD_GATEWAY, Json(json!({}))),
++                        Chain::StillHasRoot => format!("0x{:064x}", 1),
++                        Chain::RootMoved => format!("0x{:064x}", 5),
++                    };
++                    (
++                        StatusCode::OK,
++                        Json(json!({"jsonrpc":"2.0","id":1,"result":root})),
++                    )
++                }),
++            )
++            .route(
++                &format!("/v2/nullifiers/{nullifier}"),
++                get(|State(answers): State<Answers>| async move {
++                    let answer = {
++                        let mut answers = answers.lock().unwrap();
++                        answers.2.push("nullifier");
++                        answers.1
++                    };
++                    Json(match answer {
++                        "unknown" => json!({"status":"not_found","nullifier_status":"unknown"}),
++                        status => json!({"status":"ok","nullifier_status":status}),
++                    })
++                }),
++            )
++            .with_state(answers.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config.clone()).unwrap();
++        let archive = config.state_dir.join("request_archive");
++
++        // The stale_root path keeps the journal while the vault has its root.
++        let issued = service
++            .issue_direct_openrouter_lease("chat".into(), None)
++            .await;
++        assert!(
++            matches!(issued, Err(AuthError::LeasePending(_))),
++            "{:?}",
++            issued.as_ref().err()
++        );
++        for (chain, answer) in [
++            (Chain::StillHasRoot, "unknown"),
++            (Chain::Unreadable, "unknown"),
++        ] {
++            {
++                let mut answers = answers.lock().unwrap();
++                *answers = (chain, answer, Vec::new());
++            }
++            let settled = service.settle_for_withdrawal().await;
++            let case = format!("{chain:?}/{answer}");
++            assert!(
++                matches!(settled, Err(AuthError::LeasePending(_))),
++                "{case}: {settled:?}"
++            );
++            assert_eq!(settled.unwrap_err().code(), "lease_pending", "{case}");
++            assert_eq!(std::fs::read(&journal_path).unwrap(), journal, "{case}");
++            assert!(
++                zkapi_client::journal::archived_requests(&archive, &nullifier)
++                    .unwrap()
++                    .is_empty(),
++                "{case}"
++            );
++            assert_eq!(answers.lock().unwrap().2.last(), Some(&"rpc"), "{case}");
++        }
++
++        // A clearance holds the nullifier while the vault still has the
++        // request's root: the request is set aside, whole, without asking
++        // the vault.
++        *answers.lock().unwrap() = (Chain::StillHasRoot, "clearance_reserved", Vec::new());
++        let status = service.settle_for_withdrawal().await.unwrap();
++        assert!(!status.pending_request && !journal_path.exists());
++        assert_eq!(
++            answers.lock().unwrap().2,
++            ["lease_status", "request", "nullifier"]
++        );
++        let archived = zkapi_client::journal::archived_requests(&archive, &nullifier).unwrap();
++        assert_eq!(archived.len(), 1);
++        assert_eq!(archived[0].disposition, "discarded_clearance_reserved");
++        assert_eq!(
++            serde_json::to_value(&archived[0].journal).unwrap(),
++            serde_json::from_slice::<Value>(&journal).unwrap(),
++            "the archive keeps the rerandomization and the proved request"
++        );
++
++        // Once the vault's root moved, the unknown request is set aside, into
++        // the archive.
++        std::fs::write(&journal_path, &journal).unwrap();
++        *answers.lock().unwrap() = (Chain::RootMoved, "unknown", Vec::new());
++        let status = service.settle_for_withdrawal().await.unwrap();
++        assert!(!status.pending_request && !journal_path.exists());
++        let archived = zkapi_client::journal::archived_requests(&archive, &nullifier).unwrap();
++        assert_eq!(archived.len(), 2);
++        assert_eq!(archived[1].disposition, "discarded_unknown_to_server");
++        server.abort();
++    }
++
++    /// After the operator released a stuck state, its nullifier is reserved
++    /// for a clearance and the server refuses the companion's pending retry
++    /// as a replay, forever. A chat used to fail with an opaque wallet_error,
++    /// and /wallet/settle kept the retry while the vault still had its root,
++    /// claiming the next request would resend it. Chats now report
++    /// clearance_reserved_state and keep resending the same bytes (never a
++    /// new proof from that state); settlement sets the retry aside without
++    /// asking the vault.
++    #[tokio::test]
++    async fn a_released_state_stops_chats_with_an_actionable_code_and_settles_its_retry() {
++        let directory = tempfile::tempdir().unwrap();
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            protocol_server_url: url.clone(),
++            indexer_url: url.clone(),
++            demo_rpc_url: Some(format!("{url}/rpc")),
++            request_mode: RequestMode::DirectOpenrouter,
++            vault_revision: 0,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
++        let request = ApiRequestV2 {
++            client_request_id: "transmitted".into(),
++            payload_hash: compute_payload_hash(payload.as_bytes()),
++            payload,
++            public_inputs: zkapi_types::RequestPublicInputsV2 {
++                protocol_version: 2,
++                chain_id: 1,
++                contract_address: config.contract_address,
++                active_root: Felt252::ONE,
++                state_signing_key_x: config.state_signing_key.x,
++                state_signing_key_y: config.state_signing_key.y,
++                request_time: 1,
++                solvency_bound: 1_000_000,
++                request_nullifier: nullifier,
++                authorization_tag: Felt252::ONE,
++                anonymous_commitment_x: Felt252::ONE,
++                anonymous_commitment_y: Felt252::ONE,
++            },
++            proof: Groth16ProofWire {
++                backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
++                proof: "transmitted-proof".into(),
++            },
++        };
++        let journal_path = config.state_dir.join("pending_journal.json");
++        PendingRequestJournal::write(
++            &journal_path,
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: request.client_request_id.clone(),
++                nullifier,
++                payload_hash: request.payload_hash,
++                user_rerandomization: Felt252::from_u64(77),
++                created_at_ms: 1,
++                prepared_request: Some(request.clone()),
++            },
++        )
++        .unwrap();
++        let journal = std::fs::read(&journal_path).unwrap();
++        let events = Events::default();
++        let transmitted = serde_json::to_value(&request).unwrap();
++        let router = Router::new()
++            .route(
++                "/v2/openrouter/leases",
++                post(
++                    move |State(events): State<Events>, Json(body): Json<Value>| async move {
++                        events.lock().unwrap().push("lease");
++                        // Only the saved request is ever sent from this state.
++                        assert_eq!(body, transmitted);
++                        (
++                            StatusCode::CONFLICT,
++                            Json(json!({"status":"error","client_request_id":"transmitted",
++                    "error_code":"replay","error_message":"replay","retriable":false})),
++                        )
++                    },
++                ),
++            )
++            .route(
++                "/v2/openrouter/leases/transmitted",
++                get(|State(events): State<Events>| async move {
++                    events.lock().unwrap().push("lease_status");
++                    StatusCode::NOT_FOUND
++                }),
++            )
++            .route(
++                "/v2/requests/transmitted",
++                get(|State(events): State<Events>| async move {
++                    events.lock().unwrap().push("request");
++                    Json(json!({"status":"not_found","nullifier_status":"unknown"}))
++                }),
++            )
++            .route(
++                "/rpc",
++                post(|State(events): State<Events>| async move {
++                    // The vault still has the retry's root.
++                    events.lock().unwrap().push("rpc");
++                    Json(json!({"jsonrpc":"2.0","id":1,"result":format!("0x{:064x}", 1)}))
++                }),
++            )
++            .route(
++                &format!("/v2/nullifiers/{nullifier}"),
++                get(|State(events): State<Events>| async move {
++                    events.lock().unwrap().push("nullifier");
++                    Json(json!({"status":"ok","nullifier_status":"clearance_reserved"}))
++                }),
++            )
++            .with_state(events.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config.clone()).unwrap();
++        let archive = config.state_dir.join("request_archive");
++
++        for chat in 0..2 {
++            let issued = service
++                .issue_direct_openrouter_lease("chat".into(), None)
++                .await;
++            let error = issued.err().expect("no chat can settle a released state");
++            assert!(
++                matches!(error, AuthError::ClearanceReservedState),
++                "chat {chat}: {error:?}"
++            );
++            assert_eq!(error.code(), "clearance_reserved_state");
++            assert_eq!(error.status_code(), StatusCode::CONFLICT);
++            assert_eq!(
++                std::fs::read(&journal_path).unwrap(),
++                journal,
++                "chat {chat}"
++            );
++            assert!(
++                zkapi_client::journal::archived_requests(&archive, &nullifier)
++                    .unwrap()
++                    .is_empty(),
++                "chat {chat}"
++            );
++        }
++        assert_eq!(
++            events
++                .lock()
++                .unwrap()
++                .iter()
++                .filter(|event| **event == "lease")
++                .count(),
++            2
++        );
++
++        events.lock().unwrap().clear();
++        let status = service.settle_for_withdrawal().await.unwrap();
++        assert!(!status.pending_request && !journal_path.exists());
++        assert!(!events.lock().unwrap().contains(&"rpc"));
++        let archived = zkapi_client::journal::archived_requests(&archive, &nullifier).unwrap();
++        assert_eq!(archived.len(), 1);
++        assert_eq!(archived[0].disposition, "discarded_clearance_reserved");
++        assert_eq!(
++            serde_json::to_value(&archived[0].journal).unwrap(),
++            serde_json::from_slice::<Value>(&journal).unwrap()
++        );
++        server.abort();
++    }
++}
++
++#[cfg(test)]
++mod oa_request_archive_tests {
++    use super::*;
++    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
++    use serde_json::json;
++    use zkapi_client::journal::{archived_requests, PendingRequestJournal};
++    use zkapi_proof::compact::{rerandomize, server_update, CompactSigner};
++    use zkapi_types::wire::CurvePointWire;
++
++    fn lease_request(id: &str, nullifier: Felt252, bound: u128) -> ApiRequestV2 {
++        let payload = serde_json::to_string(&OpenRouterLeaseAuthorization::default()).unwrap();
++        ApiRequestV2 {
++            client_request_id: id.into(),
++            payload_hash: compute_payload_hash(payload.as_bytes()),
++            payload,
++            public_inputs: zkapi_types::RequestPublicInputsV2 {
++                protocol_version: 2,
++                chain_id: 1,
++                contract_address: Felt252::ZERO,
++                active_root: Felt252::ONE,
++                state_signing_key_x: Felt252::ZERO,
++                state_signing_key_y: Felt252::ONE,
++                request_time: 1,
++                solvency_bound: bound,
++                request_nullifier: nullifier,
++                authorization_tag: Felt252::ONE,
++                anonymous_commitment_x: Felt252::ONE,
++                anonymous_commitment_y: Felt252::ONE,
++            },
++            proof: Groth16ProofWire {
++                backend: zkapi_types::wire::ProofBackendWire::Groth16Bn254,
++                proof: format!("{id}-proof"),
++            },
++        }
++    }
++
++    /// How the wallet is asked to resolve its state.
++    #[derive(Clone, Copy, PartialEq, Debug)]
++    enum Driver {
++        Recover,
++        SettleForWithdrawal,
++        LeaseReplay,
++    }
++
++    /// A request set aside into the archive after an unsigned rejection was in
++    /// fact admitted; its retry at the same state is refused as a replay. When
++    /// the server finalizes the original, every recovery path installs its
++    /// verified receipt from the archive, charged up to the archived request's
++    /// own proved bound, and archives the retry as superseded. A receipt that
++    /// does not verify installs nothing.
++    #[tokio::test]
++    async fn every_recovery_path_installs_a_later_receipt_for_an_archived_request() {
++        for driver in [
++            Driver::Recover,
++            Driver::SettleForWithdrawal,
++            Driver::LeaseReplay,
++        ] {
++            archived_receipt_installs(driver).await;
++        }
++    }
++
++    /// A wallet reset (used only to replace an unspent note) moves a request
++    /// journal into the archive rather than deleting it.
++    #[tokio::test]
++    async fn a_wallet_reset_archives_its_request_journal() {
++        let directory = tempfile::tempdir().unwrap();
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let journal_path = config.state_dir.join("pending_journal.json");
++        let request = lease_request("sent", nullifier, 1_000_000);
++        let saved = PendingRequestJournal {
++            exists: true,
++            client_request_id: "sent".into(),
++            nullifier,
++            payload_hash: request.payload_hash,
++            user_rerandomization: Felt252::from_u64(9),
++            created_at_ms: 1,
++            prepared_request: Some(request),
++        };
++        PendingRequestJournal::write(&journal_path, &saved).unwrap();
++        let service = AuthService::new(config.clone()).unwrap();
++        let status = service.reset_wallet().await.unwrap();
++        assert!(!status.has_note && !status.pending_request);
++        assert!(!journal_path.exists());
++        let records =
++            archived_requests(&config.state_dir.join("request_archive"), &nullifier).unwrap();
++        assert_eq!(records.len(), 1);
++        assert_eq!(records[0].disposition, "wallet_reset");
++        assert_eq!(
++            serde_json::to_value(&records[0].journal).unwrap(),
++            serde_json::to_value(&saved).unwrap()
++        );
++    }
++
++    /// Withdrawal settlement sets aside a lease journal the server reports
++    /// unknown (request and nullifier) into the archive, not the bin: the
++    /// readings are unsigned, and if the request was in fact admitted its
++    /// receipt still installs once the server finalizes it.
++    #[tokio::test]
++    async fn an_orphaned_lease_journal_is_archived_and_its_later_receipt_installs() {
++        let directory = tempfile::tempdir().unwrap();
++        let signer = CompactSigner::from_seed(&Felt252::from_u64(99));
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            state_signing_key: signer.public_key(),
++            protocol_server_url: url.clone(),
++            demo_rpc_url: Some(format!("{url}/rpc")),
++            request_mode: RequestMode::DirectOpenrouter,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let journal_path = config.state_dir.join("pending_journal.json");
++        let withheld = lease_request("withheld", nullifier, 1_000_000);
++        let saved = PendingRequestJournal {
++            exists: true,
++            client_request_id: "withheld".into(),
++            nullifier,
++            payload_hash: withheld.payload_hash,
++            user_rerandomization: Felt252::from_u64(5),
++            created_at_ms: 1,
++            prepared_request: Some(withheld),
++        };
++        PendingRequestJournal::write(&journal_path, &saved).unwrap();
++        let anonymous = rerandomize(
++            &CurvePointWire {
++                x: note.current_commitment_x,
++                y: note.current_commitment_y,
++            },
++            &Felt252::from_u64(5),
++        )
++        .unwrap();
++        let next_commitment = server_update(&anonymous, 0, &Felt252::ONE).unwrap();
++        let next_anchor = Felt252::from_u64(123);
++        let message = core_v2::state_message(
++            note.protocol_version,
++            note.chain_id,
++            &note.contract_address,
++            &next_commitment.x,
++            &next_commitment.y,
++            &next_anchor,
++        );
++        let payload = json!({"type":"openrouter_lease_settlement"}).to_string();
++        let receipt = RequestResponseV2 {
++            status: "finalized".into(),
++            client_request_id: "withheld".into(),
++            request_nullifier: nullifier,
++            response_code: 200,
++            response_hash: zkapi_types::canonical_response_hash(payload.as_bytes()),
++            response_payload: payload,
++            charge_applied: 0,
++            next_commitment,
++            next_anchor,
++            blind_delta_srv: Felt252::ONE,
++            next_state_signature: signer.sign(&message),
++            policy_reason_code: None,
++            policy_evidence_hash: None,
++        };
++        let finalized = Arc::new(Mutex::new(false));
++        let router = Router::new()
++            // The vault's root moved past the request's (see
++            // withdrawal_settlement_applies_the_vault_root_witness_too).
++            .route("/rpc", axum::routing::post(|| async {
++                Json(json!({"jsonrpc":"2.0","id":1,"result":format!("0x{:064x}", 5)}))
++            }))
++            .route("/v2/openrouter/leases/withheld", get(|| async { StatusCode::NOT_FOUND }))
++            .route("/v2/requests/withheld", get(|| async { Json(json!({"status":"not_found","nullifier_status":"unknown"})) }))
++            .route(&format!("/v2/nullifiers/{nullifier}"), get(move |State(finalized): State<Arc<Mutex<bool>>>| async move {
++                Json(if *finalized.lock().unwrap() {
++                    json!({"status":"ok","nullifier_status":"finalized","request_response":receipt})
++                } else {
++                    json!({"status":"not_found","nullifier_status":"unknown"})
++                })
++            }))
++            .with_state(finalized.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config.clone()).unwrap();
++        let status = service.settle_for_withdrawal().await.unwrap();
++        assert!(!status.pending_request && !journal_path.exists());
++        let records =
++            archived_requests(&config.state_dir.join("request_archive"), &nullifier).unwrap();
++        assert_eq!(records.len(), 1);
++        assert_eq!(records[0].disposition, "discarded_unknown_to_server");
++        assert_eq!(
++            serde_json::to_value(&records[0].journal).unwrap(),
++            serde_json::to_value(&saved).unwrap()
++        );
++        // The gateway had forwarded it after all; the server finalizes it.
++        *finalized.lock().unwrap() = true;
++        let recovered = service.recover().await.unwrap();
++        assert!(recovered.recovered);
++        assert_eq!(
++            service.status().await.unwrap().note.unwrap().current_anchor,
++            next_anchor
++        );
++        server.abort();
++    }
++
++    /// A wallet whose request "original" was archived at its current state
++    /// and whose retry "retry" at that state is pending, with the server's
++    /// valid finalized receipt for "original" (charge 0, next anchor 123).
++    /// The server counts its reads of that state's nullifier record.
++    struct Archived {
++        _directory: tempfile::TempDir,
++        config: AuthConfig,
++        nullifier: Felt252,
++        retry: PendingRequestJournal,
++        reads: Arc<Mutex<usize>>,
++        server: tokio::task::JoinHandle<()>,
++    }
++
++    async fn archived_with_finalized_receipt() -> Archived {
++        let directory = tempfile::tempdir().unwrap();
++        let signer = CompactSigner::from_seed(&Felt252::from_u64(99));
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            state_signing_key: signer.public_key(),
++            protocol_server_url: url.clone(),
++            indexer_url: url,
++            request_mode: RequestMode::DirectOpenrouter,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let journal_path = config.state_dir.join("pending_journal.json");
++        let original = lease_request("original", nullifier, 400_000);
++        PendingRequestJournal::write(
++            &journal_path,
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: "original".into(),
++                nullifier,
++                payload_hash: original.payload_hash,
++                user_rerandomization: Felt252::from_u64(5),
++                created_at_ms: 1,
++                prepared_request: Some(original),
++            },
++        )
++        .unwrap();
++        wallet
++            .archive_pending_request("discarded_stale_root")
++            .unwrap();
++        let retry_request = lease_request("retry", nullifier, 50_000);
++        let retry = PendingRequestJournal {
++            exists: true,
++            client_request_id: "retry".into(),
++            nullifier,
++            payload_hash: retry_request.payload_hash,
++            user_rerandomization: Felt252::from_u64(6),
++            created_at_ms: 2,
++            prepared_request: Some(retry_request),
++        };
++        PendingRequestJournal::write(&journal_path, &retry).unwrap();
++        let anonymous = rerandomize(
++            &CurvePointWire {
++                x: note.current_commitment_x,
++                y: note.current_commitment_y,
++            },
++            &Felt252::from_u64(5),
++        )
++        .unwrap();
++        let next_commitment = server_update(&anonymous, 0, &Felt252::ONE).unwrap();
++        let next_anchor = Felt252::from_u64(123);
++        let message = core_v2::state_message(
++            note.protocol_version,
++            note.chain_id,
++            &note.contract_address,
++            &next_commitment.x,
++            &next_commitment.y,
++            &next_anchor,
++        );
++        let payload = json!({"type":"openrouter_lease_settlement"}).to_string();
++        let receipt = RequestResponseV2 {
++            status: "finalized".into(),
++            client_request_id: "original".into(),
++            request_nullifier: nullifier,
++            response_code: 200,
++            response_hash: zkapi_types::canonical_response_hash(payload.as_bytes()),
++            response_payload: payload,
++            charge_applied: 0,
++            next_commitment,
++            next_anchor,
++            blind_delta_srv: Felt252::ONE,
++            next_state_signature: signer.sign(&message),
++            policy_reason_code: None,
++            policy_evidence_hash: None,
++        };
++        let reads = Arc::new(Mutex::new(0usize));
++        let router = Router::new()
++            .route("/v2/requests/retry", get(|| async { Json(json!({"status":"not_found","nullifier_status":"unknown"})) }))
++            .route("/v2/openrouter/leases/retry", get(|| async { StatusCode::NOT_FOUND }))
++            .route("/v2/openrouter/leases", axum::routing::post(|| async {
++                (StatusCode::CONFLICT, Json(json!({"status":"error","client_request_id":"retry",
++                    "error_code":"replay","error_message":"nullifier already reserved","retriable":false})))
++            }))
++            .route(&format!("/v2/nullifiers/{nullifier}"), get(move |State(reads): State<Arc<Mutex<usize>>>| {
++                *reads.lock().unwrap() += 1;
++                let receipt = receipt.clone();
++                async move { Json(json!({"status":"ok","nullifier_status":"finalized","request_response":receipt})) }
++            }))
++            .with_state(reads.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        Archived {
++            _directory: directory,
++            config,
++            nullifier,
++            retry,
++            reads,
++            server,
++        }
++    }
++
++    /// A crash after the archived request's receipt was saved, but before
++    /// the retry journal of the old state was set aside, used to leave a
++    /// journal that nothing could resolve: its request is unknown, the
++    /// archive of the new state is empty, and settlement reported the
++    /// nullifier finalized for a request "not recoverable yet". Recovery
++    /// now sets aside a journal of an earlier state as superseded.
++    #[tokio::test]
++    async fn a_journal_left_from_an_earlier_state_is_set_aside_by_recovery() {
++        let fixture = archived_with_finalized_receipt().await;
++        let journal_path = fixture.config.state_dir.join("pending_journal.json");
++        let service = AuthService::new(fixture.config.clone()).unwrap();
++        assert!(service.recover().await.unwrap().recovered);
++        assert!(!journal_path.exists());
++        // The crash window: the successor state is saved, the retry is not
++        // yet archived.
++        PendingRequestJournal::write(&journal_path, &fixture.retry).unwrap();
++        assert!(service.status().await.unwrap().pending_request);
++        let status = service.settle_for_withdrawal().await.unwrap();
++        assert!(!status.pending_request);
++        assert_eq!(status.note.unwrap().current_anchor, Felt252::from_u64(123));
++        let records = archived_requests(
++            &fixture.config.state_dir.join("request_archive"),
++            &fixture.nullifier,
++        )
++        .unwrap();
++        assert_eq!(
++            records
++                .iter()
++                .map(|r| (r.journal.client_request_id.as_str(), r.disposition.as_str()))
++                .collect::<Vec<_>>(),
++            [
++                ("original", "discarded_stale_root"),
++                ("retry", "superseded"),
++                ("retry", "superseded")
++            ]
++        );
++        fixture.server.abort();
++    }
++
++    /// Installing an archived request's receipt sets the pending retry
++    /// aside before it saves the successor state. When setting it aside
++    /// fails, nothing is saved: the wallet never holds the successor state
++    /// beside a journal of the state before it, and the next recovery
++    /// installs the same receipt.
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn the_retry_is_archived_before_the_successor_state_is_saved() {
++        use std::os::unix::fs::PermissionsExt;
++        let fixture = archived_with_finalized_receipt().await;
++        let directory = fixture.config.state_dir.join("request_archive").join(
++            fixture
++                .nullifier
++                .0
++                .iter()
++                .map(|byte| format!("{byte:02x}"))
++                .collect::<String>(),
++        );
++        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
++        let service = AuthService::new(fixture.config.clone()).unwrap();
++        let failed = service.recover().await;
++        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(failed.is_err(), "{failed:?}");
++        let status = service.status().await.unwrap();
++        assert!(status.pending_request);
++        let note = status.note.unwrap();
++        assert_ne!(
++            note.current_anchor,
++            Felt252::from_u64(123),
++            "the successor was saved beside the old journal"
++        );
++        assert_eq!(note.current_balance, 1_500_000);
++        assert!(service.recover().await.unwrap().recovered);
++        let status = service.status().await.unwrap();
++        assert!(!status.pending_request);
++        assert_eq!(status.note.unwrap().current_anchor, Felt252::from_u64(123));
++        fixture.server.abort();
++    }
++
++    /// A file another program left in the archive, or a damaged record, no
++    /// longer disables recovery of the readable records beside it.
++    #[tokio::test]
++    async fn unreadable_archive_entries_do_not_stop_a_readable_record_from_installing() {
++        let fixture = archived_with_finalized_receipt().await;
++        let directory = fixture.config.state_dir.join("request_archive").join(
++            fixture
++                .nullifier
++                .0
++                .iter()
++                .map(|byte| format!("{byte:02x}"))
++                .collect::<String>(),
++        );
++        std::fs::write(directory.join(".DS_Store"), b"\0\0\0\x01Bud1").unwrap();
++        std::fs::write(directory.join("1-0.json"), b"").unwrap();
++        let service = AuthService::new(fixture.config.clone()).unwrap();
++        let recovered = service.recover().await.unwrap();
++        assert!(recovered.recovered);
++        assert_eq!(*fixture.reads.lock().unwrap(), 1);
++        assert!(!recovered.wallet.pending_request);
++        assert_eq!(
++            recovered.wallet.note.unwrap().current_anchor,
++            Felt252::from_u64(123)
++        );
++        fixture.server.abort();
++    }
++
++    /// A chat at a state settled by a request whose journal an earlier
++    /// release deleted (here: no archive record of "original") is refused as
++    /// a replay forever. The chat reports receipt_journal_missing with the
++    /// nullifier instead of an opaque wallet error, and keeps the retry.
++    #[tokio::test]
++    async fn a_chat_at_a_state_settled_without_a_journal_reports_receipt_journal_missing() {
++        // The server's receipt for an archived request that does not verify
++        // (here under another state key) is never reported as a missing
++        // journal: this wallet holds that request's journal.
++        let fixture = archived_with_finalized_receipt().await;
++        let mut config = fixture.config.clone();
++        config.state_signing_key = CompactSigner::from_seed(&Felt252::from_u64(98)).public_key();
++        let service = AuthService::new(config).unwrap();
++        let issued = service
++            .issue_direct_openrouter_lease("chat".into(), None)
++            .await;
++        assert!(
++            matches!(&issued, Err(AuthError::Wallet(message)) if message.contains("replay")),
++            "{:?}",
++            issued.as_ref().err()
++        );
++        fixture.server.abort();
++
++        let fixture = archived_with_finalized_receipt().await;
++        let archive = fixture.config.state_dir.join("request_archive");
++        std::fs::remove_dir_all(&archive).unwrap();
++        let service = AuthService::new(fixture.config.clone()).unwrap();
++        let issued = service
++            .issue_direct_openrouter_lease("chat".into(), None)
++            .await;
++        match issued {
++            Err(AuthError::ReceiptJournalMissing(nullifier)) => {
++                assert_eq!(nullifier, fixture.nullifier)
++            }
++            other => panic!("{:?}", other.err()),
++        }
++        assert!(service.status().await.unwrap().pending_request);
++        fixture.server.abort();
++    }
++
++    /// receipt_journal_missing never names the wallet's own pending
++    /// request. When the server's nullifier record already carries the
++    /// pending retry's receipt (its request record lagging, or a receipt
++    /// that does not install here), neither a chat nor a withdrawal tells
++    /// the owner to take the nullifier to the operator.
++    #[tokio::test]
++    async fn the_pending_requests_own_receipt_is_never_reported_as_a_missing_journal() {
++        let directory = tempfile::tempdir().unwrap();
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            protocol_server_url: url.clone(),
++            indexer_url: url,
++            request_mode: RequestMode::DirectOpenrouter,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let retry = lease_request("retry", nullifier, 50_000);
++        PendingRequestJournal::write(
++            &config.state_dir.join("pending_journal.json"),
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: "retry".into(),
++                nullifier,
++                payload_hash: retry.payload_hash,
++                user_rerandomization: Felt252::from_u64(6),
++                created_at_ms: 2,
++                prepared_request: Some(retry),
++            },
++        )
++        .unwrap();
++        // Signed by a key that is not the deployment's state key.
++        let signer = CompactSigner::from_seed(&Felt252::from_u64(97));
++        let anonymous = rerandomize(
++            &CurvePointWire {
++                x: note.current_commitment_x,
++                y: note.current_commitment_y,
++            },
++            &Felt252::from_u64(6),
++        )
++        .unwrap();
++        let next_commitment = server_update(&anonymous, 0, &Felt252::ONE).unwrap();
++        let next_anchor = Felt252::from_u64(123);
++        let payload = json!({"type":"openrouter_lease_settlement"}).to_string();
++        let next_state_signature = signer.sign(&core_v2::state_message(
++            note.protocol_version,
++            note.chain_id,
++            &note.contract_address,
++            &next_commitment.x,
++            &next_commitment.y,
++            &next_anchor,
++        ));
++        let receipt = RequestResponseV2 {
++            status: "finalized".into(),
++            client_request_id: "retry".into(),
++            request_nullifier: nullifier,
++            response_code: 200,
++            response_hash: zkapi_types::canonical_response_hash(payload.as_bytes()),
++            response_payload: payload,
++            charge_applied: 0,
++            next_commitment,
++            next_anchor,
++            blind_delta_srv: Felt252::ONE,
++            next_state_signature,
++            policy_reason_code: None,
++            policy_evidence_hash: None,
++        };
++        let router = Router::new()
++            .route("/v2/requests/retry", get(|| async { Json(json!({"status":"not_found","nullifier_status":"unknown"})) }))
++            .route("/v2/openrouter/leases/retry", get(|| async { StatusCode::NOT_FOUND }))
++            .route("/v2/openrouter/leases", axum::routing::post(|| async {
++                (StatusCode::CONFLICT, Json(json!({"status":"error","client_request_id":"retry",
++                    "error_code":"replay","error_message":"nullifier already reserved","retriable":false})))
++            }))
++            .route(&format!("/v2/nullifiers/{nullifier}"), get(move || {
++                let receipt = receipt.clone();
++                async move { Json(json!({"status":"ok","nullifier_status":"finalized","request_response":receipt})) }
++            }));
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config).unwrap();
++        let issued = service
++            .issue_direct_openrouter_lease("chat".into(), None)
++            .await;
++        assert!(
++            matches!(&issued, Err(AuthError::Wallet(message)) if message.contains("replay")),
++            "{:?}",
++            issued.as_ref().err()
++        );
++        let prepared = service.oa_prepare_withdrawal([0x22; 20], false).await;
++        assert!(
++            matches!(prepared, Err(AuthError::PendingSettlement)),
++            "{:?}",
++            prepared.as_ref().err()
++        );
++        assert!(service.status().await.unwrap().pending_request);
++        server.abort();
++    }
++
++    /// The daemon's 5-second reconcile asks only about a pending request. It
++    /// never polls the server's record of the note's current nullifier for
++    /// archived requests, which would link the client's address and uptime
++    /// to that nullifier every tick while the note is idle; explicit
++    /// recovery still asks.
++    #[tokio::test]
++    async fn the_periodic_reconcile_never_polls_the_current_nullifier() {
++        let fixture = archived_with_finalized_receipt().await;
++        let service = AuthService::new(fixture.config.clone()).unwrap();
++        for _ in 0..3 {
++            service.reconcile_direct_openrouter().await;
++        }
++        assert_eq!(*fixture.reads.lock().unwrap(), 0, "with a pending retry");
++        assert!(service.status().await.unwrap().pending_request);
++        std::fs::remove_file(fixture.config.state_dir.join("pending_journal.json")).unwrap();
++        for _ in 0..3 {
++            service.reconcile_direct_openrouter().await;
++        }
++        assert_eq!(*fixture.reads.lock().unwrap(), 0, "with nothing pending");
++        assert!(service.recover().await.unwrap().recovered);
++        assert_eq!(*fixture.reads.lock().unwrap(), 1);
++        fixture.server.abort();
++    }
++
++    async fn archived_receipt_installs(driver: Driver) {
++        use axum::routing::post;
++        let directory = tempfile::tempdir().unwrap();
++        let signer = CompactSigner::from_seed(&Felt252::from_u64(99));
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let config = AuthConfig {
++            state_dir: directory.path().to_path_buf(),
++            protocol_version: 2,
++            chain_id: 1,
++            request_charge_cap: 50_000,
++            state_signing_key: signer.public_key(),
++            protocol_server_url: url.clone(),
++            indexer_url: url,
++            request_mode: RequestMode::DirectOpenrouter,
++            ..Default::default()
++        };
++        let mut wallet = load_wallet(&config, Vec::new()).unwrap();
++        wallet
++            .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
++            .unwrap();
++        let note = wallet.state().unwrap().clone();
++        let nullifier = core_v2::nullifier(&note.secret_s, &note.current_anchor);
++        let journal_path = config.state_dir.join("pending_journal.json");
++        let archive = config.state_dir.join("request_archive");
++        let rerandomization = Felt252::from_u64(5);
++        let original = lease_request("original", nullifier, 400_000);
++        PendingRequestJournal::write(
++            &journal_path,
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: "original".into(),
++                nullifier,
++                payload_hash: original.payload_hash,
++                user_rerandomization: rerandomization,
++                created_at_ms: 1,
++                prepared_request: Some(original),
++            },
++        )
++        .unwrap();
++        wallet
++            .archive_pending_request("discarded_stale_root")
++            .unwrap();
++        let retry = lease_request("retry", nullifier, 50_000);
++        PendingRequestJournal::write(
++            &journal_path,
++            &PendingRequestJournal {
++                exists: true,
++                client_request_id: "retry".into(),
++                nullifier,
++                payload_hash: retry.payload_hash,
++                user_rerandomization: Felt252::from_u64(6),
++                created_at_ms: 2,
++                prepared_request: Some(retry.clone()),
++            },
++        )
++        .unwrap();
++
++        let anonymous = rerandomize(
++            &CurvePointWire {
++                x: note.current_commitment_x,
++                y: note.current_commitment_y,
++            },
++            &rerandomization,
++        )
++        .unwrap();
++        let charge = 300_000; // Above the wallet's cap, within the archived request's bound.
++        let next_commitment = server_update(&anonymous, charge, &Felt252::ONE).unwrap();
++        let next_anchor = Felt252::from_u64(123);
++        let message = core_v2::state_message(
++            note.protocol_version,
++            note.chain_id,
++            &note.contract_address,
++            &next_commitment.x,
++            &next_commitment.y,
++            &next_anchor,
++        );
++        let payload = json!({"type":"openrouter_lease_settlement"}).to_string();
++        let receipt = RequestResponseV2 {
++            status: "finalized".into(),
++            client_request_id: "original".into(),
++            request_nullifier: nullifier,
++            response_code: 200,
++            response_hash: zkapi_types::canonical_response_hash(payload.as_bytes()),
++            response_payload: payload,
++            charge_applied: charge,
++            next_commitment,
++            next_anchor,
++            blind_delta_srv: Felt252::ONE,
++            next_state_signature: signer.sign(&message),
++            policy_reason_code: None,
++            policy_evidence_hash: None,
++        };
++        let mut forged = receipt.clone();
++        forged.next_state_signature.s = Felt252::ZERO;
++        let reply = Arc::new(Mutex::new(forged));
++        let retried = serde_json::to_value(&retry).unwrap();
++        let router = Router::new()
++            .route("/v2/requests/retry", get(|| async { Json(json!({"status":"not_found","nullifier_status":"unknown"})) }))
++            .route("/v2/openrouter/leases/retry", get(|| async { StatusCode::NOT_FOUND }))
++            .route("/v2/openrouter/leases", post(move |Json(body): Json<Value>| async move {
++                assert_eq!(body, retried);
++                (StatusCode::CONFLICT, Json(json!({"status":"error","client_request_id":"retry",
++                    "error_code":"replay","error_message":"nullifier already reserved","retriable":false})))
++            }))
++            .route(&format!("/v2/nullifiers/{nullifier}"), get(|State(reply): State<Arc<Mutex<RequestResponseV2>>>| async move {
++                Json(json!({"status":"ok","nullifier_status":"finalized","request_response":*reply.lock().unwrap()}))
++            }))
++            .route("/v1/tree/root", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
++            .with_state(reply.clone());
++        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++        let service = AuthService::new(config.clone()).unwrap();
++        let drive = || async {
++            match driver {
++                Driver::Recover => service.recover().await.map(|_| ()),
++                Driver::SettleForWithdrawal => service.settle_for_withdrawal().await.map(|_| ()),
++                // After the receipt installs, the fresh proof at the new state
++                // stops at the unreachable indexer.
++                Driver::LeaseReplay => service
++                    .issue_direct_openrouter_lease("chat".into(), None)
++                    .await
++                    .map(|_| ()),
++            }
++        };
++
++        assert!(
++            drive().await.is_err() || driver == Driver::Recover,
++            "{driver:?}"
++        );
++        let status = service.status().await.unwrap();
++        assert!(
++            status.pending_request,
++            "{driver:?}: a forged receipt installed"
++        );
++        assert_eq!(
++            status.note.unwrap().current_balance,
++            1_500_000,
++            "{driver:?}"
++        );
++
++        *reply.lock().unwrap() = receipt;
++        let result = drive().await;
++        match driver {
++            Driver::LeaseReplay => {
++                assert!(matches!(result, Err(AuthError::Indexer(_))), "{result:?}")
++            }
++            _ => assert!(result.is_ok(), "{driver:?}: {result:?}"),
++        }
++        let status = service.status().await.unwrap();
++        assert!(!status.pending_request, "{driver:?}");
++        assert_eq!(
++            status.note.unwrap().current_balance,
++            1_500_000 - charge,
++            "{driver:?}"
++        );
++        assert!(!journal_path.exists(), "{driver:?}");
++        let records = archived_requests(&archive, &nullifier).unwrap();
++        assert_eq!(
++            records
++                .iter()
++                .map(|r| (r.journal.client_request_id.as_str(), r.disposition.as_str()))
++                .collect::<Vec<_>>(),
++            [
++                ("original", "discarded_stale_root"),
++                ("retry", "superseded")
++            ],
++            "{driver:?}"
++        );
++        server.abort();
 +    }
 +}
 +
@@ -4956,8 +7664,31 @@ index 6b0305d..d55ed4c 100644
 +            assert!(service.refresh_unaccepted_native_request(request.clone()).await.is_err());
 +            assert!(PendingRequestJournal::read(&config.state_dir.join("pending_journal.json")).unwrap().is_some());
 +        }
-+        *reply.lock().unwrap()=original;service.refresh_unaccepted_native_request(request).await.unwrap();
-+        assert!(PendingRequestJournal::read(&config.state_dir.join("pending_journal.json")).unwrap().is_none());server.abort();
++        *reply.lock().unwrap() = original;
++        service
++            .refresh_unaccepted_native_request(request.clone())
++            .await
++            .unwrap();
++        assert!(
++            PendingRequestJournal::read(&config.state_dir.join("pending_journal.json"))
++                .unwrap()
++                .is_none()
++        );
++        // The acknowledgement is unsigned and only echoes the request's own
++        // identifiers: the journal is archived whole, never deleted.
++        let archived = zkapi_client::journal::archived_requests(
++            &config.state_dir.join("request_archive"),
++            &request.public_inputs.request_nullifier,
++        )
++        .unwrap();
++        assert_eq!(archived.len(), 1);
++        assert_eq!(archived[0].disposition, "discarded_expired_unaccepted");
++        assert_eq!(
++            serde_json::to_value(archived[0].journal.prepared_request.as_ref().unwrap()).unwrap(),
++            serde_json::to_value(&request).unwrap()
++        );
++        assert_eq!(archived[0].journal.user_rerandomization, Felt252::ONE);
++        server.abort();
 +    }
 +
 +    /// A release may move the pinned feed, its decimals or the maximum quote

@@ -1,5 +1,5 @@
 diff --git a/rust/crates/zkapi-client/src/error.rs b/rust/crates/zkapi-client/src/error.rs
-index bd7524b..008870e 100644
+index bd7524b..87a4b0c 100644
 --- a/rust/crates/zkapi-client/src/error.rs
 +++ b/rust/crates/zkapi-client/src/error.rs
 @@ -4,6 +4,8 @@ use thiserror::Error;
@@ -11,6 +11,392 @@ index bd7524b..008870e 100644
      #[error("no active note")]
      NoActiveNote,
      #[error("note already exists")]
+@@ -26,4 +28,9 @@ pub enum ClientError {
+     ProofGeneration(String),
+     #[error("verification failed: {0}")]
+     VerificationFailed(String),
++    /// The server refused a clearance with a code that reserves nothing:
++    /// `clearance_ownership_required`, `legacy_clearance_capacity`, or
++    /// `nullifier_used` (a request already owns the nullifier).
++    #[error("clearance refused: {0}")]
++    ClearanceRefused(String),
+ }
+diff --git a/rust/crates/zkapi-client/src/journal.rs b/rust/crates/zkapi-client/src/journal.rs
+index 0858ba9..542da8b 100644
+--- a/rust/crates/zkapi-client/src/journal.rs
++++ b/rust/crates/zkapi-client/src/journal.rs
+@@ -4,10 +4,17 @@
+ //! that the wallet can recover to a consistent state after a crash. A journal
+ //! entry is written *before* calling the server and cleared only after the
+ //! resulting next state has been persisted atomically.
++//!
++//! A transmitted request may have been admitted even when an unsigned reply
++//! says otherwise, and its rerandomization cannot be rebuilt. A journal that
++//! is set aside without installing its response is therefore moved into an
++//! append-only archive (`request_archive/<nullifier>/`), never deleted, so a
++//! later finalized receipt can still be installed from it.
+
+ use std::fs;
+ use std::io::Write;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
++use std::time::{SystemTime, UNIX_EPOCH};
+
+ use serde::{Deserialize, Serialize};
+
+@@ -80,6 +87,212 @@ impl PendingRequestJournal {
+         }
+         Ok(())
+     }
++
++    /// Move the journal at `path`, if any, into the append-only archive under
++    /// `archive_dir`. The record is durable before the journal is removed, so
++    /// a crash leaves both, never neither.
++    pub fn archive(path: &Path, archive_dir: &Path, disposition: &str) -> Result<(), ClientError> {
++        let Some(journal) = Self::read(path)? else {
++            return Ok(());
++        };
++        archive_request(archive_dir, &journal, disposition)?;
++        fs::remove_file(path)?;
++        if let Some(parent) = path.parent() {
++            sync_directory(parent)?;
++        }
++        Ok(())
++    }
++}
++
++/// A request journal that left the pending slot without its response being
++/// installed. Records are written once and never changed or removed.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ArchivedRequest {
++    pub version: u8,
++    /// Why the journal was set aside, for example `discarded_stale_root`.
++    pub disposition: String,
++    /// Wall-clock time of archiving (milliseconds since epoch); informational.
++    pub archived_at_ms: u64,
++    pub journal: PendingRequestJournal,
++}
++
++fn archive_directory(archive_dir: &Path, nullifier: &Felt252) -> PathBuf {
++    archive_dir.join(hex::encode(nullifier.0))
++}
++
++/// Append one archive record for `journal` and return its path. The record
++/// is written and synced under a temporary name and only then linked into
++/// place, so a record name never holds a partial record.
++pub fn archive_request(
++    archive_dir: &Path,
++    journal: &PendingRequestJournal,
++    disposition: &str,
++) -> Result<PathBuf, ClientError> {
++    let directory = archive_directory(archive_dir, &journal.nullifier);
++    for path in [archive_dir, directory.as_path()] {
++        if !path.exists() {
++            fs::create_dir_all(path)?;
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::PermissionsExt;
++                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
++            }
++            if let Some(parent) = path.parent() {
++                sync_directory(parent)?;
++            }
++        }
++    }
++    let record = ArchivedRequest {
++        version: 1,
++        disposition: disposition.to_string(),
++        archived_at_ms: SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map(|time| time.as_millis() as u64)
++            .unwrap_or_default(),
++        journal: journal.clone(),
++    };
++    let json = serde_json::to_vec_pretty(&record)
++        .map_err(|e| ClientError::Serialization(e.to_string()))?;
++    // Hidden and without the record suffix: never read as a record.
++    let temporary = directory.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
++    let mut options = fs::OpenOptions::new();
++    options.write(true).create_new(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let written = options.open(&temporary).and_then(|mut file| {
++        file.write_all(&json)?;
++        file.sync_all()
++    });
++    if let Err(error) = written {
++        let _ = fs::remove_file(&temporary);
++        return Err(error.into());
++    }
++    let published = (0u32..)
++        .map(|sequence| directory.join(format!("{}-{sequence}.json", record.archived_at_ms)))
++        .find_map(|path| match publish_record(&temporary, &path) {
++            Ok(true) => Some(Ok(path)),
++            Ok(false) => None,
++            Err(error) => Some(Err(error)),
++        })
++        .expect("the archive sequence space is non-empty");
++    let _ = fs::remove_file(&temporary);
++    let path = published?;
++    sync_directory(&directory)?;
++    Ok(path)
++}
++
++/// Give the complete record at `temporary` the name `path` without replacing
++/// an existing record: false when that name is taken.
++fn publish_record(temporary: &Path, path: &Path) -> std::io::Result<bool> {
++    match fs::hard_link(temporary, path) {
++        Ok(()) => Ok(true),
++        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
++        // A file system without hard links. Writers hold the wallet lock, so
++        // nothing can take the free name between the check and the rename.
++        Err(_) if !path.exists() => fs::rename(temporary, path).map(|()| true),
++        Err(error) => Err(error),
++    }
++}
++
++/// Whether `name` is an archive record's name, `<ms>-<sequence>.json`.
++/// Anything else in an archive directory (an interrupted write's temporary
++/// file, or a file another program left there) is not a record.
++fn is_record_name(name: &str) -> bool {
++    name.strip_suffix(".json")
++        .and_then(|stem| stem.split_once('-'))
++        .is_some_and(|(time, sequence)| {
++            [time, sequence]
++                .iter()
++                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
++        })
++}
++
++/// The archive of one nullifier: its readable records, oldest first, and the
++/// record files that could not be read or do not belong to that nullifier.
++#[derive(Debug, Default)]
++pub struct ArchiveListing {
++    pub records: Vec<ArchivedRequest>,
++    pub unreadable: Vec<PathBuf>,
++}
++
++impl ArchiveListing {
++    /// Whether anything was archived for the nullifier, readable or not.
++    pub fn is_empty(&self) -> bool {
++        self.records.is_empty() && self.unreadable.is_empty()
++    }
++}
++
++/// Read the archive of `nullifier`. Only files named like records are read;
++/// a record that cannot be read is listed in `unreadable`, never dropped
++/// silently and never mistaken for absence.
++pub fn read_archive(
++    archive_dir: &Path,
++    nullifier: &Felt252,
++) -> Result<ArchiveListing, ClientError> {
++    let directory = archive_directory(archive_dir, nullifier);
++    let entries = match fs::read_dir(&directory) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            return Ok(ArchiveListing::default())
++        }
++        Err(error) => return Err(error.into()),
++    };
++    let mut listing = ArchiveListing::default();
++    let mut records = Vec::new();
++    for entry in entries {
++        let path = entry?.path();
++        if !path
++            .file_name()
++            .and_then(|name| name.to_str())
++            .is_some_and(is_record_name)
++        {
++            continue;
++        }
++        match fs::read(&path)
++            .ok()
++            .and_then(|bytes| serde_json::from_slice::<ArchivedRequest>(&bytes).ok())
++        {
++            Some(record) if record.version == 1 && record.journal.nullifier == *nullifier => {
++                records.push((path, record))
++            }
++            _ => listing.unreadable.push(path),
++        }
++    }
++    records.sort_by(|(left_path, left), (right_path, right)| {
++        left.archived_at_ms
++            .cmp(&right.archived_at_ms)
++            .then_with(|| left_path.cmp(right_path))
++    });
++    listing.unreadable.sort();
++    listing.records = records.into_iter().map(|(_, record)| record).collect();
++    Ok(listing)
++}
++
++/// Every archived request for `nullifier`, oldest first. An unreadable
++/// record is an error: callers must not mistake it for absence.
++pub fn archived_requests(
++    archive_dir: &Path,
++    nullifier: &Felt252,
++) -> Result<Vec<ArchivedRequest>, ClientError> {
++    let listing = read_archive(archive_dir, nullifier)?;
++    if let Some(path) = listing.unreadable.first() {
++        return Err(ClientError::Serialization(format!(
++            "archived request {} is unreadable or does not belong to its nullifier",
++            path.display()
++        )));
++    }
++    Ok(listing.records)
++}
++
++fn sync_directory(path: &Path) -> Result<(), ClientError> {
++    #[cfg(unix)]
++    fs::File::open(path)?.sync_all()?;
++    #[cfg(not(unix))]
++    let _ = path;
++    Ok(())
+ }
+
+ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
+@@ -146,6 +359,139 @@ mod tests {
+         assert!(PendingRequestJournal::read(&path).unwrap().is_none());
+     }
+
++    #[test]
++    fn archive_keeps_every_set_aside_journal_append_only() {
++        let dir = test_dir("archive");
++        let path = dir.join("pending_journal.json");
++        let archive = dir.join("request_archive");
++        let journal = |id: &str, nullifier: u64| PendingRequestJournal {
++            exists: true,
++            client_request_id: id.to_string(),
++            nullifier: Felt252::from_u64(nullifier),
++            payload_hash: Felt252::ONE,
++            user_rerandomization: Felt252::from_u64(7),
++            created_at_ms: 1,
++            prepared_request: None,
++        };
++        PendingRequestJournal::archive(&path, &archive, "none").unwrap();
++        assert!(!archive.exists(), "archiving no journal must write nothing");
++        for (id, nullifier) in [("a", 5), ("b", 5), ("c", 6)] {
++            PendingRequestJournal::write(&path, &journal(id, nullifier)).unwrap();
++            PendingRequestJournal::archive(&path, &archive, "discarded_stale_root").unwrap();
++            assert!(!path.exists());
++        }
++        let five = archived_requests(&archive, &Felt252::from_u64(5)).unwrap();
++        assert_eq!(
++            five.iter()
++                .map(|r| r.journal.client_request_id.as_str())
++                .collect::<Vec<_>>(),
++            ["a", "b"]
++        );
++        assert!(five.iter().all(|r| r.disposition == "discarded_stale_root"
++            && r.journal.user_rerandomization == Felt252::from_u64(7)));
++        assert_eq!(
++            archived_requests(&archive, &Felt252::from_u64(6))
++                .unwrap()
++                .len(),
++            1
++        );
++        assert!(archived_requests(&archive, &Felt252::from_u64(9))
++            .unwrap()
++            .is_empty());
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            let directory = archive.join(hex::encode(Felt252::from_u64(5).0));
++            assert_eq!(
++                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
++                0o700
++            );
++            for entry in fs::read_dir(&directory).unwrap() {
++                assert_eq!(
++                    entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
++                    0o600
++                );
++            }
++        }
++        // An unreadable record is never mistaken for absence.
++        fs::write(
++            archive
++                .join(hex::encode(Felt252::from_u64(6).0))
++                .join("1-0.json"),
++            b"{",
++        )
++        .unwrap();
++        assert!(archived_requests(&archive, &Felt252::from_u64(6)).is_err());
++    }
++
++    #[test]
++    fn records_are_published_whole_and_other_files_are_not_records() {
++        let dir = test_dir("archive_files");
++        let archive = dir.join("request_archive");
++        let nullifier = Felt252::from_u64(8);
++        let journal = PendingRequestJournal {
++            exists: true,
++            client_request_id: "kept".to_string(),
++            nullifier,
++            payload_hash: Felt252::ONE,
++            user_rerandomization: Felt252::from_u64(7),
++            created_at_ms: 1,
++            prepared_request: None,
++        };
++        let first = archive_request(&archive, &journal, "discarded_stale_root").unwrap();
++        let directory = first.parent().unwrap().to_path_buf();
++        // Only the published record remains: no temporary file is left behind.
++        let names = || {
++            let mut names = fs::read_dir(&directory)
++                .unwrap()
++                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
++                .collect::<Vec<_>>();
++            names.sort();
++            names
++        };
++        assert_eq!(names().len(), 1);
++        assert!(is_record_name(&names()[0]), "{:?}", names());
++        // A finder or editor file, or an interrupted write's temporary file,
++        // beside the records is not a record and hides none of them.
++        fs::write(directory.join(".DS_Store"), b"\0\0\0\x01Bud1").unwrap();
++        fs::write(directory.join(".tmp-interrupted"), b"{\"version\":1").unwrap();
++        fs::write(directory.join("notes.txt"), b"backup").unwrap();
++        let listing = read_archive(&archive, &nullifier).unwrap();
++        assert_eq!(listing.records.len(), 1);
++        assert!(listing.unreadable.is_empty());
++        assert_eq!(archived_requests(&archive, &nullifier).unwrap().len(), 1);
++        // A damaged record is listed as unreadable next to the readable one.
++        let torn = directory.join("2-0.json");
++        fs::write(&torn, b"").unwrap();
++        let listing = read_archive(&archive, &nullifier).unwrap();
++        assert_eq!(listing.records.len(), 1);
++        assert_eq!(listing.unreadable, vec![torn]);
++        assert!(!listing.is_empty());
++        assert!(archived_requests(&archive, &nullifier).is_err());
++        // A second record is added beside the first, and publishing never
++        // replaces a record that already has the name.
++        let second = archive_request(&archive, &journal, "superseded").unwrap();
++        assert_ne!(first, second);
++        assert_eq!(read_archive(&archive, &nullifier).unwrap().records.len(), 2);
++        let before = fs::read(&first).unwrap();
++        let temporary = directory.join(".tmp-other");
++        fs::write(&temporary, b"other").unwrap();
++        assert!(!publish_record(&temporary, &first).unwrap());
++        assert_eq!(fs::read(&first).unwrap(), before);
++        assert!(is_record_name("1700000000000-12.json"));
++        for name in [
++            "1-0.json.tmp",
++            "-0.json",
++            "1-.json",
++            "a-0.json",
++            "1_0.json",
++            ".tmp-x",
++            "1-0",
++        ] {
++            assert!(!is_record_name(name), "{name}");
++        }
++    }
++
+     #[test]
+     fn test_clear() {
+         let dir = test_dir("clear");
 diff --git a/rust/crates/zkapi-client/src/lib.rs b/rust/crates/zkapi-client/src/lib.rs
 index 528d699..62c8584 100644
 --- a/rust/crates/zkapi-client/src/lib.rs
@@ -211,7 +597,7 @@ index 98ed732..352b879 100644
              .json(&req)
              .send()
 diff --git a/rust/crates/zkapi-client/src/wallet_v2.rs b/rust/crates/zkapi-client/src/wallet_v2.rs
-index b0f0162..46a488a 100644
+index b0f0162..99e5bb7 100644
 --- a/rust/crates/zkapi-client/src/wallet_v2.rs
 +++ b/rust/crates/zkapi-client/src/wallet_v2.rs
 @@ -9,8 +9,8 @@ use zkapi_proof::compact::{
@@ -225,8 +611,12 @@ index b0f0162..46a488a 100644
  };
  use zkapi_types::{
      canonical_payload_hash, canonical_request_context, canonical_response_hash, Felt252,
-@@ -22,12 +22,19 @@ use crate::error::ClientError;
- use crate::journal::PendingRequestJournal;
+@@ -19,15 +19,23 @@ use zkapi_types::{
+
+ use crate::config::{ClientConfig, ClientProofMode};
+ use crate::error::ClientError;
+-use crate::journal::PendingRequestJournal;
++use crate::journal::{read_archive, ArchiveListing, ArchivedRequest, PendingRequestJournal};
  use crate::note_state::NoteState;
 
 +/// Delays before resending the identical clearance body after a retriable
@@ -243,18 +633,28 @@ index b0f0162..46a488a 100644
      state_path: PathBuf,
      journal_path: PathBuf,
 -    http: reqwest::Client,
++    archive_dir: PathBuf,
  }
 
  impl Wallet {
-@@ -50,7 +57,6 @@ impl Wallet {
+@@ -41,6 +49,7 @@ impl Wallet {
+         }
+         let state_path = state_dir.join("note_state.json");
+         let journal_path = state_dir.join("pending_journal.json");
++        let archive_dir = state_dir.join("request_archive");
+         let state = state_path
+             .exists()
+             .then(|| NoteState::load(&state_path))
+@@ -50,7 +59,7 @@ impl Wallet {
              state,
              state_path,
              journal_path,
 -            http: reqwest::Client::new(),
++            archive_dir,
          })
      }
 
-@@ -131,16 +137,15 @@ impl Wallet {
+@@ -131,16 +140,15 @@ impl Wallet {
          merkle_siblings: Vec<Felt252>,
      ) -> Result<RequestResponseV2, ClientError> {
          let request = self.prepare_request(payload, payload_hash, active_root, merkle_siblings)?;
@@ -274,10 +674,40 @@ index b0f0162..46a488a 100644
          let status = response.status();
          let body = response
              .text()
-@@ -277,6 +282,16 @@ impl Wallet {
+@@ -149,7 +157,9 @@ impl Wallet {
+         if !status.is_success() {
+             if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
+                 if error.error_code == "stale_root" {
+-                    self.clear_pending_request()?;
++                    // Unsigned: kept in the archive, where a later receipt
++                    // can still be installed from it.
++                    self.archive_pending_request("discarded_stale_root")?;
+                     return Err(ClientError::StaleRoot);
+                 }
+                 return Err(ClientError::ServerError(format!(
+@@ -277,6 +287,35 @@ impl Wallet {
      ) -> Result<(), ClientError> {
          let journal =
              PendingRequestJournal::read(&self.journal_path)?.ok_or(ClientError::PendingRequest)?;
++        let cap = if self.config.policy_enabled {
++            self.config.policy_charge_cap
++        } else {
++            self.config.request_charge_cap
++        };
++        let next = self.verified_successor(&journal, response, cap)?;
++        self.persist_state(next)?;
++        PendingRequestJournal::clear(&self.journal_path)?;
++        Ok(())
++    }
++
++    /// Verify `response` for `journal`'s request at the current state and
++    /// return the next note state, without persisting anything.
++    fn verified_successor(
++        &self,
++        journal: &PendingRequestJournal,
++        response: &RequestResponseV2,
++        cap: u128,
++    ) -> Result<NoteState, ClientError> {
 +        if let Some(prepared) = &journal.prepared_request {
 +            let request_payload = serde_json::from_str::<serde_json::Value>(&prepared.payload).ok();
 +            if let Some(quote) = request_payload.as_ref().and_then(|payload| payload.get("billing_quote")) {
@@ -291,27 +721,227 @@ index b0f0162..46a488a 100644
          let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
          let current = balance_commitment(
              state.current_balance,
-@@ -307,16 +322,15 @@ impl Wallet {
-         let Some(journal) = PendingRequestJournal::read(&self.journal_path)? else {
-             return Ok(None);
+@@ -286,62 +325,254 @@ impl Wallet {
+         ensure_stored_commitment(state, &current)?;
+         let anonymous = rerandomize(&current, &journal.user_rerandomization)
+             .map_err(|error| ClientError::VerificationFailed(error.to_string()))?;
+-        self.apply_response(
++        self.successor_state(
+             response,
+             &journal.client_request_id,
+             journal.nullifier,
+             &anonymous,
+             journal.user_rerandomization,
+-        )?;
+-        PendingRequestJournal::clear(&self.journal_path)?;
++            cap,
++        )
++    }
++
++    fn persist_state(&mut self, next: NoteState) -> Result<(), ClientError> {
++        next.save(&self.state_path)?;
++        self.state = Some(next);
+         Ok(())
+     }
+
+-    /// Clear a request that the server explicitly rejected before reserving its
+-    /// nullifier (for example because the indexer root was stale).
++    /// Set aside the pending request without installing a response. Its
++    /// journal moves into the append-only request archive, where `recover`
++    /// can still install a later finalized receipt for it.
+     pub fn clear_pending_request(&self) -> Result<(), ClientError> {
+-        PendingRequestJournal::clear(&self.journal_path)
++        self.archive_pending_request("discarded")
+     }
+
+-    pub async fn recover(&mut self) -> Result<Option<RequestResponseV2>, ClientError> {
+-        let Some(journal) = PendingRequestJournal::read(&self.journal_path)? else {
+-            return Ok(None);
++    /// Like `clear_pending_request`, recording why the journal was set aside.
++    pub fn archive_pending_request(&self, disposition: &str) -> Result<(), ClientError> {
++        PendingRequestJournal::archive(&self.journal_path, &self.archive_dir, disposition)
++    }
++
++    /// The archive of the current note state: requests transmitted from it
++    /// share its nullifier. None of them has installed a response, since that
++    /// would have advanced the state. A record that cannot be read is listed
++    /// as unreadable, so callers can still tell that something was archived.
++    pub fn archive_at_current_state(&self) -> Result<ArchiveListing, ClientError> {
++        let Some(state) = self.state.as_ref() else {
++            return Ok(ArchiveListing::default());
          };
 -        let response = self
 -            .http
 -            .get(format!(
-+        let response = crate::testnet_auth::request(self.config.chain_id, &self.config.server_url, reqwest::Method::GET, format!(
-                 "{}/v2/requests/{}",
-                 self.config.server_url.trim_end_matches('/'),
-                 journal.client_request_id
+-                "{}/v2/requests/{}",
+-                self.config.server_url.trim_end_matches('/'),
+-                journal.client_request_id
 -            ))
-+            ))?
++        read_archive(
++            &self.archive_dir,
++            &core::nullifier(&state.secret_s, &state.current_anchor),
++        )
++    }
++
++    /// The readable archived requests of the current note state.
++    pub fn archived_requests_at_current_state(&self) -> Result<Vec<ArchivedRequest>, ClientError> {
++        Ok(self.archive_at_current_state()?.records)
++    }
++
++    /// Install a finalized response for the pending request, or else for a
++    /// request archived at the current state.
++    pub async fn recover(&mut self) -> Result<Option<RequestResponseV2>, ClientError> {
++        if let Some(response) = self.recover_pending().await? {
++            return Ok(Some(response));
++        }
++        self.recover_archived().await
++    }
++
++    /// Install a finalized response for the pending request only. Unlike
++    /// `recover`, this sends nothing when no request is pending, so it suits
++    /// background polling.
++    pub async fn recover_pending(&mut self) -> Result<Option<RequestResponseV2>, ClientError> {
++        self.archive_stale_pending_request()?;
++        if let Some(journal) = PendingRequestJournal::read(&self.journal_path)? {
++            let response = crate::testnet_auth::request(
++                self.config.chain_id,
++                &self.config.server_url,
++                reqwest::Method::GET,
++                format!(
++                    "{}/v2/requests/{}",
++                    self.config.server_url.trim_end_matches('/'),
++                    journal.client_request_id
++                ),
++            )?
              .send()
              .await
              .map_err(|error| ClientError::ServerError(error.to_string()))?;
-+        let response = crate::testnet_auth::check_response(response)?;
-         if response.status() == reqwest::StatusCode::NOT_FOUND {
+-        if response.status() == reqwest::StatusCode::NOT_FOUND {
++            let response = crate::testnet_auth::check_response(response)?;
++            if response.status() != reqwest::StatusCode::NOT_FOUND {
++                let recovery: RecoveryResponseV2 = response
++                    .error_for_status()
++                    .map_err(|error| ClientError::ServerError(error.to_string()))?
++                    .json()
++                    .await
++                    .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
++                if let Some(response) = recovery.request_response {
++                    self.complete_pending_response(&response)?;
++                    return Ok(Some(response));
++                }
++            }
++        }
++        Ok(None)
++    }
++
++    /// A pending journal whose nullifier is not the current state's was
++    /// proved at an earlier state, which has since been settled: its own
++    /// response was installed (a crash before the journal was cleared), or
++    /// another request's was. It can never be installed or admitted at this
++    /// state, so it moves into the archive as superseded.
++    fn archive_stale_pending_request(&self) -> Result<(), ClientError> {
++        let Some(state) = self.state.as_ref() else {
++            return Ok(());
++        };
++        let current = core::nullifier(&state.secret_s, &state.current_anchor);
++        if PendingRequestJournal::read(&self.journal_path)?
++            .is_some_and(|pending| pending.nullifier != current)
++        {
++            self.archive_pending_request("superseded")?;
++        }
++        Ok(())
++    }
++
++    /// One read of the server's record for the current state's nullifier,
++    /// made only when requests were archived at this state. A finalized
++    /// response for one of them is installed when it verifies; the pending
++    /// request at this state, if any, can then never be admitted and is
++    /// archived as superseded. Failures and unverifiable claims change
++    /// nothing.
++    async fn recover_archived(&mut self) -> Result<Option<RequestResponseV2>, ClientError> {
++        let archived = match self.archive_at_current_state() {
++            Ok(listing) => {
++                // A damaged record cannot be installed, but it must not stop
++                // the readable ones from being installed.
++                for path in &listing.unreadable {
++                    tracing::warn!(path = %path.display(), "skipping an unreadable request archive record");
++                }
++                listing.records
++            }
++            Err(error) => {
++                tracing::warn!(%error, "the request archive could not be read");
++                return Ok(None);
++            }
++        };
++        if archived.is_empty() {
              return Ok(None);
          }
-@@ -333,6 +347,10 @@ impl Wallet {
+-        let recovery: RecoveryResponseV2 = response
+-            .error_for_status()
+-            .map_err(|error| ClientError::ServerError(error.to_string()))?
+-            .json()
+-            .await
+-            .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
++        let nullifier = archived[0].journal.nullifier;
++        let Ok(response) = crate::testnet_auth::request(
++            self.config.chain_id,
++            &self.config.server_url,
++            reqwest::Method::GET,
++            format!(
++                "{}/v2/nullifiers/{}",
++                self.config.server_url.trim_end_matches('/'),
++                nullifier
++            ),
++        ) else {
++            return Ok(None);
++        };
++        let Ok(response) = response.send().await else {
++            return Ok(None);
++        };
++        let response = crate::testnet_auth::check_response(response)?;
++        if !response.status().is_success() {
++            return Ok(None);
++        }
++        let Ok(recovery) = response.json::<RecoveryResponseV2>().await else {
++            return Ok(None);
++        };
+         let Some(response) = recovery.request_response else {
+             return Ok(None);
+         };
+-        self.complete_pending_response(&response)?;
++        let Some(record) = archived
++            .iter()
++            .rev()
++            .find(|record| record.journal.client_request_id == response.client_request_id)
++        else {
++            return Ok(None);
++        };
++        // The request's own proved bound limits its charge, whatever cap
++        // the wallet was opened with.
++        let cap = record
++            .journal
++            .prepared_request
++            .as_ref()
++            .map(|request| request.public_inputs.solvency_bound)
++            .unwrap_or(if self.config.policy_enabled {
++                self.config.policy_charge_cap
++            } else {
++                self.config.request_charge_cap
++            });
++        let Ok(next) = self.verified_successor(&record.journal, &response, cap) else {
++            return Ok(None);
++        };
++        // The pending retry at this state can never be admitted once the
++        // archived request owns its nullifier. Archive it before the next
++        // state is saved: a crash in between leaves both requests archived
++        // at this state, where the next recovery installs the same receipt,
++        // never a saved successor beside a journal of the old state.
++        if PendingRequestJournal::read(&self.journal_path)?
++            .is_some_and(|pending| pending.nullifier == nullifier)
++        {
++            self.archive_pending_request("superseded")?;
++        }
++        self.persist_state(next)?;
          Ok(Some(response))
      }
 
@@ -322,11 +952,9 @@ index b0f0162..46a488a 100644
      pub async fn withdrawal_mutual_close(
          &self,
          destination: [u8; 20],
-@@ -341,7 +359,20 @@ impl Wallet {
-     ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
-         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
-         let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
--        let clearance = self.request_clearance(&nullifier).await?;
+         active_root: Felt252,
+         merkle_siblings: Vec<Felt252>,
++    ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
 +        // Never a request proof or a placeholder destination: this proof is a
 +        // submittable escape that pays `destination` the current balance.
 +        let (public_inputs, proof) = self.build_withdrawal(
@@ -340,11 +968,49 @@ index b0f0162..46a488a 100644
 +            public_inputs,
 +            proof,
 +        };
++        self.mutual_close_with_clearance(destination, active_root, merkle_siblings, Some(ownership))
++            .await
++    }
++
++    /// Like `withdrawal_mutual_close`, but the clearance request carries no
++    /// ownership proof, so nothing this sends can be submitted as an escape.
++    /// Only a server that still allows legacy clearance grants it; a refusal
++    /// that reserves nothing, including one for a nullifier a request already
++    /// owns, is `ClientError::ClearanceRefused`.
++    pub async fn withdrawal_mutual_close_without_ownership_proof(
++        &self,
++        destination: [u8; 20],
++        active_root: Felt252,
++        merkle_siblings: Vec<Felt252>,
++    ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
++        self.mutual_close_with_clearance(destination, active_root, merkle_siblings, None)
++            .await
++    }
++
++    async fn mutual_close_with_clearance(
++        &self,
++        destination: [u8; 20],
++        active_root: Felt252,
++        merkle_siblings: Vec<Felt252>,
++        ownership: Option<ClearanceOwnershipProof>,
+     ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
+         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+         let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
+-        let clearance = self.request_clearance(&nullifier).await?;
 +        let clearance = self.request_clearance(&nullifier, ownership).await?;
          let message = core::clearance_message(
              state.protocol_version,
              state.chain_id,
-@@ -395,6 +426,11 @@ impl Wallet {
+@@ -382,7 +613,7 @@ impl Wallet {
+             state.archive(&self.state_path)?;
+         }
+         self.state = None;
+-        PendingRequestJournal::clear(&self.journal_path)?;
++        self.archive_pending_request("note_archived")?;
+         Ok(())
+     }
+
+@@ -395,6 +626,11 @@ impl Wallet {
          clearance_signature: Option<zkapi_types::SchnorrSignature>,
      ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
          let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
@@ -356,11 +1022,11 @@ index b0f0162..46a488a 100644
          let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
          let mut destination_bytes = [0u8; 32];
          destination_bytes[12..].copy_from_slice(&destination);
-@@ -444,28 +480,55 @@ impl Wallet {
+@@ -444,38 +680,74 @@ impl Wallet {
      async fn request_clearance(
          &self,
          nullifier: &Felt252,
-+        ownership: ClearanceOwnershipProof,
++        ownership: Option<ClearanceOwnershipProof>,
      ) -> Result<ClearanceResponseV2, ClientError> {
 -        let response = self
 -            .http
@@ -373,7 +1039,7 @@ index b0f0162..46a488a 100644
 -            })
 +        let request = ClearanceRequest {
 +            withdrawal_nullifier: *nullifier,
-+            ownership_proof: Some(ownership),
++            ownership_proof: ownership,
 +        };
 +        let url = format!(
 +            "{}/v2/withdraw/clearance",
@@ -422,13 +1088,58 @@ index b0f0162..46a488a 100644
 +                    return Err(ClientError::StaleRoot);
 +                }
 +            }
++            if (status == reqwest::StatusCode::BAD_REQUEST
++                && code == "clearance_ownership_required")
++                || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE
++                    && code == "legacy_clearance_capacity")
++                || (status == reqwest::StatusCode::CONFLICT && code == "nullifier_used")
++            {
++                return Err(ClientError::ClearanceRefused(code));
++            }
              return Err(ClientError::ServerError(format!("HTTP {status}: {body}")));
          }
 -        serde_json::from_str(&body).map_err(|error| ClientError::InvalidResponse(error.to_string()))
      }
 
-     fn apply_response(
-@@ -600,3 +663,305 @@ fn state_note_leaf(state: &NoteState) -> Felt252 {
+-    fn apply_response(
+-        &mut self,
++    fn successor_state(
++        &self,
+         response: &RequestResponseV2,
+         request_id: &str,
+         nullifier: Felt252,
+         anonymous: &CurvePointWire,
+         rerandomization: Felt252,
+-    ) -> Result<(), ClientError> {
++        cap: u128,
++    ) -> Result<NoteState, ClientError> {
+         if response.client_request_id != request_id || response.request_nullifier != nullifier {
+             return Err(ClientError::VerificationFailed(
+                 "response request identity mismatch".to_string(),
+@@ -486,11 +758,6 @@ impl Wallet {
+                 "response payload hash mismatch".to_string(),
+             ));
+         }
+-        let cap = if self.config.policy_enabled {
+-            self.config.policy_charge_cap
+-        } else {
+-            self.config.request_charge_cap
+-        };
+         if response.charge_applied > cap || response.next_anchor.is_zero() {
+             return Err(ClientError::VerificationFailed(
+                 "invalid charge or next anchor".to_string(),
+@@ -544,9 +811,7 @@ impl Wallet {
+         next.current_anchor = response.next_anchor;
+         next.is_genesis = false;
+         next.state_signature = Some(response.next_state_signature);
+-        next.save(&self.state_path)?;
+-        self.state = Some(next);
+-        Ok(())
++        Ok(next)
+     }
+
+     fn setup_dir(&self) -> &str {
+@@ -600,3 +865,315 @@ fn state_note_leaf(state: &NoteState) -> Felt252 {
          state.expiry_ts,
      )
  }
@@ -698,8 +1409,18 @@ index b0f0162..46a488a 100644
 +                .wallet
 +                .withdrawal_mutual_close(DESTINATION, fixture.root, fixture.siblings.clone())
 +                .await;
++            // nullifier_used reserves nothing for this clearance, so the caller
++            // may release its reservation (see ClientError::ClearanceRefused).
++            let refused =
++                matches!(&result, Err(ClientError::ClearanceRefused(refused)) if refused == code);
++            let failed =
++                matches!(&result, Err(ClientError::ServerError(message)) if message.contains(code));
 +            assert!(
-+                matches!(&result, Err(ClientError::ServerError(message)) if message.contains(code)),
++                if code == "nullifier_used" {
++                    refused
++                } else {
++                    failed
++                },
 +                "{result:?}"
 +            );
 +            assert_eq!(server.calls().len(), 1, "{code}");

@@ -172,6 +172,12 @@ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.
 	var remote *zkapi.Error
 	if errors.As(err, &remote) {
 		switch remote.Code {
+		case "receipt_journal_missing":
+			// The message names the nullifier the operator needs.
+			return nil, &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
+		case "clearance_reserved_state":
+			// No chat can settle this state; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}
 		case "testnet_password_required":
 			return nil, &server.BackendError{Status: 401, Code: "testnet_password_required", Message: remote.Error()}
 		case "invalid_model":

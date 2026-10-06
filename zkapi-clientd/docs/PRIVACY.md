@@ -77,9 +77,38 @@ and OA key before retiring it; that recovered credential never enters the
 inference cache or bridge response. A confirmed unissued cancellation advances
 the wallet only through the normal matching signed response. Missing keys,
 expiry, HTTP errors and ambiguous issuance never authorize clearing a journal.
-A `stale_root` reply clears it only when the server's nullifier record also
-reports the request unknown. Stopping or failing recovery keeps the original
-note and request for retry.
+A journal that was sent is never deleted without installing its signed
+response. When an unsigned answer sets one aside, it moves, whole, into an
+append-only archive (`request_archive/` in the companion's state directory,
+owner-only like the journal, never pruned, and holding the same
+prompt-free lease authorization and proof as the journal). Each record is
+written and synced under a temporary name before it gets its
+`<milliseconds>-<sequence>.json` name; other files there are ignored, and a
+record that cannot be read is skipped by recovery and treated as an
+unsettled request by withdrawal. A journal is set aside after a
+`stale_root` reply, or when withdrawal settlement finds a request the
+server reports unknown, but in both cases only once the pinned vault's
+`currentRoot()` (read over the packaged RPC) no longer equals the request's
+root and the server reports the request's nullifier unknown too; while the
+vault still has that root, or the root cannot be read, the request stays
+pending and the next lease attempt resends it unchanged. Withdrawal
+settlement also sets aside a request whose nullifier the server reports
+reserved for a clearance (an earlier withdrawal, or the operator's release
+of a stuck state), without reading the root: the server refuses every
+request at such a nullifier whatever the root, so it could never settle.
+Chats at such a state stop with `clearance_reserved_state` and keep the
+request, so they send no new request proof from that state. A journal is
+also set aside after the server's
+`/expire` acknowledgement of a never-admitted native request, when a wallet
+reset replaces an unspent note, and, as superseded, when the note has
+already moved past the state it was proved at. Explicit recovery
+(`/wallet/recover`), a chat request that opens a new lease, withdrawal settlement and
+withdrawal preparation also ask the server's nullifier record about
+requests archived at the note's current state, and install a finalized
+response for one of them only when it verifies. The daemon's background
+recovery, every 5 seconds, asks only about a pending request, so it sends
+nothing while the note is idle. Stopping or failing recovery keeps the
+original note and request for retry.
 
 Inference is loopback-only and key-free by default. Other local processes can
 use it. Optional local API-key authentication affects only the UI-to-daemon hop.
@@ -146,7 +175,26 @@ the server the note ID, the payout amount and the destination before the close
 transaction publishes them. It is also a valid escape input, so a server that
 kept it could start an escape to the same destination and amount, delaying the
 payout by the vault's challenge period without changing it. The ownership proof
-is never written to disk.
+is never written to disk. On the packaged deployments' vaults (no
+`vault_revision` 2) a challenged escape also consumes the note's nullifier for
+good, and a request proof sent from the same note state, if it never settled,
+is challenge evidence for whoever kept it. So at a note state with such an
+archived request the companion sends no ownership proof and builds no
+escape: it asks for a clearance without one, which only a server that still
+allows legacy clearance grants, and otherwise refuses the withdrawal with
+`unsettled_request_state` until a chat request or the earlier request's
+settlement moves the note to a new state. After the note expires no chat
+request can do that, and the vault's owner can claim the note at any time;
+nor can one once the server holds a clearance for the state (refused with
+`unsettled_clearance_reserved`). Then, and only after the owner types `send`
+at the guided withdrawal's warning, the companion sends the ownership proof
+anyway, accepting that a challenge with the unsettled request would consume
+the nullifier. A request discarded by an earlier release left no archive
+record, so this rule cannot apply to its state. When the server reports the
+note's current nullifier settled by a request the wallet holds no record of,
+chats and withdrawal stop with `receipt_journal_missing` and show that
+nullifier locally, for the owner to give the operator; giving it links the
+owner to that request.
 
 The daemon creates no request-history log files. Foreground output includes
 HTTP route/method/status/timing, local sequential `request=` numbers and local

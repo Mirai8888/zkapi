@@ -77,6 +77,7 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 			NoteID                      *uint64 `json:"note_id"`
 			RetryTransactionHash        string  `json:"retry_transaction_hash,omitempty"`
 			ConfirmationTransactionHash string  `json:"confirmation_transaction_hash,omitempty"`
+			AcceptUnsettledRequestRisk  bool    `json:"accept_unsettled_request_risk,omitempty"`
 		}
 		if err = decode(&body); err == nil {
 			if body.NoteID == nil {
@@ -85,8 +86,10 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 				if body.ConfirmationTransactionHash != "" {
 					err = errors.New("receipt adoption cannot create a quote")
 				} else {
-					result, err = h.QuoteAddressWithdrawal(ctx, body.Destination, *body.NoteID, body.RetryTransactionHash)
+					result, err = h.QuoteAddressWithdrawal(ctx, body.Destination, *body.NoteID, body.RetryTransactionHash, body.AcceptUnsettledRequestRisk)
 				}
+			} else if body.AcceptUnsettledRequestRisk {
+				err = errors.New("the unsettled-request acknowledgement is given only with a new withdrawal quote")
 			} else {
 				result, err = h.WithdrawAddress(ctx, body.Destination, *body.NoteID, body.RetryTransactionHash, body.ConfirmationTransactionHash)
 			}
@@ -141,7 +144,14 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		failure := map[string]string{"error": err.Error()}
+		// The guided withdrawal acts on this refusal, so its code crosses
+		// the management boundary as well as its message.
+		var companion *Error
+		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing") {
+			failure["code"] = companion.Code
+		}
+		_ = json.NewEncoder(w).Encode(failure)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(result)

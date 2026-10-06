@@ -426,7 +426,7 @@ func TestWithdrawPendingContinuesOnlyTheSameSavedDestination(t *testing.T) {
 }
 
 func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.T) {
-	for _, code := range []string{"withdrawal_pending", "withdrawal_conflict", "unknown"} {
+	for _, code := range []string{"withdrawal_pending", "withdrawal_conflict", "unknown", "receipt_journal_missing", "clearance_reserved_state"} {
 		t.Run(code, func(t *testing.T) {
 			bridge := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -438,7 +438,7 @@ func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.
 						t.Error("inference contents crossed companion boundary")
 					}
 					w.WriteHeader(http.StatusConflict)
-					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": "private diagnostics must not cross this boundary", "funding_url": "/funding"}})
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": "private diagnostics must not cross this boundary", "funding_url": "/funding", "nullifier": "0x1234ab"}})
 				default:
 					t.Error("unexpected companion path")
 					w.WriteHeader(http.StatusNotFound)
@@ -460,7 +460,19 @@ func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.
 			if !errors.As(err, &backend) || backend.Status != 409 {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if strings.HasPrefix(code, "withdrawal_") {
+			if code == "receipt_journal_missing" {
+				// The chat shows what the operator needs, nothing private.
+				if backend.Code != code || !strings.Contains(backend.Message, "0x1234ab") || !strings.Contains(backend.Message, "Contact the zkAPI operator") || strings.Contains(backend.Message, "private") {
+					t.Fatalf("missing receipt journal: %+v", backend)
+				}
+			} else if code == "clearance_reserved_state" {
+				// No chat can settle a state the server holds a clearance
+				// for (as after the operator released it): the chat says to
+				// withdraw instead of reporting an unknown conflict.
+				if backend.Code != code || !strings.Contains(backend.Message, "choose withdraw") || !strings.Contains(backend.Message, "no chat request can settle it") || strings.Contains(backend.Message, "diagnostics") {
+					t.Fatalf("clearance-reserved state: %+v", backend)
+				}
+			} else if strings.HasPrefix(code, "withdrawal_") {
 				if backend.Code != "withdrawal_pending" || !strings.Contains(backend.Message, "saved destination") || strings.Contains(backend.Message, "settling") {
 					t.Fatalf("withdrawal confused with settlement: %+v", backend)
 				}

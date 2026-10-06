@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"slices"
@@ -46,6 +47,16 @@ const (
 	// this many occupied slots from a signed slot, over this many expiry days.
 	depositRevertScanSlots  = 64
 	depositRevertMaxBuckets = 64
+	// The search's expiry window is anchored to chain time (see
+	// snapshotChainTime), with one day of tolerance on each side for bucket
+	// rounding and fork timing.
+	chainTimeTolerance = vaultExpiryBucket
+	// A slot saved before chain times were recorded has only the device
+	// clock's preparation time. Its window starts this much earlier.
+	devicePreparedTolerance = 7 * vaultExpiryBucket
+	// No deposit is signed and no reported revert retired while the device
+	// clock is further than this from chain time.
+	deviceClockTolerance = vaultExpiryBucket
 	// A tree root response is a few hundred bytes.
 	indexerRootLimit = 4 << 10
 )
@@ -143,6 +154,8 @@ type treeSnapshot struct {
 	Leaves      []string
 	BlockNumber uint64
 	BlockHash   string
+	// Time is the view's block time, set only by snapshotChainTime.
+	Time int64
 }
 
 // leaf returns the indexer's current leaf for id. present is false only when
@@ -252,6 +265,35 @@ func (h *FundingHandler) indexerSnapshot(ctx context.Context, config fundingConf
 		return nil, errors.New("the zkAPI indexer snapshot has no block identity; the indexer must be upgraded")
 	}
 	return &treeSnapshot{Root: root, NextNoteID: *wire.NextNoteID, Leaves: wire.Leaves, BlockNumber: *wire.BlockNumber, BlockHash: strings.ToLower(wire.BlockHash)}, nil
+}
+
+// snapshotChainTime sets snapshot.Time to the block time of the indexer's
+// view. The payment RPC serves the header of the view's block by its hash,
+// and the header is accepted only when it hashes to that block hash and
+// carries the view's block number. The indexer names the block, so a hostile
+// RPC can withhold the header but cannot move its time. A deposit search is
+// anchored to this time, never to the device clock: every leaf in the view
+// was mined at or before it.
+func (h *FundingHandler) snapshotChainTime(ctx context.Context, config fundingConfig, snapshot *treeSnapshot) error {
+	var header types.Header
+	if err := h.addressRPC(ctx, config, "eth_getBlockByHash", []any{snapshot.BlockHash, false}, &header); err != nil {
+		return errors.New("the payment RPC did not serve the block header of the zkAPI indexer's view")
+	}
+	if !strings.EqualFold(header.Hash().Hex(), snapshot.BlockHash) || header.Number == nil || !header.Number.IsUint64() || header.Number.Uint64() != snapshot.BlockNumber || header.Time == 0 || header.Time > math.MaxInt64 {
+		return errors.New("the payment RPC's block header does not match the zkAPI indexer's view")
+	}
+	snapshot.Time = int64(header.Time)
+	return nil
+}
+
+// checkDeviceClock refuses a device clock more than deviceClockTolerance
+// from chain time. The search does not use the device clock, but slots
+// saved by earlier builds and the user's own expectations do.
+func checkDeviceClock(chain int64) error {
+	if skew := time.Now().Unix() - chain; skew > deviceClockTolerance || skew < -deviceClockTolerance {
+		return errors.New("this device's clock differs from Ethereum's block time by more than a day; correct the system clock and retry")
+	}
+	return nil
 }
 
 // confirmedSnapshot is an indexer view that has applied minBlock, on the
@@ -377,9 +419,15 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	if merkleRoot(snapshot.NextNoteID, new(big.Int), siblings).Cmp(snapshot.Root) != 0 {
 		return "", errors.New("the deposit witness does not match the zkAPI indexer's current tree; no deposit was signed, retry")
 	}
+	if err := h.snapshotChainTime(ctx, config, snapshot); err != nil {
+		return "", fmt.Errorf("%v; no deposit was signed, retry", err)
+	}
 	signed := signedDepositSlots(deposit, record)
 	if err := h.priorDepositConflict(snapshot, deposit, signed); err != nil {
 		return "", err
+	}
+	if err := checkDeviceClock(snapshot.Time); err != nil {
+		return "", fmt.Errorf("%v; no deposit was signed", err)
 	}
 	data := "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", deposit.Amount)
 	for _, sibling := range refreshed.ZeroPath {
@@ -391,7 +439,7 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
 	deposit.SignedSlots = signed
-	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix(), EmptyBefore: snapshot.emptyBeforeNext()}
+	deposit.Slot = &depositSlot{NoteID: snapshot.NextNoteID, PathSHA256: depositPathDigest(calldata), PreparedAt: time.Now().Unix(), PreparedChainAt: snapshot.Time, EmptyBefore: snapshot.emptyBeforeNext()}
 	if err := h.save(*deposit); err != nil {
 		return "", err
 	}
@@ -441,10 +489,16 @@ func (h *FundingHandler) checkDepositRevert(ctx context.Context, config fundingC
 	if err != nil {
 		return fmt.Errorf("%w (%v)", errRevertVerificationPending, err)
 	}
+	if err := h.snapshotChainTime(ctx, config, snapshot); err != nil {
+		return fmt.Errorf("%w (%v)", errRevertVerificationPending, err)
+	}
 	// Otherwise another leaf holds the slot, it was emptied, or it is still
 	// free. The deposit may still land later, so a retry is searched for it
 	// again, in the tree the retry is built from, before it is signed.
-	return h.priorDepositConflict(snapshot, deposit, signedDepositSlots(deposit, record))
+	if err := h.priorDepositConflict(snapshot, deposit, signedDepositSlots(deposit, record)); err != nil {
+		return err
+	}
+	return checkDeviceClock(snapshot.Time)
 }
 
 // landedDepositConflict reports this note's deposit found in the indexer's
@@ -455,10 +509,13 @@ func landedDepositConflict(id uint32) error {
 }
 
 // priorDepositConflict searches snapshot for our leaf from every slot a
-// deposit of this note was signed for.
+// deposit of this note was signed for, at the snapshot's chain time.
 func (h *FundingHandler) priorDepositConflict(snapshot *treeSnapshot, deposit *depositRecord, slots []depositSlot) error {
 	if len(slots) == 0 {
 		return nil
+	}
+	if snapshot.Time <= 0 {
+		return errors.New("the zkAPI indexer view has no verified block time")
 	}
 	commitment, ok := parseFieldElement(deposit.Commitment)
 	if !ok {
@@ -468,7 +525,7 @@ func (h *FundingHandler) priorDepositConflict(snapshot *treeSnapshot, deposit *d
 	if err != nil {
 		return err
 	}
-	if id, found := findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, time.Now().Unix()); found {
+	if id, found := findSignedDepositLeaf(snapshot, slots, commitment, deposit.Amount, ttl, snapshot.Time); found {
 		return landedDepositConflict(id)
 	}
 	return nil
@@ -485,6 +542,9 @@ func (h *FundingHandler) checkPriorDeposits(ctx context.Context, config fundingC
 	}
 	snapshot, err := h.indexerSnapshot(ctx, config)
 	if err != nil {
+		return err
+	}
+	if err := h.snapshotChainTime(ctx, config, snapshot); err != nil {
 		return err
 	}
 	return h.priorDepositConflict(snapshot, deposit, slots)
@@ -522,7 +582,7 @@ func (h *FundingHandler) advisePriorDeposits(ctx context.Context, config funding
 		}
 	}
 	snapshot, err := h.indexerSnapshot(ctx, config)
-	if err != nil {
+	if err != nil || h.snapshotChainTime(ctx, config, snapshot) != nil {
 		return nil
 	}
 	if err := h.priorDepositConflict(snapshot, deposit, slots); err != nil {
@@ -549,12 +609,15 @@ func priorDepositKey(config fundingConfig, deposit *depositRecord, slots []depos
 		if ordered[i].PreparedAt != ordered[j].PreparedAt {
 			return ordered[i].PreparedAt < ordered[j].PreparedAt
 		}
+		if ordered[i].PreparedChainAt != ordered[j].PreparedChainAt {
+			return ordered[i].PreparedChainAt < ordered[j].PreparedChainAt
+		}
 		return strings.ToLower(ordered[i].PathSHA256) < strings.ToLower(ordered[j].PathSHA256)
 	})
 	var key strings.Builder
 	fmt.Fprintf(&key, "%s|%s|%d|%d", config.Indexer, strings.ToLower(deposit.Commitment), deposit.Amount, ttl)
 	for _, slot := range ordered {
-		fmt.Fprintf(&key, "|%d-%d:%d:%s", slot.NoteID, slot.EmptyBefore, slot.PreparedAt, strings.ToLower(slot.PathSHA256))
+		fmt.Fprintf(&key, "|%d-%d:%d:%d:%s", slot.NoteID, slot.EmptyBefore, slot.PreparedAt, slot.PreparedChainAt, strings.ToLower(slot.PathSHA256))
 	}
 	return key.String()
 }
@@ -607,9 +670,9 @@ func noteDepositTransactions(record *addressFundingRecord, deposit *depositRecor
 	return deposits
 }
 
-// findSignedDepositLeaf searches from each signed slot, earliest first. Slots
-// with the same note ID and empty run are searched once, from the earliest
-// preparation.
+// findSignedDepositLeaf searches from each signed slot, earliest first, at
+// chain time now. Slots with the same note ID and empty run are searched
+// once, with the earliest window start.
 func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
 	ordered := append([]depositSlot{}, slots...)
 	sort.Slice(ordered, func(i, j int) bool {
@@ -619,7 +682,7 @@ func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitme
 		if ordered[i].EmptyBefore != ordered[j].EmptyBefore {
 			return ordered[i].EmptyBefore < ordered[j].EmptyBefore
 		}
-		return ordered[i].PreparedAt < ordered[j].PreparedAt
+		return ordered[i].searchFrom() < ordered[j].searchFrom()
 	})
 	for i := range ordered {
 		if i > 0 && ordered[i].NoteID == ordered[i-1].NoteID && ordered[i].EmptyBefore == ordered[i-1].EmptyBefore {
@@ -648,7 +711,7 @@ func findSignedDepositLeaf(snapshot *treeSnapshot, slots []depositSlot, commitme
 // restore leaves that escapes removed in between, and a landing behind
 // depositRevertScanSlots restored leaves is not found.
 func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.Int, amount, ttl uint64, now int64) (uint32, bool) {
-	expiries := plausibleExpiries(slot.PreparedAt, now, ttl)
+	expiries := plausibleExpiries(slot.searchFrom(), now, ttl)
 	search := func(from, to uint64) (uint32, bool) {
 		compared := 0
 		for id := from; id < to && id < uint64(snapshot.NextNoteID) && compared < depositRevertScanSlots; id++ {
@@ -671,20 +734,32 @@ func findDepositLeaf(snapshot *treeSnapshot, slot *depositSlot, commitment *big.
 	return search(uint64(slot.NoteID)-uint64(min(slot.EmptyBefore, slot.NoteID)), uint64(slot.NoteID))
 }
 
+// searchFrom is the earliest time this slot's deposit can have been mined:
+// the chain time of the indexer view it was built from, one day earlier, or
+// for a slot saved before chain times were recorded, the device clock's
+// preparation time devicePreparedTolerance earlier.
+func (slot depositSlot) searchFrom() int64 {
+	if slot.PreparedChainAt > 0 {
+		return slot.PreparedChainAt - chainTimeTolerance
+	}
+	return slot.PreparedAt - devicePreparedTolerance
+}
+
 // plausibleExpiries lists every bucketed expiry for a deposit mined between
-// preparation and now, with one day of clock tolerance on each side, limited
-// to the depositRevertMaxBuckets days that end one day after now. A deposit
+// from and chain time now, plus one day of tolerance, limited to the
+// depositRevertMaxBuckets days that end one day after now. now is the block
+// time of the searched indexer view, never the device clock, so a device
+// clock that is days off cannot move the window past the landing. A deposit
 // mined about 63 or more days before the search is not covered. The 30-day
 // note TTL of the pinned deployments has passed by then, unless vault pauses
 // extended it by more than 33 days.
-func plausibleExpiries(preparedAt, now int64, ttl uint64) []uint64 {
-	to := now + vaultExpiryBucket
-	from := preparedAt - vaultExpiryBucket
+func plausibleExpiries(from, now int64, ttl uint64) []uint64 {
+	to := now + chainTimeTolerance
 	if oldest := to - depositRevertMaxBuckets*vaultExpiryBucket; from < oldest {
 		from = oldest
 	}
 	if from > to {
-		from = now - vaultExpiryBucket // A clock moved backwards since preparation.
+		from = now - chainTimeTolerance // A view older than the slot's own.
 	}
 	if from < 0 {
 		from = 0

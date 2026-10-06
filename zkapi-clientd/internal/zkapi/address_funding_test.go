@@ -21,7 +21,11 @@ import (
 
 const addressTestVault = "0x4386fdbda35d995beb3bf8625118ec5982ec81fe"
 const addressTestToken = "0x2222222222222222222222222222222222222222"
-const addressTestBlock = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// addressTestBlock is the hash of the fixture's canonical block 0x20, whose
+// header the RPC serves by hash with the time this test binary started.
+var addressTestHeader = fixtureHeader(0x20, time.Now().Unix())
+var addressTestBlock = addressTestHeader.Hash().Hex()
 
 type addressFixture struct {
 	native                                                         bool
@@ -55,6 +59,8 @@ type addressFixture struct {
 	cachedVersion, leafVersion int
 	mined                      map[string]uint32
 	minedExpiry                map[uint32]uint64
+	// Block headers served by eth_getBlockByHash, by lowercase hash.
+	headers map[string]*types.Header
 	// Companion wallet state for activation and rebind.
 	walletNote      map[string]any
 	walletPending   bool
@@ -107,6 +113,7 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	f := &addressFixture{chain: "0x1", decimals: "0x6", gas: "0x10000", gasPrice: "0x3b9aca00", balance: "0xf4240", eth: "0xde0b6b3a7640000", allowance: "0x0", nonce: "0x0", finalized: "0x20", canonical: addressTestBlock, accepted: map[string]*types.Transaction{}, receipts: map[string]map[string]any{}}
 	f.native = len(native) > 0 && native[0]
 	f.vaultNotes, f.mined, f.minedExpiry = map[uint32]fixtureNote{}, map[string]uint32{}, map[uint32]uint64{}
+	f.headers = map[string]*types.Header{strings.ToLower(addressTestBlock): addressTestHeader}
 	for i := range addressTestFirstNote {
 		f.setLeaf(uint32(i), big.NewInt(int64(0x1000+i)))
 	}
@@ -260,6 +267,12 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				number = "0x20"
 			}
 			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", time.Now().Unix()), "baseFeePerGas": f.gasPrice}
+		case "eth_getBlockByHash":
+			var hash string
+			_ = json.Unmarshal(request.Params[0], &hash)
+			if header, ok := f.headers[strings.ToLower(hash)]; ok {
+				result = header
+			}
 		case "eth_sendRawTransaction":
 			var raw string
 			_ = json.Unmarshal(request.Params[0], &raw)
@@ -386,6 +399,18 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 	return f
 }
 
+// setChainTime makes the fixture chain's block 0x20, which the indexer's
+// view and the RPC's canonical reads name, carry block time at. Call it
+// before anything is mined.
+func (f *addressFixture) setChainTime(at int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	header := fixtureHeader(0x20, at)
+	hash := header.Hash().Hex()
+	f.headers[strings.ToLower(hash)] = header
+	f.canonical, f.indexerHash = hash, hash
+}
+
 // mine includes a broadcast transaction. A successful deposit lands at the
 // indexer's next slot, in both the vault state and the indexer snapshot; a
 // re-inclusion of the same transaction keeps its note and expiry.
@@ -401,7 +426,7 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 	if reverted {
 		status = "0x0"
 	}
-	receipt := map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": addressTestBlock, "to": tx.To().Hex()}
+	receipt := map[string]any{"transactionHash": hash, "status": status, "blockNumber": "0x10", "blockHash": f.canonical, "to": tx.To().Hex()}
 	if !reverted {
 		data := hex.EncodeToString(tx.Data())
 		if strings.HasPrefix(data, "095ea7b3") {

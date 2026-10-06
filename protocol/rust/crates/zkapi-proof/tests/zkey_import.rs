@@ -218,3 +218,21 @@ fn import_zkey_refuses_foreign_constraints() {
     assert!(!dir.join("tampered-setup").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Fidelity gate (c) on real ceremony output: the A and B matrices of the
+/// final zkeys (read by `ark_circom::read_zkey`) equal the synthesized ones,
+/// and the shipping prover's proofs verify under them. Run after the
+/// ceremony with
+/// `ZKAPI_REQUEST_ZKEY=... ZKAPI_WITHDRAWAL_ZKEY=... cargo test --release
+/// -p zkapi-proof --test zkey_import zkey_matrices_match -- --ignored`.
+#[test]
+#[ignore = "needs ceremony zkeys in ZKAPI_REQUEST_ZKEY and ZKAPI_WITHDRAWAL_ZKEY"]
+fn zkey_matrices_match() {
+    for (variable, kind) in [
+        ("ZKAPI_REQUEST_ZKEY", KeyKind::Request),
+        ("ZKAPI_WITHDRAWAL_ZKEY", KeyKind::Withdrawal),
+    ] {
+        let path = std::env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
+        import_zkey::read_checked_zkey(Path::new(&path), kind).unwrap();
+    }
+}

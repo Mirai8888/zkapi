@@ -3,7 +3,9 @@
 //! Vendored from `ark-circom` 0.5.0 (`src/circom/qap.rs`, MIT OR Apache-2.0)
 //! so that the WebAssembly prover does not depend on `ark-circom` and its
 //! WebAssembly runtime. A non-WASM test (`tests/reduction_cross_check.rs`)
-//! checks every method against the `ark-circom` crate.
+//! checks every method against the `ark-circom` crate. The one change is
+//! how a row is evaluated (`evaluate_row`): the same sum, without a rayon
+//! round trip per row, which makes the witness map about 15 times faster.
 //!
 //! Every zkAPI prover and the development setup use this reduction
 //! ([`crate::compact::Prover`]), so proving keys produced by a snarkjs
@@ -33,9 +35,25 @@
 //! both generators).
 
 use ark_ff::PrimeField;
-use ark_groth16::r1cs_to_qap::{evaluate_constraint, LibsnarkReduction, R1CSToQAP};
+use ark_groth16::r1cs_to_qap::{LibsnarkReduction, R1CSToQAP};
 use ark_poly::EvaluationDomain;
 use ark_relations::r1cs::{ConstraintMatrices, ConstraintSystemRef, SynthesisError};
+
+/// `<row, assignment>`, the same value as `ark_groth16`'s
+/// `evaluate_constraint`. That function folds each row with a rayon parallel
+/// iterator, which costs a thread-pool round trip per row when it is called
+/// outside the pool: ark-circom's sequential row loop spends about 0.4 s of
+/// a 0.65 s request proof there. A plain loop takes under a millisecond.
+fn evaluate_row<F: PrimeField>(terms: &[(F, usize)], assignment: &[F]) -> F {
+    terms.iter().fold(F::zero(), |sum, (coefficient, index)| {
+        let value = assignment[*index];
+        if coefficient.is_one() {
+            sum + value
+        } else {
+            sum + value * coefficient
+        }
+    })
+}
 
 /// The snarkjs-compatible R1CS-to-QAP reduction. See the module documentation.
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,8 +89,8 @@ impl R1CSToQAP for CircomReduction {
             .take(num_constraints)
             .enumerate()
         {
-            a[row] = evaluate_constraint(a_row, full_assignment);
-            b[row] = evaluate_constraint(b_row, full_assignment);
+            a[row] = evaluate_row(a_row, full_assignment);
+            b[row] = evaluate_row(b_row, full_assignment);
         }
         a[num_constraints..num_constraints + num_inputs]
             .clone_from_slice(&full_assignment[..num_inputs]);

@@ -31,8 +31,9 @@ obligation on private status endpoints. See
 Settlement always finalizes: a lease that never reached the wallet settles at
 zero, and a delivered lease whose usage is still unavailable at its write-once
 deadline settles at the proof's solvency bound. The exceptions are a lease
-whose record is corrupt and a pending lease whose saved request cannot be
-decoded; the operator repairs and reopens the first and restores the second
+whose record is corrupt and a pending lease whose row cannot be decoded; the
+operator repairs and reopens the first, and repairs the second, restoring an
+unreadable saved request with the reopen command
 ([settlement terminality](native-eth-billing.md#settlement-terminality)). The
 API server must stay
 available through every challenge window, because owners recover their next

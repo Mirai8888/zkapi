@@ -401,7 +401,8 @@ Alert on:
 - `unreadable OpenRouter lease row cannot be settled` in the server log (logged
   at every settlement tick, naming the row's `client_request_id`): that pending
   lease is not settled, not even at its settlement deadline, and its nullifier
-  stays reserved until you restore its saved request; see
+  stays reserved until you repair the row: restore a saved request that cannot
+  be read, or repair any other corrupt column by hand; see
   [Restoring an unreadable pending lease](../../docs/native-eth-billing.md#restoring-an-unreadable-pending-lease);
 - on a hardened vault, its owner, treasury and payout events: any
   `OwnershipTransferStarted` you did not send, `TreasuryChangeScheduled`,
@@ -503,11 +504,14 @@ adds one. Each reopening or concession itself acknowledges the lease's open
 `binding_corrupt` reviews. See
 [Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease).
 
-A pending lease whose saved request cannot be read (the log line above, or
-`lease_record_unreadable` on its status) is restored with the same command,
-`-T` after `run` and `--saved-request - < request.json`, without waiting for a
-cancellation: it keeps its status and the command prints
-`"result": "restored"`; see
+A pending lease whose saved request cannot be read (one cause of the log line
+above, or of `lease_record_unreadable` on its status) is restored with the
+same command, `-T` after `run` and `--saved-request - < request.json`, without
+waiting for a cancellation: it keeps its status and the command prints
+`"result": "restored"`. If the row's saved request can be read, the command
+refuses it, and if the row stays undecodable after the restoration, the
+command fails with a database error and changes nothing: either way another
+column is corrupt and needs a hand repair. See
 [Restoring an unreadable pending lease](../../docs/native-eth-billing.md#restoring-an-unreadable-pending-lease).
 
 Back up the server database regularly with sqlite3's online backup; the server

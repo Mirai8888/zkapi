@@ -98,9 +98,10 @@ key issuance lock, so no key is returned for such a lease; `/expire` checks no
 longer hold that lock across their oracle reads, and a lease past its deadline
 queues for it. A
 lease the server cannot sign because its record is corrupt can be repaired and
-reopened with `zkapi settlement reopen`, and a pending lease whose saved
-request cannot be decoded, which no tick settles, is restored with
-`zkapi settlement reopen --saved-request`. Each settlement tick attempts the
+reopened with `zkapi settlement reopen`. A pending lease whose row cannot be
+decoded is settled by no tick until it is repaired: an unreadable saved
+request with `zkapi settlement reopen --saved-request`, any other corrupt
+column by hand. Each settlement tick attempts the
 lease nearest its deadline first, alternating with the least recently
 attempted one; a receipt the OA org reports as pending waits for its retry
 time without counting as a failure; and each lease settles under its own lock,
@@ -227,10 +228,11 @@ defect; only the owner policy in Phase 0 mitigates it.
 
 **Escape payouts a destination rejects.** On a legacy vault
 `finalizeEscapeWithdrawal` pays the destination and the treasury in one call,
-so an escape to a destination that rejects ETH can never finalize: the note,
-including the operator's share, stays locked. On the hardened vault
-withdrawals to the vault itself revert `InvalidDestination()`, and
-finalization pushes the user's balance with at most `ESCAPE_PAYOUT_GAS()`
+so an escape cannot finalize while its destination rejects ETH: the note,
+including the operator's share, stays locked until that destination accepts
+ETH, which some destinations never do, and anyone can finalize it then. On the
+hardened vault withdrawals to the vault itself revert `InvalidDestination()`,
+and finalization pushes the user's balance with at most `ESCAPE_PAYOUT_GAS()`
 (100,000). If the destination rejects it or needs more gas, the escape still
 closes and the treasury share is paid; the balance is credited to
 `escapePayoutCredits(destination)` with an `EscapePayoutDeferred` event, and
@@ -308,14 +310,17 @@ API server (`zkapi serverd`):
   `operator_conceded`) and, for fallbacks and concessions, `settlement_reason`
   (`settlement_deadline`, `unsettleable` or `operator_conceded`). Payload `type`
   strings are unchanged.
-- Lease routes answer a lease row that cannot be decoded with
-  `404 lease_record_unreadable` (not retriable; read
-  `GET /v2/nullifiers/{request_nullifier}`), and a pending lease in that state
-  is not settled, not even at its deadline, until the operator restores its
-  saved request with `zkapi settlement reopen --saved-request`. A store that
-  cannot be read answers recovery (`GET /v2/nullifiers/{nullifier}`,
-  `GET /v2/requests/{id}`), lease status, retirement, a lease retry and
-  `/expire` with retriable `500 database_error`: only a 200 `not_found` with
+- Lease status, retirement and a lease retry answer a lease row that cannot be
+  decoded with `404 lease_record_unreadable` (not retriable; read
+  `GET /v2/nullifiers/{request_nullifier}`); `/expire` answers
+  `409 lease_pending` for it, because its nullifier has a record. A pending
+  lease in that state is not settled, not even at its deadline, until the
+  operator repairs the row: an unreadable saved request with
+  `zkapi settlement reopen --saved-request`, any other corrupt column by hand.
+  A store that cannot be read answers recovery
+  (`GET /v2/nullifiers/{nullifier}`, `GET /v2/requests/{id}`), lease status,
+  retirement, a lease retry and `/expire` with retriable
+  `500 database_error`: only a 200 `not_found` with
   `nullifier_status: "unknown"` means unknown. See the
   [API specification](api-spec.md).
 - Startup refuses to switch the lease key source (direct OpenRouter or an OA
@@ -742,7 +747,8 @@ and `NATIVE_BILLING_RPC_URL` (`ZKAPI_NATIVE_BILLING_RPC_URL` of
    and every expiry claim on the legacy vault reverts; see Phase 0, step 8.
 
 2. **Pending escapes and their evidence.** List every pending escape with its
-   deadline and the server's record for its nullifier:
+   deadline, destination and final balance (gwei), and the server's record for
+   its nullifier:
 
    ```sh
    N=$(cast call --json "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC_URL" | jq -r '.[0]')
@@ -751,7 +757,8 @@ and `NATIVE_BILLING_RPC_URL` (`ZKAPI_NATIVE_BILLING_RPC_URL` of
      [ "$status" = 2 ] || continue
      pending=$(cast call --json "$VAULT" 'pendingWithdrawals(uint32)(bool,uint256,uint256,uint128,address,uint64)' "$i" --rpc-url "$RPC_URL")
      nullifier=$(cast to-hex "$(echo "$pending" | jq -r '.[2]')")
-     echo "note $i deadline $(echo "$pending" | jq -r '.[5]') nullifier $nullifier"
+     echo "note $i deadline $(echo "$pending" | jq -r '.[5]') nullifier $nullifier" \
+       "destination $(echo "$pending" | jq -r '.[4]') final_balance $(echo "$pending" | jq -r '.[3]')"
      sudo sqlite3 -readonly "$DATA_DIR/server.db" \
        "SELECT n.status, n.reservation_kind, l.status, l.key_source, l.key_hash IS NOT NULL FROM nullifiers n LEFT JOIN openrouter_leases l ON l.request_nullifier = n.nullifier WHERE n.nullifier = '$nullifier';"
    done
@@ -1263,8 +1270,11 @@ before Phase 4.
   follows at that nullifier. Retrying the close, or escaping, completes it. At
   the Phase 3 cutoff, also set `"deposits": "closed"` in this profile.
   Tell users that an escape's destination cannot change after initiation and
-  must accept ETH: on this vault an escape to a destination that rejects ETH
-  never finalizes. This release's SDK simulates the vault's payout before it
+  must accept ETH: on this vault an escape cannot finalize while its
+  destination rejects ETH, and its funds stay locked until that destination
+  accepts ETH, which some destinations never do; anyone can finalize it then
+  ([Phase 3](#phase-3-stop-deposits-to-the-legacy-vault-and-drain-it), step 2).
+  This release's SDK simulates the vault's payout before it
   proves an escape and refuses such a destination with
   `escape_destination_unpayable`; a host passes
   `overrideDestinationCheck: true` only after the user confirms that address
@@ -1385,8 +1395,19 @@ before Phase 4.
   `snapshot().config.other_deployment_credits` report it, without blocking a
   deposit. Its claim needs that deployment's profile, which loads only while
   the runtime slot holds no other deployment's state; anyone can also call
-  `claimEscapePayout(destination)` on that vault. Never clear site data to get
-  past the check.
+  `claimEscapePayout(destination)` on that vault. The one exception to these
+  rules is a legacy escape that the operator announced as stuck because its
+  destination rejects ETH
+  ([Phase 3](#phase-3-stop-deposits-to-the-legacy-vault-and-drain-it), step 2).
+  It needs no client: anyone can finalize it on chain once the destination
+  accepts ETH. Once the legacy stack is retired, the legacy profile no longer
+  loads, so its record stays listed in this browser for good. When the legacy
+  entry has `runtime: false` and each of its withdrawals is such an announced
+  escape (`mode: "escape"`, matched by `noteId`), configure the hardened
+  profile and offer deposits, and show the owner that note ID and how to
+  finalize it. A deposit then fills the runtime slot, so this browser cannot
+  load the legacy profile again until that note is withdrawn. Never clear site
+  data to get past the check.
   Hosts that route protocol calls through a same-origin rewrite need a rewrite
   for the new hostname as well.
 - **`zkapi-clientd`.** A release pinned to the hardened vault needs work that
@@ -1463,19 +1484,29 @@ are out:
    Anyone can finalize an escape after its deadline, and the call also pays
    the treasury, so finalize any that their owners leave pending. For each
    pending escape past its deadline (from the loop of Before you start, item
-   2), simulate it first:
+   2), simulate it first, and send it from any funded account in a Foundry
+   keystore (`PAYER_ACCOUNT`) once the simulation prints `0x`:
 
    ```sh
    cast call "$VAULT" 'finalizeEscapeWithdrawal(uint32)' <noteId> --rpc-url "$RPC_URL"
+   cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)' <noteId> \
+     --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"   # emits EscapeWithdrawalFinalized
    ```
 
-   It prints `0x` when the finalization would succeed. A revert with data
-   `0xf4b3b1bc` (`NativeTransferFailed()`) while the treasury check of Before
-   you start, item 1, still prints `0x` means the escape's destination rejects
-   ETH: on a legacy vault that escape cannot finalize while it does, and
-   nothing can challenge or change it any more. Record its note ID,
-   destination and final balance (`.[4]` and `.[3]` of that loop's
-   `pendingWithdrawals` output), and tell its owner through the hosts.
+   The simulation prints `0x` when the finalization would succeed. A revert
+   with data `0xf4b3b1bc` (`NativeTransferFailed()`) while the treasury check
+   of Before you start, item 1, still prints `0x` means the escape's
+   destination rejects ETH: on a legacy vault that escape cannot finalize
+   while it does, and nothing can challenge or change it any more. Record its
+   note ID, destination and final balance (the loop's `destination` and
+   `final_balance`, in gwei), and announce it to the hosts (see **Wallet
+   ordering in browsers** in Phase 2). Tell its owner through them that the
+   funds stay in the vault, and that once the destination accepts ETH anyone,
+   the owner included, can finalize the escape without a zkAPI client, with
+   the `cast send` above or any wallet that can call
+   `finalizeEscapeWithdrawal(uint32)` on the vault; the payout goes only to
+   the recorded destination. Keep simulating recorded escapes, also after
+   Phase 4, and send the finalization once the simulation prints `0x`.
 
 3. **Expired notes.** Exits remain possible after expiry until someone calls
    `claimExpired`, which anyone can do; on a legacy vault it pays the full
@@ -1525,7 +1556,10 @@ are out:
    deadline has passed. The one exception is an escape stuck because its
    destination rejects ETH (Phase 3, step 2): once its deadline has passed it
    does not block retirement, since finalizing it needs only the chain should
-   the destination ever accept ETH. Record it as described there first.
+   the destination ever accept ETH. Record and announce it as described there
+   first. Removing the legacy origin stops the legacy browser profile from
+   loading, so a browser that started such an escape lists it for good; hosts
+   then follow the exception under **Wallet ordering in browsers** in Phase 2.
    Retiring earlier strands the remaining notes: without the API and indexer,
    clients can neither close nor build escape paths. Then, with the legacy
    deployment's `dc` (see Phase 1 for a shared VM):
@@ -1750,15 +1784,19 @@ expiry:
 
 An `unreadable OpenRouter lease row cannot be settled` line in the server log,
 logged at every settlement tick with the row's `client_request_id`, names a
-pending lease whose saved request cannot be decoded. No tick settles it, not
-even at its settlement deadline, and its nullifier stays reserved, which
-leaves its owner without an exit as above. Restore its saved request with the
-reopen command of step 4 and `--saved-request` (from a backup or its owner),
-without waiting for a cancellation: the lease keeps its status and the command
-prints `"result": "restored"`. If its deadline has already passed, it is
-charged its solvency bound on restart; add `--zero-charge` to concede
-instead. Acknowledge the restoration's `binding_reopened` review once the
-lease is `finalized`. See
+pending lease whose row cannot be decoded: its saved request, or another
+column. No tick settles it, not even at its settlement deadline, and its
+nullifier stays reserved, which leaves its owner without an exit as above.
+Restore an unreadable saved request with the reopen command of step 4 and
+`--saved-request` (from a backup or its owner), without waiting for a
+cancellation: the lease keeps its status and the command prints
+`"result": "restored"`. If its deadline has already passed, it is charged its
+solvency bound on restart; add `--zero-charge` to concede instead.
+Acknowledge the restoration's `binding_reopened` review once the lease is
+`finalized`. The command refuses the lease as not cancelled when its saved
+request can be read, and fails with a database error, changing nothing, when
+the row stays undecodable after the restoration. Either way another column is
+corrupt and needs a hand repair from a backup, as above. See
 [Restoring an unreadable pending lease](native-eth-billing.md#restoring-an-unreadable-pending-lease).
 
 **Receipt journal missing.** A user reporting `receipt_journal_missing` was told
@@ -2089,9 +2127,12 @@ outside this release:
   permanent. Legacy vaults also allow the sweep described above, and a treasury
   that rejects ETH blocks the exits of their spent notes until the owner
   replaces it, so only the owner policy protects them.
-- **Escape destinations that reject ETH.** On legacy vaults an escape to a
-  destination that rejects ETH can never finalize, so the note, including the
-  operator's share, stays locked. Hardened vaults credit the payout instead,
+- **Escape destinations that reject ETH.** On legacy vaults an escape cannot
+  finalize while its destination rejects ETH, so the note, including the
+  operator's share, stays locked until that destination accepts ETH, possibly
+  for good. Once the legacy stack is retired, a browser that started such an
+  escape can no longer close its record and lists it for good (Phase 4, step
+  2). Hardened vaults credit the payout instead,
   and a credit to a destination that keeps rejecting ETH waits until it
   accepts.
 - **Root races.** Merkle siblings must match the live root on every vault, so a

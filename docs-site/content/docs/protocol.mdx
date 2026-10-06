@@ -97,12 +97,12 @@ clamped to the proven `solvency_bound` before conversion. If its usage cannot
 be settled at all, or is still unavailable when the server's write-once
 settlement deadline passes, the lease settles at `solvency_bound`. The server
 refuses to sign only a lease whose own record is corrupt, until the operator
-verifies, repairs and reopens it; a pending lease whose saved request cannot be
-decoded is not settled at all, not even at its deadline, until the operator
-restores that request. It refuses to start unless the lease lifetime
-plus that deadline fit within half the vault's challenge period, so every
-signed transcript exists well before an escape from the same state could
-finalize.
+verifies, repairs and reopens it; a pending lease whose row cannot be decoded
+(its saved request, or another column) is not settled at all, not even at its
+deadline, until the operator repairs that row. It refuses to start unless the
+lease lifetime plus that deadline fit within half the vault's challenge
+period, so every signed transcript exists well before an escape from the same
+state could finalize.
 
 ## Refunds
 

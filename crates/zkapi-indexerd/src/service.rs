@@ -577,8 +577,8 @@ pub struct HealthResponse {
     /// below the checkpoint replaced the note's escape (see `MissedReEscape`).
     #[serde(default)]
     pub missed_re_escape_count: u64,
-    /// Of those, finalizations: the vault paid out an escape the indexer's
-    /// pending list never showed.
+    /// Of those, finalizations: the vault finalized (paid or credited) an
+    /// escape the indexer's pending list never showed.
     #[serde(default)]
     pub missed_re_escape_finalized_count: u64,
 }

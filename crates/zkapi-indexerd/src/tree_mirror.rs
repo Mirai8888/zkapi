@@ -34,7 +34,8 @@ pub struct PendingEscape {
 pub enum EscapeClose {
     /// `EscapeWithdrawalChallenged`: the note's leaf was restored.
     Challenged,
-    /// `EscapeWithdrawalFinalized`: the vault paid the escape out.
+    /// `EscapeWithdrawalFinalized`: the vault finalized the escape (paid the
+    /// destination or, if the push failed, credited the payout).
     Finalized,
 }
 

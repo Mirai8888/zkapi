@@ -891,15 +891,29 @@ async fn unknown_vault_events_are_ignored() {
         event_topic("TreasuryChangeScheduled(address,uint64)"),
         "0xc6c2218a88093c850424bc0b3f475912876098dcc3cb7f14a52c580293569750"
     );
+    let payout_deferred = event_topic("EscapePayoutDeferred(uint32,address,uint128)");
+    assert_eq!(
+        payout_deferred,
+        "0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942"
+    );
+    let payout_claimed = event_topic("EscapePayoutClaimed(address,uint128)");
+    assert_eq!(
+        payout_claimed,
+        "0x6bf75371d42e9753c0913bf8fcecb651e8db173d99d7da0e4d836e91512bbe27"
+    );
     let owner = format!("0x{:064x}", 0x0e);
     let raw = |signature: &str, data: &str| Tx::Raw {
         topics: vec![event_topic(signature), owner.clone()],
         data: data.to_string(),
     };
+    // The mock vault's escape destination and final balance.
+    let destination = format!("0x{:064x}", 0xd0d0);
+    let amount = format!("0x{:064x}", 10);
     let chain = MockChain::start().await;
     chain.mine(vec![
         raw("Paused(address)", "0x"),
         Tx::Deposit { commitment: 0xa },
+        Tx::Deposit { commitment: 0xb },
         raw("Unpaused(address)", "0x1234"),
         raw(
             "TreasuryChangeScheduled(address,uint64)",
@@ -922,12 +936,49 @@ async fn unknown_vault_events_are_ignored() {
             data: "0xdeadbeef".to_string(),
         },
     ]);
-    chain.mine(vec![raw("Paused(address)", "0x"), Tx::Close { note_id: 0 }]);
+    chain.mine(vec![
+        raw("Paused(address)", "0x"),
+        Tx::Close { note_id: 0 },
+        Tx::Escape {
+            note_id: 1,
+            nullifier: 0x51,
+        },
+    ]);
+    // A finalization whose push to the destination failed: the hardened vault
+    // credits the payout and emits a three-topic `EscapePayoutDeferred` just
+    // before `EscapeWithdrawalFinalized`, in the same transaction.
+    chain.mine(vec![
+        Tx::Raw {
+            topics: vec![
+                payout_deferred.clone(),
+                format!("0x{:064x}", 1),
+                destination.clone(),
+            ],
+            data: amount.clone(),
+        },
+        Tx::Finalize { note_id: 1 },
+    ]);
+    // Anyone later delivers the credit.
+    chain.mine(vec![Tx::Raw {
+        topics: vec![payout_claimed.clone(), destination.clone()],
+        data: amount.clone(),
+    }]);
     chain.mine_empty(2);
     let mut indexer = Indexer::new(config(&chain, 1, None));
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert_eq!(indexer.service.health().consecutive_failures, 0);
+    // The credited finalization still closed the escape, and the mirror stays
+    // verified against the vault's state.
+    let view = indexer.view();
+    assert_eq!(view.mirror.pending_escapes(), Vec::new());
+    assert_eq!(view.next_note_id, 2);
+    let health = indexer.service.health();
+    assert_eq!(health.status, SyncStatus::Ok);
+    assert_eq!(health.consecutive_failures, 0);
+    assert_eq!(health.divergence_count, 0);
+    assert_eq!(health.rebuild_count, 0);
+    assert_eq!(health.missed_re_escape_count, 0);
+    assert_eq!(health.last_error, None);
 }
 
 #[tokio::test]
@@ -1390,7 +1441,8 @@ async fn missed_re_escape_case(follow_up: Tx, follow_up_kind: EscapeClose) {
         let line = format!("zkapi_indexer_missed_re_escapes_total{{event=\"{event}\"}} {value}");
         assert!(metrics.lines().any(|candidate| candidate == line), "{line}");
     }
-    // Logged once; at error level when the vault paid the escape out.
+    // Logged once; at error level when the vault finalized the escape (paid
+    // or credited).
     let reports = logs.reports(follow_up_kind);
     assert_eq!(reports.len(), 1, "{reports:?}");
     let level = match follow_up_kind {

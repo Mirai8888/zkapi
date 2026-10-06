@@ -729,7 +729,8 @@ impl JsonRpcLogPoller {
                     detail = %at,
                     "escape challenged that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list showed a stale nullifier and deadline until now"
                 ),
-                // The vault paid out an escape the pending list never showed.
+                // The vault finalized (paid or credited) an escape the pending
+                // list never showed.
                 EscapeClose::Finalized => tracing::error!(
                     detail = %at,
                     "escape finalized that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list showed a stale nullifier and deadline until now, so check that the challenge service tracked this escape"

@@ -540,7 +540,14 @@ loaded runtime also reports what it cannot reach:
 `snapshot().config.other_deployment_withdrawals` lists the open withdrawal
 records of other deployments (`deployment_id`, `record_id`, `note_id`, `mode`,
 `phase`; no note state). A host should not offer a deposit while it is
-non-empty. Never clear site data to get past these checks.
+non-empty. The one exception is an escape on an older deployment that its
+operator announced as stuck because its destination rejects ETH
+([migration guide](../docs/migration-hardened-vault.md#phase-3-stop-deposits-to-the-legacy-vault-and-drain-it),
+Phase 3, step 2): when that deployment's entry has `runtime: false` and each
+of its withdrawals is such an announced escape (`mode: "escape"`, matched by
+`noteId`), the host may configure the newer profile and offer deposits, and
+shows the owner that note ID and how to finalize it on chain. Never clear site
+data to get past these checks.
 
 A finalized escape whose payout the vault only credited
 ([Credited escape payouts](#credited-escape-payouts)) holds no note. It does

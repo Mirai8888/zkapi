@@ -324,9 +324,12 @@ API server (`zkapi serverd`):
   `nullifier_status: "unknown"` means unknown. See the
   [API specification](api-spec.md).
 - Startup refuses to switch the lease key source (direct OpenRouter or an OA
-  org) while the database holds possibly delivered leases of the other source
-  without a committed charge, or, when leaving direct OpenRouter, queued
-  deletions of unexpired keys. Drain them first, as in
+  org), or to another OA org URL or OpenRouter API base, while the database
+  holds possibly delivered leases of the other issuer without a committed
+  charge, or, when leaving direct OpenRouter, queued deletions of unexpired
+  keys. Leases activated before this release record no issuer; the check
+  takes them as the configured issuer's unless another issuer of that source
+  still has rows to settle. Drain them first, as in
   [Changing the key source](native-eth-billing.md#changing-the-key-source);
   `--allow-key-source-switch` (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true`) starts
   anyway and charges each such lease at its settlement deadline without a
@@ -363,7 +366,7 @@ Challenger (`zkapi-challenged`):
   - it was not pending in the checkpoint at the upgrade;
   - its deadline is no later than that release's last recorded miss
     (`last_missed.recorded_at` plus 15 minutes, or that miss's deadline if
-    later);
+    later), nor than the timestamp of the upgraded daemon's first head block;
   - its event lies below the checkpoint's scan cursor at the upgrade (not
     checked when the cursor had been reset for a replay).
 
@@ -846,6 +849,9 @@ and `NATIVE_BILLING_RPC_URL` (`ZKAPI_NATIVE_BILLING_RPC_URL` of
    If unsettled leases of a key source other than the one this release will
    run with remain, the upgraded server refuses to start until they drain; see
    [Changing the key source](native-eth-billing.md#changing-the-key-source).
+   Changing the OA org URL, or the OpenRouter API base or account, in the same
+   upgrade is not detected for leases from before the upgrade, because they
+   record no issuer: drain them under the old one first.
 
    Proof-less clearance reservations made by the old endpoint stay reserved;
    after the upgrade they are the rows with
@@ -1400,13 +1406,13 @@ before Phase 4.
   destination rejects ETH
   ([Phase 3](#phase-3-stop-deposits-to-the-legacy-vault-and-drain-it), step 2).
   It needs no client: anyone can finalize it on chain once the destination
-  accepts ETH. Once the legacy stack is retired, the legacy profile no longer
+  accepts ETH, as long as the legacy vault's treasury still does. Once the legacy stack is retired, the legacy profile no longer
   loads, so its record stays listed in this browser for good. When the legacy
   entry has `runtime: false` and each of its withdrawals is such an announced
   escape (`mode: "escape"`, matched by `noteId`), configure the hardened
   profile and offer deposits, and show the owner that note ID and how to
-  finalize it. A deposit then fills the runtime slot, so this browser cannot
-  load the legacy profile again until that note is withdrawn. Never clear site
+  finalize it. A hardened deposit then fills the runtime slot, so this browser
+  cannot load the legacy profile again until that hardened note is withdrawn. Never clear site
   data to get past the check.
   Hosts that route protocol calls through a same-origin rewrite need a rewrite
   for the new hostname as well.
@@ -1501,8 +1507,10 @@ are out:
    note ID, destination and final balance (the loop's `destination` and
    `final_balance`, in gwei), and announce it to the hosts (see **Wallet
    ordering in browsers** in Phase 2). Tell its owner through them that the
-   funds stay in the vault, and that once the destination accepts ETH anyone,
-   the owner included, can finalize the escape without a zkAPI client, with
+   funds stay in the vault, and that once the destination accepts ETH (and
+   while the vault's treasury still does, since a legacy finalization pays
+   both in one call) anyone, the owner included, can finalize the escape
+   without a zkAPI client, with
    the `cast send` above or any wallet that can call
    `finalizeEscapeWithdrawal(uint32)` on the vault; the payout goes only to
    the recorded destination. Keep simulating recorded escapes, also after
@@ -1557,7 +1565,9 @@ are out:
    destination rejects ETH (Phase 3, step 2): once its deadline has passed it
    does not block retirement, since finalizing it needs only the chain should
    the destination ever accept ETH. Record and announce it as described there
-   first. Removing the legacy origin stops the legacy browser profile from
+   first, and keep the legacy treasury able to receive ETH while any recorded
+   stuck escape is pending: a legacy finalization pays the treasury in the same
+   call and reverts if it rejects ETH. Removing the legacy origin stops the legacy browser profile from
    loading, so a browser that started such an escape lists it for good; hosts
    then follow the exception under **Wallet ordering in browsers** in Phase 2.
    Retiring earlier strands the remaining notes: without the API and indexer,
@@ -1856,9 +1866,11 @@ turn the row into a clearance reservation, and that rests on the owner's word:
   the vault pays that state's balance to the destination in the proof. A
   claim filed by anyone else gains its filer nothing. The server verifies an
   ownership proof sent with the clearance request, and requires one where
-  legacy clearance is off; once the row is changed, the challenger no longer
-  contests an escape at that state, so sending that proof no longer risks the
-  challenge above. To tie the claimant to the exit, ask them, before you
+  legacy clearance is off; once the row is changed, the operator's challenger
+  no longer contests an escape at that state. On a legacy vault anyone else
+  who holds a request proof from that state still can, because
+  `challengeEscapeWithdrawal` is permissionless; `zkapi-clientd` asks its owner
+  to acknowledge exactly that risk before it sends the proof. To tie the claimant to the exit, ask them, before you
   change the row, for the note ID (`NOTE_ID`) and the destination address, and
   read the note:
   `cast call --json "$VAULT" 'notes(uint32)(bytes32,uint128,uint64,uint8)' "$NOTE_ID" --rpc-url "$RPC_URL"`

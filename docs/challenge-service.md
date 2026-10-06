@@ -567,6 +567,9 @@ is:
   - critical, blocked by `evidence_db_error`, while the evidence database
     cannot be read: the obligation stays tracked until a read decides whether
     a payout was a missed deadline;
+- behind a blocked queue, a `missed` or `resolved_unconfirmed` obligation
+  whose withdrawal is gone shows the queue's blocked reason and its detail,
+  which names the blocking nonce, in place of the details quoted above;
 - for obligations with evidence, or expected evidence, by remaining time:
   warning within `--warning-remaining-seconds`, critical within
   `--critical-remaining-seconds`;

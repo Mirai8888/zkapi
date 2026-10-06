@@ -120,8 +120,10 @@ means unknown, and `POST .../expire` attests non-acceptance only with HTTP 200
 (an I/O error, a corrupt page, a lock held past the busy timeout) answers
 these routes, lease status and retirement, and a lease retry with retriable
 `500 database_error`: retry later, and never read it as unknown, unaccepted or
-not found. An undecodable lease row answers `404 lease_record_unreadable`
-(not retriable); read `GET /v2/nullifiers/{request_nullifier}` instead. The
+not found. An undecodable lease row answers lease status, retirement and a
+lease retry with `404 lease_record_unreadable` (not retriable), and `/expire`
+with `409 lease_pending` while its reservation is held; read
+`GET /v2/nullifiers/{request_nullifier}` instead, which reports it `reserved`. The
 [API specification](https://github.com/ethereum/zkapi/blob/main/docs/api-spec.md)
 has the full contract.
 

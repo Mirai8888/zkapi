@@ -777,8 +777,9 @@ treasury.
 ## Restoring an unreadable pending lease
 
 A pending lease (`provisioning`, `active`, `retiring`, `disabled` or
-`revoking`) whose saved request cannot be decoded is never settled, as
-described under [settlement terminality](#settlement-terminality). The server
+`revoking`) whose row cannot be decoded, normally because its saved request
+cannot be, is never settled, as described under
+[settlement terminality](#settlement-terminality). The server
 cannot cancel it either, because it cannot read the request that a review
 needs. Restore the request with the reopen command and `--saved-request`, with
 the server stopped, exactly as for a cancelled lease:

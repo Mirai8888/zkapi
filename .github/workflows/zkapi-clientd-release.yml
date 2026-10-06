@@ -59,11 +59,9 @@ jobs:
           python3 zkapi-clientd/scripts/test-source-install.py
       - name: Prepare pinned native wallet source
         run: zkapi-clientd/scripts/prepare-zkapi.sh "$RUNNER_TEMP/zkapi-walletd-source"
-      - name: Test native wallet and station trust policy
+      - name: Test the patched companion and protocol crates
         shell: bash
-        run: |
-          cd "$RUNNER_TEMP/zkapi-walletd-source"
-          cargo test --release --locked -p zkapi-clientd
+        run: zkapi-clientd/scripts/test-companion.sh "$RUNNER_TEMP/zkapi-walletd-source"
       - name: Build native bundle and Linux packages
         shell: bash
         run: |

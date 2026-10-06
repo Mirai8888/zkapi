@@ -35,7 +35,9 @@ it as unknown, unaccepted or not found. Lease status returns 404 only for a
 lease the store does not hold (an empty body), or, with
 `error_code: "lease_record_unreadable"` and `retriable: false`, for a lease
 row the store holds but cannot decode. That row never heals by itself, and
-lease retirement and a lease retry or `/expire` that need it answer the same.
+lease retirement and a lease retry that need it answer the same; `/expire`
+answers `409 lease_pending` while the lease's reservation is held, and
+recovery reports the nullifier `reserved` without a settlement deadline.
 A pending lease in that state is not settled, not even at its settlement
 deadline, and its nullifier reads `reserved`, until the operator restores its
 saved request (`zkapi settlement reopen --saved-request`), or repairs by hand

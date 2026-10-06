@@ -56,6 +56,17 @@ pub enum ServerError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// The store holds a lease row for this ID that it cannot decode. It
+    /// never heals by itself (an operator restores its saved request with
+    /// `zkapi settlement reopen --saved-request`, also for a pending lease,
+    /// which the settlement sweep skips until then); the request's
+    /// nullifier record stays readable and authoritative. The decoding error
+    /// is logged, not returned.
+    #[error(
+        "lease record cannot be decoded until an operator repairs it; GET /v2/nullifiers/{{request_nullifier}} is authoritative"
+    )]
+    LeaseRecordUnreadable,
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
@@ -99,6 +110,7 @@ impl ServerError {
             ServerError::LegacyClearanceCapacity { .. } => "legacy_clearance_capacity",
             ServerError::NullifierUsed => "nullifier_used",
             ServerError::Database(_) => "database_error",
+            ServerError::LeaseRecordUnreadable => "lease_record_unreadable",
             ServerError::InvalidRequest(_) => "invalid_request",
             ServerError::ProtocolMismatch(_) => "protocol_mismatch",
             ServerError::LeasePending => "lease_pending",
@@ -116,6 +128,8 @@ impl ServerError {
             ServerError::StaleRoot { .. } => true,
             ServerError::Internal(_) => true,
             ServerError::Database(_) => true,
+            // Only an operator's repair of the row changes the answer.
+            ServerError::LeaseRecordUnreadable => false,
             ServerError::Unsettleable(_) => false,
             ServerError::ClearanceOwnershipRequired => false,
             ServerError::InvalidProof(_) => false,

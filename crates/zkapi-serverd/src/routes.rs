@@ -122,17 +122,23 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
             Ok(root) => root,
             Err(err) => {
                 tracing::warn!("failed to fetch initial root from indexer: {}", err);
-                config.initial_root
+                startup_root_from_vault(&config).await
             }
         }
     } else {
         config.initial_root
     };
     let dashboard = Arc::new(DashboardHub::new(500));
+    let signing_keys = VaultSigningKeys {
+        state: signer.state_public_key(),
+        clearance: signer.clearance_public_key(),
+    };
     let processor = Arc::new(
         RequestProcessor::try_new(config.clone(), store, signer, initial_root)?
             .with_dashboard(dashboard),
     );
+    // Read while holding the writer lock, before anything is written.
+    ensure_key_sources_drained(&config, processor.store())?;
     // Record a fresh verification only while holding the writer lock.
     if binding_source == BindingSource::VerifiedNow {
         processor.store().write_deployment_binding(&binding)?;
@@ -159,7 +165,7 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         // vault definitively contradicts the recorded binding.
         tokio::select! {
             result = serve => result?,
-            Err(mismatch) = reverify_deployment_binding(&config, &binding, VAULT_REVERIFY_FIRST_DELAY) => {
+            Err(mismatch) = reverify_deployment_binding(&config, &binding, &signing_keys, VAULT_REVERIFY_FIRST_DELAY) => {
                 return Err(mismatch);
             }
         }
@@ -167,6 +173,34 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         serve.await?;
     }
     Ok(())
+}
+
+/// The vault's currentRoot() for a server whose indexer cannot serve a
+/// verified root at startup (unverified, stale or replaying), instead of
+/// --initial-root (0x0 by default), which would refuse every new request as
+/// stale_root until the poller reads a verified root. Clearance already
+/// accepts the same read; --initial-root remains the fallback.
+async fn startup_root_from_vault(config: &ServerConfig) -> Felt252 {
+    let read = async {
+        anyhow::Ok(
+            NativeBillingOracle::for_server(config)?
+                .vault_current_root()
+                .await?,
+        )
+    };
+    match read.await {
+        Ok(root) => {
+            tracing::info!(
+                root = %root,
+                "starting with the vault's currentRoot() until the indexer serves a verified root"
+            );
+            root
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "vault currentRoot() unavailable at startup; using --initial-root");
+            config.initial_root
+        }
+    }
 }
 
 /// Whether the deployment binding was verified against the vault during this
@@ -365,10 +399,14 @@ fn ensure_vault_keys_match(
 
 /// Re-verify a recorded binding while serving. Unavailable or wrong-chain RPCs
 /// cannot prove a mismatch and are retried indefinitely; only vault keys (or a
-/// challenge period) that contradict the record end the server.
+/// challenge period) that contradict the record, or the keys this server signs
+/// with, end the server. Startup uses a record only for the keys it was
+/// configured with; comparing the live keys too keeps a server from signing
+/// under keys the vault never pinned should that check ever fail.
 async fn reverify_deployment_binding(
     config: &ServerConfig,
     recorded: &DeploymentBinding,
+    signing_keys: &VaultSigningKeys,
     first_delay: Duration,
 ) -> anyhow::Result<Infallible> {
     let oracle = NativeBillingOracle::for_server(config)?;
@@ -380,7 +418,9 @@ async fn reverify_deployment_binding(
     loop {
         match read_vault_deployment(&oracle, config.chain_id).await {
             Ok(vault) => {
-                let outcome = ensure_vault_keys_match(config, &expected, &vault.keys).and_then(|()| {
+                let outcome = ensure_vault_keys_match(config, signing_keys, &vault.keys)
+                    .and_then(|()| ensure_vault_keys_match(config, &expected, &vault.keys))
+                    .and_then(|()| {
                     anyhow::ensure!(
                         vault.challenge_period_seconds == recorded.challenge_period_seconds,
                         "vault challengePeriod() is {} s, but this database recorded {} s for vault {}",
@@ -417,6 +457,94 @@ async fn reverify_deployment_binding(
         tokio::time::sleep(delay).await;
         delay = delay.saturating_mul(2).min(VAULT_REVERIFY_MAX_DELAY);
     }
+}
+
+/// How an operator configures each lease key source.
+fn key_source_setting(source: &str) -> &'static str {
+    match source {
+        "openrouter" => {
+            "direct OpenRouter: ZKAPI_OPENROUTER_MANAGEMENT_KEY or --openrouter-management-key"
+        }
+        "oa_org" => "OA org: --oa-org-url with ZKAPI_OA_ORG_SHARED_SECRET",
+        _ => "unknown",
+    }
+}
+
+/// Only the key source that issued a lease can measure its usage, and only
+/// the direct source deletes direct keys. Refuse to start while the database
+/// holds, of a known key source other than the configured one, leases that
+/// only that source can settle (possibly delivered, with no committed charge)
+/// or queued deletions of its direct keys that may still be usable: each such
+/// lease would be finalized at its settlement deadline without a usage
+/// measurement, and those keys would stay usable until they expire. Rows any
+/// configuration finalizes without provider I/O (never delivered, committed
+/// to a zero or conceded charge) do not count, nor do rows of a source this
+/// release does not know, which it never settles or charges (so a rollback
+/// stays safe). `allow_key_source_switch` accepts those charges and starts:
+/// for a database that holds such leases of both sources, which no single
+/// credential can drain, or a source that can no longer be reached.
+fn ensure_key_sources_drained(config: &ServerConfig, store: &NullifierStore) -> anyhow::Result<()> {
+    let Some(lease) = config.openrouter_leases.as_ref() else {
+        return Ok(());
+    };
+    let configured = lease.source.label();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backlog = store.key_source_backlog(now)?;
+    let own_leases = backlog
+        .get(configured)
+        .map_or(0, |backlog| backlog.unsettled_leases);
+    let stranded: Vec<String> = backlog
+        .into_iter()
+        .filter(|(source, _)| {
+            source != configured && matches!(source.as_str(), "openrouter" | "oa_org")
+        })
+        .filter_map(|(source, backlog)| {
+            let deletions = if source == "openrouter" {
+                backlog.queued_key_deletions
+            } else {
+                0
+            };
+            (backlog.unsettled_leases > 0 || deletions > 0).then(|| {
+                format!(
+                    "{} unsettled lease(s) and {deletions} queued key deletion(s) of key source '{source}' ({})",
+                    backlog.unsettled_leases,
+                    key_source_setting(&source)
+                )
+            })
+        })
+        .collect();
+    if stranded.is_empty() {
+        if config.allow_key_source_switch {
+            tracing::info!(
+                "--allow-key-source-switch is set, but no other key source has leases to settle; remove it"
+            );
+        }
+        return Ok(());
+    }
+    if config.allow_key_source_switch {
+        tracing::warn!(
+            configured,
+            stranded = %stranded.join("; "),
+            "--allow-key-source-switch: starting although this key source can neither measure nor delete these; each such lease will be finalized at its settlement deadline without a usage measurement (normally at its full solvency bound). Remove the flag once they are settled."
+        );
+        return Ok(());
+    }
+    let remedy = if own_leases > 0 {
+        format!(
+            "It also holds {own_leases} such lease(s) of '{configured}', so no single credential can drain it: start under one key source with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true), stop routing new requests to the server, and once GET /v1/dashboard/settlement lists no pending lease of that source, restart under the other without the flag, before the remaining leases reach their deadlines."
+        )
+    } else {
+        "Drain the previous key source first: restart with its credential, stop routing new requests to the server, and wait until GET /v1/dashboard/settlement lists no pending lease of that key source (and, for 'openrouter', counts.pending_key_cleanups is 0); then switch. If that source can no longer be reached, start with --allow-key-source-switch (ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true) to accept those charges, and remove it once they are settled.".to_string()
+    };
+    anyhow::bail!(
+        "refusing to start: server database {} holds {}, but this server is configured for key source '{configured}' ({}), which can neither measure nor delete them: each such lease (possibly delivered, with no committed charge) would be finalized at its settlement deadline without a usage measurement, normally at its full solvency bound. {remedy} See docs/native-eth-billing.md, \"Changing the key source\".",
+        config.db_path,
+        stranded.join("; "),
+        key_source_setting(configured)
+    );
 }
 
 /// Create the Axum router with all zkAPI server routes.
@@ -567,14 +695,19 @@ async fn handle_openrouter_lease(
         .map_err(|error| error_to_response(&error, &api_request.client_request_id, &processor))
 }
 
+/// 404 for a lease the store does not hold, and (with error_code
+/// lease_record_unreadable, not retriable) for a lease row it cannot decode:
+/// either way GET /v2/nullifiers/{request_nullifier} is authoritative. A
+/// store that cannot be read is a retriable 500 database_error.
 async fn handle_openrouter_lease_status(
     State(processor): State<AppState>,
     Path(client_request_id): Path<String>,
-) -> Result<Json<OpenRouterLeaseStatusResponse>, StatusCode> {
-    processor
-        .openrouter_lease_status(&client_request_id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+) -> Response {
+    match processor.openrouter_lease_status(&client_request_id) {
+        Ok(Some(status)) => Json::<OpenRouterLeaseStatusResponse>(status).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => error_to_response(&error, &client_request_id, &processor).into_response(),
+    }
 }
 
 async fn handle_openrouter_lease_retirement(
@@ -832,6 +965,9 @@ fn build_error_response(
             StatusCode::CONFLICT
         }
         ServerError::NoteExpired => StatusCode::GONE,
+        // Like an unknown lease, it sends clients to the authoritative
+        // nullifier record (GET /v2/nullifiers/{request_nullifier}).
+        ServerError::LeaseRecordUnreadable => StatusCode::NOT_FOUND,
         ServerError::CapacityExhausted | ServerError::LegacyClearanceCapacity { .. } => {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -1081,7 +1217,7 @@ mod startup_tests {
     use super::*;
     use crate::native_billing::{
         NativeBillingConfig, CHALLENGE_PERIOD_SELECTOR, CLEARANCE_SIGNING_KEY_X_SELECTOR,
-        CLEARANCE_SIGNING_KEY_Y_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR,
+        CLEARANCE_SIGNING_KEY_Y_SELECTOR, CURRENT_ROOT_SELECTOR, STATE_SIGNING_KEY_X_SELECTOR,
         STATE_SIGNING_KEY_Y_SELECTOR,
     };
     use crate::signer::strong_test_seeds;
@@ -1128,6 +1264,8 @@ mod startup_tests {
         /// Holds every response until permits are added.
         gate: Option<Arc<Semaphore>>,
         challenge_period: u64,
+        /// Answers currentRoot() when set.
+        root: Option<Felt252>,
     }
 
     impl VaultRpc {
@@ -1138,6 +1276,7 @@ mod startup_tests {
                 unavailable: false,
                 gate: None,
                 challenge_period: 86_400,
+                root: None,
             }
         }
     }
@@ -1184,6 +1323,9 @@ mod startup_tests {
                             CLEARANCE_SIGNING_KEY_Y_SELECTOR => word(&keys.clearance.y),
                             CHALLENGE_PERIOD_SELECTOR => {
                                 format!("0x{:064x}", vault.challenge_period)
+                            }
+                            CURRENT_ROOT_SELECTOR if vault.root.is_some() => {
+                                word(vault.root.as_ref().unwrap())
                             }
                             _ => return Err(StatusCode::BAD_REQUEST),
                         },
@@ -1300,10 +1442,15 @@ mod startup_tests {
         let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(other_strong_seeds()))).await;
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("must-not-exist.db");
-        let error = run_server_with(config(&rpc, &db_path, strong_test_seeds()), TEST_RETRY)
-            .await
-            .unwrap_err()
-            .to_string();
+        // Bounded: a regressed key check would start serving, not return.
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_server_with(config(&rpc, &db_path, strong_test_seeds()), TEST_RETRY),
+        )
+        .await
+        .expect("the server started under keys the vault does not pin")
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("do not match the vault's immutable keys")
                 && error.contains("state MISMATCH")
@@ -1632,7 +1779,12 @@ mod startup_tests {
             // Neither an outage, a wrong chain nor a missing vault is definitive.
             assert!(tokio::time::timeout(
                 Duration::from_millis(300),
-                reverify_deployment_binding(&config, &recorded, Duration::from_millis(1)),
+                reverify_deployment_binding(
+                    &config,
+                    &recorded,
+                    &keys_of(seeds),
+                    Duration::from_millis(1)
+                ),
             )
             .await
             .is_err());
@@ -1646,14 +1798,365 @@ mod startup_tests {
         }
         let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of(other_strong_seeds()))).await;
         let config = config(&rpc, &directory.path().join("server.db"), seeds);
-        let error = reverify_deployment_binding(&config, &recorded, Duration::from_millis(1))
+        let error = reverify_deployment_binding(
+            &config,
+            &recorded,
+            &keys_of(seeds),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("do not match the vault's immutable keys"),
+            "{error}"
+        );
+    }
+
+    /// Final review (seam:tests-ci#5): a restart on a recorded database with
+    /// other signing seeds must run the vault check before serving, and
+    /// refuse. Nothing else covered the recorded-binding shortcut's key
+    /// comparison.
+    #[tokio::test]
+    async fn restart_with_changed_seeds_rechecks_the_vault_before_serving() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+        NullifierStore::new(&db_path)
+            .unwrap()
+            .write_deployment_binding(&recorded_binding(seeds))
+            .unwrap();
+        // The vault answers only once the test has checked that nothing is
+        // served meanwhile.
+        let gate = Arc::new(Semaphore::new(0));
+        let (rpc, calls) = vault_rpc(VaultRpc {
+            gate: Some(gate.clone()),
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let mut config = config(&rpc, &db_path, other_strong_seeds());
+        config.listen_addr = free_listen_addr().await;
+        let server = tokio::spawn(run_server_with(config.clone(), TEST_RETRY));
+        let health = format!("http://{}/health", config.listen_addr);
+        for _ in 0..20 {
+            assert!(
+                reqwest::get(&health).await.is_err(),
+                "served under seeds the vault was not checked against"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        gate.add_permits(1_000);
+        let error = tokio::time::timeout(Duration::from_secs(20), server)
             .await
+            .expect("the server kept running under unverified seeds")
+            .unwrap()
             .unwrap_err()
             .to_string();
         assert!(
             error.contains("do not match the vault's immutable keys"),
             "{error}"
         );
+        assert_eq!(methods(&calls).len(), 1 + KEY_READS.len());
+        // The record is unchanged.
+        assert_eq!(
+            NullifierStore::open_read_only(&db_path)
+                .unwrap()
+                .read_deployment_binding()
+                .unwrap(),
+            Some(recorded_binding(seeds))
+        );
+    }
+
+    /// Defense in depth for the same shortcut: background re-verification
+    /// compares the keys this server signs with, not only the recorded ones.
+    #[tokio::test]
+    async fn background_reverification_compares_the_live_signing_keys() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+        let config = config(&rpc, &directory.path().join("server.db"), seeds);
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            reverify_deployment_binding(
+                &config,
+                &recorded_binding(seeds),
+                &keys_of(other_strong_seeds()),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("live keys the vault never pinned were accepted")
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("do not match the vault's immutable keys"),
+            "{error}"
+        );
+    }
+
+    /// Optional review nit (seam:ops-config#9): with the indexer unavailable at
+    /// startup, the server starts at the vault's currentRoot(), not at 0x0.
+    #[tokio::test]
+    async fn startup_without_an_indexer_root_uses_the_vault_root() {
+        let seeds = strong_test_seeds();
+        let vault_root = Felt252::from_u64(0x7007);
+        let (rpc, _) = vault_rpc(VaultRpc {
+            root: Some(vault_root),
+            ..VaultRpc::serving(keys_of(seeds))
+        })
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(&rpc, &directory.path().join("server.db"), seeds);
+        config.listen_addr = free_listen_addr().await;
+        // Nothing listens there: the indexer is unavailable.
+        config.indexer_url = Some("http://127.0.0.1:9".into());
+        let server = tokio::spawn(run_server_with(config.clone(), TEST_RETRY));
+        wait_for_health(&config.listen_addr).await;
+        let health: Value = reqwest::get(format!("http://{}/health", config.listen_addr))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["current_root"], json!(vault_root));
+        server.abort();
+    }
+
+    /// A delivered lease row as issuance leaves it, of `key_source`.
+    fn stored_lease(store: &NullifierStore, id: &str, nullifier: u64, key_source: &str) {
+        let request: ApiRequestV2 = serde_json::from_value(json!({
+            "client_request_id": id,
+            "payload": "{}",
+            "payload_hash": "0x1",
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x1234",
+                "active_root": "0x0", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+                "request_time": 1, "solvency_bound": 10,
+                "request_nullifier": format!("0x{nullifier:x}"),
+                "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
+                "anonymous_commitment_y": "0x5"
+            },
+            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+        }))
+        .unwrap();
+        store.reserve_openrouter_lease(&request).unwrap();
+        store
+            .create_openrouter_lease(&request, key_source, 10, 4_000_000_000, 4_000_000_000, 1.0)
+            .unwrap();
+        store
+            .activate_openrouter_lease(id, &format!("{id}-hash"))
+            .unwrap();
+    }
+
+    /// Final review (seam:settlement-lifecycle#2): a server configured for one
+    /// key source cannot measure or delete another source's keys, so it
+    /// refuses to start until the other source's leases and queued direct-key
+    /// deletions are drained.
+    #[test]
+    fn startup_refuses_a_key_source_switch_until_the_old_source_drains() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+        {
+            let store = NullifierStore::new(&db_path).unwrap();
+            store
+                .write_deployment_binding(&recorded_binding(seeds))
+                .unwrap();
+            stored_lease(&store, "direct-lease", 0x51, "openrouter");
+            stored_lease(&store, "oa-lease", 0x52, "oa_org");
+            // A source this release does not know never blocks startup.
+            stored_lease(&store, "future-lease", 0x53, "future_source");
+        }
+        let start_with = |source: crate::config::OpenRouterLeaseSourceConfig,
+                          allow_switch: bool| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let database = db_path.clone();
+            let outcome = runtime.block_on(async move {
+                let (rpc, _) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+                let mut config = config(&rpc, &database, seeds);
+                config.listen_addr = free_listen_addr().await;
+                config.openrouter_leases.as_mut().unwrap().source = source;
+                config.allow_key_source_switch = allow_switch;
+                let server = tokio::spawn(run_server_with(config.clone(), TEST_RETRY));
+                let url = format!("http://{}/health", config.listen_addr);
+                for _ in 0..400 {
+                    if server.is_finished() {
+                        return Err(server.await.unwrap().unwrap_err().to_string());
+                    }
+                    if reqwest::get(&url)
+                        .await
+                        .is_ok_and(|r| r.status().is_success())
+                    {
+                        server.abort();
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("the server neither started nor refused");
+            });
+            // Dropping the runtime releases the writer lock.
+            drop(runtime);
+            let released = std::time::Instant::now();
+            while crate::writer_lock::ServerWriterLock::acquire(&db_path).is_err() {
+                assert!(released.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome
+        };
+        let start = |source| start_with(source, false);
+        let oa = || crate::test_support::lease_config().source;
+        let direct = || crate::config::OpenRouterLeaseSourceConfig::OpenRouter {
+            management_key: "test".into(),
+            api_base: "http://127.0.0.1:9".into(),
+        };
+        let error = start(oa()).unwrap_err();
+        assert!(
+            error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'openrouter'"
+            ) && error.contains("configured for key source 'oa_org'")
+                && error.contains("Changing the key source")
+                && !error.contains("future_source"),
+            "{error}"
+        );
+        let error = start(direct()).unwrap_err();
+        assert!(
+            error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'oa_org'"
+            ) && error.contains("configured for key source 'openrouter'"),
+            "{error}"
+        );
+        // Final review, round 1: a database holding unsettled leases of both
+        // sources is refused under either one, so the refusal names the
+        // override, which starts it under either.
+        for error in [start(oa()).unwrap_err(), start(direct()).unwrap_err()] {
+            assert!(
+                error.contains("It also holds 1 such lease(s) of")
+                    && error.contains("no single credential can drain it")
+                    && error.contains("--allow-key-source-switch"),
+                "{error}"
+            );
+        }
+        start_with(oa(), true).unwrap();
+        start_with(direct(), true).unwrap();
+        // The direct lease settles, but its key's deletion is still queued.
+        let finalize = |id: &str| {
+            NullifierStore::new(&db_path).unwrap().execute_for_test(
+                "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+                [id],
+            );
+        };
+        finalize("direct-lease");
+        NullifierStore::new(&db_path).unwrap().execute_for_test(
+            "INSERT INTO provider_key_cleanup (client_request_id, key_source, key_hash, key_name,
+                next_attempt_at, created_at)
+             VALUES ('direct-lease', 'openrouter', 'direct-lease-hash', 'zkapi-direct-lease', 0, 0)",
+            [],
+        );
+        let error = start(oa()).unwrap_err();
+        assert!(
+            error.contains(
+                "0 unsettled lease(s) and 1 queued key deletion(s) of key source 'openrouter'"
+            ),
+            "{error}"
+        );
+        NullifierStore::new(&db_path)
+            .unwrap()
+            .execute_for_test("DELETE FROM provider_key_cleanup", []);
+        // Drained: the OA server starts, still holding its own pending lease.
+        start(oa()).unwrap();
+        // The direct server still refuses until the OA lease settles.
+        assert!(start(direct()).is_err());
+        finalize("oa-lease");
+        start(direct()).unwrap();
+    }
+
+    /// Final review, round 1: only rows that need the other source's
+    /// credential block startup: possibly delivered leases with no committed
+    /// charge, and deletions of direct keys that may still be usable. A
+    /// never-issued provisioning row, a lease whose key was never delivered,
+    /// a conceded or zero-committed lease, a terminal lease and the deletion
+    /// of an expired key finalize (or are moot) under any configuration.
+    #[test]
+    fn key_source_check_counts_only_what_needs_the_other_credential() {
+        let store = NullifierStore::in_memory().unwrap();
+        let mut config = ServerConfig {
+            openrouter_leases: Some(crate::test_support::lease_config()),
+            ..Default::default()
+        };
+        let set = |sql: &str, id: &str| store.execute_for_test(sql, [id]);
+        // A never-issued provisioning row (no key hash).
+        stored_lease(&store, "provisioning", 0x60, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET status = 'provisioning', key_hash = NULL
+             WHERE client_request_id = ?1",
+            "provisioning",
+        );
+        stored_lease(&store, "never-delivered", 0x61, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET delivered = 0 WHERE client_request_id = ?1",
+            "never-delivered",
+        );
+        stored_lease(&store, "conceded", 0x62, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET charge_basis = 'operator_conceded' WHERE client_request_id = ?1",
+            "conceded",
+        );
+        stored_lease(&store, "zero", 0x63, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET charge_basis = 'unissued', delivered = 0 WHERE client_request_id = ?1",
+            "zero",
+        );
+        stored_lease(&store, "finalized", 0x64, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+            "finalized",
+        );
+        stored_lease(&store, "expired", 0x65, "openrouter");
+        set(
+            "UPDATE openrouter_leases SET status = 'finalized', expires_at = 1 WHERE client_request_id = ?1",
+            "expired",
+        );
+        let queue_deletion = |id: &str| {
+            store.execute_for_test(
+                "INSERT INTO provider_key_cleanup (client_request_id, key_source, key_hash, key_name,
+                    next_attempt_at, created_at)
+                 VALUES (?1, 'openrouter', ?1, ?1, 0, 0)",
+                [id],
+            )
+        };
+        queue_deletion("expired");
+        ensure_key_sources_drained(&config, &store).unwrap();
+
+        // A possibly delivered direct lease needs the direct credential.
+        stored_lease(&store, "delivered", 0x66, "openrouter");
+        let error = ensure_key_sources_drained(&config, &store)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "1 unsettled lease(s) and 0 queued key deletion(s) of key source 'openrouter'"
+            ) && error.contains("Drain the previous key source first")
+                && error.contains("--allow-key-source-switch"),
+            "{error}"
+        );
+        // So does the deletion of a key that has not expired.
+        set(
+            "UPDATE openrouter_leases SET status = 'finalized' WHERE client_request_id = ?1",
+            "delivered",
+        );
+        queue_deletion("delivered");
+        let error = ensure_key_sources_drained(&config, &store)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "0 unsettled lease(s) and 1 queued key deletion(s) of key source 'openrouter'"
+            ),
+            "{error}"
+        );
+        // The operator's override accepts the charges and starts.
+        config.allow_key_source_switch = true;
+        ensure_key_sources_drained(&config, &store).unwrap();
     }
 }
 

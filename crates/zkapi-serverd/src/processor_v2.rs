@@ -72,6 +72,8 @@ const RECENT_ROOTS_CAPACITY: usize = 1024;
 const REJECTED_CLEARANCE_CAPACITY: usize = 4096;
 const KEY_CLEANUP_BATCH: usize = 50;
 const KEY_CLEANUP_MAX_BACKOFF_SECONDS: u64 = 3_600;
+/// Longest wait honoured from an org's retry-after for a pending receipt.
+const MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS: u64 = 300;
 
 /// Latency bounds of the settler. Every settlement step persists its phase
 /// before its external side effect, so cancelling an attempt is safe.
@@ -81,7 +83,7 @@ struct SettlementTiming {
     tick_budget: Duration,
     /// One provider-I/O settlement attempt.
     attempt_timeout: Duration,
-    /// Client retirement waits this long for the settlement lock...
+    /// Client retirement waits this long for its lease's lock...
     retire_lock_timeout: Duration,
     /// ...and this long for its settlement attempt.
     retire_timeout: Duration,
@@ -98,7 +100,10 @@ struct SettlementTiming {
 impl Default for SettlementTiming {
     fn default() -> Self {
         // Issuance-lock wait + tick budget + attempt timeout + cleanup stays
-        // well inside config::SETTLEMENT_SWEEP_SLACK_SECONDS (600).
+        // well inside config::SETTLEMENT_SWEEP_SLACK_SECONDS (600). The
+        // sweep never waits for a lease's lock: a lease an owner's
+        // retirement holds (at most retire_lock_timeout waiting, then
+        // retire_timeout) is left to it.
         Self {
             tick_budget: Duration::from_secs(120),
             attempt_timeout: Duration::from_secs(150),
@@ -138,6 +143,59 @@ impl RecentRoots {
         self.entries
             .iter()
             .any(|(seen, at)| seen == root && at.saturating_add(window) >= now)
+    }
+}
+
+/// Per-lease settlement locks. Settling, retiring or finalizing a lease
+/// excludes every other settlement of that lease, and of no other: an owner's
+/// retirements of one lease never queue ahead of the sweep's work on the
+/// others. A lock lives while someone holds or awaits it.
+#[derive(Default)]
+struct LeaseLocks {
+    table: Mutex<LeaseLockTable>,
+}
+
+#[derive(Default)]
+struct LeaseLockTable {
+    locks: std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    /// Size at which entries nobody holds or awaits are dropped.
+    prune_at: usize,
+}
+
+impl LeaseLocks {
+    const MIN_PRUNE_AT: usize = 64;
+
+    fn lock_of(&self, client_request_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lock) = table
+            .locks
+            .get(client_request_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return lock;
+        }
+        if table.locks.len() >= table.prune_at.max(Self::MIN_PRUNE_AT) {
+            table.locks.retain(|_, lock| lock.strong_count() > 0);
+            table.prune_at = table.locks.len().saturating_mul(2);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        table
+            .locks
+            .insert(client_request_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    /// The lease's lock, unless someone holds or awaits it.
+    fn try_lock(&self, client_request_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.lock_of(client_request_id).try_lock_owned().ok()
+    }
+
+    /// The lease's lock, after those who await it already (FIFO).
+    async fn lock(&self, client_request_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_of(client_request_id).lock_owned().await
     }
 }
 
@@ -270,7 +328,7 @@ pub struct RequestProcessor {
     oa_org: Option<Arc<OaOrgProvisioner>>,
     native_oracle: NativeBillingOracle,
     lease_issue_lock: tokio::sync::Mutex<()>,
-    lease_settlement_lock: tokio::sync::Mutex<()>,
+    lease_locks: LeaseLocks,
     // Keep the database exclusive for this processor's full lifetime, including
     // background tasks that may outlive an HTTP listener.
     _writer_lock: Option<crate::writer_lock::ServerWriterLock>,
@@ -377,7 +435,7 @@ impl RequestProcessor {
             openrouter,
             oa_org,
             lease_issue_lock: tokio::sync::Mutex::new(()),
-            lease_settlement_lock: tokio::sync::Mutex::new(()),
+            lease_locks: LeaseLocks::default(),
             _writer_lock: writer_lock,
         })
     }
@@ -731,13 +789,15 @@ impl RequestProcessor {
         };
 
         // A persisted request already froze its quote before external issuance.
-        // Matching retries remain valid after the oracle round ages out.
+        // Matching retries remain valid after the oracle round ages out. An
+        // unreadable store is an error: never a new request whose quote and
+        // freshness are checked again.
         let existing_lease = self
             .store
-            .lookup_openrouter_lease(&request.client_request_id);
+            .try_lookup_openrouter_lease(&request.client_request_id)?;
         let existing_reservation = self
             .store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier);
+            .try_lookup_by_nullifier(&request.public_inputs.request_nullifier)?;
         if let Some(existing) = existing_lease.as_ref() {
             if api_request_binding(&existing.api_request)? != api_request_binding(request)? {
                 return Err(ServerError::Replay);
@@ -769,7 +829,7 @@ impl RequestProcessor {
         let mut ttl_seconds = lease_config.ttl_seconds;
         let existing = self
             .store
-            .lookup_openrouter_lease(&request.client_request_id);
+            .try_lookup_openrouter_lease(&request.client_request_id)?;
         if let Some(existing) = existing.as_ref() {
             let persisted_binding = api_request_binding(&existing.api_request)?;
             if existing.request_nullifier != request.public_inputs.request_nullifier
@@ -1136,7 +1196,8 @@ impl RequestProcessor {
     }
 
     /// Under the issuance lock (awaiting earlier in-flight issuance), require
-    /// that neither the request's nullifier nor its ID has a reservation.
+    /// that neither the request's nullifier nor its ID has a reservation. A
+    /// store that cannot be read is an error, never an absent reservation.
     async fn ensure_unaccepted(
         &self,
         client_request_id: &str,
@@ -1145,13 +1206,16 @@ impl RequestProcessor {
         let _guard = self.lease_issue_lock.lock().await;
         if self
             .store
-            .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .try_lookup_by_nullifier(&request.public_inputs.request_nullifier)?
             .is_some()
             || self
                 .store
-                .lookup_openrouter_lease(client_request_id)
+                .try_lookup_openrouter_lease(client_request_id)?
                 .is_some()
-            || self.store.lookup_by_client_id(client_request_id).is_some()
+            || self
+                .store
+                .try_lookup_by_client_id(client_request_id)?
+                .is_some()
         {
             return Err(ServerError::LeasePending);
         }
@@ -1164,106 +1228,203 @@ impl RequestProcessor {
     /// lease needs the issuance lock: a busy lock defers it to the next tick,
     /// or, once it is past its deadline, to a bounded wait for the lock that
     /// follows pass 1. Pass 2 settles from provider usage, bounded per attempt
-    /// and per tick. Pass 3 deletes provider keys of terminal leases, outside
-    /// the lock.
+    /// and per tick, nearest deadline first (see `settle_from_provider_usage`).
+    /// Pass 3 deletes provider keys of terminal leases, outside every lock.
+    /// Each lease is handled under its own lock (`LeaseLocks`), on the row as
+    /// stored then; a lease whose lock is held or awaited is being settled
+    /// by its owner's retirement, which applies the same rules, and is seen
+    /// again next tick.
     pub async fn settle_due_openrouter_leases(&self) {
-        {
-            let _settlement_guard = self.lease_settlement_lock.lock().await;
-            let started = Instant::now();
-            let now = current_timestamp();
-            self.assign_missing_settlement_deadlines(now);
-            let mut provider_io = Vec::new();
-            let mut overdue_unissued = Vec::new();
-            for lease in self.store.due_openrouter_leases(now) {
-                let result = if Self::conceded(&lease) {
-                    self.finalize_conceded_lease(&lease.client_request_id)
-                } else if Self::never_delivered(&lease) {
-                    // Issuance holds this lock across provider I/O and until
-                    // it has returned or abandoned the key.
-                    match self.lease_issue_lock.try_lock() {
-                        Ok(_issue_guard) => {
-                            self.finalize_never_delivered_lease(&lease.client_request_id)
-                        }
-                        Err(_) => {
-                            if matches!(self.settlement_deadline(&lease, now), Ok(deadline) if now >= deadline)
-                            {
-                                overdue_unissued.push(lease);
-                            }
-                            continue;
-                        }
-                    }
-                } else {
-                    match self.settlement_deadline(&lease, now) {
-                        Ok(deadline)
-                            if now >= deadline
-                                && matches!(lease.key_source.as_str(), "openrouter" | "oa_org") =>
-                        {
-                            self.finalize_lease_fallback(
-                                &lease.client_request_id,
-                                FallbackCause::Deadline,
-                            )
-                        }
-                        Ok(_) => {
-                            provider_io.push(lease);
-                            continue;
-                        }
-                        Err(error) => Err(error),
-                    }
-                };
-                if let Err(error) = result {
-                    self.note_settlement_failure(&lease, &error);
+        let started = Instant::now();
+        let now = current_timestamp();
+        self.assign_missing_settlement_deadlines(now);
+        let mut provider_io = Vec::new();
+        let mut overdue_unissued = Vec::new();
+        for scanned in self.store.due_openrouter_leases(now) {
+            let Some(lease_guard) = self.lease_locks.try_lock(&scanned.client_request_id) else {
+                continue;
+            };
+            let lease = match self
+                .store
+                .try_lookup_openrouter_lease(&scanned.client_request_id)
+            {
+                Ok(Some(lease)) if !matches!(lease.status.as_str(), "finalized" | "cancelled") => {
+                    lease
                 }
-            }
-            if !overdue_unissued.is_empty() {
-                // Queue for the lock (FIFO) instead of skipping: no stream of
-                // lock holders can postpone these past their deadline. The
-                // wait is bounded so that the rest of the tick still runs.
-                match tokio::time::timeout(
-                    self.timing.issue_lock_timeout,
-                    self.lease_issue_lock.lock(),
-                )
-                .await
-                {
+                Ok(_) => continue,
+                Err(error) => {
+                    self.note_settlement_failure(&scanned, &error);
+                    continue;
+                }
+            };
+            let result = if Self::conceded(&lease) {
+                self.finalize_conceded_lease(&lease.client_request_id)
+            } else if Self::never_delivered(&lease) {
+                // Issuance holds this lock across provider I/O and until
+                // it has returned or abandoned the key.
+                match self.lease_issue_lock.try_lock() {
                     Ok(_issue_guard) => {
-                        for lease in &overdue_unissued {
-                            if let Err(error) =
-                                self.finalize_never_delivered_lease(&lease.client_request_id)
-                            {
-                                self.note_settlement_failure(lease, &error);
-                            }
-                        }
+                        self.finalize_never_delivered_lease(&lease.client_request_id)
                     }
-                    Err(_) => tracing::warn!(
-                        leases = overdue_unissued.len(),
-                        "issuance lock stayed busy; never-delivered leases past their settlement deadline are retried next tick"
-                    ),
+                    Err(_) => {
+                        if matches!(self.settlement_deadline(&lease, now), Ok(deadline) if now >= deadline)
+                        {
+                            overdue_unissued.push((lease, lease_guard));
+                        }
+                        continue;
+                    }
                 }
-            }
-            for lease in provider_io {
-                if started.elapsed() >= self.timing.tick_budget {
-                    break;
+            } else {
+                match self.settlement_deadline(&lease, now) {
+                    Ok(deadline)
+                        if now >= deadline
+                            && matches!(lease.key_source.as_str(), "openrouter" | "oa_org") =>
+                    {
+                        self.finalize_lease_fallback(
+                            &lease.client_request_id,
+                            FallbackCause::Deadline,
+                        )
+                    }
+                    Ok(_) => {
+                        // Pass 2 takes the lease's lock again per attempt.
+                        provider_io.push(lease);
+                        continue;
+                    }
+                    Err(error) => Err(error),
                 }
-                let attempt = tokio::time::timeout(
-                    self.timing.attempt_timeout,
-                    self.settle_with_provider(&lease),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ServerError::Internal(
-                        "settlement attempt timed out".to_string(),
-                    ))
-                });
-                if let Err(error) = attempt {
-                    self.note_settlement_failure(&lease, &error);
-                }
+            };
+            if let Err(error) = result {
+                self.note_settlement_failure(&lease, &error);
             }
         }
+        if !overdue_unissued.is_empty() {
+            // Queue for the lock (FIFO) instead of skipping: no stream of
+            // lock holders can postpone these past their deadline. The
+            // wait is bounded so that the rest of the tick still runs. Their
+            // own locks are kept meanwhile.
+            match tokio::time::timeout(self.timing.issue_lock_timeout, self.lease_issue_lock.lock())
+                .await
+            {
+                Ok(_issue_guard) => {
+                    for (lease, _lease_guard) in &overdue_unissued {
+                        if let Err(error) =
+                            self.finalize_never_delivered_lease(&lease.client_request_id)
+                        {
+                            self.note_settlement_failure(lease, &error);
+                        }
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    leases = overdue_unissued.len(),
+                    "issuance lock stayed busy; never-delivered leases past their settlement deadline are retried next tick"
+                ),
+            }
+        }
+        drop(overdue_unissued);
+        self.settle_from_provider_usage(provider_io, started).await;
         self.cleanup_provider_keys().await;
     }
 
+    /// Pass 2: one provider-I/O attempt per due lease until the tick budget is
+    /// spent. Leases are drawn from two orders over the same set: nearest
+    /// write-once deadline first, and least recently attempted first. Each
+    /// attempt comes from whichever order has used less of this tick, so the
+    /// lease nearest its deadline is attempted first, and leases that keep
+    /// failing slowly near their deadlines cannot starve the rest (nor the
+    /// reverse). A pending result defers its lease (`note_settlement_failure`),
+    /// so it is not polled again on every tick. Each attempt takes only its
+    /// lease's lock, and skips a lease whose lock is held or awaited (by its
+    /// owner's retirement): retirements wait for no other lease's attempt,
+    /// and no lease's retirements hold up the others' attempts.
+    async fn settle_from_provider_usage(
+        &self,
+        leases: Vec<OpenRouterLeaseRecord>,
+        started: Instant,
+    ) {
+        let mut by_deadline: Vec<usize> = (0..leases.len()).collect();
+        by_deadline.sort_by_key(|&index| {
+            let lease = &leases[index];
+            (
+                lease.settlement_deadline_at.unwrap_or(u64::MAX),
+                lease.updated_at,
+                lease.settle_after,
+            )
+        });
+        // The store returns leases least recently attempted first.
+        let by_age: Vec<usize> = (0..leases.len()).collect();
+        let orders = [by_deadline, by_age];
+        let mut next = [0usize; 2];
+        let mut spent = [Duration::ZERO; 2];
+        let mut attempted = vec![false; leases.len()];
+        while started.elapsed() < self.timing.tick_budget {
+            let order = usize::from(spent[1] < spent[0]);
+            let queue = &orders[order];
+            while next[order] < queue.len() && attempted[queue[next[order]]] {
+                next[order] += 1;
+            }
+            // Either order holds every lease: once one is used up, all were
+            // attempted.
+            let Some(&index) = queue.get(next[order]) else {
+                break;
+            };
+            next[order] += 1;
+            attempted[index] = true;
+            let attempt_started = Instant::now();
+            self.attempt_provider_settlement(&leases[index]).await;
+            spent[order] += attempt_started.elapsed();
+        }
+    }
+
+    /// One pass-2 attempt under the lease's lock, on the lease as stored now:
+    /// an owner's retirement may have settled, advanced or deferred it since
+    /// the scan. A lease whose lock is held or awaited is left to its owner's
+    /// retirement.
+    async fn attempt_provider_settlement(&self, scanned: &OpenRouterLeaseRecord) {
+        let Some(_lease_guard) = self.lease_locks.try_lock(&scanned.client_request_id) else {
+            return;
+        };
+        let lease = match self
+            .store
+            .try_lookup_openrouter_lease(&scanned.client_request_id)
+        {
+            Ok(Some(lease)) if !matches!(lease.status.as_str(), "finalized" | "cancelled") => lease,
+            Ok(_) => return,
+            Err(error) => {
+                self.note_settlement_failure(scanned, &error);
+                return;
+            }
+        };
+        match self.pending_deferral(&lease, current_timestamp()) {
+            Ok(None) => {}
+            Ok(Some(_)) => return,
+            Err(error) => {
+                self.note_settlement_failure(&lease, &error);
+                return;
+            }
+        }
+        let attempt = tokio::time::timeout(
+            self.timing.attempt_timeout,
+            self.settle_with_provider(&lease),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ServerError::Internal(
+                "settlement attempt timed out".to_string(),
+            ))
+        });
+        if let Err(error) = attempt {
+            self.note_settlement_failure(&lease, &error);
+        }
+    }
+
     fn note_settlement_failure(&self, lease: &OpenRouterLeaseRecord, error: &ServerError) {
-        // Waiting for a drain interval or an OA receipt is not a failure.
-        if matches!(error, ServerError::LeaseSettlementPending { .. }) {
+        // Waiting for a drain interval or an OA receipt is not a failure: the
+        // lease is asked again after the retry time it was given.
+        if let ServerError::LeaseSettlementPending {
+            retry_after_seconds,
+        } = error
+        {
+            self.defer_pending_settlement(lease, *retry_after_seconds);
             return;
         }
         tracing::warn!(
@@ -1274,6 +1435,50 @@ impl RequestProcessor {
         let _ = self
             .store
             .record_openrouter_lease_error(&lease.client_request_id, &error.to_string());
+    }
+
+    /// The time a pending settlement of this lease was deferred to
+    /// (`defer_pending_settlement`), while it is still ahead.
+    fn pending_deferral(
+        &self,
+        lease: &OpenRouterLeaseRecord,
+        now: u64,
+    ) -> Result<Option<u64>, ServerError> {
+        Ok(self
+            .store
+            .openrouter_lease_next_attempt_at(&lease.client_request_id)?
+            .filter(|next_attempt_at| *next_attempt_at > now))
+    }
+
+    /// Defer the next provider-I/O attempt of a lease whose settlement is
+    /// pending by its retry time: at least the poll interval, at most
+    /// MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS, and never more than half of the
+    /// time left before its deadline, so that it is asked again shortly
+    /// before the deadline turns it into a worst-case charge.
+    fn defer_pending_settlement(&self, lease: &OpenRouterLeaseRecord, retry_after_seconds: u64) {
+        let now = current_timestamp();
+        let poll = self
+            .config
+            .openrouter_leases
+            .as_ref()
+            .map_or(1, |config| config.settlement_poll_seconds.max(1));
+        let left = lease
+            .settlement_deadline_at
+            .map_or(u64::MAX, |deadline| deadline.saturating_sub(now));
+        let delay = retry_after_seconds
+            .clamp(poll, MAX_PENDING_SETTLEMENT_DEFERRAL_SECONDS.max(poll))
+            .min(left / 2);
+        if let Err(error) = self.store.defer_openrouter_lease_settlement(
+            &lease.client_request_id,
+            now.saturating_add(delay),
+            now,
+        ) {
+            tracing::warn!(
+                client_request_id = %lease.client_request_id,
+                error = %error,
+                "could not defer a pending lease settlement; it is asked again next tick"
+            );
+        }
     }
 
     /// One provider-I/O settlement attempt for a possibly delivered lease. A
@@ -1319,38 +1524,51 @@ impl RequestProcessor {
                 .as_ref()
                 .map_or(1, |lease| lease.settlement_poll_seconds.max(1)),
         };
-        let Ok(_settlement_guard) = tokio::time::timeout(
+        // The lease as stored, if `request` is its owner's proof.
+        let owned_lease = || {
+            let lease = self
+                .store
+                .try_lookup_openrouter_lease(client_request_id)?
+                .ok_or_else(|| {
+                    ServerError::InvalidRequest("unknown OpenRouter lease".to_string())
+                })?;
+            let request_matches = serde_json::to_value(request)
+                .and_then(|request| {
+                    serde_json::to_value(&lease.api_request).map(|issued| request == issued)
+                })
+                .map_err(|error| {
+                    ServerError::Internal(format!(
+                        "failed to compare lease retirement proof: {error}"
+                    ))
+                })?;
+            if request.client_request_id != client_request_id || !request_matches {
+                return Err(ServerError::InvalidRequest(
+                    "lease retirement proof does not match the issued lease".to_string(),
+                ));
+            }
+            Ok(lease)
+        };
+        // Check the proof before taking the lease's lock too, so that only
+        // its owner can make the sweep leave the lease to a retirement.
+        owned_lease()?;
+        // Waits only for settlement of this lease.
+        let Ok(_lease_guard) = tokio::time::timeout(
             self.timing.retire_lock_timeout,
-            self.lease_settlement_lock.lock(),
+            self.lease_locks.lock(client_request_id),
         )
         .await
         else {
             return Err(pending());
         };
-        let lease = self
-            .store
-            .lookup_openrouter_lease(client_request_id)
-            .ok_or_else(|| ServerError::InvalidRequest("unknown OpenRouter lease".to_string()))?;
-        let request_matches = serde_json::to_value(request)
-            .and_then(|request| {
-                serde_json::to_value(&lease.api_request).map(|issued| request == issued)
-            })
-            .map_err(|error| {
-                ServerError::Internal(format!("failed to compare lease retirement proof: {error}"))
-            })?;
-        if request.client_request_id != client_request_id || !request_matches {
-            return Err(ServerError::InvalidRequest(
-                "lease retirement proof does not match the issued lease".to_string(),
-            ));
-        }
+        let lease = owned_lease()?;
         tokio::time::timeout(self.timing.retire_timeout, self.retire_locked(&lease))
             .await
             .map_err(|_| pending())??;
-        self.openrouter_lease_status(client_request_id)
+        self.openrouter_lease_status(client_request_id)?
             .ok_or_else(|| ServerError::Internal("retired lease disappeared".to_string()))
     }
 
-    /// Callers hold the settlement lock.
+    /// Callers hold the lease's lock.
     async fn retire_locked(&self, lease: &OpenRouterLeaseRecord) -> Result<(), ServerError> {
         if matches!(lease.status.as_str(), "finalized" | "cancelled") {
             return Ok(());
@@ -1396,7 +1614,17 @@ impl RequestProcessor {
                             FallbackCause::Deadline,
                         )
                     }
-                    _ => self.settle_with_provider(lease).await,
+                    _ => {
+                        // Like pass 2, honour the deferral of a pending
+                        // result: repeated retirements of a lease whose
+                        // receipt is pending answer without provider I/O.
+                        if let Some(next_attempt_at) = self.pending_deferral(lease, now)? {
+                            return Err(ServerError::LeaseSettlementPending {
+                                retry_after_seconds: next_attempt_at - now,
+                            });
+                        }
+                        self.settle_with_provider(lease).await
+                    }
                 }
             }
             _ => return Err(ServerError::LeasePending),
@@ -2364,7 +2592,10 @@ impl RequestProcessor {
         // all checks on its first attempt. Resume it before root/freshness
         // checks so a transport retry remains possible after those values move.
         // A different endpoint kind can never claim the reservation.
-        if let Some(existing) = self.store.lookup_by_nullifier(&public.request_nullifier) {
+        if let Some(existing) = self
+            .store
+            .try_lookup_by_nullifier(&public.request_nullifier)?
+        {
             let same_request = existing.client_request_id.as_deref()
                 == Some(&request.client_request_id)
                 && existing.payload_hash == Some(request.payload_hash)
@@ -2453,7 +2684,7 @@ impl RequestProcessor {
         }
         let reservation_kind = self
             .store
-            .lookup_by_nullifier(&public.request_nullifier)
+            .try_lookup_by_nullifier(&public.request_nullifier)?
             .ok_or_else(|| {
                 ServerError::Internal("request nullifier is no longer reserved".to_string())
             })?
@@ -2598,13 +2829,16 @@ impl RequestProcessor {
         })
     }
 
+    /// A lease's non-secret status; None for an unknown lease. A store that
+    /// cannot be read is an error, never an unknown lease.
     pub fn openrouter_lease_status(
         &self,
         client_request_id: &str,
-    ) -> Option<OpenRouterLeaseStatusResponse> {
+    ) -> Result<Option<OpenRouterLeaseStatusResponse>, ServerError> {
         let now = current_timestamp();
-        self.store
-            .lookup_openrouter_lease(client_request_id)
+        Ok(self
+            .store
+            .try_lookup_openrouter_lease(client_request_id)?
             .map(|lease| OpenRouterLeaseStatusResponse {
                 settlement_deadline: self.pending_settlement_deadline(&lease, now),
                 // The basis of a finalized charge only.
@@ -2618,7 +2852,7 @@ impl RequestProcessor {
                 usage_usd: lease.usage_usd,
                 charge_applied: lease.charge_applied,
                 last_error: lease.last_error,
-            })
+            }))
     }
 
     /// Sign a mutual-close clearance for a nullifier and reserve it for good.
@@ -2838,24 +3072,28 @@ impl RequestProcessor {
         read.map_err(ServerError::Internal)
     }
 
+    /// Recovery by client request ID. `not_found` (nullifier_status
+    /// `unknown`) means the store was read and holds no such request; a store
+    /// that cannot be read is a retriable database error.
     pub fn recover_by_client_id(
         &self,
         client_request_id: &str,
     ) -> Result<RecoveryResponseV2, ServerError> {
         Ok(self
             .store
-            .lookup_by_client_id(client_request_id)
+            .try_lookup_by_client_id(client_request_id)?
             .map(|record| self.recovery_from_record(&record))
             .unwrap_or_else(not_found_recovery))
     }
 
+    /// Recovery by nullifier, with the same contract as by client request ID.
     pub fn recover_by_nullifier(
         &self,
         nullifier: &Felt252,
     ) -> Result<RecoveryResponseV2, ServerError> {
         Ok(self
             .store
-            .lookup_by_nullifier(nullifier)
+            .try_lookup_by_nullifier(nullifier)?
             .map(|record| self.recovery_from_record(&record))
             .unwrap_or_else(not_found_recovery))
     }
@@ -2865,10 +3103,18 @@ impl RequestProcessor {
         if record.status == NullifierStatus::Reserved
             && record.reservation_kind == "openrouter_lease"
         {
-            recovery.settlement_deadline = record
-                .client_request_id
-                .as_deref()
-                .and_then(|id| self.store.lookup_openrouter_lease(id))
+            // Informational: a lease row that cannot be read omits the
+            // deadline, but never hides the reservation itself.
+            let lease = record.client_request_id.as_deref().and_then(|id| {
+                self.store
+                    .try_lookup_openrouter_lease(id)
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "settlement deadline unavailable for recovery");
+                    })
+                    .ok()
+                    .flatten()
+            });
+            recovery.settlement_deadline = lease
                 .filter(|lease| lease.request_nullifier == record.nullifier)
                 .and_then(|lease| self.pending_settlement_deadline(&lease, current_timestamp()));
         }
@@ -3465,6 +3711,7 @@ mod tests {
             processor
                 .openrouter_lease_status(&request.client_request_id)
                 .unwrap()
+                .unwrap()
                 .status,
             "finalized"
         );
@@ -3584,6 +3831,7 @@ mod tests {
             processor
                 .openrouter_lease_status(&request.client_request_id)
                 .unwrap()
+                .unwrap()
                 .status,
             "finalized"
         );
@@ -3630,6 +3878,7 @@ mod tests {
             processor
                 .openrouter_lease_status(&request.client_request_id)
                 .unwrap()
+                .unwrap()
                 .status,
             "finalized"
         );
@@ -3665,6 +3914,7 @@ mod tests {
         assert_eq!(
             processor
                 .openrouter_lease_status(&request.client_request_id)
+                .unwrap()
                 .unwrap()
                 .status,
             "finalized"
@@ -5546,6 +5796,7 @@ mod tests {
         );
         let status = processor
             .openrouter_lease_status(&pending.client_request_id)
+            .unwrap()
             .unwrap();
         assert_eq!(status.settlement_deadline, Some(now + 3_600));
 
@@ -5564,6 +5815,7 @@ mod tests {
         assert_eq!(review.charge_applied, Some(bound));
         let status = processor
             .openrouter_lease_status(&overdue.client_request_id)
+            .unwrap()
             .unwrap();
         assert_eq!(status.status, "finalized");
         assert_eq!(status.charge_basis.as_deref(), Some("worst_case"));
@@ -5800,6 +6052,7 @@ mod tests {
         assert_eq!(
             processor
                 .openrouter_lease_status(&request.client_request_id)
+                .unwrap()
                 .unwrap()
                 .charge_basis
                 .as_deref(),
@@ -6723,6 +6976,7 @@ mod tests {
                 while !issuance.is_finished()
                     && processor
                         .openrouter_lease_status(&request.client_request_id)
+                        .unwrap()
                         .is_none_or(|status| status.status != "active")
                 {
                     tokio::time::sleep(Duration::from_micros(100)).await;
@@ -7245,7 +7499,7 @@ mod tests {
             // A database fault: the reservation's payload hash changes.
             set_payload_hash(&processor.store, "0x1".into());
             runtime.block_on(processor.settle_due_openrouter_leases());
-            let status = processor.openrouter_lease_status(&id).unwrap();
+            let status = processor.openrouter_lease_status(&id).unwrap().unwrap();
             assert_eq!(status.status, "cancelled", "{case}");
             assert_eq!(
                 record_of(&processor, &request).status,
@@ -7292,7 +7546,7 @@ mod tests {
             let calls = *usage_calls.lock().unwrap();
             let processor = serving(&path);
             runtime.block_on(processor.settle_due_openrouter_leases());
-            let status = processor.openrouter_lease_status(&id).unwrap();
+            let status = processor.openrouter_lease_status(&id).unwrap().unwrap();
             assert_eq!(
                 (status.status.as_str(), status.charge_basis.as_deref()),
                 ("finalized", Some(basis)),
@@ -7683,6 +7937,7 @@ mod tests {
             processor
                 .openrouter_lease_status("concede-later")
                 .unwrap()
+                .unwrap()
                 .status,
             "cancelled"
         );
@@ -7798,6 +8053,7 @@ mod tests {
         assert_eq!(
             processor
                 .openrouter_lease_status("tampered")
+                .unwrap()
                 .unwrap()
                 .status,
             "cancelled"
@@ -8041,7 +8297,11 @@ mod tests {
                 .execute_for_test(corrupt, rusqlite::params![nullifier]);
             runtime.block_on(processor.settle_due_openrouter_leases());
             assert_eq!(
-                processor.openrouter_lease_status("rebound").unwrap().status,
+                processor
+                    .openrouter_lease_status("rebound")
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 "cancelled",
                 "{case}"
             );
@@ -8328,7 +8588,10 @@ mod tests {
                 .any(|stored| stored.review.reason == "binding_corrupt"
                     && stored.acknowledged_at.is_some()));
             runtime.block_on(processor.settle_due_openrouter_leases());
-            let status = processor.openrouter_lease_status("lease-a").unwrap();
+            let status = processor
+                .openrouter_lease_status("lease-a")
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 (status.status.as_str(), status.charge_basis.as_deref()),
                 ("finalized", Some("measured"))
@@ -8401,7 +8664,11 @@ mod tests {
             set_saved(&processor.store, &serde_json::to_string(&faulted).unwrap());
             runtime.block_on(processor.settle_due_openrouter_leases());
             assert_eq!(
-                processor.openrouter_lease_status("bitrot").unwrap().status,
+                processor
+                    .openrouter_lease_status("bitrot")
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 "cancelled"
             );
             if unreadable {
@@ -8451,7 +8718,10 @@ mod tests {
                 api_request_binding(&request).unwrap()
             );
             runtime.block_on(processor.settle_due_openrouter_leases());
-            let status = processor.openrouter_lease_status("bitrot").unwrap();
+            let status = processor
+                .openrouter_lease_status("bitrot")
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 (status.status.as_str(), status.charge_basis.as_deref()),
                 ("finalized", Some("measured"))
@@ -8459,6 +8729,137 @@ mod tests {
             assert_eq!(
                 installed_balance(&processor, &wallet, &note, &prepared),
                 2_000_000 - 1_234
+            );
+        }
+        usage_server.abort();
+    }
+
+    /// Final review, round 2: a pending (delivered, active) lease whose saved
+    /// request cannot be decoded was skipped by every settlement tick, so its
+    /// write-once deadline never applied and its nullifier stayed reserved,
+    /// while `settlement reopen --saved-request` refused it as not
+    /// cancelled: lease routes promised an operator repair that no tool made.
+    /// The command now restores the request of such a pending lease, keeping
+    /// its status, and the next tick settles it: from measured usage before
+    /// its deadline, at its solvency bound once that has passed (the output
+    /// warns), and the wallet installs the successor.
+    #[test]
+    fn saved_request_restores_a_pending_lease_the_sweep_could_not_read() {
+        use crate::nullifier_store::{OfflineStore, ReopenOptions, ReopenRefusal};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (usage_url, usage_server, usage_calls) = runtime.block_on(oa_usage_server(1_234, 5));
+        let verifier = RequestVerifier::load(setup_directory()).unwrap();
+        for past_deadline in [false, true] {
+            let (wallet, note, prepared) = browser_lease_request("rotting");
+            let request = prepared.request.clone();
+            let bound = request.public_inputs.solvency_bound;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            let now = current_timestamp();
+            let processor = oa_usage_processor(&path, &usage_url);
+            add_lease(
+                &processor,
+                &request,
+                LeaseSetup {
+                    key_source: "oa_org",
+                    expires_at: now - 100,
+                    deadline: Some(if past_deadline { now - 1 } else { now + 3_600 }),
+                    key_hash: Some("rotting-hash"),
+                    delivered: Some(true),
+                    ttl: Some(300),
+                },
+            );
+            processor.store.execute_for_test(
+                "UPDATE openrouter_leases SET api_request_json = '{\"client_request_id\":\"rot'
+                 WHERE client_request_id = 'rotting'",
+                [],
+            );
+            let calls_before = *usage_calls.lock().unwrap();
+            for _ in 0..3 {
+                runtime.block_on(processor.settle_due_openrouter_leases());
+            }
+            // Never settled, not even past its deadline: still active and
+            // reserved, and its status unreadable.
+            assert_eq!(*usage_calls.lock().unwrap(), calls_before);
+            assert_eq!(
+                processor.store.query_i64_for_test(
+                    "SELECT status = 'active' FROM openrouter_leases
+                     WHERE client_request_id = 'rotting'",
+                    [],
+                ),
+                1
+            );
+            assert_eq!(
+                record_of(&processor, &request).status,
+                NullifierStatus::Reserved
+            );
+            assert!(matches!(
+                processor.openrouter_lease_status("rotting"),
+                Err(ServerError::LeaseRecordUnreadable)
+            ));
+            drop(processor);
+
+            let offline = OfflineStore::open(&path).unwrap();
+            assert!(matches!(
+                offline.reopen_cancelled_lease("rotting", ReopenOptions::default(), &verifier),
+                Err(ReopenRefusal::NotCancelled(status)) if status == "active"
+            ));
+            let restored = offline
+                .reopen_cancelled_lease(
+                    "rotting",
+                    ReopenOptions {
+                        saved_request: Some(&request),
+                        ..ReopenOptions::default()
+                    },
+                    &verifier,
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    restored.status.as_str(),
+                    restored.saved_request,
+                    restored.restored_pending
+                ),
+                ("active", "restored", true)
+            );
+            assert_eq!(
+                (restored.settles, restored.warning.is_some()),
+                if past_deadline {
+                    ("deadline_fallback", true)
+                } else {
+                    ("measured_until_deadline", false)
+                }
+            );
+            drop(offline);
+
+            let processor = oa_usage_processor(&path, &usage_url);
+            runtime.block_on(processor.settle_due_openrouter_leases());
+            let status = processor
+                .openrouter_lease_status("rotting")
+                .unwrap()
+                .unwrap();
+            let charge = if past_deadline {
+                assert_eq!(
+                    (status.status.as_str(), status.charge_basis.as_deref()),
+                    ("finalized", Some("worst_case"))
+                );
+                // Past its deadline: no provider I/O.
+                assert_eq!(*usage_calls.lock().unwrap(), calls_before);
+                bound
+            } else {
+                assert_eq!(
+                    (status.status.as_str(), status.charge_basis.as_deref()),
+                    ("finalized", Some("measured"))
+                );
+                1_234
+            };
+            assert_eq!(
+                record_of(&processor, &request).status,
+                NullifierStatus::Finalized
+            );
+            assert_eq!(
+                installed_balance(&processor, &wallet, &note, &prepared),
+                2_000_000 - charge
             );
         }
         usage_server.abort();
@@ -9272,5 +9673,709 @@ mod tests {
             .process_clearance(&clearance(fixture))
             .await
             .unwrap();
+    }
+
+    // ---- Pass-2 scheduling: pending receipts, deadlines, retirement --------
+
+    type UsageCalls = Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>;
+
+    /// An OA usage relay that answers by key hash: "pending-*" says pending
+    /// (retry after `retry_after` s) and "error-*" fails with 503, both after
+    /// `delay`; "flaky-*" fails once, then settles; any other key gets a
+    /// finalized receipt of 1000 credits at once. Counts calls per key.
+    async fn oa_scheduling_server(
+        delay: std::time::Duration,
+        retry_after: u64,
+    ) -> (String, tokio::task::JoinHandle<()>, UsageCalls) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let calls = UsageCalls::default();
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/api/zkapi/key_usage",
+            post(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let key = body["key_hash"].as_str().unwrap().to_string();
+                    let count = {
+                        let mut calls = seen.lock().unwrap();
+                        let count = calls.entry(key.clone()).or_default();
+                        *count += 1;
+                        *count
+                    };
+                    if key.starts_with("pending") {
+                        tokio::time::sleep(delay).await;
+                        return (
+                            StatusCode::OK,
+                            Json(json!({"source":"oa_org", "version":1, "status":"pending",
+                                "client_request_id":body["client_request_id"],
+                                "station_request_id":"ab".repeat(32), "key_hash":key,
+                                "retry_after_seconds":retry_after})),
+                        );
+                    }
+                    if key.starts_with("error") || (key.starts_with("flaky") && count == 1) {
+                        tokio::time::sleep(delay).await;
+                        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+                    }
+                    let expires_at = body["expires_at_unix"].as_u64().unwrap() - 30;
+                    (
+                        StatusCode::OK,
+                        Json(json!({"source":"oa_org", "version":1, "status":"finalized",
+                            "client_request_id":body["client_request_id"],
+                            "station_request_id":"ab".repeat(32), "key_hash":key,
+                            "usage_credits":1000, "credit_limit_credits":body["credit_limit_credits"],
+                            "expires_at_unix":expires_at, "closed_at_unix":expires_at,
+                            "finalized_at_unix":expires_at + 1, "station_id":"station",
+                            "station_signature":"ab".repeat(64), "org_signature":"cd".repeat(64)})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, server, calls)
+    }
+
+    /// An OA processor settling against `url`, with a scaled-down tick budget
+    /// (production: 120 s).
+    fn oa_scheduling_processor(url: String, tick_budget: std::time::Duration) -> RequestProcessor {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.oa_org = Some(Arc::new(
+            OaOrgProvisioner::new(url, "test-secret".into()).unwrap(),
+        ));
+        processor.timing.tick_budget = tick_budget;
+        processor
+    }
+
+    /// A delivered OA lease past its drain with `key_hash`, a write-once
+    /// `deadline` and a last-attempt time of `updated_at`.
+    fn add_delivered_oa_lease(
+        processor: &RequestProcessor,
+        id: &str,
+        nullifier: u64,
+        key_hash: &str,
+        deadline: u64,
+        updated_at: i64,
+    ) -> ApiRequestV2 {
+        let request = lease_request_for(processor, id, nullifier, None);
+        add_lease(
+            processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: current_timestamp() - 100,
+                deadline: Some(deadline),
+                key_hash: Some(key_hash),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        processor.store.execute_for_test(
+            "UPDATE openrouter_leases SET updated_at = ?1 WHERE client_request_id = ?2",
+            rusqlite::params![updated_at, id],
+        );
+        request
+    }
+
+    fn calls_to(calls: &UsageCalls, key: &str) -> usize {
+        calls.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+
+    fn assert_settled_from_usage(processor: &RequestProcessor, request: &ApiRequestV2) {
+        let record = record_of(processor, request);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(payload_of(&record)["charge_basis"], "measured");
+        assert!(record.charge_applied.unwrap() < request.public_inputs.solvency_bound);
+        assert!(review_of(processor, request).is_none());
+    }
+
+    /// Sweep until `deadline` has passed.
+    async fn sweep_through(processor: &RequestProcessor, deadline: u64) {
+        while current_timestamp() <= deadline {
+            processor.settle_due_openrouter_leases().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Final review (seam:settlement-lifecycle#1): OA receipts that stay
+    /// pending once held the front of pass 2 on every tick, so a lease behind
+    /// them whose receipt was available was never attempted and was charged
+    /// its solvency bound at its deadline.
+    #[tokio::test]
+    async fn pending_receipts_ahead_cannot_starve_a_lease_near_its_deadline() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(150), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_millis(400));
+        let now = current_timestamp();
+        for i in 0..3u64 {
+            add_delivered_oa_lease(
+                &processor,
+                &format!("pending-{i}"),
+                800 + i,
+                &format!("pending-hash-{i}"),
+                now + 3_600,
+                100 + i as i64,
+            );
+        }
+        let deadline = now + 4;
+        let healthy =
+            add_delivered_oa_lease(&processor, "healthy", 900, "healthy-hash", deadline, 200);
+        sweep_through(&processor, deadline).await;
+        assert_settled_from_usage(&processor, &healthy);
+        assert_eq!(calls_to(&calls, "healthy-hash"), 1);
+        server.abort();
+    }
+
+    /// The realistic ordering: the lease was delivered first, then one
+    /// transient org error moved it behind pending leases delivered after it,
+    /// whose deadlines are later than its own.
+    #[tokio::test]
+    async fn a_transient_error_cannot_strand_a_lease_behind_pending_receipts() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(150), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_millis(400));
+        let now = current_timestamp();
+        let deadline = now + 4;
+        let flaky = add_delivered_oa_lease(&processor, "flaky", 900, "flaky-hash", deadline, 50);
+        for i in 0..3u64 {
+            add_delivered_oa_lease(
+                &processor,
+                &format!("pending-{i}"),
+                800 + i,
+                &format!("pending-hash-{i}"),
+                deadline + 60,
+                100 + i as i64,
+            );
+        }
+        sweep_through(&processor, deadline).await;
+        assert_settled_from_usage(&processor, &flaky);
+        assert_eq!(calls_to(&calls, "flaky-hash"), 2);
+        server.abort();
+    }
+
+    /// A pending receipt is not a failed attempt: nothing is counted, and the
+    /// org's retry-after is honoured durably (bounded by half the time left
+    /// before the deadline), instead of polling it again on every tick.
+    #[tokio::test]
+    async fn pending_receipt_waits_for_its_retry_after_without_counting_a_failure() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(1), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_secs(5));
+        let now = current_timestamp();
+        let far = add_delivered_oa_lease(&processor, "far", 801, "pending-far", now + 3_600, 1);
+        add_delivered_oa_lease(&processor, "near", 802, "pending-near", now + 20, 1);
+        processor.settle_due_openrouter_leases().await;
+        processor.settle_due_openrouter_leases().await;
+        assert_eq!(calls_to(&calls, "pending-far"), 1);
+        assert_eq!(calls_to(&calls, "pending-near"), 1);
+        let lease = processor
+            .store
+            .try_lookup_openrouter_lease(&far.client_request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.status, "active");
+        assert_eq!(lease.settlement_attempts, 0);
+        assert_eq!(lease.first_error_at, None);
+        assert_eq!(lease.last_error, None);
+        let next_attempt = |id: &str| {
+            processor.store.query_i64_for_test(
+                "SELECT next_attempt_at FROM openrouter_leases WHERE client_request_id = ?1",
+                rusqlite::params![id],
+            )
+        };
+        let far_next = next_attempt("far");
+        assert!(
+            (now as i64 + 30..=now as i64 + 32).contains(&far_next),
+            "{far_next}"
+        );
+        // 30 s would overshoot half of the 20 s left: the lease near its
+        // deadline is asked again within 10 s.
+        let near_next = next_attempt("near");
+        assert!(
+            (now as i64..=now as i64 + 10).contains(&near_next),
+            "{near_next}"
+        );
+        // Once the retry time has come, it is asked again.
+        processor.store.execute_for_test(
+            "UPDATE openrouter_leases SET next_attempt_at = ?1 WHERE client_request_id = 'far'",
+            rusqlite::params![now as i64 - 1],
+        );
+        processor.settle_due_openrouter_leases().await;
+        assert_eq!(calls_to(&calls, "pending-far"), 2);
+        server.abort();
+    }
+
+    /// Nearest-deadline-first must not let leases that keep failing slowly
+    /// near their deadline starve every other lease: part of each tick goes
+    /// to the least recently attempted lease.
+    #[tokio::test]
+    async fn slow_failures_near_their_deadline_cannot_starve_other_leases() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(200), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_millis(500));
+        let now = current_timestamp();
+        for i in 0..3u64 {
+            add_delivered_oa_lease(
+                &processor,
+                &format!("error-{i}"),
+                800 + i,
+                &format!("error-hash-{i}"),
+                now + 3_600 + i,
+                100,
+            );
+        }
+        let healthy =
+            add_delivered_oa_lease(&processor, "healthy", 900, "healthy-hash", now + 7_200, 1);
+        processor.settle_due_openrouter_leases().await;
+        assert_settled_from_usage(&processor, &healthy);
+        // The lease nearest its deadline was still attempted first.
+        assert_eq!(calls_to(&calls, "error-hash-0"), 1);
+        server.abort();
+    }
+
+    /// Final review, round 1: the nearest-deadline order is what reaches a
+    /// lease near its deadline that a transient error just moved to the back
+    /// of the least-recently-attempted order, while slow failures fill the
+    /// tick.
+    #[tokio::test]
+    async fn a_lease_near_its_deadline_is_attempted_first_in_a_saturated_tick() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(200), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_millis(500));
+        let now = current_timestamp();
+        for i in 0..5u64 {
+            add_delivered_oa_lease(
+                &processor,
+                &format!("error-{i}"),
+                800 + i,
+                &format!("error-hash-{i}"),
+                now + 3_600 + i,
+                100 + i as i64,
+            );
+        }
+        // Attempted a moment ago (a transient error), due well before the
+        // others.
+        let near =
+            add_delivered_oa_lease(&processor, "near", 900, "near-hash", now + 600, now as i64);
+        processor.settle_due_openrouter_leases().await;
+        assert_settled_from_usage(&processor, &near);
+        assert_eq!(calls_to(&calls, "near-hash"), 1);
+        // The tick was saturated: it could not reach every slow failure.
+        let attempted = (0..5)
+            .filter(|i| calls_to(&calls, &format!("error-hash-{i}")) > 0)
+            .count();
+        assert!(attempted < 5, "{attempted}");
+        server.abort();
+    }
+
+    /// Final review, round 1: owner retirements of one lease whose receipt
+    /// stays pending, sent back to back, once queued on a settlement lock
+    /// shared by every lease, ahead of each pass-2 attempt, so that pass 2
+    /// reached a handful of leases per tick and the rest were charged their
+    /// solvency bound at their deadlines. Each also asked the org again.
+    /// Production ratio kept: tick budget / retirement lock wait = 12.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retirement_flood_on_one_lease_cannot_throttle_other_settlements() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(50), 30).await;
+        let mut processor = oa_scheduling_processor(url, std::time::Duration::from_millis(2_400));
+        processor.timing.retire_lock_timeout = std::time::Duration::from_millis(200);
+        processor.timing.retire_timeout = std::time::Duration::from_millis(900);
+        let processor = Arc::new(processor);
+        let now = current_timestamp();
+        let attacker = add_delivered_oa_lease(
+            &processor,
+            "attacker",
+            700,
+            "pending-attacker",
+            now + 3_600,
+            1_000,
+        );
+        let healthy: Vec<_> = (0..100u64)
+            .map(|i| {
+                add_delivered_oa_lease(
+                    &processor,
+                    &format!("h{i}"),
+                    1_000 + i,
+                    &format!("healthy-{i}"),
+                    now + 3_600,
+                    100 + i as i64,
+                )
+            })
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let retirements = Arc::new(AtomicUsize::new(0));
+        let flood: Vec<_> = (0..8)
+            .map(|_| {
+                let processor = processor.clone();
+                let attacker = attacker.clone();
+                let stop = stop.clone();
+                let retirements = retirements.clone();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        let outcome = processor
+                            .retire_openrouter_lease(&attacker.client_request_id, &attacker)
+                            .await;
+                        assert!(
+                            matches!(outcome, Err(ServerError::LeaseSettlementPending { .. })),
+                            "{outcome:?}"
+                        );
+                        retirements.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        processor.settle_due_openrouter_leases().await;
+        stop.store(true, Ordering::Relaxed);
+        for task in flood {
+            task.await.unwrap();
+        }
+        let unsettled = healthy
+            .iter()
+            .filter(|request| record_of(&processor, request).status != NullifierStatus::Finalized)
+            .count();
+        assert_eq!(unsettled, 0, "of {} healthy leases", healthy.len());
+        for request in &healthy {
+            assert_settled_from_usage(&processor, request);
+        }
+        // The pending receipt was asked for once; every later retirement
+        // honoured its deferral without asking the org again.
+        assert!(retirements.load(Ordering::Relaxed) > 8);
+        assert_eq!(calls_to(&calls, "pending-attacker"), 1);
+        server.abort();
+    }
+
+    /// The sweep never waits for a lease's lock, and never settles a lease
+    /// whose lock is held (by its owner's retirement) behind its holder's
+    /// back: it leaves the lease to the holder and settles it on a later tick.
+    #[tokio::test]
+    async fn the_sweep_leaves_a_lease_whose_lock_is_held_to_its_holder() {
+        let (url, server, calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(1), 30).await;
+        let processor = oa_scheduling_processor(url, std::time::Duration::from_secs(5));
+        let now = current_timestamp();
+        let overdue =
+            add_delivered_oa_lease(&processor, "overdue", 700, "overdue-hash", now - 1, 1);
+        let due = add_delivered_oa_lease(&processor, "due", 701, "due-hash", now + 3_600, 1);
+        let held = [
+            processor.lease_locks.lock(&overdue.client_request_id).await,
+            processor.lease_locks.lock(&due.client_request_id).await,
+        ];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            processor.settle_due_openrouter_leases(),
+        )
+        .await
+        .expect("the sweep waited for a held lease lock");
+        assert_eq!(
+            record_of(&processor, &overdue).status,
+            NullifierStatus::Reserved
+        );
+        assert_eq!(
+            record_of(&processor, &due).status,
+            NullifierStatus::Reserved
+        );
+        assert_eq!(calls_to(&calls, "due-hash"), 0);
+        drop(held);
+        processor.settle_due_openrouter_leases().await;
+        let record = record_of(&processor, &overdue);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(payload_of(&record)["charge_basis"], "worst_case");
+        assert_settled_from_usage(&processor, &due);
+        server.abort();
+    }
+
+    /// Only a lease's owner can make the sweep leave the lease to a
+    /// retirement: a retirement whose proof does not match is refused before
+    /// it takes the lease's lock.
+    #[tokio::test]
+    async fn a_retirement_without_the_owners_proof_never_takes_the_lease_lock() {
+        let mut processor = oa_scheduling_processor(
+            "http://127.0.0.1:9".into(),
+            std::time::Duration::from_secs(1),
+        );
+        processor.timing.retire_lock_timeout = std::time::Duration::from_millis(200);
+        let now = current_timestamp();
+        let owner = add_delivered_oa_lease(&processor, "owner", 700, "owner-hash", now + 3_600, 1);
+        let mut forged = owner.clone();
+        forged.payload.push(' ');
+        let _held = processor.lease_locks.lock(&owner.client_request_id).await;
+        let error = processor
+            .retire_openrouter_lease(&owner.client_request_id, &forged)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ServerError::InvalidRequest(detail) if detail.contains("does not match")),
+            "{error:?}"
+        );
+    }
+
+    /// An owner's retirement waits for no other lease's settlement, so it is
+    /// served during a long pass 2 instead of timing out as
+    /// lease_settlement_pending.
+    #[tokio::test]
+    async fn owner_retirement_interleaves_with_a_long_settlement_pass() {
+        let (url, server, _calls) =
+            oa_scheduling_server(std::time::Duration::from_millis(300), 30).await;
+        let mut processor = oa_scheduling_processor(url, std::time::Duration::from_secs(10));
+        processor.timing.retire_lock_timeout = std::time::Duration::from_secs(1);
+        let processor = Arc::new(processor);
+        let now = current_timestamp();
+        for i in 0..5u64 {
+            add_delivered_oa_lease(
+                &processor,
+                &format!("pending-{i}"),
+                800 + i,
+                &format!("pending-hash-{i}"),
+                now + 3_600,
+                100,
+            );
+        }
+        let owner = lease_request_for(&processor, "owner", 900, None);
+        add_lease(
+            &processor,
+            &owner,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now + 200,
+                deadline: Some(now + 7_200),
+                key_hash: Some("owner-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        let sweep = tokio::spawn({
+            let processor = processor.clone();
+            async move { processor.settle_due_openrouter_leases().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let status = processor
+            .retire_openrouter_lease(&owner.client_request_id, &owner)
+            .await
+            .unwrap();
+        assert_eq!(status.status, "finalized");
+        assert!(
+            !sweep.is_finished(),
+            "the sweep ended before the retirement"
+        );
+        sweep.await.unwrap();
+        assert_settled_from_usage(&processor, &owner);
+        server.abort();
+    }
+
+    /// Final review (seam:http-contract#2): a store that cannot be read is a
+    /// retriable 500 database_error on every recovery route, never an
+    /// unknown request or nullifier (which clients read as authoritative),
+    /// and never an attestation that an accepted request was not accepted.
+    #[tokio::test]
+    async fn store_failures_are_database_errors_never_unknown_or_unaccepted() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let processor = Arc::new(oa_lease_processor(Arc::new(
+            NullifierStore::in_memory().unwrap(),
+        )));
+        // An accepted lease request whose quote has expired since.
+        let quote = serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,
+            "billing_quote":{"asset":"native_eth", "units_per_eth":1_000_000_000, "chain_id":1,
+            "feed_address":"0x694aa1769357215de4fac081bf1f309adc325306", "round_id":"123",
+            "answer":"100000000000", "decimals":8, "updated_at":100, "expires_at":3700}});
+        let request = lease_request_for(&processor, "accepted", 530, Some(quote.to_string()));
+        let now = current_timestamp();
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now + 200,
+                deadline: Some(now + 3_600),
+                key_hash: Some("accepted-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        let app = crate::routes::create_router(processor.clone());
+        let call = |method: &'static str, uri: String, body: Option<&ApiRequestV2>| {
+            let app = app.clone();
+            let body = body.map(|body| serde_json::to_vec(body).unwrap());
+            async move {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(body.map_or_else(Body::empty, Body::from))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            }
+        };
+        let nullifier = format!(
+            "/v2/nullifiers/{}",
+            request.public_inputs.request_nullifier.to_hex()
+        );
+        let by_id = "/v2/requests/accepted".to_string();
+        let lease = "/v2/openrouter/leases/accepted".to_string();
+        let expire = "/v2/openrouter/leases/accepted/expire".to_string();
+        let issue = "/v2/openrouter/leases".to_string();
+        let (status, body) = call("GET", nullifier.clone(), None).await;
+        assert_eq!(
+            (status, &body["nullifier_status"]),
+            (StatusCode::OK, &"reserved".into())
+        );
+        let (status, body) = call("POST", expire.clone(), Some(&request)).await;
+        assert_eq!(
+            (status, &body["error_code"]),
+            (StatusCode::CONFLICT, &"lease_pending".into())
+        );
+
+        // The store becomes unreadable (an I/O error, a corrupt page, a lock
+        // held past the busy timeout): here, its tables are renamed away.
+        processor
+            .store
+            .execute_for_test("ALTER TABLE nullifiers RENAME TO nullifiers_offline", []);
+        processor
+            .store
+            .execute_for_test("ALTER TABLE openrouter_leases RENAME TO leases_offline", []);
+        for (method, uri, body) in [
+            ("GET", nullifier.clone(), None),
+            ("GET", by_id.clone(), None),
+            ("GET", lease.clone(), None),
+            ("POST", lease.clone(), Some(&request)),
+            ("POST", expire.clone(), Some(&request)),
+            ("POST", issue.clone(), Some(&request)),
+        ] {
+            let (status, body) = call(method, uri.clone(), body).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri}: {body}"
+            );
+            assert_eq!(
+                body["error_code"], "database_error",
+                "{method} {uri}: {body}"
+            );
+            assert_eq!(body["retriable"], true, "{method} {uri}: {body}");
+        }
+
+        // Once the store is readable again, the true answers return.
+        processor
+            .store
+            .execute_for_test("ALTER TABLE nullifiers_offline RENAME TO nullifiers", []);
+        processor
+            .store
+            .execute_for_test("ALTER TABLE leases_offline RENAME TO openrouter_leases", []);
+        let (status, body) = call("GET", by_id, None).await;
+        assert_eq!(
+            (status, &body["nullifier_status"]),
+            (StatusCode::OK, &"reserved".into())
+        );
+        assert_eq!(body["settlement_deadline"], now + 3_600);
+        let (status, body) = call("POST", expire, Some(&request)).await;
+        assert_eq!(
+            (status, &body["error_code"]),
+            (StatusCode::CONFLICT, &"lease_pending".into())
+        );
+        let (status, _) = call("GET", lease, None).await;
+        assert_eq!(status, StatusCode::OK);
+        // Only a readable store reports an unknown request.
+        let (status, body) = call("GET", "/v2/requests/never-seen".into(), None).await;
+        assert_eq!(
+            (status, &body["status"], &body["nullifier_status"]),
+            (StatusCode::OK, &"not_found".into(), &"unknown".into())
+        );
+    }
+
+    /// Final review, round 1: a lease row that is present but cannot be
+    /// decoded never heals by itself. It is not a retriable database_error
+    /// (which turned off the clients' 404 fallback and kept them retrying):
+    /// lease routes answer 404 lease_record_unreadable, not retriable, which
+    /// sends clients to the authoritative nullifier record, still readable.
+    #[tokio::test]
+    async fn an_undecodable_lease_row_sends_clients_to_the_nullifier_record() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let processor = Arc::new(oa_lease_processor(Arc::new(
+            NullifierStore::in_memory().unwrap(),
+        )));
+        let request = lease_request_for(&processor, "rot", 531, None);
+        let now = current_timestamp();
+        add_lease(
+            &processor,
+            &request,
+            LeaseSetup {
+                key_source: "oa_org",
+                expires_at: now + 200,
+                deadline: Some(now + 3_600),
+                key_hash: Some("rot-hash"),
+                delivered: Some(true),
+                ttl: Some(300),
+            },
+        );
+        processor.store.execute_for_test(
+            "UPDATE openrouter_leases SET api_request_json = '{\"client_request_id\":\"rot'
+             WHERE client_request_id = 'rot'",
+            [],
+        );
+        let app = crate::routes::create_router(processor.clone());
+        let call = |method: &'static str, uri: String, body: Option<&ApiRequestV2>| {
+            let app = app.clone();
+            let body = body.map(|body| serde_json::to_vec(body).unwrap());
+            async move {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(body.map_or_else(Body::empty, Body::from))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            }
+        };
+        let lease = "/v2/openrouter/leases/rot".to_string();
+        for (method, body) in [("GET", None), ("POST", Some(&request))] {
+            let (status, body) = call(method, lease.clone(), body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method}: {body}");
+            assert_eq!(
+                body["error_code"], "lease_record_unreadable",
+                "{method}: {body}"
+            );
+            assert_eq!(body["retriable"], false, "{method}: {body}");
+        }
+        let (status, body) = call(
+            "GET",
+            format!(
+                "/v2/nullifiers/{}",
+                request.public_inputs.request_nullifier.to_hex()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, &body["nullifier_status"]),
+            (StatusCode::OK, &"reserved".into())
+        );
+        // An unknown lease is still a bare 404.
+        let (status, body) = call("GET", "/v2/openrouter/leases/never-seen".into(), None).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::NOT_FOUND, serde_json::Value::Null)
+        );
     }
 }

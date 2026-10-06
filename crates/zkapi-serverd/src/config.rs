@@ -161,6 +161,12 @@ pub struct ServerConfig {
     /// How long after the server last observed a Merkle root a clearance
     /// ownership proof may still use it.
     pub clearance_root_window_seconds: u64,
+    /// Start even though the database holds leases (or live direct-key
+    /// deletions) of a lease key source other than the configured one, which
+    /// this server can neither measure nor delete: each such lease is
+    /// finalized at its settlement deadline without a usage measurement.
+    /// Off by default; startup otherwise refuses until they drain.
+    pub allow_key_source_switch: bool,
 }
 
 impl ServerConfig {
@@ -221,6 +227,7 @@ impl std::fmt::Debug for ServerConfig {
             allow_legacy_clearance,
             legacy_clearance_max_per_minute,
             clearance_root_window_seconds,
+            allow_key_source_switch,
         } = self;
         formatter
             .debug_struct("ServerConfig")
@@ -249,6 +256,7 @@ impl std::fmt::Debug for ServerConfig {
                 "clearance_root_window_seconds",
                 clearance_root_window_seconds,
             )
+            .field("allow_key_source_switch", allow_key_source_switch)
             .finish()
     }
 }
@@ -275,6 +283,7 @@ impl Default for ServerConfig {
             allow_legacy_clearance: false,
             legacy_clearance_max_per_minute: DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE,
             clearance_root_window_seconds: DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
+            allow_key_source_switch: false,
         }
     }
 }

@@ -23,6 +23,26 @@ HTTP 401 with `error_code: "testnet_password_required"` before request parsing.
 See [Sepolia shared password](testnet-auth.md) for the complete access,
 transport and credential-lifecycle contract. Mainnet is unaffected.
 
+Recovery answers are authoritative only when the server could read its store.
+`GET /v2/requests/{client_request_id}` and `GET /v2/nullifiers/{nullifier}`
+mean "unknown" only with HTTP 200 `{"status":"not_found","nullifier_status":"unknown"}`,
+and `POST .../expire` attests non-acceptance only with HTTP 200
+`expired_unaccepted` or `superseded_unaccepted`. A store that cannot be read
+(an I/O error, a corrupt page, a lock held past the busy timeout) returns HTTP
+500 `error_code: "database_error"` with `retriable: true` on these routes, on
+lease status and retirement, and on a lease retry: retry later, and never read
+it as unknown, unaccepted or not found. Lease status returns 404 only for a
+lease the store does not hold (an empty body), or, with
+`error_code: "lease_record_unreadable"` and `retriable: false`, for a lease
+row the store holds but cannot decode. That row never heals by itself, and
+lease retirement and a lease retry or `/expire` that need it answer the same.
+A pending lease in that state is not settled, not even at its settlement
+deadline, and its nullifier reads `reserved`, until the operator restores its
+saved request (`zkapi settlement reopen --saved-request`; see
+[Restoring an unreadable pending lease](native-eth-billing.md#restoring-an-unreadable-pending-lease)).
+In either 404 case, read `GET /v2/nullifiers/{request_nullifier}`, which stays
+authoritative.
+
 The reference gateway in `docker/aws` also applies coarse per-source limits to
 `POST /v2/*` requests. A throttled request never reaches the server: it
 returns HTTP 429 with `Retry-After: 5` and

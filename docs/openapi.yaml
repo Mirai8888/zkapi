@@ -63,6 +63,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
         "400": {description: Invalid request, proof, or disabled lease mode}
+        "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
         "409": {description: Existing active or settling lease, or a used nullifier}
         "429":
           description: >-
@@ -90,7 +91,106 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/OpenRouterLeaseStatus"}
-        "404": {description: Unknown lease}
+        "404":
+          description: >-
+            Unknown lease: the server read its store and holds no such lease
+            (empty body); or lease_record_unreadable (not retriable): it holds
+            a lease row for this ID that it cannot decode (a pending one is not
+            settled) until an operator restores its saved request. Either way,
+            GET /v2/nullifiers/{request_nullifier} is authoritative.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500": {$ref: "#/components/responses/DatabaseError"}
+    post:
+      summary: Retire and settle the exact lease, proven by its original request
+      parameters:
+        - in: path
+          name: client_request_id
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApiRequestV2"}
+      responses:
+        "200":
+          description: The lease's status after the retirement attempt
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OpenRouterLeaseStatus"}
+        "400": {description: "invalid_request: an unknown lease, or a request that is not the issued one"}
+        "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
+        "409":
+          description: >-
+            lease_settlement_pending (retriable; retry after Retry-After): the
+            lease's receipt or drain interval is still pending, its earlier
+            pending result set a retry time that has not come yet (answered
+            without asking the provider again), or other work on this lease
+            held it for longer than the retirement waits; or lease_pending
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500":
+          description: >-
+            internal_error or database_error (retriable; database_error means
+            the store could not be read, never an unknown lease), or
+            lease_unsettleable
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+  /v2/openrouter/leases/{client_request_id}/expire:
+    post:
+      summary: Attest, under the issuance lock, that an exact saved request was never accepted
+      parameters:
+        - in: path
+          name: client_request_id
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApiRequestV2"}
+      responses:
+        "200":
+          description: >-
+            The server read its store and holds no reservation of this
+            request's nullifier or ID, and its quote is expired or superseded,
+            so it can never be accepted. Only this answer attests
+            non-acceptance.
+          headers:
+            Cache-Control:
+              schema: {const: no-store}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, client_request_id, request_nullifier, payload_hash, server_time_ms]
+                properties:
+                  status: {type: string, enum: [expired_unaccepted, superseded_unaccepted]}
+                  client_request_id: {type: string}
+                  request_nullifier: {$ref: "#/components/schemas/Felt"}
+                  payload_hash: {$ref: "#/components/schemas/Felt"}
+                  server_time_ms: {type: integer}
+        "400": {description: "invalid_request or protocol_mismatch: not the exact request for this deployment"}
+        "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
+        "409":
+          description: >-
+            lease_pending: the request was accepted, or its quote is still
+            live; or native_quote_expired from the oracle check
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500":
+          description: >-
+            internal_error (the oracle could not be read) or database_error
+            (the store could not be read); both retriable, and neither attests
+            anything about acceptance
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
   /v2/withdraw/clearance:
     post:
       summary: Request a mutual-close clearance signature for a note whose ownership is proven
@@ -149,10 +249,14 @@ paths:
           schema: {type: string}
       responses:
         "200":
-          description: Recovery state; status not_found with nullifier_status unknown for an unknown request
+          description: >-
+            Recovery state read from the server's store; status not_found with
+            nullifier_status unknown means the store holds no such request.
+            Only this 200 answer means unknown.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/RecoveryResponseV2"}
+        "500": {$ref: "#/components/responses/DatabaseError"}
   /v2/nullifiers/{nullifier}:
     get:
       summary: Recover a transcript or reservation state by nullifier
@@ -163,7 +267,10 @@ paths:
           schema: {$ref: "#/components/schemas/Felt"}
       responses:
         "200":
-          description: Recovery state; status not_found with nullifier_status unknown for an unknown nullifier
+          description: >-
+            Recovery state read from the server's store; status not_found with
+            nullifier_status unknown means the store holds no such nullifier.
+            Only this 200 answer means unknown.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/RecoveryResponseV2"}
@@ -172,6 +279,7 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500": {$ref: "#/components/responses/DatabaseError"}
 components:
   securitySchemes:
     TestnetPassword:
@@ -180,6 +288,38 @@ components:
       name: X-ZKAPI-Testnet-Password
       description: Required only when Sepolia health reports testnet_password_required.
   responses:
+    LeaseRecordUnreadable:
+      description: >-
+        lease_record_unreadable (not retriable): the server holds a lease row
+        for this ID that it cannot decode. It never heals by itself: a pending
+        lease is not settled, not even at its settlement deadline, until an
+        operator restores its saved request (zkapi settlement reopen
+        --saved-request).
+        Read GET /v2/nullifiers/{request_nullifier}, which stays
+        authoritative, as for an unknown lease.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: "#/components/schemas/ErrorResponse"}
+              - type: object
+                properties:
+                  error_code: {const: lease_record_unreadable}
+                  retriable: {const: false}
+    DatabaseError:
+      description: >-
+        database_error (retriable): the server could not read its store, so it
+        knows nothing about the request, nullifier or lease. Retry later; never
+        read it as unknown, unaccepted or not found.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: "#/components/schemas/ErrorResponse"}
+              - type: object
+                properties:
+                  error_code: {const: database_error}
+                  retriable: {const: true}
     TestnetPasswordRequired:
       description: Missing or invalid shared password; no request processing occurred.
       headers:
@@ -359,7 +499,9 @@ components:
           description: Present only once the request is finalized
         settlement_deadline:
           type: integer
-          description: For a reserved lease request, the UNIX time by which the server finalizes it
+          description: >-
+            For a reserved lease request, the UNIX time by which the server
+            finalizes it; omitted if the lease row cannot be read
     OpenRouterLeaseStatus:
       type: object
       required: [status, client_request_id, issued_at, expires_at, settle_after, spending_limit_usd]
@@ -403,8 +545,9 @@ components:
             Stable machine code. OA limits use oa_minute_request_limit,
             oa_hourly_issuance_budget, or oa_rate_limited. Clearance adds
             clearance_ownership_required, nullifier_used, capacity_exhausted
-            and legacy_clearance_capacity. The reference gateway uses
-            gateway_rate_limited.
+            and legacy_clearance_capacity. Lease routes add
+            lease_record_unreadable (HTTP 404, not retriable). The reference
+            gateway uses gateway_rate_limited.
         error_message: {type: string}
         retriable: {type: boolean}
         latest_root: {type: string, pattern: "^0x[0-9a-f]+$"}

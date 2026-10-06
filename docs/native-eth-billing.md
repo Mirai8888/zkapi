@@ -241,7 +241,9 @@ zkapi ... serverd ... \
   --native-price-max-age-seconds 4500
 ```
 
-The server requires native oracle and prompt-private lease configuration.
+The server requires native oracle and prompt-private lease configuration, with
+one key source; to change it, see
+[Changing the key source](#changing-the-key-source).
 `--openrouter-settlement-deadline-seconds` (default 21600) sets the settlement
 deadline described below. Operate the compatible v2
 [challenge daemon](challenge-service.md) alongside server and indexer, with a
@@ -260,7 +262,8 @@ Do not reuse a daemon, verifier or setup from another circuit. Configure the pub
 not rewrite static frontend manifests. The browser SDK handles funding and
 withdrawals; the operator CLI runs setup, signing-key, server and indexer
 commands, and `zkapi settlement reopen` (see
-[Reopening a cancelled lease](#reopening-a-cancelled-lease)).
+[Reopening a cancelled lease](#reopening-a-cancelled-lease) and
+[Restoring an unreadable pending lease](#restoring-an-unreadable-pending-lease)).
 
 OA provisioning retries accept a shortened remaining lifetime only when the
 relay explicitly marks the station response `replayed: true`. Its original
@@ -368,6 +371,27 @@ no longer hold its note state reserved indefinitely:
   (`key_deleted: false`, review `finalized_before_key_deletion`); any other is
   charged its solvency bound (`charge_basis: "worst_case"`,
   `settlement_reason: "settlement_deadline"`, review `deadline_worst_case`).
+- Each tick starts provider attempts for at most 120 seconds (each attempt is
+  bounded at 150 seconds). It draws them alternately, by time spent, from two
+  orders over the due leases: nearest settlement deadline first, and least
+  recently attempted first. The lease closest to its deadline is therefore
+  attempted first, and leases that keep failing slowly cannot starve the
+  others. A receipt that the OA org reports as still pending, or a direct key
+  still in its drain interval, is not a failure: it changes neither `attempts`
+  nor `last_error`, and the lease is not asked again before the retry time it
+  was given (`retry_after_seconds`; at least the poll interval, at most 300
+  seconds, and never more than half of the time left before its deadline).
+  The lease also moves behind every other lease in the least recently
+  attempted order. A failed attempt is retried on the next tick. An owner's
+  retirement honours the same retry time: until it comes, the retirement
+  answers `lease_settlement_pending` with the time left, without asking the
+  provider again.
+- Each lease is settled under its own lock. A retirement waits only for work
+  on its own lease (and checks the owner's proof before it waits). The tick
+  never waits for a lease's lock: it leaves a lease whose lock is held or
+  awaited to that retirement, which applies the same rules, including the
+  deadline, and sees it again on the next tick. Retirements of one lease,
+  however frequent, therefore never slow the settlement of the others.
 - A deterministic failure, such as a corrupt saved quote, missing revocation
   usage, or an invalid saved TTL, namespace or limit, is finalized at the
   solvency bound at once (`settlement_reason: "unsettleable"`, review
@@ -394,9 +418,18 @@ no longer hold its note state reserved indefinitely:
   [reopen the lease](#reopening-a-cancelled-lease) once its binding is
   repaired. Conceding its charge (`--zero-charge`) is a choice of charge within
   that remedy, not a way around the repair.
+- A pending lease row whose saved request (`api_request_json`) cannot be
+  decoded is skipped by every tick: neither provider I/O, nor its settlement
+  deadline, nor a cancellation reaches it, and its nullifier stays reserved,
+  with the same consequences for its owner as a cancellation. Each tick logs
+  `unreadable OpenRouter lease row cannot be settled` at error level with the
+  row's `client_request_id`; alert on that line. Lease routes answer it with
+  `lease_record_unreadable`. The dashboard counts include it, but its `pending`
+  list does not. The deadline guarantee above applies to it only once the
+  operator [restores its saved request](#restoring-an-unreadable-pending-lease).
 - Keys of terminal direct leases that may still exist at the provider (worst
   case, never delivered or cancelled) are disabled and then deleted in the
-  background, outside the settlement lock; a 404 counts as done, and failures
+  background, outside every lease lock; a 404 counts as done, and failures
   are retried with backoff up to one hour.
 
 Lease status responses carry `charge_basis` and, until the lease is terminal,
@@ -420,9 +453,11 @@ settlement writes a row to the `settlement_reviews` table with one of the
 reasons `usage_clamped`, `deadline_worst_case`, `unsettleable_worst_case`,
 `finalized_before_key_deletion` or `binding_corrupt`, and logs
 `settlement required operator review` at error level. Alert on that line.
-Reopening a cancelled lease adds a `binding_reopened` row, as does conceding the
-charge of a reopened lease later. The table is a log: one lease can have
-several rows, such as its cancellation, its reopening and its final settlement.
+Reopening a cancelled lease adds a `binding_reopened` row, as do conceding the
+charge of a reopened lease later and
+[restoring an unreadable pending lease](#restoring-an-unreadable-pending-lease).
+The table is a log: one lease can have several rows, such as its cancellation,
+its reopening and its final settlement.
 A `binding_corrupt` row's detail names the first disagreeing field; either side
 of the disagreement may be the corrupt one, which the reopen command tells
 apart. A direct lease that may have been delivered gets one such row when its
@@ -463,6 +498,71 @@ again, and ignores both a lease's commitment to a zero charge and an operator
 concession; rows already finalized stay finalized. Rollback requires a
 compatible writer or stopped-service reconciliation of affected rows, not
 restoring an old database over newer wallet activity.
+
+## Changing the key source
+
+A server issues and settles leases with one key source: direct OpenRouter
+(`ZKAPI_OPENROUTER_MANAGEMENT_KEY` or `--openrouter-management-key`) or an OA
+org (`--oa-org-url` with `ZKAPI_OA_ORG_SHARED_SECRET`). Only the source that
+issued a lease can measure its usage, and only the direct source deletes direct
+keys. A server started with the other source could only finalize each possibly
+delivered lease of the previous source at its settlement deadline without a
+usage measurement (normally at its full solvency bound), and would never
+delete the previous source's keys queued for deletion.
+
+The server therefore refuses to start while its database holds, of the other
+key source, a lease that only that source can settle (one that may have been
+delivered and has no committed charge) or, when leaving direct OpenRouter, a
+queued deletion of a key that has not expired yet. Rows any server finalizes
+without provider I/O do not count: never-issued provisioning rows, leases whose
+key was never delivered, and leases committed to a zero or conceded charge. Nor
+do deletions of expired keys, which can no longer be used. The error names the
+counts and this procedure:
+
+1. Keep the server running with its current key source, and stop routing new
+   requests to it, for example by taking it out of the gateway. Settlement
+   continues without clients.
+2. Watch `GET /v1/dashboard/settlement` until `counts.pending` is 0 (or
+   `pending` lists no lease of the current `key_source`) and, when leaving
+   direct OpenRouter, `counts.pending_key_cleanups` is 0. A delivered lease
+   settles once its key has expired and the grace has passed, unless its
+   usage stays unavailable (an OA receipt can stay pending longer); none waits
+   past its settlement deadline.
+3. Stop the server, change the credential, start it with the new key source,
+   and route requests to it again.
+
+`--allow-key-source-switch` (or `ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true`) starts
+the server anyway and accepts that each such lease of the other source is
+finalized at its settlement deadline without a usage measurement; the server
+logs what it strands. Use it only where the procedure above cannot work, and
+remove it once those leases are settled:
+
+- **A database holding such leases of both sources**, which an earlier release
+  could leave behind (a source switch, at 045b444 or f7c99837, with leases of
+  the previous source outstanding). No single credential drains it, so the
+  server refuses under either source, and the error says so. Start under one
+  source with the flag, stop routing new requests, and wait until its leases
+  are settled as in step 2. Then restart under the other source without the
+  flag, before its remaining leases reach their settlement deadlines (by
+  default 6 hours after their keys expire): they are then still measured.
+  Finally switch to the source you want with the procedure above.
+- **A previous key source that can no longer be reached** (its org is gone, or
+  its management key was revoked), or an outage of one source that the
+  operator decides to fail over from: the flag starts the other source at
+  once instead of waiting for the unreachable source's deadlines. Each
+  possibly delivered lease of the unreachable source is then charged its
+  solvency bound at its settlement deadline, as any lease whose usage stays
+  unavailable.
+
+Queued deletions of direct keys whose management key was revoked never
+complete, but those keys expired with their leases, and they stop blocking
+startup once expired: to clear `counts.pending_key_cleanups`, remove the
+queued rows while the server is stopped, with
+`sudo sqlite3 /var/lib/zkapi/server.db "DELETE FROM provider_key_cleanup WHERE key_source = 'openrouter'"`
+on the Docker host.
+
+Rows of a key source this release does not know never block startup; this
+release never settles or charges them.
 
 ## Reopening a cancelled lease
 
@@ -607,3 +707,54 @@ lease. Once signed, the transcript is challenge evidence: an escape the owner
 started at that state is contested, and the owner exits from the signed
 successor state. Reopen before the note expires, or its deposit goes to the
 treasury.
+
+## Restoring an unreadable pending lease
+
+A pending lease (`provisioning`, `active`, `retiring`, `disabled` or
+`revoking`) whose saved request cannot be decoded is never settled, as
+described under [settlement terminality](#settlement-terminality). The server
+cannot cancel it either, because it cannot read the request that a review
+needs. Restore the request with the reopen command and `--saved-request`, with
+the server stopped, exactly as for a cancelled lease:
+
+```sh
+dc stop server
+dc run -T --rm --no-deps --entrypoint zkapi server settlement reopen \
+  --db-path /data/server.db --client-request-id "$ID" --saved-request - < request.json
+dc start server
+```
+
+`$ID` is the `client_request_id` that the log line names. Take `request.json`
+from a backup of the server database or from the lease's owner, as in step 2
+of [Reopening a cancelled lease](#reopening-a-cancelled-lease). The copy is
+accepted only after the same checks: it verifies against its proof with the
+server's proof setup, its binding is the `api_request_binding` that its
+reservation recorded at admission, and it shares the lease row's
+`client_request_id` or `request_nullifier`. The lease row and its reservation
+must then agree, or the command refuses and names the field, which `--rebind`
+repairs as for a reopening. A `ClearanceReserved` nullifier is refused. The
+command refuses a pending lease whose saved request can be read: the server
+settles that lease itself, and cancels it if its binding is corrupt.
+
+The restored lease keeps its status, its write-once deadline and any charge
+already committed, and the command prints `"result": "restored"` with the same
+fields as a reopening. Its `settles` field says how the restarted server
+settles the lease:
+
+- `measured_until_deadline` while its deadline is ahead;
+- `deadline_fallback` with a `warning` once its deadline has passed, because
+  the deadline applies at once on restart and charges the full solvency bound;
+- `captured_usage`, `zero_never_delivered`, `operator_conceded` or
+  `signed_transcript` as for a reopening.
+
+To concede the charge instead, run the command again with `--zero-charge`
+before starting the server, or pass `--zero-charge` together with
+`--saved-request`. The restoration records a `binding_reopened` review, and the
+server verifies the restored request again before it signs, as for a reopened
+lease. Acknowledge that review once the lease is `finalized`. Restore before the
+note expires, or its deposit goes to the treasury.
+
+A row that stays undecodable after its request is restored has another corrupt
+column. The command then fails with a database error, and that column needs a
+hand repair as described under
+[Reopening a cancelled lease](#reopening-a-cancelled-lease).

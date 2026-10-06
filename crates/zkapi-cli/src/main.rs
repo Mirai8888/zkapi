@@ -119,6 +119,21 @@ enum Commands {
             hide_env_values = true
         )]
         clearance_root_window_seconds: u64,
+        /// Start although the database holds leases of the other lease key
+        /// source, which this server can neither measure nor delete: each is
+        /// charged at its settlement deadline without a usage measurement,
+        /// normally its full solvency bound. Default off: startup refuses
+        /// until the other source drains. For a database holding unsettled
+        /// leases of both sources, or a source that can no longer be reached;
+        /// see docs/native-eth-billing.md, "Changing the key source".
+        #[arg(
+            long,
+            env = "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new(),
+            hide_env_values = true
+        )]
+        allow_key_source_switch: bool,
         /// Required native ETH oracle RPC for gwei billing and the startup vault
         /// signing-key check; must serve --chain-id. May embed a provider key.
         #[arg(
@@ -161,6 +176,9 @@ enum Commands {
         /// No default.
         #[arg(long)]
         clear_seed: Option<String>,
+        /// Merkle root accepted until the indexer serves one. With
+        /// --indexer-url, an indexer that cannot serve a verified root at
+        /// startup falls back to the vault's currentRoot(), then to this.
         #[arg(long, default_value = "0x0")]
         initial_root: String,
         #[arg(long)]
@@ -224,11 +242,17 @@ enum SettlementCommand {
     /// the usage captured before its direct key was deleted, or from measured
     /// usage until its unchanged settlement deadline, and at its solvency
     /// bound when no usage can be measured (the output then warns).
+    ///
+    /// With --saved-request, also restores the saved request of a pending
+    /// lease that cannot be read (the server skips such a lease, deadline
+    /// included, and answers its status with lease_record_unreadable),
+    /// after the same checks, keeping its status ("result": "restored").
     Reopen {
         /// The server's SQLite database (the --db-path of serverd).
         #[arg(long)]
         db_path: String,
-        /// The lease's id as its binding_corrupt review names it.
+        /// The lease's id as its binding_corrupt review names it (or the
+        /// server's log names an unreadable lease row).
         #[arg(long)]
         client_request_id: String,
         /// Finalize at zero instead (charge_basis "operator_conceded"): the
@@ -249,7 +273,8 @@ enum SettlementCommand {
         /// be read: from a backup of the server database, or its owner's
         /// copy. Accepted only if it verifies, its binding is the one its
         /// nullifier reservation recorded at admission, and it shares the
-        /// lease row's client_request_id or request_nullifier.
+        /// lease row's client_request_id or request_nullifier. Also for a
+        /// pending lease whose saved request cannot be read.
         #[arg(long, value_name = "FILE")]
         saved_request: Option<String>,
     },
@@ -300,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
             allow_legacy_clearance,
             legacy_clearance_max_per_minute,
             clearance_root_window_seconds,
+            allow_key_source_switch,
             native_billing_rpc_url,
             native_price_feed_address,
             native_price_feed_decimals,
@@ -387,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_legacy_clearance,
                 legacy_clearance_max_per_minute,
                 clearance_root_window_seconds,
+                allow_key_source_switch,
             };
             zkapi_serverd::routes::run_server(config).await?;
         }
@@ -487,8 +514,15 @@ fn reopen_cancelled_lease(
     let reopened = store
         .reopen_cancelled_lease(client_request_id, options, &verifier)
         .map_err(|refusal| anyhow::anyhow!("{}", refusal_message(&refusal, proof_setup_dir)))?;
+    // A pending lease is not reopened: only its unreadable saved request
+    // was restored.
+    let result = if reopened.restored_pending {
+        "restored"
+    } else {
+        "reopened"
+    };
     let mut report = serde_json::to_value(reopened)?;
-    report["result"] = "reopened".into();
+    report["result"] = result.into();
     Ok(report)
 }
 
@@ -892,12 +926,14 @@ mod tests {
                     allow_legacy_clearance,
                     legacy_clearance_max_per_minute,
                     clearance_root_window_seconds,
+                    allow_key_source_switch,
                     ..
                 } => (
                     openrouter_settlement_deadline_seconds,
                     allow_legacy_clearance,
                     legacy_clearance_max_per_minute,
                     clearance_root_window_seconds,
+                    allow_key_source_switch,
                 ),
                 _ => panic!("expected serverd"),
             }
@@ -910,13 +946,15 @@ mod tests {
             "5",
             "--clearance-root-window-seconds",
             "600",
+            "--allow-key-source-switch",
         ]);
-        assert_eq!(overridden, (7200, true, 5, 600));
+        assert_eq!(overridden, (7200, true, 5, 600, true));
         if [
             "ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS",
             "ZKAPI_ALLOW_LEGACY_CLEARANCE",
             "ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE",
             "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
+            "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",
         ]
         .iter()
         .any(|name| std::env::var_os(name).is_some())
@@ -924,7 +962,7 @@ mod tests {
             eprintln!("skipping default checks: a settlement or clearance variable is set");
             return;
         }
-        assert_eq!(parse(&[]), (21_600, false, 60, 3_600));
+        assert_eq!(parse(&[]), (21_600, false, 60, 3_600, false));
     }
 
     #[test]

@@ -36,8 +36,12 @@ and are used by the same `CircomReduction` prover as the ceremony keys
 (checked by `tests/reduction_cross_check.rs` and `tests/proofs.rs`).
 
 Re-importing these keys through the ceremony path (`.zkey` export, then
-`examples/import_zkey.rs --setup-id dev`) reproduces this directory byte for
-byte (`tests/zkey_import.rs`).
+`examples/import_zkey.rs --setup-id dev`) reproduces every generated file in
+this directory byte for byte (`tests/zkey_import.rs`). A dry run of the full
+ceremony pipeline (exported `.r1cs`, snarkjs 0.7.5 with a throwaway 2^16
+powers of tau, one contribution and a beacon, `import_zkey --setup-id mpc-1`)
+passed the import gates, and snarkjs `groth16 verify` accepted the shipping
+prover's proofs under those keys.
 
 ## Regenerating
 

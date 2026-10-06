@@ -561,6 +561,35 @@ async fn diverge_on_dropped_close() -> (MockChain, Indexer, String, u64) {
     (chain, indexer, base, served)
 }
 
+/// A deposit and the close of that note both missing from the logs leave the
+/// mirror at the vault's root (the note's leaf is zero again) with a stale
+/// next_note_id. Only the nextNoteId comparison of the verified-head check
+/// catches it, and such a view is never served.
+#[tokio::test]
+async fn missed_deposit_and_close_at_the_vaults_root_are_never_served() {
+    let chain = MockChain::start().await;
+    chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine_empty(3);
+    let mut indexer = Indexer::new(config(&chain, 2, None));
+    indexer.poll_to_idle().await;
+    assert_serves_head(&chain, &indexer);
+    let deposit = chain.mine(vec![Tx::Deposit { commitment: 0xb }]);
+    let close = chain.mine(vec![Tx::Close { note_id: 1 }]);
+    chain.drop_log(deposit, 0);
+    chain.drop_log(close, 0);
+    let head = chain.mine_empty(3);
+    assert_eq!(chain.root_at(head), chain.root_at(deposit - 1));
+    assert_eq!(chain.next_note_id_at(head), 2);
+    let base = serve(indexer.service.clone()).await;
+    for _ in 0..3 {
+        indexer.cycle().await;
+        assert_canonical(&chain, &indexer.service);
+    }
+    assert_unavailable(&base, "diverged").await;
+    let health = indexer.service.health();
+    assert!(health.reason.unwrap().contains("nextNoteId 2"));
+}
+
 #[tokio::test]
 async fn persistent_log_gap_fails_closed_then_recovers() {
     let (chain, mut indexer, base, _) = diverge_on_dropped_close().await;

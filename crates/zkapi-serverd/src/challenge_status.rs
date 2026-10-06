@@ -33,6 +33,9 @@ pub const HEAD_AGE_CRITICAL_SECONDS: u64 = 600;
 /// Confirmed blocks not yet scanned for escape events.
 pub const SCAN_LAG_WARNING_BLOCKS: u64 = 50;
 pub const SCAN_LAG_CRITICAL_BLOCKS: u64 = 300;
+/// A recorded missed deadline stays a critical alarm this long, also when
+/// its escape was paid out and the obligation retired within one poll.
+pub const MISSED_ALARM_SECONDS: u64 = 3_600;
 const DEFAULT_WARNING_REMAINING_SECONDS: u64 = 43_200;
 const DEFAULT_CRITICAL_REMAINING_SECONDS: u64 = 21_600;
 
@@ -61,7 +64,8 @@ pub enum ObligationState {
     Submitted,
     /// The nonce was consumed while the withdrawal is still pending.
     MinedUnconfirmed,
-    /// The withdrawal is gone at the latest block, not yet at confirmation depth.
+    /// The withdrawal is gone at the latest block, not yet at confirmation
+    /// depth. With evidence it may have been paid out, not challenged.
     ResolvedUnconfirmed,
     /// The deadline passed while evidence existed or was expected.
     Missed,
@@ -502,6 +506,8 @@ pub fn obligation_severity(
     };
     match o.state {
         ObligationState::Missed => Severity::Critical,
+        // Until confirmation depth tells a challenge from a payout.
+        ObligationState::ResolvedUnconfirmed if o.evidence.is_some() => deadline.max(blocked),
         ObligationState::NoEvidence
         | ObligationState::ExpiredWithoutEvidence
         | ObligationState::ResolvedUnconfirmed => Severity::Ok,
@@ -579,6 +585,19 @@ pub fn evaluate(
                 o.blocked_reason
                     .map(|reason| format!(" ({})", wire_name(reason)))
                     .unwrap_or_default()
+            ),
+        );
+    }
+    if let Some(missed) = s
+        .last_missed
+        .as_ref()
+        .filter(|missed| wall_now.saturating_sub(missed.recorded_at) < MISSED_ALARM_SECONDS)
+    {
+        raise(
+            Severity::Critical,
+            format!(
+                "missed challenge deadline of note {} ({})",
+                missed.note_id, missed.reason
             ),
         );
     }
@@ -905,7 +924,9 @@ mod tests {
             (AwaitingSettlement, 5, Severity::Critical),
             (NoEvidence, 0, Severity::Ok),
             (ExpiredWithoutEvidence, 0, Severity::Ok),
-            (ResolvedUnconfirmed, 0, Severity::Ok),
+            // With evidence it may have been paid out: its deadline counts.
+            (ResolvedUnconfirmed, 100, Severity::Ok),
+            (ResolvedUnconfirmed, 0, Severity::Critical),
             (Missed, 0, Severity::Critical),
         ] {
             assert_eq!(
@@ -914,6 +935,9 @@ mod tests {
                 "{state:?} at {remaining}s"
             );
         }
+        let mut resolved = obligation(ResolvedUnconfirmed, 0);
+        resolved.evidence = None;
+        assert_eq!(severity(&resolved), Severity::Ok, "no evidence, no miss");
         // Blocked reasons: some are critical at once, the rest escalate.
         for reason in [
             BlockedReason::EvidenceInvalid,
@@ -1066,6 +1090,25 @@ mod tests {
         let mut s = healthy_snapshot();
         s.chain.scan_lag_blocks = Some(SCAN_LAG_CRITICAL_BLOCKS);
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Critical);
+
+        // A recorded miss stays critical for a while after it is recorded.
+        let mut s = healthy_snapshot();
+        s.missed_total = 1;
+        s.last_missed = Some(MissedRecord {
+            note_id: 4,
+            nullifier: Felt252::from_u64(9),
+            challenge_deadline: NOW - 30,
+            reason: "challenge not mined before the deadline".into(),
+            recorded_at: NOW - 10,
+        });
+        let current = evaluate(&s, &policy, NOW);
+        assert_eq!(current.status, Severity::Critical);
+        assert_eq!(
+            current.alarms,
+            ["critical: missed challenge deadline of note 4 (challenge not mined before the deadline)"]
+        );
+        s.last_missed.as_mut().unwrap().recorded_at = NOW - MISSED_ALARM_SECONDS;
+        assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Ok);
         let mut s = healthy_snapshot();
         s.indexer.pending_escapes = "unsupported".into();
         assert_eq!(evaluate(&s, &policy, NOW).status, Severity::Warning);

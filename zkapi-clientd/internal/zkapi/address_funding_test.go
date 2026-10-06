@@ -72,6 +72,10 @@ type addressFixture struct {
 	releaseBodies  []map[string]any
 	releaseRefusal string
 	companionSteps []string
+	// escapeCredits answers the vault's escapePayoutCredits(address), by
+	// lowercase destination address; a missing destination reads zero.
+	escapeCredits map[string]string
+	creditReads   int
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -217,6 +221,14 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				result = "0x"
 				if len(request.Params) == 3 {
 					f.overrideReads++
+				}
+				break
+			}
+			if strings.EqualFold(call.To, addressTestVault) && strings.HasPrefix(call.Data, "0x"+escapePayoutCreditsSelector) && len(call.Data) == 74 {
+				f.creditReads++
+				result = "0x0"
+				if credit, ok := f.escapeCredits["0x"+strings.ToLower(call.Data[34:])]; ok {
+					result = credit
 				}
 				break
 			}

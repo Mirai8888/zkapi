@@ -145,10 +145,11 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		failure := map[string]string{"error": err.Error()}
-		// The guided withdrawal acts on this refusal, so its code crosses
-		// the management boundary as well as its message.
+		// The guided withdrawal acts on these refusals, and repair's
+		// refused release names ownership_proof_sent, so their code crosses
+		// the management boundary as well as the message.
 		var companion *Error
-		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing") {
+		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing" || companion.Code == "ownership_proof_sent") {
 			failure["code"] = companion.Code
 		}
 		_ = json.NewEncoder(w).Encode(failure)

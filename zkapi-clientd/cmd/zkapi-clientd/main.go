@@ -175,6 +175,9 @@ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.
 		case "receipt_journal_missing":
 			// The message names the nullifier the operator needs.
 			return nil, &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
+		case "ownership_proof_sent":
+			// The note stays withdrawal-only; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "ownership_proof_sent", Message: "A withdrawal sent, or may have sent, the ownership proof of the note's current state, so no chat request is made from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal."}
 		case "clearance_reserved_state":
 			// No chat can settle this state; waiting or retrying cannot help.
 			return nil, &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}

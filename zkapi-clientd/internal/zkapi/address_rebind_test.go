@@ -3,7 +3,10 @@ package zkapi
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -96,6 +99,10 @@ func TestRebindReplacesOnlyNamedGenesisCompanionNote(t *testing.T) {
 		"planned reservation": {&wrong, func() {
 			f.withdrawalPhase, f.releaseRefusal = reservedWithdrawal(0xA4A4), "withdrawal_conflict"
 		}, func() { f.withdrawalPhase, f.releaseRefusal = nil, "" }},
+		// ... or one whose ownership proof was sent (on a legacy vault).
+		"reservation whose ownership proof was sent": {&wrong, func() {
+			f.withdrawalPhase, f.releaseRefusal = reservedWithdrawal(0xA4A4), "ownership_proof_sent"
+		}, func() { f.withdrawalPhase, f.releaseRefusal = nil, "" }},
 		"reservation of another note": {&wrong, func() { f.withdrawalPhase = reservedWithdrawal(7) }, func() { f.withdrawalPhase = nil }},
 	} {
 		f.mu.Lock()
@@ -113,11 +120,15 @@ func TestRebindReplacesOnlyNamedGenesisCompanionNote(t *testing.T) {
 		if name == "unnamed" && !strings.Contains(err.Error(), "--replace-note-id 42148") {
 			t.Fatalf("unnamed replacement did not explain the flag: %v", err)
 		}
-		if refusedRelease := name == "reservation with server state" || name == "planned reservation"; refusedRelease != (released == 1) || released > 1 {
+		if refusedRelease := name == "reservation with server state" || name == "planned reservation" || name == "reservation whose ownership proof was sent"; refusedRelease != (released == 1) || released > 1 {
 			t.Fatalf("%s: unexpected withdrawal release attempts: %d", name, released)
 		}
 		if released == 1 && !strings.Contains(err.Error(), "finish that withdrawal") {
 			t.Fatalf("%s: refused release did not explain the withdrawal: %v", name, err)
+		}
+		var coded *Error
+		if name == "reservation whose ownership proof was sent" && (!strings.Contains(err.Error(), "may have sent, its ownership proof") || !errors.As(err, &coded) || coded.Code != "ownership_proof_sent") {
+			t.Fatalf("%s: refused release did not name the sent ownership proof with its code: %v", name, err)
 		}
 		if f.resetCalls != 0 || f.activated != 0 || f.savedDeposit(t).Rebind != nil {
 			t.Fatalf("%s: refused rebind reset, confirmed, or journaled a replacement", name)
@@ -132,6 +143,29 @@ func TestRebindReplacesOnlyNamedGenesisCompanionNote(t *testing.T) {
 	}
 	if record := f.savedDeposit(t); record.Rebind != nil || record.Binding == nil || record.Binding.NoteID != 12 || !record.Active {
 		t.Fatalf("replacement was not committed: %+v", record)
+	}
+}
+
+// Repair's refused release crosses the management boundary with its code:
+// ownership_proof_sent, beside the explanation, and no companion detail.
+// Other refusals carry only their explanation.
+func TestRebindForwardsTheOwnershipProofRefusalCode(t *testing.T) {
+	f, _ := activatedWithWrongCompanionNote(t)
+	for refusal, code := range map[string]string{"ownership_proof_sent": "ownership_proof_sent", "withdrawal_pending": ""} {
+		f.mu.Lock()
+		f.withdrawalPhase, f.releaseRefusal = reservedWithdrawal(0xA4A4), refusal
+		f.mu.Unlock()
+		r := httptest.NewRequest("POST", "http://127.0.0.1:8787/admin/funding/rebind", strings.NewReader(`{"replace_note_id":42148}`))
+		r.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		f.h.ServeAdminHTTP(recorder, r)
+		var failure struct{ Error, Code string }
+		if recorder.Code != http.StatusBadGateway || json.Unmarshal(recorder.Body.Bytes(), &failure) != nil || failure.Code != code || !strings.Contains(failure.Error, "finish that withdrawal") || strings.Contains(failure.Error, "private reservation detail") {
+			t.Fatalf("%s: management refusal: %d %s", refusal, recorder.Code, recorder.Body.String())
+		}
+		if f.resetCalls != 0 || f.activated != 0 {
+			t.Fatalf("%s: a refused release replaced the note", refusal)
+		}
 	}
 }
 

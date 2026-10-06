@@ -109,6 +109,9 @@ func (e *Error) Error() string {
 	if e.Code == "unsettled_clearance_reserved" {
 		return "zkAPI withdrawal needs your acknowledgement: a chat request sent from the note's current state never settled, and the server already holds a withdrawal clearance for that state (for example because the zkAPI operator released it), so no chat request can settle it and the clearance is granted only with an ownership proof. Run zkapi-clientd config --menu and choose withdraw to review the risk and send the proof"
 	}
+	if e.Code == "ownership_proof_sent" {
+		return "zkAPI note state is withdrawal-only: a withdrawal sent, or may have sent, the ownership proof of the note's current state towards the zkAPI server, and on this vault a chat request from that state could let whoever kept the proof burn the private balance, so no chat request is sent from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal"
+	}
 	if e.Code == "clearance_reserved_state" {
 		return "zkAPI note state is reserved for withdrawal: the server holds a withdrawal clearance for the note's current state (for example because the zkAPI operator released it) and refuses every chat request from it, so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance"
 	}
@@ -281,7 +284,7 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			}
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
-				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state":
+				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent":
 					return nil, &Error{response.StatusCode, code}
 				}
 			}

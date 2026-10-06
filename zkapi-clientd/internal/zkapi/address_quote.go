@@ -170,7 +170,7 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	if microUSD != 0 {
 		record.DepositUSDUnits = amount
 	}
-	record.Withdrawal = nil
+	retireWithdrawal(record)
 	if err = h.saveAddress(record); err != nil {
 		return quote, err
 	}

@@ -38,6 +38,9 @@ type AddressFundingStatus struct {
 	DepositStage    string `json:"deposit_stage,omitempty"`
 	TransactionHash string `json:"transaction_hash,omitempty"`
 	Message         string `json:"message"`
+	// EscapePayoutCredits lists credited escape payouts of earlier notes
+	// that the vault still holds (see EscapePayoutCredit).
+	EscapePayoutCredits []EscapePayoutCredit `json:"escape_payout_credits,omitempty"`
 }
 
 var errAddressNeedsETH = errors.New("send more ETH to the payment address for Ethereum network fees")
@@ -93,6 +96,9 @@ func (h *FundingHandler) addressSnapshot(ctx context.Context) (fundingConfig, *a
 		token.Quo(eth, big.NewInt(1_000_000_000))
 	}
 	status.TokenBalance, status.ETHBalance = token.String(), eth.String()
+	if status.EscapePayoutCredits, err = h.escapePayoutCredits(ctx, config, record); err != nil {
+		return config, record, status, err
+	}
 	if record.Phase == "active" {
 		hasNote, err := h.addressHasNote(ctx)
 		if err != nil {
@@ -182,7 +188,7 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	depositStage := ""
 	update := func() AddressFundingStatus {
 		next := addressPublicStatus(record)
-		next.TokenBalance, next.ETHBalance = status.TokenBalance, status.ETHBalance
+		next.TokenBalance, next.ETHBalance, next.EscapePayoutCredits = status.TokenBalance, status.ETHBalance, status.EscapePayoutCredits
 		if depositStage != "" {
 			next.DepositStage = depositStage
 		}
@@ -332,9 +338,16 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 			return update(), nil
 		}
 		record.Amount, record.Phase = amount, "waiting_funds"
-		record.Withdrawal = nil
+		credited := len(record.CreditedPayouts)
+		retireWithdrawal(record)
 		if err := h.saveAddress(record); err != nil {
 			return status, err
+		}
+		if len(record.CreditedPayouts) != credited {
+			// The replaced withdrawal's credited payout is reported from now on.
+			if status.EscapePayoutCredits, err = h.escapePayoutCredits(ctx, config, record); err != nil {
+				return update(), err
+			}
 		}
 	}
 	if record.Phase == "legacy_recovery" {

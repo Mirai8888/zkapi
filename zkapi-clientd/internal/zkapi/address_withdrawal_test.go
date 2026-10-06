@@ -41,8 +41,10 @@ type withdrawalFixture struct {
 	// overrideVersion is the companion's unsettled_request_override_version.
 	overrideVersion int
 	// prepareBodies records every withdrawal prepare request body.
-	prepareBodies         []map[string]any
-	confirmFailure        bool
+	prepareBodies  []map[string]any
+	confirmFailure bool
+	// companionCredited makes the companion report escape_payout_credited.
+	companionCredited     bool
 	capability            bool
 	planMutation          func(map[string]any)
 	reservedDestination   string
@@ -208,6 +210,9 @@ func (f *withdrawalFixture) bridgeStatus() map[string]any {
 	status := map[string]any{"phase": "reserved", "note_id": f.reservedNoteID, "destination": f.reservedDestination, "final_balance": fmt.Sprint(f.reservedBalance), "withdrawal_nullifier": f.reservedNullifier}
 	if f.completedHash != "" {
 		status["phase"], status["transaction_hash"] = "complete", f.completedHash
+		if f.companionCredited {
+			status["escape_payout_credited"] = true
+		}
 	}
 	return status
 }

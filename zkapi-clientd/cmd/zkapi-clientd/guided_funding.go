@@ -184,6 +184,9 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		if state.TransactionHash != "" {
 			return errors.New("a saved transaction needs recovery; run zkapi-clientd config before continuing")
 		}
+		if err := showSetupEscapePayoutCredits(ctx, service, state, ui); err != nil {
+			return err
+		}
 		var usd uint64
 		if state.Amount == 0 {
 			usd, err = chooseSetupDepositUSD(ctx, usdText, ui)
@@ -219,6 +222,24 @@ func guidedFunding(ctx context.Context, service guidedFundingService, usdText st
 		return errors.New("deposit recovery did not activate the private balance; run zkapi-clientd config with the same configuration")
 	}
 	return checkSetupBalance(ready, ui)
+}
+
+// showSetupEscapePayoutCredits names every escape payout the vault credited
+// instead of paying before a new deposit: the deposit replaces a credited
+// withdrawal's record (its credit is then listed in the funding status), and
+// nothing has reached those destinations until someone claims the credit.
+func showSetupEscapePayoutCredits(ctx context.Context, service guidedFundingService, state zkapi.AddressFundingStatus, ui setupPrompter) error {
+	withdrawal, err := service.Withdrawal(ctx)
+	if err != nil {
+		return err
+	}
+	if withdrawal.Phase == "complete" && withdrawal.PayoutCredited {
+		ui.Printf("Unclaimed escape payout: %s\n", withdrawal.Message)
+	}
+	for _, credit := range state.EscapePayoutCredits {
+		ui.Printf("Unclaimed escape payout: %s\n", credit.Message)
+	}
+	return nil
 }
 
 func waitSetupWallet(ctx context.Context, service guidedFundingService, ui setupPrompter, wait func(context.Context) error) (zkapi.WalletReadiness, error) {

@@ -597,7 +597,7 @@ index 98ed732..352b879 100644
              .json(&req)
              .send()
 diff --git a/rust/crates/zkapi-client/src/wallet_v2.rs b/rust/crates/zkapi-client/src/wallet_v2.rs
-index b0f0162..99e5bb7 100644
+index b0f0162..391f962 100644
 --- a/rust/crates/zkapi-client/src/wallet_v2.rs
 +++ b/rust/crates/zkapi-client/src/wallet_v2.rs
 @@ -9,8 +9,8 @@ use zkapi_proof::compact::{
@@ -721,7 +721,7 @@ index b0f0162..99e5bb7 100644
          let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
          let current = balance_commitment(
              state.current_balance,
-@@ -286,62 +325,254 @@ impl Wallet {
+@@ -286,62 +325,271 @@ impl Wallet {
          ensure_stored_commitment(state, &current)?;
          let anonymous = rerandomize(&current, &journal.user_rerandomization)
              .map_err(|error| ClientError::VerificationFailed(error.to_string()))?;
@@ -955,6 +955,22 @@ index b0f0162..99e5bb7 100644
          active_root: Felt252,
          merkle_siblings: Vec<Felt252>,
 +    ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
++        self.withdrawal_mutual_close_recorded(destination, active_root, merkle_siblings, || Ok(()))
++            .await
++    }
++
++    /// Like `withdrawal_mutual_close`, but calls `before_send` once the
++    /// ownership proof is built and before the clearance request carrying it
++    /// is sent. An error from it sends nothing. Callers record there, durably,
++    /// that the proof may have left: any answer, or none, can follow the
++    /// request, and whoever saw it may hold a submittable escape.
++    pub async fn withdrawal_mutual_close_recorded(
++        &self,
++        destination: [u8; 20],
++        active_root: Felt252,
++        merkle_siblings: Vec<Felt252>,
++        before_send: impl FnOnce() -> Result<(), ClientError>,
++    ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
 +        // Never a request proof or a placeholder destination: this proof is a
 +        // submittable escape that pays `destination` the current balance.
 +        let (public_inputs, proof) = self.build_withdrawal(
@@ -964,6 +980,7 @@ index b0f0162..99e5bb7 100644
 +            false,
 +            None,
 +        )?;
++        before_send()?;
 +        let ownership = ClearanceOwnershipProof {
 +            public_inputs,
 +            proof,
@@ -1001,7 +1018,7 @@ index b0f0162..99e5bb7 100644
          let message = core::clearance_message(
              state.protocol_version,
              state.chain_id,
-@@ -382,7 +613,7 @@ impl Wallet {
+@@ -382,7 +630,7 @@ impl Wallet {
              state.archive(&self.state_path)?;
          }
          self.state = None;
@@ -1010,7 +1027,7 @@ index b0f0162..99e5bb7 100644
          Ok(())
      }
 
-@@ -395,6 +626,11 @@ impl Wallet {
+@@ -395,6 +643,11 @@ impl Wallet {
          clearance_signature: Option<zkapi_types::SchnorrSignature>,
      ) -> Result<(WithdrawalPublicInputsV2, Groth16ProofWire), ClientError> {
          let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
@@ -1022,7 +1039,7 @@ index b0f0162..99e5bb7 100644
          let nullifier = core::nullifier(&state.secret_s, &state.current_anchor);
          let mut destination_bytes = [0u8; 32];
          destination_bytes[12..].copy_from_slice(&destination);
-@@ -444,38 +680,74 @@ impl Wallet {
+@@ -444,38 +697,74 @@ impl Wallet {
      async fn request_clearance(
          &self,
          nullifier: &Felt252,
@@ -1116,7 +1133,7 @@ index b0f0162..99e5bb7 100644
          if response.client_request_id != request_id || response.request_nullifier != nullifier {
              return Err(ClientError::VerificationFailed(
                  "response request identity mismatch".to_string(),
-@@ -486,11 +758,6 @@ impl Wallet {
+@@ -486,11 +775,6 @@ impl Wallet {
                  "response payload hash mismatch".to_string(),
              ));
          }
@@ -1128,7 +1145,7 @@ index b0f0162..99e5bb7 100644
          if response.charge_applied > cap || response.next_anchor.is_zero() {
              return Err(ClientError::VerificationFailed(
                  "invalid charge or next anchor".to_string(),
-@@ -544,9 +811,7 @@ impl Wallet {
+@@ -544,9 +828,7 @@ impl Wallet {
          next.current_anchor = response.next_anchor;
          next.is_genesis = false;
          next.state_signature = Some(response.next_state_signature);
@@ -1139,7 +1156,7 @@ index b0f0162..99e5bb7 100644
      }
 
      fn setup_dir(&self) -> &str {
-@@ -600,3 +865,315 @@ fn state_note_leaf(state: &NoteState) -> Felt252 {
+@@ -600,3 +882,377 @@ fn state_note_leaf(state: &NoteState) -> Felt252 {
          state.expiry_ts,
      )
  }
@@ -1453,6 +1470,68 @@ index b0f0162..99e5bb7 100644
 +            .wallet
 +            .withdrawal_escape_hatch([0; 20], fixture.root, fixture.siblings.clone())
 +            .is_err());
++    }
++
++    /// The caller's record that an ownership proof may have left is made
++    /// after the proof is built and before the request carrying it is sent,
++    /// so it covers every answer, including none: a gateway's 429 here. A
++    /// proof that cannot be built records nothing, and a failed record sends
++    /// nothing.
++    #[tokio::test]
++    async fn the_ownership_proof_is_recorded_before_its_clearance_request_leaves() {
++        let server = MockServer::start().await;
++        let fixture = fixture(&server.url);
++        server.reply(
++            429,
++            serde_json::json!({"error": {"code": "gateway_rate_limited"}}).to_string(),
++        );
++        let mut recorded = Vec::new();
++        let result = fixture
++            .wallet
++            .withdrawal_mutual_close_recorded(
++                DESTINATION,
++                fixture.root,
++                fixture.siblings.clone(),
++                || {
++                    recorded.push(server.calls().len());
++                    Ok(())
++                },
++            )
++            .await;
++        assert!(
++            matches!(result, Err(ClientError::ServerError(_))),
++            "{result:?}"
++        );
++        assert_eq!(recorded, [0], "recorded once, before any request");
++        assert_eq!(server.calls().len(), 1);
++
++        let mut wrong_path = fixture.siblings.clone();
++        wrong_path[3] = Felt252::from_u64(9);
++        let result = fixture
++            .wallet
++            .withdrawal_mutual_close_recorded(DESTINATION, fixture.root, wrong_path, || {
++                panic!("recorded a proof that was never built")
++            })
++            .await;
++        assert!(
++            matches!(result, Err(ClientError::ProofGeneration(_))),
++            "{result:?}"
++        );
++
++        let result = fixture
++            .wallet
++            .withdrawal_mutual_close_recorded(
++                DESTINATION,
++                fixture.root,
++                fixture.siblings.clone(),
++                || Err(ClientError::Serialization("storage unavailable".into())),
++            )
++            .await;
++        assert!(
++            matches!(result, Err(ClientError::Serialization(_))),
++            "{result:?}"
++        );
++        assert_eq!(server.calls().len(), 1, "a failed record sends nothing");
 +    }
 +}
 diff --git a/rust/crates/zkapi-types/src/wire.rs b/rust/crates/zkapi-types/src/wire.rs

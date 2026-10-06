@@ -65,6 +65,10 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 	if initial.BillingAsset != "native_eth" {
 		return errors.New("guided withdrawal requires the native ETH deployment")
 	}
+	for _, credit := range initial.EscapePayoutCredits {
+		clearSetupProgress(ui)
+		ui.Printf("Unclaimed escape payout: %s\n", credit.Message)
+	}
 	switch initial.Phase {
 	case "no_note":
 		ui.Printf("There is no open private balance to withdraw.\n")
@@ -367,6 +371,12 @@ func finishGuidedWithdrawal(ctx context.Context, service guidedWithdrawalService
 		switch state.Phase {
 		case "complete":
 			clearSetupProgress(ui)
+			if state.PayoutCredited {
+				// The escape closed the note, but the vault holds the
+				// payout for the destination: nothing was sent yet.
+				ui.Printf("The private note is closed, but its %s ETH payout was not delivered to %s.\n%s\n", fundingUnits(strconv.FormatUint(state.Amount, 10), 9), state.Destination, state.Message)
+				return nil
+			}
 			ui.Printf("Withdrawal complete: %s ETH sent to %s.\n", fundingUnits(strconv.FormatUint(state.Amount, 10), 9), state.Destination)
 			if state.ActualFeeWei != "" {
 				ui.Printf("Network fee: %s ETH.\n", fundingUnits(state.ActualFeeWei, 18))

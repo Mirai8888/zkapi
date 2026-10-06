@@ -201,7 +201,25 @@ private state:
   waiting. A finalized escape of the same reservation (same note, nullifier,
   payout and destination) is accepted as an independently relayed payout:
   after a reverted withdrawal, choose `confirm` in the `withdraw` menu action
-  and enter that transaction's hash.
+  and enter that transaction's hash. On a vault with `vault_revision` 2 such
+  an escape can close the note without paying the destination: when the
+  destination rejects ETH or needs more than 100,000 gas to receive it, the
+  vault credits the balance to `escapePayoutCredits(destination)` and logs
+  `EscapePayoutDeferred` in the same receipt. The withdrawal then completes
+  as **payout credited, not delivered**: nothing has arrived yet. Once the
+  destination accepts a plain ETH transfer, anyone can deliver the credit,
+  also while the vault is paused, by calling `claimEscapePayout(destination)`
+  (selector `0x88c10aee`) on the vault. The withdrawal status names the vault
+  (`vault_address`) and the transaction data (`claim_calldata`) with
+  `payout_credited: true`. The guided setup repeats this before it asks for
+  a new deposit. A new deposit replaces the withdrawal record but keeps the
+  credit: the funding and withdrawal statuses then list it under
+  `escape_payout_credits`, one entry per destination with its
+  `credited_amount` (the vault's `escapePayoutCredits(destination)` now),
+  `note_ids`, `transaction_hashes`, `vault_address`, `claim_calldata` and
+  `message`, and **fund**, **withdraw** and the guided withdrawal print it as
+  an unclaimed escape payout. An entry disappears once the vault's credit
+  for its destination reads zero.
 
 If a deposit stays in `verification_conflict`, compare its transaction on a
 block explorer, then run `zkapi-clientd config --menu` (with the same
@@ -225,8 +243,10 @@ retired after a reported revert), or while the wallet has an unsettled
 request, and it replaces an existing wallet note only when you name it and it
 is an unspent genesis note of the same amount. A withdrawal reservation of
 that note is released first through the companion's `POST /oa/v1/withdraw/release`,
-which refuses when the withdrawal has a prepared plan or the protocol server
-knows its nullifier; any other reservation blocks the rebind. The replacement
+which refuses when the withdrawal has a prepared plan, when its clearance
+request carried, or may have carried, an ownership proof on a vault without
+`vault_revision` 2 (`ownership_proof_sent`, described below), or when the
+protocol server knows its nullifier; any other reservation blocks the rebind. The replacement
 is saved before the wallet is reset, so an interrupted rebind resumes when
 **repair** is chosen again with both fields left blank.
 
@@ -237,6 +257,34 @@ manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
 later requires a wallet companion whose `/oa/v1/status` reports
 `clearance_ownership_proof_version`; an older companion is refused before any
 note is reserved.
+
+On a vault without `vault_revision` 2, which includes both packaged
+deployments, the ownership proof is also a valid escape, and a challenge of
+that escape with a chat request from the same note state consumes the note's
+only nullifier. So once a clearance request carrying the proof has left the
+companion, the note state stays reserved for that withdrawal, whatever came
+back: a gateway's 429, a server error, or no answer at all, since whoever saw
+the request may have kept the proof. The companion records this in its
+reservation before the request leaves. It then never releases that
+reservation, even when the server reports the nullifier unknown (that answer
+is unsigned): **repair** stops, explaining that the withdrawal sent or may
+have sent its ownership proof, and the management API's error body carries
+`"code": "ownership_proof_sent"` beside that explanation. The companion
+makes no chat request from that state either (the chat API answers 409
+`ownership_proof_sent`). Choose **withdraw** again to finish the close,
+which sends the proof again.
+
+A reservation saved before the companion recorded this does not say whether
+a proof left. No tagged release up to 0.1.6 sent one: their clearance
+requests carried only the nullifier. Development builds after 0.1.6 sent one
+whenever they could build it, which needs the note's leaf in the vault's tree
+at its note ID. So for such a reservation the release asks the indexer for
+that leaf. When the indexer holds another leaf there, as for a wrongly bound
+note, no proof was ever built, and the reservation is released on the
+server's unknown reading as before. When it holds this note's leaf, the
+reservation stays, unless its note state had an unsettled request (below)
+and you never acknowledged sending the proof. When the indexer cannot answer,
+nothing is released; try again later.
 
 The exception is a note state from which a chat request was sent but never
 settled: the companion set the request aside into its request archive (see

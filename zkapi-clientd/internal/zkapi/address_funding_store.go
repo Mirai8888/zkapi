@@ -36,6 +36,21 @@ type addressFundingRecord struct {
 	Withdrawal      *addressWithdrawalRecord `json:"withdrawal,omitempty"`
 	Quote           *AddressPaymentQuote     `json:"quote,omitempty"`
 	Return          *addressReturnRecord     `json:"return,omitempty"`
+	// CreditedPayouts keeps every credited escape payout (a complete
+	// withdrawal with PayoutCredited) after a later deposit replaced its
+	// withdrawal record, so status keeps reporting its claim until the
+	// vault no longer holds a credit for the destination.
+	CreditedPayouts []addressCreditedPayout `json:"credited_payouts,omitempty"`
+}
+
+// addressCreditedPayout is a finalized escape that closed a note without
+// paying its destination: the vault credited the balance to
+// escapePayoutCredits(Destination) instead.
+type addressCreditedPayout struct {
+	NoteID         uint64 `json:"note_id"`
+	Destination    string `json:"destination"`
+	Amount         uint64 `json:"amount"`
+	SettlementHash string `json:"settlement_hash"`
 }
 
 type addressTransaction struct {
@@ -197,6 +212,11 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			return nil, errors.New("pending public return is missing its authorization; preserve the file")
 		}
 	}
+	for _, credit := range record.CreditedPayouts {
+		if _, err := NormalizeWithdrawalDestination(credit.Destination); err != nil || credit.NoteID > 0xffffffff || !isHex(credit.SettlementHash, 32) {
+			return nil, errors.New("credited escape payout recovery data is invalid; preserve the file")
+		}
+	}
 	if w := record.Withdrawal; w != nil {
 		if _, err := NormalizeWithdrawalDestination(w.Destination); err != nil || w.NoteID > 0xffffffff || (w.Binding != "" && (!isHex(w.Binding, 32) || !isHex(w.Nullifier, 32))) {
 			return nil, errors.New("withdrawal recovery data is invalid; preserve the file")
@@ -208,6 +228,10 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		}
 		if w.Phase == "complete" && (!isHex(w.TransactionHash, 32) || w.Binding == "") {
 			return nil, errors.New("completed withdrawal recovery data is invalid; preserve the file")
+		}
+		// Only an independently relayed escape can leave a credited payout.
+		if w.PayoutCredited && (w.SettlementHash == "" || (w.Phase != "confirming" && w.Phase != "complete")) {
+			return nil, errors.New("credited escape payout recovery data is invalid; preserve the file")
 		}
 		if w.SettlementHash != "" {
 			if !isHex(w.SettlementHash, 32) || !isHex(w.TransactionHash, 32) || strings.EqualFold(w.SettlementHash, w.TransactionHash) || w.Binding == "" || (w.Phase != "confirming" && w.Phase != "complete") {

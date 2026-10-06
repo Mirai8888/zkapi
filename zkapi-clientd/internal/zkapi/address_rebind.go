@@ -207,7 +207,7 @@ func (h *FundingHandler) RebindDeposit(ctx context.Context, noteID, replaceNoteI
 		record.Pending = nil
 	}
 	if record.Withdrawal != nil && record.Withdrawal.Phase == "complete" && record.Withdrawal.NoteID != uint64(candidate) {
-		record.Withdrawal = nil
+		retireWithdrawal(record)
 	}
 	if record.Quote != nil && record.Quote.Kind == "deposit" {
 		record.Quote = nil
@@ -318,8 +318,9 @@ func (h *FundingHandler) rebindCompanion(ctx context.Context, deposit *depositRe
 
 // releaseWithdrawalReservation releases the companion's withdrawal
 // reservation of the note being replaced. The companion releases only a
-// reservation that never obtained a withdrawal plan and whose nullifier the
-// zkAPI server does not know; otherwise that withdrawal must finish first.
+// reservation that never obtained a withdrawal plan, that on a vault below
+// revision 2 never sent an ownership proof, and whose nullifier the zkAPI
+// server does not know; otherwise that withdrawal must finish first.
 func (h *FundingHandler) releaseWithdrawalReservation(ctx context.Context, reservation withdrawalBridgeStatus) error {
 	body, _ := json.Marshal(map[string]any{"note_id": reservation.NoteID, "withdrawal_nullifier": reservation.Nullifier})
 	raw, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/release", body)
@@ -330,6 +331,12 @@ func (h *FundingHandler) releaseWithdrawalReservation(ctx context.Context, reser
 			return fmt.Errorf("the zkAPI server already holds a clearance or request for the withdrawal reserved on note %d, so the note cannot be replaced; finish that withdrawal (run zkapi-clientd config --menu and choose withdraw) instead of rebinding; nothing was changed", reservation.NoteID)
 		case "withdrawal_conflict":
 			return fmt.Errorf("the withdrawal reserved on note %d has a prepared plan or no longer matches the companion's note, so the note cannot be replaced; finish that withdrawal (run zkapi-clientd config --menu and choose withdraw) instead of rebinding; nothing was changed", reservation.NoteID)
+		case "ownership_proof_sent":
+			// Whoever saw that clearance request may hold the proof, an
+			// escape at this state; on a vault below revision 2 the
+			// reservation never lifts. The code crosses the management
+			// boundary with this explanation.
+			return &codedError{code: refused, message: fmt.Sprintf("the withdrawal reserved on note %d sent, or may have sent, its ownership proof towards the zkAPI server, so on this vault the note must stay reserved for that withdrawal and cannot be replaced; finish that withdrawal (run zkapi-clientd config --menu and choose withdraw) instead of rebinding; nothing was changed", reservation.NoteID)}
 		}
 	}
 	if err != nil {
@@ -341,3 +348,15 @@ func (h *FundingHandler) releaseWithdrawalReservation(ctx context.Context, reser
 	}
 	return nil
 }
+
+// codedError explains a companion refusal in its own words while keeping the
+// refusal's code: errors.As finds the *Error, so the management API forwards
+// the code beside this message.
+type codedError struct {
+	code    *Error
+	message string
+}
+
+func (e *codedError) Error() string { return e.message }
+
+func (e *codedError) Unwrap() error { return e.code }

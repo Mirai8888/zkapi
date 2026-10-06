@@ -205,6 +205,16 @@ func printFundingProgress(out io.Writer, state zkapi.AddressFundingStatus) {
 	if state.ActualFeeWei != "" {
 		fmt.Fprintf(out, "Actual network fee: %s ETH\n", fundingUnits(state.ActualFeeWei, 18))
 	}
+	printEscapePayoutCredits(out, state.EscapePayoutCredits)
+}
+
+// printEscapePayoutCredits reminds of earlier escapes' payouts that the vault
+// still holds for their destinations: a later deposit replaced their
+// withdrawal records, and nothing arrives until someone claims them.
+func printEscapePayoutCredits(out io.Writer, credits []zkapi.EscapePayoutCredit) {
+	for _, credit := range credits {
+		fmt.Fprintf(out, "Unclaimed escape payout: %s\n", credit.Message)
+	}
 }
 
 func waitFundingPoll(ctx context.Context) error {

@@ -40,6 +40,16 @@ type AddressWithdrawalStatus struct {
 	// NoteExpiry is the active note's expiry (Unix seconds). After it no
 	// chat request can move the note to a new state.
 	NoteExpiry uint64 `json:"note_expiry,omitempty"`
+	// PayoutCredited marks a complete withdrawal whose note an escape closed
+	// without paying the destination: the vault holds the balance in
+	// escapePayoutCredits(destination). Nothing has reached the destination
+	// until someone sends ClaimCalldata to VaultAddress.
+	PayoutCredited bool   `json:"payout_credited,omitempty"`
+	VaultAddress   string `json:"vault_address,omitempty"`
+	ClaimCalldata  string `json:"claim_calldata,omitempty"`
+	// EscapePayoutCredits lists credited escape payouts of earlier notes
+	// that the vault still holds (see EscapePayoutCredit).
+	EscapePayoutCredits []EscapePayoutCredit `json:"escape_payout_credits,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -53,6 +63,11 @@ type addressWithdrawalRecord struct {
 	// SettlementHash records an independently relayed payout. TransactionHash
 	// remains the locally signed intent whose nonce was consumed by a revert.
 	SettlementHash string `json:"settlement_hash,omitempty"`
+	// PayoutCredited records that the relayed payout is a finalized escape
+	// whose push to Destination failed (EscapePayoutDeferred in the same
+	// receipt): the note is closed, and the vault holds its balance for
+	// Destination until claimEscapePayout(Destination) delivers it.
+	PayoutCredited bool `json:"payout_credited,omitempty"`
 }
 
 type withdrawalWallet struct {
@@ -72,6 +87,9 @@ type withdrawalBridgeStatus struct {
 	FinalBalance    string `json:"final_balance"`
 	Nullifier       string `json:"withdrawal_nullifier"`
 	TransactionHash string `json:"transaction_hash"`
+	// EscapePayoutCredited is the companion's own reading of the confirmed
+	// receipt: a finalized escape whose payout the vault credited.
+	EscapePayoutCredited bool `json:"escape_payout_credited"`
 }
 
 type withdrawalInputs struct {
@@ -108,6 +126,92 @@ var withdrawalEventTopic = crypto.Keccak256Hash([]byte("MutualClose(uint32,uint2
 // balance and destination. An ownership proof sent for clearance is a valid
 // escape proof, so anyone holding it can close the note this way instead.
 var escapeFinalizedEventTopic = crypto.Keccak256Hash([]byte("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)")).Hex()
+
+// A vault with vault_revision 2 pushes an escape payout with at most 100,000
+// gas. When the destination rejects it or needs more, the escape still
+// finalizes, but the balance is credited to escapePayoutCredits(destination)
+// and EscapePayoutDeferred(noteId, destination, amount) precedes
+// EscapeWithdrawalFinalized in the same receipt. Anyone can then deliver the
+// credit with claimEscapePayout(destination).
+var escapePayoutDeferredEventTopic = crypto.Keccak256Hash([]byte("EscapePayoutDeferred(uint32,address,uint128)")).Hex()
+
+const claimEscapePayoutSelector = "88c10aee"
+
+// escapePayoutCredits(address) on a vault with vault_revision 2.
+const escapePayoutCreditsSelector = "91f6e93a"
+
+// EscapePayoutCredit is a destination for which the vault still holds an
+// escape payout credit left by this wallet's finalized escapes, whose
+// withdrawal records a later deposit replaced. Nothing has arrived at
+// Destination until someone sends ClaimCalldata to VaultAddress.
+type EscapePayoutCredit struct {
+	Destination string `json:"destination"`
+	// CreditedAmount is escapePayoutCredits(Destination) as the vault reads
+	// now, in the deployment's billing units.
+	CreditedAmount    string   `json:"credited_amount"`
+	NoteIDs           []uint64 `json:"note_ids"`
+	TransactionHashes []string `json:"transaction_hashes"`
+	VaultAddress      string   `json:"vault_address"`
+	ClaimCalldata     string   `json:"claim_calldata"`
+	Message           string   `json:"message"`
+}
+
+// retireWithdrawal drops a complete withdrawal's record for the next note. A
+// credited escape payout stays in CreditedPayouts: the vault holds it for
+// the destination until claimEscapePayout(destination) delivers it.
+func retireWithdrawal(record *addressFundingRecord) {
+	if w := record.Withdrawal; w != nil && w.Phase == "complete" && w.PayoutCredited {
+		listed := false
+		for _, credit := range record.CreditedPayouts {
+			listed = listed || strings.EqualFold(credit.SettlementHash, w.SettlementHash)
+		}
+		if !listed {
+			record.CreditedPayouts = append(record.CreditedPayouts, addressCreditedPayout{NoteID: w.NoteID, Destination: w.Destination, Amount: w.Amount, SettlementHash: strings.ToLower(w.SettlementHash)})
+		}
+	}
+	record.Withdrawal = nil
+}
+
+// escapePayoutCredits reports the saved credited escape payouts whose
+// destination the vault still credits. A destination whose credit reads zero
+// was claimed since; its entries stay saved but are not reported.
+func (h *FundingHandler) escapePayoutCredits(ctx context.Context, config fundingConfig, record *addressFundingRecord) ([]EscapePayoutCredit, error) {
+	var credits []EscapePayoutCredit
+	index := map[string]int{}
+	for _, saved := range record.CreditedPayouts {
+		destination := common.HexToAddress(saved.Destination).Hex()
+		i, seen := index[destination]
+		if !seen {
+			amount, err := h.addressUintCall(ctx, config, config.Contract, "0x"+escapePayoutCreditsSelector+addressABIWord(strings.ToLower(destination)), "latest")
+			if err != nil {
+				return nil, err
+			}
+			i = -1
+			if amount.Sign() > 0 {
+				credits = append(credits, EscapePayoutCredit{Destination: destination, CreditedAmount: amount.String(), VaultAddress: common.HexToAddress(config.Contract).Hex(), ClaimCalldata: "0x" + claimEscapePayoutSelector + addressABIWord(strings.ToLower(destination))})
+				i = len(credits) - 1
+			}
+			index[destination] = i
+		}
+		if i >= 0 {
+			credits[i].NoteIDs = append(credits[i].NoteIDs, saved.NoteID)
+			credits[i].TransactionHashes = append(credits[i].TransactionHashes, saved.SettlementHash)
+		}
+	}
+	unit := config.BillingUnit
+	if unit == "" {
+		unit = "token units"
+	}
+	for i := range credits {
+		c := &credits[i]
+		notes := make([]string, len(c.NoteIDs))
+		for j, id := range c.NoteIDs {
+			notes[j] = fmt.Sprint(id)
+		}
+		c.Message = fmt.Sprintf("An earlier escape (note %[5]s) closed its note, but the vault could not deliver the payout to %[1]s, and it still holds a credit of %[2]s %[7]s for that address, so nothing has arrived there yet. Once %[1]s accepts a plain ETH transfer, anyone can deliver the credit, even while the vault is paused, by calling claimEscapePayout(%[1]s) (selector 0x%[6]s) on the vault %[3]s; the transaction's data is %[4]s.", c.Destination, c.CreditedAmount, c.VaultAddress, c.ClaimCalldata, strings.Join(notes, ", "), claimEscapePayoutSelector, unit)
+	}
+	return credits, nil
+}
 
 const withdrawalVerifyingMessage = "The withdrawal is final on Ethereum; waiting for the vault state and the zkAPI indexer to confirm the note is closed before finishing local bookkeeping."
 
@@ -175,7 +279,7 @@ func (h *FundingHandler) AddressWithdrawal(ctx context.Context) (AddressWithdraw
 
 func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
 	config, record, payment, err := h.addressSnapshot(ctx)
-	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance}
+	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits}
 	var wallet withdrawalWallet
 	if err != nil {
 		return config, record, wallet, status, err
@@ -216,6 +320,7 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 		if withdrawal.SettlementHash != "" {
 			status.TransactionHash = withdrawal.SettlementHash
 		}
+		setEscapePayoutCredit(&status, withdrawal, config)
 		if *wallet.HasNote && wallet.Note.NoteID != withdrawal.NoteID {
 			status.Phase = "recovery_required"
 		}
@@ -233,7 +338,23 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 	return config, record, wallet, status, nil
 }
 
+// setEscapePayoutCredit reports a complete withdrawal whose escape payout the
+// vault credited instead of paying, with the call that delivers it.
+func setEscapePayoutCredit(status *AddressWithdrawalStatus, w *addressWithdrawalRecord, config fundingConfig) {
+	status.PayoutCredited, status.VaultAddress, status.ClaimCalldata = false, "", ""
+	if w == nil || !w.PayoutCredited || w.Phase != "complete" {
+		return
+	}
+	status.PayoutCredited = true
+	status.VaultAddress = common.HexToAddress(config.Contract).Hex()
+	status.ClaimCalldata = "0x" + claimEscapePayoutSelector + addressABIWord(strings.ToLower(w.Destination))
+}
+
 func setWithdrawalMessage(status *AddressWithdrawalStatus) {
+	if status.Phase == "complete" && status.PayoutCredited {
+		status.Message = fmt.Sprintf("An escape of this note finalized and closed it, but the vault could not deliver the payout to %[1]s: that address rejected the ETH or needed more than 100,000 gas to receive it. The vault holds the balance for that address as an escape payout credit, so nothing has arrived there yet. Once %[1]s accepts a plain ETH transfer, anyone can deliver the credit, even while the vault is paused, by calling claimEscapePayout(%[1]s) (selector 0x%[2]s) on the vault %[3]s; the transaction's data is %[4]s.", status.Destination, claimEscapePayoutSelector, status.VaultAddress, status.ClaimCalldata)
+		return
+	}
 	switch status.Phase {
 	case "ready":
 		status.Message = "Withdraw the entire remaining private balance to an explicit Ethereum address. The local payment address pays network fees."
@@ -300,6 +421,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 				status.TransactionHash = w.SettlementHash
 			}
 		}
+		setEscapePayoutCredit(&status, record.Withdrawal, config)
 		if record.Withdrawal != nil && record.Pending == nil {
 			for _, entry := range record.History {
 				if strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash) {
@@ -414,13 +536,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			if !alternateFinal {
 				return update(), errors.New("the alternate payout is missing or not finalized; the saved withdrawal has not changed")
 			}
-			if err := validateWithdrawalReceipt(alternate, config, w, true); err != nil {
+			payout, err := validateWithdrawalReceipt(alternate, config, w, true)
+			if err != nil {
 				return update(), err
 			}
 			if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, alternate); err != nil {
 				return closeUnconfirmed(err)
 			}
-			if err := h.completeAddressWithdrawal(ctx, config, record, confirmationHash, true); err != nil {
+			if err := h.completeAddressWithdrawal(ctx, config, record, confirmationHash, true, payout.Credited); err != nil {
 				return update(), err
 			}
 			status.PrivateBalance = 0
@@ -442,13 +565,14 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			// Proof generation or simulation can fail because it already paid.
 			retrying = record.Pending
 		} else {
-			if err := validateWithdrawalReceipt(receipt, config, w, false); err != nil {
+			payout, err := validateWithdrawalReceipt(receipt, config, w, false)
+			if err != nil {
 				return update(), err
 			}
 			if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, receipt); err != nil {
 				return closeUnconfirmed(err)
 			}
-			if err := h.completeAddressWithdrawal(ctx, config, record, record.Pending.Hash, false); err != nil {
+			if err := h.completeAddressWithdrawal(ctx, config, record, record.Pending.Hash, false, payout.Credited); err != nil {
 				return update(), err
 			}
 			status.PrivateBalance = 0
@@ -556,12 +680,16 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 // Call only after checking exact, canonical, finalized payout evidence. Save
 // its identity before companion confirmation so an uncertain response resumes
 // confirmation rather than signing another withdrawal or releasing the nonce.
-func (h *FundingHandler) completeAddressWithdrawal(ctx context.Context, config fundingConfig, record *addressFundingRecord, settlementHash string, localReverted bool) error {
+// credited marks a relayed escape whose payout the vault credited instead of
+// paying; the companion's own reading of the same receipt can only add that
+// mark. Our own signed mutual close pays in full or reverts.
+func (h *FundingHandler) completeAddressWithdrawal(ctx context.Context, config fundingConfig, record *addressFundingRecord, settlementHash string, localReverted, credited bool) error {
 	w := record.Withdrawal
 	w.Phase, w.TransactionHash = "confirming", record.Pending.Hash
 	if localReverted {
 		w.SettlementHash = strings.ToLower(settlementHash)
 	}
+	w.PayoutCredited = localReverted && credited
 	if err := h.saveAddress(record); err != nil {
 		return err
 	}
@@ -574,6 +702,7 @@ func (h *FundingHandler) completeAddressWithdrawal(ctx context.Context, config f
 	if json.Unmarshal(raw, &confirmed) != nil || !withdrawalStatusMatches(confirmed, w) || confirmed.Phase != "complete" || !strings.EqualFold(confirmed.TransactionHash, settlementHash) {
 		return errors.New("invalid withdrawal confirmation; preserve the saved transaction")
 	}
+	w.PayoutCredited = localReverted && (w.PayoutCredited || confirmed.EscapePayoutCredited)
 	if err := h.archiveWithdrawnDeposit(config, record); err != nil {
 		return err
 	}
@@ -626,18 +755,38 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 	return "0x" + withdrawalSelector + strings.Join(words, ""), binding, nil
 }
 
-func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, saved *addressWithdrawalRecord, relayed bool) error {
+// withdrawalPayout is what a matching payout receipt shows.
+type withdrawalPayout struct {
+	// Credited: the receipt's escape closed the note, but the vault could
+	// not push the balance to the destination and credited it to
+	// escapePayoutCredits(destination) instead (EscapePayoutDeferred for
+	// this note and destination). Nothing reached the destination yet.
+	Credited bool
+}
+
+func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, saved *addressWithdrawalRecord, relayed bool) (withdrawalPayout, error) {
 	// An independently relayed payout can call the vault through a wrapper.
 	// Its exact authenticated vault event is the payout evidence; the outer
 	// recipient remains bound to the vault for our own signed transaction.
 	// Only a relayed payout may be a finalized escape of the same reservation.
 	if receipt.Status == "0x1" && (relayed || strings.EqualFold(receipt.To, config.Contract)) {
-		matches := 0
+		matches, credited := 0, false
+		noteTopic := fmt.Sprintf("0x%064x", saved.NoteID)
 		for _, log := range receipt.Logs {
-			if !strings.EqualFold(log.Address, config.Contract) || len(log.Topics) != 2 || !(strings.EqualFold(log.Topics[0], withdrawalEventTopic) || (relayed && strings.EqualFold(log.Topics[0], escapeFinalizedEventTopic))) {
+			if log.Removed || !strings.EqualFold(log.Address, config.Contract) {
 				continue
 			}
-			if log.Removed || !strings.EqualFold(log.Topics[1], fmt.Sprintf("0x%064x", saved.NoteID)) || !isHex(log.Data, 96) {
+			// Whatever amount it names, a deferral for this note and
+			// destination means the destination was not paid. Only an
+			// escape, and so only a relayed payout, can be credited.
+			if len(log.Topics) == 3 && strings.EqualFold(log.Topics[0], escapePayoutDeferredEventTopic) && strings.EqualFold(log.Topics[1], noteTopic) && strings.EqualFold(log.Topics[2], "0x"+addressABIWord(saved.Destination)) {
+				credited = relayed
+				continue
+			}
+			if len(log.Topics) != 2 || !(strings.EqualFold(log.Topics[0], withdrawalEventTopic) || (relayed && strings.EqualFold(log.Topics[0], escapeFinalizedEventTopic))) {
+				continue
+			}
+			if !strings.EqualFold(log.Topics[1], noteTopic) || !isHex(log.Data, 96) {
 				continue
 			}
 			expected := "0x" + addressABIWord(saved.Nullifier) + fmt.Sprintf("%064x", saved.Amount) + addressABIWord(saved.Destination)
@@ -646,10 +795,10 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 			}
 		}
 		if matches == 1 {
-			return nil
+			return withdrawalPayout{Credited: credited}, nil
 		}
 	}
-	return errors.New("finalized receipt does not match the saved withdrawal; preserve recovery files")
+	return withdrawalPayout{}, errors.New("finalized receipt does not match the saved withdrawal; preserve recovery files")
 }
 
 func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord) error {
@@ -748,7 +897,7 @@ func (h *FundingHandler) adoptPostWithdrawalDeposit(config fundingConfig, deposi
 	if record.Pending != nil {
 		return errors.New("a saved transaction must be recovered before adopting a new note")
 	}
-	record.Withdrawal = nil
+	retireWithdrawal(record)
 	record.Phase, record.Amount, record.Commitment = "active", deposit.Amount, deposit.Commitment
 	return h.saveAddress(record)
 }

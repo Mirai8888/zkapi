@@ -426,7 +426,7 @@ func TestWithdrawPendingContinuesOnlyTheSameSavedDestination(t *testing.T) {
 }
 
 func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.T) {
-	for _, code := range []string{"withdrawal_pending", "withdrawal_conflict", "unknown", "receipt_journal_missing", "clearance_reserved_state"} {
+	for _, code := range []string{"withdrawal_pending", "withdrawal_conflict", "unknown", "receipt_journal_missing", "clearance_reserved_state", "ownership_proof_sent"} {
 		t.Run(code, func(t *testing.T) {
 			bridge := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -471,6 +471,11 @@ func TestInferenceConflictDistinguishesWithdrawalFromUnknownConflict(t *testing.
 				// withdraw instead of reporting an unknown conflict.
 				if backend.Code != code || !strings.Contains(backend.Message, "choose withdraw") || !strings.Contains(backend.Message, "no chat request can settle it") || strings.Contains(backend.Message, "diagnostics") {
 					t.Fatalf("clearance-reserved state: %+v", backend)
+				}
+			} else if code == "ownership_proof_sent" {
+				// A state whose ownership proof left stays withdrawal-only.
+				if backend.Code != code || !strings.Contains(backend.Message, "choose withdraw") || strings.Contains(backend.Message, "diagnostics") {
+					t.Fatalf("ownership proof sent: %+v", backend)
 				}
 			} else if strings.HasPrefix(code, "withdrawal_") {
 				if backend.Code != "withdrawal_pending" || !strings.Contains(backend.Message, "saved destination") || strings.Contains(backend.Message, "settling") {

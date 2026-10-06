@@ -218,13 +218,18 @@ func printWithdrawalProgress(out io.Writer, state zkapi.AddressWithdrawalStatus,
 	if state.Destination != "" && state.Phase != "ready" {
 		fmt.Fprintf(out, "Saved withdrawal: %s %s to %s\n", fundingUnits(strconv.FormatUint(state.Amount, 10), decimals), token, state.Destination)
 	}
-	fmt.Fprintf(out, "%s: %s\n", state.Phase, state.Message)
+	phase := state.Phase
+	if state.PayoutCredited {
+		phase = "payout credited, not delivered"
+	}
+	fmt.Fprintf(out, "%s: %s\n", phase, state.Message)
 	if state.TransactionHash != "" {
 		fmt.Fprintln(out, "Transaction:", state.TransactionHash)
 	}
 	if state.ActualFeeWei != "" {
 		fmt.Fprintf(out, "Actual network fee: %s ETH\n", fundingUnits(state.ActualFeeWei, 18))
 	}
+	printEscapePayoutCredits(out, state.EscapePayoutCredits)
 }
 
 func withdrawalResumeInstructions(out io.Writer, state zkapi.AddressWithdrawalStatus) {

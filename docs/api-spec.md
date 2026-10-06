@@ -99,8 +99,14 @@ ownership proof is an escape-form withdrawal proof (`has_clearance: false`)
 for the same nullifier: `public_inputs` is `WithdrawalPublicInputsV2`, with
 `destination` as 20 byte values, and `proof` is
 `{backend: "groth16_bn254", proof: "base64..."}`. Build it for the real
-destination and current balance; it is also a valid escape input, which lets
-its holder delay, but not redirect, the payout.
+destination and current balance. It is also a valid escape input: its holder
+can start the owner's escape, which pays the owner's destination one challenge
+period later unless a request proof for the same state challenges it. On a
+vault without non-destructive challenges (anything but `vault_revision` 2),
+such a challenge consumes the nullifier, and the owner can then no longer exit
+at that state. On such a vault, a client must never send an ownership proof
+from a state whose request proof may have left the device. It must also never
+send a request proof from a state whose ownership proof it has sent.
 
 The server requires the matching nullifier, `has_clearance: false`, its own
 deployment and both signing keys, a valid proof, and a root it observed within

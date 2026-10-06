@@ -75,7 +75,12 @@ whose request proof left the device: there it sends only the proof-less
 request, and refuses with `409 transmitted_anchor_ownership_unsafe` when the
 server asks for a proof. The reason for both exceptions: an ownership proof is
 a valid escape, and on such a vault a challenge with a request proof for the
-same state burns the nullifier. The gateway now limits POST floods per
+same state burns the nullifier. For the same reason, on such a vault neither
+client sends a request proof from a state once a clearance request carrying
+its ownership proof has left, even when the answer is a gateway 429 or is
+lost: the SDK keeps the note withdrawal-only, and `zkapi-clientd` keeps the
+withdrawal reserved and refuses to release it (`409 ownership_proof_sent`).
+Retrying the close completes it. The gateway now limits POST floods per
 source.
 Reservations stay permanent, because a clearance signature has no expiry.
 
@@ -232,8 +237,15 @@ closes and the treasury share is paid; the balance is credited to
 anyone can deliver it with `claimEscapePayout(destination)`, also while paused.
 A mutual close to a destination that rejects ETH still reverts (it forwards
 all gas, so a destination that only needs more gas is paid): its submitter can
-prove the close again to another destination. Clients from this release do not
-detect a credited payout yet; see
+prove the close again to another destination. The browser SDK from this
+release reports such an escape, when this browser started it, as credited
+rather than returned, and offers its claim (`claimEscapePayout`).
+`zkapi-clientd` reports an independently relayed escape it accepts as payout
+evidence as credited (`payout_credited`), with the claim's calldata; its
+pinned manifests are still legacy vaults, which never credit. On a legacy
+vault the SDK refuses, before proving, an escape to a destination that
+rejects a plain ETH transfer from the vault (`escape_destination_unpayable`),
+unless the caller overrides that check. See
 [Escape payout credits](#operations-runbooks).
 
 **Unpinned funding RPC.** `zkapi-clientd` trusted one third-party RPC for
@@ -553,7 +565,51 @@ Browser SDK:
   `browserRuntimeHoldsState` and `isOpenBrowserWithdrawal`.
   `readBrowserWalletSnapshot(id)` adds `otherDeploymentWithdrawals`, and
   `snapshot().config.other_deployment_withdrawals` lists other deployments'
-  open withdrawals.
+  open withdrawals. The store also exports `readBrowserWalletPayoutCredits`,
+  `browserWalletPayoutCredits` and `isUnclaimedPayoutCredit`;
+  `readBrowserWalletSnapshot(id)` adds `otherDeploymentCredits`, and
+  `snapshot().config.other_deployment_credits` lists other deployments'
+  unclaimed escape payout credits, which do not block a deposit.
+- An escape whose finalization receipt carries `EscapePayoutDeferred` for its
+  note and destination is reported as credited: its withdrawal record gets
+  `payoutCredited: true`, `payoutVerified: false`, `creditedAmount` (vault
+  units) and `payoutCreditEvidence: "receipt"`, the status message says the
+  destination did not accept the payout, and `finalizeEscape` returns
+  `payoutCredited: true`. Without a readable receipt (another device or a
+  third party finalized it), a `vault_revision` 2 vault's nonzero
+  `escapePayoutCredits(destination)` at the block where the note reads Closed
+  marks it credited with `payoutCreditEvidence: "vault_credit"` and
+  `creditedAmount: null`; this escape's own receipt proving the push later
+  turns it into `payoutCredited: false`, `payoutVerified: true`. A close that
+  a reorganization removed resets the payout, credit and claim fields.
+  Records written by earlier builds have no credit fields and keep their
+  meaning.
+- `client.creditedEscapePayouts` lists credited records not yet seen
+  delivered, and `client.claimEscapePayout(recordId, onStatus)` reads
+  `escapePayoutCredits(destination)` and sends
+  `claimEscapePayout(destination)` from the connected account, which pays
+  only gas. It returns `{ status: "claimed" }`, or `{ status: "pending" }`
+  while an earlier claim for that destination is pending, or throws with a
+  `shortMessage` (`native_transfer_failed` while the destination still
+  rejects ETH; the credit stays). A delivered credit sets
+  `payoutClaimed: true`, `payoutVerified: true` and `payoutClaimEvidence`
+  (`"claim_receipt"`, or `"credit_cleared"` when a zero credit shows that
+  someone else claimed it). `client.readEscapePayoutCredit(destination)` reads
+  the credit, and a manual signer's claim carries
+  `zkapiRecovery.kind: "escape-payout-claim"`, which
+  `resumeExternalTransaction` accepts. Vault reverts also map
+  `ZeroAmount()` to `zero_amount`.
+- Before proving an escape, the SDK simulates the vault's push to the
+  destination; `client.checkEscapeDestination(destination, { finalBalance })`
+  runs the same check and returns `{ destination, accepts, warning }`
+  (`accepts: null` when the RPC cannot tell, which never refuses). On a
+  `vault_revision` 2 vault a failing destination only warns: `onStatus`
+  shows the warning and the result carries `destinationWarning`. On any other
+  vault `withdraw('escape')` refuses that destination with
+  `escape_destination_unpayable`, because such an escape could never
+  finalize; its `error.data.override_option` is `"overrideDestinationCheck"`,
+  and `withdraw('escape', onStatus, { destination, overrideDestinationCheck: true })`
+  proceeds. The runtime adds `currentWithdrawals()`.
 
 `zkapi-clientd`:
 
@@ -587,14 +643,41 @@ Browser SDK:
   client may send it only after showing the owner the challenge risk and
   getting an explicit acknowledgement. `409 receipt_journal_missing` carries
   the state's nullifier in `error.nullifier`. The daemon's management API
-  forwards these three codes in its error body's `code` field; its
-  `POST /admin/withdrawal/quote` accepts `accept_unsettled_request_risk`,
+  forwards these three codes, and `ownership_proof_sent` (below), in its
+  error body's `code` field; its `POST /admin/withdrawal/quote` accepts
+  `accept_unsettled_request_risk`,
   `POST /admin/withdrawal` refuses it, and withdrawal status adds
   `note_expiry`.
 - The companion's `/oa/v1/lease` answers `409 clearance_reserved_state` when
   the server holds a clearance for the note's current state (for example after
   the operator's release): no chat request can settle it. `zkapi-clientd`
   shows that code in the chat error with the remedy, **withdraw**.
+- On a vault below `vault_revision` 2 the companion records in its
+  reservation (`ownership_proof_sent` in `oa-withdrawal.json`), before a
+  clearance request carrying the ownership proof leaves, that the proof may
+  have left; the generic `/wallet/withdraw` close records it in
+  `oa-ownership-proof-sent.json`. Such a reservation is never released:
+  `/oa/v1/withdraw/release`, and so **repair**, refuse it with
+  `409 ownership_proof_sent`, even after the server reports the nullifier
+  unknown, and no chat request is made from that state (while the
+  reservation stands, `/oa/v1/lease` answers `409 withdrawal_conflict`, as for
+  any reservation, which the daemon's chat API reports as
+  `409 withdrawal_pending`; after the generic close, chats there answer
+  `409 ownership_proof_sent`). Choosing **withdraw** again completes the
+  close. A reservation saved before the field existed
+  counts as sent when the indexer holds the reserved state's note leaf at its
+  note ID, unless that state had an unsettled request whose risk the owner
+  never acknowledged; while the indexer cannot answer, nothing is released.
+- A relayed escape accepted as withdrawal evidence whose receipt also carries
+  `EscapePayoutDeferred` for the note and destination (only a
+  `vault_revision` 2 vault emits it) completes as credited, not paid: the
+  withdrawal status adds `payout_credited`, `vault_address` and
+  `claim_calldata` (`claimEscapePayout(destination)`, selector `0x88c10aee`),
+  and the companion's withdrawal status adds `escape_payout_credited`. A later
+  deposit keeps the credit in the funding record's `credited_payouts`
+  (validated on load; a damaged entry is refused, not dropped), and funding
+  and withdrawal statuses list it under `escape_payout_credits` until
+  `escapePayoutCredits(destination)` reads zero.
 
 ## Compatibility
 
@@ -1181,7 +1264,11 @@ before Phase 4.
   the Phase 3 cutoff, also set `"deposits": "closed"` in this profile.
   Tell users that an escape's destination cannot change after initiation and
   must accept ETH: on this vault an escape to a destination that rejects ETH
-  never finalizes.
+  never finalizes. This release's SDK simulates the vault's payout before it
+  proves an escape and refuses such a destination with
+  `escape_destination_unpayable`; a host passes
+  `overrideDestinationCheck: true` only after the user confirms that address
+  anyway.
   Once the legacy deployment's server is upgraded, declaring
   `"clearance_ownership_proof": "optional"` in the legacy profile's
   `trusted_deployment` (in `sdk/assets/config/mainnet.json` and `sepolia.json`,
@@ -1214,7 +1301,13 @@ before Phase 4.
   set-aside request journals in `request_archive/` in its state directory and
   never prunes them. Users who back up the wallet must include that directory
   and must not delete files in it; a damaged record there counts as an
-  unsettled request. A deposit in
+  unsettled request. Once a withdrawal's clearance request carrying the
+  ownership proof has left the companion, the note state stays reserved for
+  that withdrawal: **repair** cannot release it (`ownership_proof_sent`), no
+  chat request is made from it, and the user finishes the close by choosing
+  **withdraw** again. A reservation saved by an earlier build is judged by
+  the note's leaf in the indexer's tree (see
+  [Breaking changes](#breaking-changes)). A deposit in
   `verification_conflict` is re-checked by `zkapi-clientd config` and repaired
   with `zkapi-clientd config --menu`, then **repair**; this includes a retry
   refused because an earlier deposit of the same note, reported as reverted,
@@ -1256,9 +1349,18 @@ before Phase 4.
   `request_archive_limit` as a prompt to withdraw that balance. An escape's
   destination cannot change after initiation, so tell users to choose one
   that accepts a plain ETH transfer within 100,000 gas, such as an ordinary
-  account. This release reports an escape whose payout the vault credited
-  (`EscapePayoutDeferred`) as returned; relay the operator's credit
-  announcements to the owner (see
+  account; `client.checkEscapeDestination(destination)` checks an address
+  before the user confirms it, and an escape to a failing one proceeds with a
+  warning. The SDK reports an escape whose payout the vault credited
+  (`EscapePayoutDeferred`) as credited (`payoutCredited: true`, with
+  `payoutVerified: false` until a claim is proven), lists it in
+  `client.creditedEscapePayouts` and delivers it with
+  `client.claimEscapePayout(recordId)`, sent from the connected account,
+  which pays only gas. Show it as credited, never as returned, and offer the
+  claim; while the destination still rejects ETH, the claim fails its gas
+  estimate (`native_transfer_failed`) before the wallet is asked to sign, and
+  the credit stays. The SDK detects only escapes this browser started, so
+  keep relaying the operator's credit announcements to other owners (see
   [Escape payout credits](#operations-runbooks)).
 - **Wallet ordering in browsers.** The SDK keeps one selected note per origin
   and refuses to open a wallet for another deployment while it holds durable
@@ -1277,7 +1379,14 @@ before Phase 4.
   a withdrawal aside is not an exit: the withdrawal stays bound to the legacy
   deployment. A loaded runtime also lists other deployments' open withdrawals
   in `snapshot().config.other_deployment_withdrawals`; do not offer a deposit
-  while that list is non-empty. Never clear site data to get past the check.
+  while that list is non-empty. A finalized escape whose payout the hardened
+  vault only credited is not listed, because it holds no note;
+  `readBrowserWalletPayoutCredits()` and
+  `snapshot().config.other_deployment_credits` report it, without blocking a
+  deposit. Its claim needs that deployment's profile, which loads only while
+  the runtime slot holds no other deployment's state; anyone can also call
+  `claimEscapePayout(destination)` on that vault. Never clear site data to get
+  past the check.
   Hosts that route protocol calls through a same-origin rewrite need a rewrite
   for the new hostname as well.
 - **`zkapi-clientd`.** A release pinned to the hardened vault needs work that
@@ -1505,10 +1614,21 @@ cast send "$NEW_VAULT" 'withdrawTreasuryArrears()' \
 **Escape payout credits.** An `EscapePayoutDeferred(noteId, destination, amount)`
 event means an escape closed but its push to `destination` failed: the
 destination rejected ETH or needed more than 100,000 gas. The amount (gwei
-units) waits in `escapePayoutCredits(destination)`. Clients from this release
-do not detect this: the browser SDK reports such an escape as returned. Anyone
-can deliver the credit, also while paused, and the claim pays only
-`destination`, whoever sends it, so claim it on the owner's behalf:
+units) waits in `escapePayoutCredits(destination)`. The browser SDK from this
+release reports an escape it started as credited, and its users can claim it
+from the app (`client.claimEscapePayout`). `zkapi-clientd` reports a credited
+escape payout as `payout_credited`, with the vault and the claim's calldata,
+and lists it under `escape_payout_credits` until the vault's credit for that
+destination reads zero; its pinned manifests are still legacy vaults, which
+never credit. Browser SDKs from earlier releases report such an escape as
+returned. Clients detect a credit in only two cases: the browser SDK for an
+escape that the same browser started, and `zkapi-clientd`, which has no
+escape, for a relayed escape whose transaction hash the user enters as
+withdrawal evidence. Any other escape, for example one started in another
+browser or with an ownership proof that someone kept, reaches the owner only
+through you, so still tell the owner. Anyone can deliver the credit, also
+while paused, and the claim pays only `destination`, whoever sends it, so
+claim it on the owner's behalf:
 
 ```sh
 cast call "$NEW_VAULT" 'escapePayoutCredits(address)(uint128)' <destination> --rpc-url "$RPC_URL"
@@ -1521,7 +1641,13 @@ The claim forwards all its gas, so a destination that needed more than
 reverts and keeps the credit while the destination still rejects ETH; the
 credit then waits until that destination's owner makes it accept ETH. The
 server cannot tell who owns a note, so announce such a credit with its note ID
-(the event's first indexed topic) and destination through the hosts.
+(the event's first indexed topic) and destination through the hosts. An
+`EscapePayoutClaimed(destination, amount)` event, whoever sent the claim,
+shows that the credit was delivered, and `escapePayoutCredits(destination)`
+then reads zero until another escape to that address is credited. A browser
+SDK that started the escape marks it delivered at its next claim action, also
+when someone else claimed it, and `zkapi-clientd` stops listing it once the
+credit reads zero.
 
 **Settlement reviews.** Alert on `settlement required operator review`, list
 open reviews, and acknowledge each handled one, as in the
@@ -1856,21 +1982,37 @@ Roll forward where possible: the earlier binaries bring back the defects.
 - **Browser SDK:** earlier builds ignore the archive records, which stay inert;
   the archive's protections are lost, wallet data is not. They send clearance
   without an ownership proof, as in [Compatibility](#compatibility), and ignore
-  `trusted_deployment.deposits`.
+  `trusted_deployment.deposits`. They also ignore the payout-credit fields:
+  they show a credited escape as returned and offer no claim, while the vault
+  keeps the credit, and they start a legacy-vault escape to a destination that
+  rejects ETH without the destination check.
 - **`zkapi-clientd`:** the additive state fields are ignored by earlier
   releases, subject to the downgrade warning in Phase 2. An earlier release
   (0.1.6 or before) drops `slot`, `signed_slots` and each slot's
   `empty_before` from `pending-deposit.json` when it rewrites that file. After
   upgrading again, a revert of that deposit is retired, and a retry signed,
   without any indexer search for its earlier deposits, as for deposits signed
-  before this release; this is one more reason for that warning. An earlier
-  companion cannot accept an escape payout as withdrawal evidence and has no
-  release route, and 0.1.6 and earlier cannot open a wallet whose journaled
-  request was quoted under other native-price pins. Earlier companions ignore
+  before this release; this is one more reason for that warning. A companion
+  from 0.1.6 or before cannot accept an escape payout as withdrawal evidence,
+  has no release route, and cannot open a wallet whose journaled request was
+  quoted under other native-price pins. Earlier companions ignore
   `request_archive/` and delete journals again instead of archiving them; a
   pre-release build of this companion also sends an ownership proof from a
   state with a set-aside request. Keep the directory, so that an upgrade sees
-  those requests again.
+  those requests again. Every earlier companion, 0.1.6 included, ignores
+  `oa-ownership-proof-sent.json`, so it makes chat requests again from a
+  state whose ownership proof left through the generic `/wallet/withdraw`
+  close. On a vault below `vault_revision` 2, whoever kept that proof can then
+  escape with it and challenge the escape with such a request, which burns
+  the nullifier, so finish such a close (repeat it until the note is closed)
+  before rolling back. Earlier companions also ignore a reservation's
+  `ownership_proof_sent`: a pre-release build of this companion, which has
+  the release route, can again release through **repair** a reservation whose
+  ownership proof left the device, and a reservation that any earlier
+  companion rewrites loses that field and is judged by its note leaf after an
+  upgrade. Earlier daemons ignore `payout_credited` and drop
+  `credited_payouts` when they rewrite the funding record; the vault keeps the
+  credit.
 - **Contracts:** a deployed vault cannot be rolled back. The legacy vault is
   untouched by this release; an unannounced hardened deployment can simply be
   abandoned before anyone deposits.
@@ -1979,6 +2121,9 @@ outside this release:
   legacy-vault state with an archived (set-aside) request, unless its owner
   types `send` at the guided withdrawal's risk warning, which it offers only
   once the note has expired or the server holds a clearance for the state.
+  Once a clearance request carrying the proof has left it, it makes no
+  request proof from that state and never releases that withdrawal's
+  reservation, whatever the answer.
 - **Client gaps.**
   - `zkapi-clientd` cannot yet abandon an unmined deposit, has no hardened
     manifests or retired-deployment guard, and does not warn against
@@ -1994,18 +2139,12 @@ outside this release:
     before then. A note whose journal 0.1.6 or earlier discarded reports
     `receipt_journal_missing` with its nullifier; a lying server or gateway can
     produce the same code.
-  - `zkapi-clientd` does not record that a withdrawal's clearance request
-    carried an ownership proof: **repair**, when it replaces an unused note,
-    releases that note's reservation after an unsigned `unknown` reading even
-    if the proof already left the device. The replacement note has the same
-    secret and genesis nullifier, so where the replaced note is a real note of
-    that deposit, an escape of it with that proof can be challenged with the
-    replacement's first request proof, which burns the nullifier on a legacy
-    vault.
-  - The browser SDK does not detect a credited escape payout
-    (`EscapePayoutDeferred`) and reports such an escape as returned, so
-    operators alert on the event and deliver the credit (see Escape payout
-    credits under Operations runbooks). Its expiry display does not use
+  - The browser SDK detects a credited escape payout only for an escape this
+    browser started, and its claim action runs only in that deployment's
+    runtime: a user who has since funded another deployment must withdraw
+    there first, or claim on chain directly. Operators still alert on
+    `EscapePayoutDeferred` and announce credits (see Escape payout credits
+    under Operations runbooks). Its expiry display does not use
     `effectiveExpiry` yet.
   - A wallet whose older SDK already discarded a journal cannot rebuild it, so
     a finalized receipt it cannot install shows `receipt_journal_missing`; a

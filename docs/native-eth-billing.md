@@ -14,10 +14,28 @@ integer gwei and requires exactly `amount * 1 gwei` in `msg.value`. Wrong values
 revert atomically. Native deposits are capped at JavaScript's maximum exact
 integer, 9,007,199,254,740,991 units. Withdrawal and expiry payouts convert ledger
 units back to wei and enforce proof, nullifier, destination, timing
-and reentrancy protections. A failed transfer to the withdrawal destination
-reverts the complete close. On vaults deployed from this release a treasury
-that rejects its share, or needs more than 100,000 gas to receive it, cannot
-block a close: the share accrues to `treasuryArrears()` with a
+and reentrancy protections. A failed transfer to a mutual-close destination
+reverts the complete close; the user can prove the close again to another
+destination. A mutual close forwards all gas, so only a destination that
+rejects ETH reverts it. On vaults deployed from this release
+`finalizeEscapeWithdrawal` pushes the balance with at most 100,000 gas
+(`ESCAPE_PAYOUT_GAS`); if the destination rejects it or needs more gas, the
+escape still closes and the treasury share is paid, and the balance is
+credited to `escapePayoutCredits(destination)` (`EscapePayoutDeferred`) for a
+later `claimEscapePayout(destination)`, which anyone can call, also while
+paused. This release's browser SDK reports such an escape that it started as
+credited, not returned, and offers that claim; see
+[Credited escape payouts](../sdk/README.md#credited-escape-payouts). Earlier
+SDK builds report such an escape as returned, and clients detect a credit
+only for an escape that the same browser started (the browser SDK) or a
+relayed escape whose transaction hash the user enters (`zkapi-clientd`), so
+operators still announce credits; see
+[Escape payout credits](migration-hardened-vault.md#operations-runbooks).
+On older vaults an escape to a destination that rejects ETH cannot finalize,
+so the SDK refuses to start one unless the caller overrides its destination
+check.
+Likewise, on vaults deployed from this release a treasury that rejects its
+share, or needs more than 100,000 gas to receive it, cannot block a close: the share accrues to `treasuryArrears()` with a
 `TreasuryPaymentDeferred` event, and anyone can pay it out later with
 `withdrawTreasuryArrears()`.
 

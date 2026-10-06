@@ -296,7 +296,9 @@ The browser SDK retries a throttled clearance request within 15 seconds and
 cannot tell an honest 429 from a forged one. After a clearance request that
 carried an ownership proof, on a vault without `vault_revision` 2, it keeps the
 note withdrawal-only (`error.data.withdrawal_only: true`); retrying the close
-completes it.
+completes it. `zkapi-clientd` likewise keeps such a withdrawal reserved,
+whatever the answer: its **repair** cannot release it
+(`ownership_proof_sent`), and choosing **withdraw** again completes it.
 
 To change a limit, edit `nginx.conf` and rebuild and restart the gateway:
 
@@ -408,8 +410,12 @@ Alert on:
   [Operations runbooks](../../docs/migration-hardened-vault.md#operations-runbooks),
   Treasury arrears and Escape payout credits). `EscapePayoutDeferred` means an
   escape closed without paying its destination. The browser SDK from this
-  release does not detect that and reports such an escape as returned, so this
-  alert can be the only signal;
+  release reports an escape it started as credited and offers its users the
+  claim, but earlier builds report such an escape as returned. Clients detect
+  a credit only for an escape that the same browser started (the browser SDK)
+  or a relayed escape whose transaction hash the user enters
+  (`zkapi-clientd`), so this alert can be the owner's only signal: announce
+  the credit as that runbook says;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
   `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
   suppress the last only while the signer's

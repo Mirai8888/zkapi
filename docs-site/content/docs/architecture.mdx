@@ -154,8 +154,10 @@ to restore the note in the current tree. Other deposits and closes do not
 require rewriting the old proof's root. A successful challenge releases the
 nullifier but blocks every later escape at it; the owner withdraws from the
 signed successor state. An unchallenged escape is finalized after its
-deadline; if the destination rejects the payout, the vault credits it to that
-destination for a later `claimEscapePayout`. See [Protocol](/docs/protocol#withdrawal) and the
+deadline; if the destination rejects the payout or needs more than 100,000 gas
+to receive it, the vault credits it to that destination for a later
+`claimEscapePayout`. The browser SDK reports an escape it started as credited,
+not returned, and offers that claim. See [Protocol](/docs/protocol#withdrawal) and the
 [vault API](/docs/api-reference/vault).
 
 The challenge service serves `/livez`, `/health` and `/status` on a private

@@ -177,7 +177,7 @@ wei values as hex quantities:
 | -32003 | `tx_fee_above_cap` | `gas_limit`, `max_fee_per_gas`, `tx_fee_cap_wei`, `max_fee_per_gas_allowed` (floor of the cap / gas limit) | Gas limit x `maxFeePerGas`, proposed or default, exceeds `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. Checked before any upstream call. Bid at most `max_fee_per_gas_allowed`. |
 | -32003 | `upstream_tx_fee_cap` | `gas_limit`, `max_fee_per_gas` | The upstream node refused the broadcast because gas limit x `maxFeePerGas` exceeds its own `--rpc.txfeecap`, which is below `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. The node refuses before its pool, so nothing was broadcast. Lower the variable to the node's cap, or raise both. |
 | -32000 | `upstream_unavailable`, `upstream_rejected`, `upstream_chain_mismatch`, `base_fee_unavailable`, `simulation_failed` | none | Upstream or simulation failure. Transient. |
-| -32603 | none | none | Signer self-check failed or an internal error. |
+| -32603 | none | none | Signer self-check failed or an internal error. Nothing was broadcast, but `zkapi-challenged` treats the code as possibly broadcast, as it does any error it cannot attribute to this signer: it keeps the nonce and re-sends on it as a valid replacement. If the obligation expires first, the nonce is held (`nonce_blocked`) until resolved as in [Recovery and verification](../../../docs/challenge-service.md#recovery-and-verification). |
 | -32000 | `broadcast_ambiguous` | `transaction_hash` | The broadcast was attempted and its outcome is unknown. |
 
 Every error except `broadcast_ambiguous` means nothing was broadcast. All of
@@ -258,19 +258,22 @@ proposes no fees, so every challenge bids the fee cap with the default tip):
   refused; see [Node transaction fee cap](#node-transaction-fee-cap).
 - A refused challenge (`base_fee_above_max_fee`, `insufficient_balance`) signs
   on the daemon's next poll after you raise `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`
-  (within the transaction fee cap) or fund the sender. Restart the signer to
+  (within the transaction fee cap) or fund the sender. Recreate the signer to
   apply a new cap:
-  `sudo docker compose -f docker/aws/compose.yml --profile challenge up -d signer`.
+  `sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait signer`
+  (a container reads `signer.env` only when it is created;
+  `docker compose restart` keeps the old values).
 - A dropped challenge is re-sent on the same nonce at the new cap.
 - This daemon never replaces a still-pending challenge. Geth and reth usually
   keep a transaction whose `maxFeePerGas` is below the base fee in their pools
   until the base fee falls. To replace it by hand, raise both
   `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` and
   `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` by at least 12.5% (gas limit x the
-  new cap must stay within the transaction fee cap), restart the
-  signer, read the pending transaction with `eth_getTransactionByHash`, and send
-  its `from`, `to`, `input` (as `data`), `gas` and `nonce` back through the
-  signer without fee fields. Run both calls from the challenger container:
+  new cap must stay within the transaction fee cap), recreate the signer
+  (`sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait signer`),
+  read the pending transaction with `eth_getTransactionByHash`, and send its
+  `from`, `to`, `input` (as `data`), `gas` and `nonce` back through the signer
+  without fee fields. Run both calls from the challenger container:
 
   ```sh
   sudo docker compose -f docker/aws/compose.yml --profile challenge exec challenger \
@@ -290,17 +293,30 @@ With the **upgraded `zkapi-challenged`** (it proposes both fees), the daemon
 replaces its own pending challenge on the same nonce, raising both fees by at
 least the bump up to its caps, and jumps to its caps near the deadline. When its
 status reports that it reached its caps, raise the signer's caps in `signer.env`
-and restart the signer first, then raise the daemon's caps in `challenge.env`
-(never above the signer's) and restart the challenger. It never bids above the
+and recreate the signer first, then raise the daemon's caps in `challenge.env`
+(never above the signer's) and recreate the challenger:
+
+```sh
+sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait signer
+sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait challenger
+```
+
+A container reads its environment files only when it is created, so
+`docker compose restart` keeps the old values. The daemon never bids above the
 transaction fee cap / gas limit (about 132.7 gwei at 1 ETH for 7.53M gas), so
 when it reports `tx_fee_cap_reached`, raising the fee caps changes nothing:
 raise the node's `--rpc.txfeecap` first, then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
-in `signer.env` (restart the signer) and in `deployment.env` (restart the
-challenger). A `tx_fee_above_cap` or `upstream_tx_fee_cap` refusal means these
-settings disagree; nothing was broadcast. After `upstream_tx_fee_cap` the
+in `signer.env` (recreate the signer) and in `deployment.env` (recreate the
+challenger, with the same commands; `--no-deps` leaves the server and indexer,
+which also read `deployment.env`, running). A `tx_fee_above_cap` or
+`upstream_tx_fee_cap` refusal means these settings disagree; nothing was
+broadcast. After `upstream_tx_fee_cap` the
 challenger bids within 10/11 of the lowest refused transaction fee until it
-restarts, so it keeps challenging below the node's cap. Restart it after
-aligning the caps.
+restarts, so it keeps challenging below the node's cap. Recreate it after
+aligning the caps:
+`sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait --force-recreate challenger`
+(`--force-recreate` restarts it, clearing that bound, even when only
+`signer.env` changed).
 
 **Private relays.** The upstream is used for reads, simulation and broadcast. A
 private or MEV-protection relay may not expose pending transactions through
@@ -328,7 +344,7 @@ fee cap (step 1).
    That challenger then retries the refused challenge and holds back the ones
    after it (see the [fee-spike runbook](#fee-spike-runbook)), so choose a fee
    cap within that limit, or raise the node's cap and the variable together.
-2. Fund the sender as above, then rebuild and restart the signer, and check its
+2. Fund the sender as above, then rebuild and recreate the signer, and check its
    startup line and `zkapi_signerStatus`:
 
    ```sh

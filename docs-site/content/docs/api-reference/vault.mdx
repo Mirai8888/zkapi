@@ -138,7 +138,13 @@ ordinary account.
 | Effect | Pays `destination` all of its credited escape payouts, forwarding all gas, and emits `EscapePayoutClaimed(destination, amount)` |
 | Reverts | `ZeroAmount()` (`0x1f2a2005`) when there is no credit; `NativeTransferFailed()` (`0xf4b3b1bc`) while the destination still rejects ETH, and the credit is kept |
 
-Only `destination` is paid, whoever calls.
+Only `destination` is paid, whoever calls. The browser SDK reports an escape
+it started whose finalization receipt carries `EscapePayoutDeferred` for its
+note and destination as credited, not returned, and offers this claim from
+the connected account, which pays only gas. On a vault without payout credits
+it refuses to start an escape to a destination that rejects a plain ETH
+transfer from the vault, unless the caller overrides that check. See
+[Credited escape payouts](https://github.com/ethereum/zkapi/blob/main/sdk/README.md#credited-escape-payouts).
 
 ## Claim expired note
 

@@ -423,7 +423,11 @@ components:
       type: object
       description: >-
         Escape-form withdrawal proof for the same nullifier, built for the real
-        destination and current balance. It is also a valid escape input.
+        destination and current balance. It is also a valid escape input. On a
+        vault other than vault_revision 2, a challenge with a request proof for
+        the same state consumes the nullifier, so never send it from a state
+        whose request proof may have left the device, and never send a request
+        proof from a state after sending its ownership proof.
       additionalProperties: false
       required: [public_inputs, proof]
       properties:

@@ -20,7 +20,7 @@ library Errors {
     /// @notice An escape at this nullifier was defeated by a challenge; exit from the successor state.
     error ChallengedNullifier();
 
-    /// @notice The withdrawal destination is the zero address.
+    /// @notice The withdrawal destination is the zero address or the vault itself.
     error InvalidDestination();
 
     /// @notice The note is not in Active status.

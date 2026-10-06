@@ -11,6 +11,7 @@ import {Errors} from "../src/libraries/Errors.sol";
 import {Events} from "../src/libraries/Events.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+import {ToggleableDestination} from "./NativeEthVault.t.sol";
 
 contract AcceptAllProofs is IZkApiProofAdapter {
     function assertValidRequest(Types.RequestPublicInputs calldata, bytes calldata) external pure {}
@@ -29,7 +30,7 @@ contract GasBurningTreasury {
     }
 }
 
-/// Accepts payments with about 45k gas, well inside TREASURY_PAYOUT_GAS.
+/// Accepts payments with about 45k gas, well inside TREASURY_PAYOUT_GAS and ESCAPE_PAYOUT_GAS.
 contract CostlyTreasury {
     uint256 public payments;
     mapping(uint256 => uint256) private receipts;
@@ -43,8 +44,8 @@ contract CostlyTreasury {
 contract ZkApiVaultPauseTest is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint128 constant UNITS = 1_000_000;
-    /// TREASURY_PAYOUT_GAS as the docs state it. Pinned here rather than read from the vault, so
-    /// that raising the cap fails the gas-burning-treasury bounds.
+    /// TREASURY_PAYOUT_GAS and ESCAPE_PAYOUT_GAS as the docs state them. Pinned here rather than
+    /// read from the vault, so that raising a cap fails the gas-burning payee bounds.
     uint256 constant DOCUMENTED_PAYOUT_GAS = 100_000;
     address user = address(0x1234);
     address treasury = address(0x5678);
@@ -150,34 +151,43 @@ contract ZkApiVaultPauseTest is Test {
     }
 
     function testFuzz_effectiveExpiryMatchesPauseModel(uint32[6] memory gaps, uint8 depositAfter) public {
-        uint256 deposited = depositAfter % 4;
-        uint32 id;
-        uint256 pausedSinceDeposit;
-        for (uint256 i = 0; i < 3; ++i) {
-            if (i == deposited) id = _deposit(bytes32(uint256(42)));
-            // Unpaused gaps can outlast the TTL, so both claim bounds below get exercised.
-            vm.warp(block.timestamp + (gaps[2 * i] % 20 days));
-            vault.pause();
-            uint256 duration = gaps[2 * i + 1] % 10 days;
-            vm.warp(block.timestamp + duration);
-            vault.unpause();
-            if (i >= deposited) pausedSinceDeposit += duration;
-        }
-        if (deposited == 3) id = _deposit(bytes32(uint256(42)));
-        (,, uint64 expiry,) = vault.notes(id);
+        (uint32 id, uint256 shiftedExpiry) = _depositAmidPauses(gaps, depositAfter);
         // Expiry moves by the pause time since the deposit, and never lands inside the
         // grace that follows the latest unpause (which just happened).
         assertEq(vault.lastUnpausedAt(), block.timestamp);
-        uint256 claimAt = uint256(expiry) + pausedSinceDeposit;
+        uint256 claimAt = shiftedExpiry;
         uint256 graceEnd = block.timestamp + vault.unpauseClaimGrace();
         if (graceEnd > claimAt) claimAt = graceEnd;
-        assertEq(vault.effectiveExpiry(id), claimAt);
-        uint256[32] memory path = _path(id);
-        vm.warp(claimAt - 1);
-        vm.expectRevert(Errors.NoteNotExpired.selector);
-        vault.claimExpired(id, path);
-        vm.warp(claimAt);
-        vault.claimExpired(id, path);
+        _assertClaimableExactlyAt(id, claimAt);
+    }
+
+    /// With pauses before and after the deposit, a challenge before, near or after the
+    /// pause-shifted expiry leaves the note claimable at the latest of that expiry, challengePeriod
+    /// after the challenge, and unpauseClaimGrace after the latest unpause: the grace never
+    /// lowers the expiry and is never lost to the paused time folded into the note's expiry.
+    function testFuzz_challengeGraceMatchesPauseModel(
+        uint32[6] memory gaps,
+        uint8 depositAfter,
+        uint32 challengeLead,
+        uint32 escapeAge
+    ) public {
+        (uint32 id, uint256 shiftedExpiry) = _depositAmidPauses(gaps, depositAfter);
+        uint256 period = vault.challengePeriod();
+        // Challenge up to 2 periods before the shifted expiry, or up to a period after it.
+        uint256 challengedAt = shiftedExpiry + period - (challengeLead % (3 * period));
+        if (challengedAt <= block.timestamp) challengedAt = block.timestamp + 1;
+        uint256 initiatedAt = challengedAt - (escapeAge % period);
+        if (initiatedAt < block.timestamp) initiatedAt = block.timestamp;
+        vm.warp(initiatedAt);
+        vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "", _path(id));
+        vm.warp(challengedAt);
+        vault.challengeEscapeWithdrawal(id, _request(101), "", _path(id));
+
+        uint256 claimAt = shiftedExpiry;
+        if (challengedAt + period > claimAt) claimAt = challengedAt + period;
+        uint256 unpauseGraceEnd = vault.lastUnpausedAt() + vault.unpauseClaimGrace();
+        if (unpauseGraceEnd > claimAt) claimAt = unpauseGraceEnd;
+        _assertClaimableExactlyAt(id, claimAt);
     }
 
     function test_inFlightEscapeResolvesWhilePaused() public {
@@ -224,6 +234,84 @@ contract ZkApiVaultPauseTest is Test {
         vault.claimExpired(id, path);
         vm.warp(graceEnd);
         vault.claimExpired(id, path);
+    }
+
+    /// A challenge after a completed pause longer than challengePeriod still grants exactly
+    /// challengePeriod of unpaused time. The challenge comes an hour after the unpause, so the
+    /// grace ends an hour after the unpause claim grace and the latter cannot hide it.
+    function test_challengeSoonAfterCompletedPauseGetsExactGrace() public {
+        uint32 id = _deposit(42);
+        (,, uint64 expiry,) = vault.notes(id);
+        vm.warp(expiry - 2 hours);
+        vault.pause();
+        vm.warp(expiry + 10 days);
+        vault.unpause();
+        // Two hours of note time remain; escape with one of them left and challenge an hour
+        // after the unpause, well before the challenge deadline.
+        vm.warp(block.timestamp + 1 hours);
+        vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "", _path(id));
+        _challengeAndAssertExactGrace(id);
+    }
+
+    /// The same when the challenge falls weeks after lastUnpausedAt + unpauseClaimGrace, where
+    /// only the paused time folded into the active clock separates the grace end from the
+    /// challenge time.
+    function test_challengeLongAfterCompletedPauseGetsExactGrace() public {
+        uint32 id = _deposit(42);
+        (,, uint64 expiry,) = vault.notes(id);
+        vm.warp(block.timestamp + 1 days);
+        vault.pause();
+        vm.warp(block.timestamp + 10 days);
+        vault.unpause();
+        // Paused time moved expiry by 10 days; escape an hour before that and challenge at the
+        // last moment of the challenge window, after the shifted expiry.
+        vm.warp(uint256(expiry) + 10 days - 1 hours);
+        assertGt(block.timestamp, vault.lastUnpausedAt() + vault.unpauseClaimGrace() + 20 days);
+        Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
+        vault.initiateEscapeWithdrawal(escape, "", _path(id));
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        vm.warp(deadline - 1);
+        _challengeAndAssertExactGrace(id);
+    }
+
+    /// A note deposited after a completed pause longer than challengePeriod keeps its expiry on
+    /// the active clock, already shifted back by that pause. The grace guard must compare the
+    /// grace end with that shifted expiry, not the wall-clock expiryTs: challenged an hour before
+    /// its wall-clock expiry, the note still gets the full challengePeriod.
+    function test_challengeOnNoteDepositedAfterPauseGetsExactGrace() public {
+        vault.pause();
+        vm.warp(block.timestamp + 10 days);
+        vault.unpause();
+        vm.warp(block.timestamp + 2 days);
+        uint32 id = _deposit(42);
+        (,, uint64 expiry,) = vault.notes(id);
+        assertEq(vault.effectiveExpiry(id), expiry);
+        vm.warp(uint256(expiry) - 2 hours);
+        vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "", _path(id));
+        vm.warp(block.timestamp + 1 hours);
+        // The pause precedes the deposit, so the grace must exceed expiryTs, not just the
+        // active-clock expiry (expiryTs - 10 days) that the guard compares against.
+        assertGt(block.timestamp + vault.challengePeriod(), uint256(expiry));
+        _challengeAndAssertExactGrace(id);
+    }
+
+    /// Challenges the pending escape of `id` (nullifier 101) at the current time and checks that
+    /// the note becomes claimable exactly challengePeriod later, not a second earlier.
+    function _challengeAndAssertExactGrace(uint32 id) private {
+        Types.RequestPublicInputs memory request = _request(101);
+        uint256[32] memory zeroPath = _path(id);
+        uint256 challengedAt = vm.getBlockTimestamp();
+        vault.challengeEscapeWithdrawal(id, request, "", zeroPath);
+        uint256 graceEnd = challengedAt + vault.challengePeriod();
+        assertGt(graceEnd, vault.lastUnpausedAt() + vault.unpauseClaimGrace());
+        assertEq(vault.effectiveExpiry(id), graceEnd);
+        uint256[32] memory path = _path(id);
+        vm.warp(graceEnd - 1);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(id, path);
+        vm.warp(graceEnd);
+        vault.claimExpired(id, path);
+        assertEq(treasury.balance, uint256(UNITS) * 1 gwei);
     }
 
     function test_pauseJustBeforeExpiryLeavesClaimGraceAfterUnpause() public {
@@ -606,11 +694,116 @@ contract ZkApiVaultPauseTest is Test {
         assertGt(reverted, 0);
     }
 
+    // -------------------------------------------------------- escape payouts
+
+    /// A destination that burns all the gas it is given adds at most ESCAPE_PAYOUT_GAS (plus the
+    /// credit bookkeeping) to finalizeEscapeWithdrawal, however much gas the caller sends, and
+    /// the treasury share is still paid.
+    function test_gasBurningDestinationIsBoundedOnEscapeFinalization() public {
+        assertEq(vault.ESCAPE_PAYOUT_GAS(), DOCUMENTED_PAYOUT_GAS, "documented cap");
+        uint32 id = _deposit(42);
+        address burner = address(new GasBurningTreasury());
+        // A funded treasury, so neither run pays a new-account surcharge (the user is funded).
+        vm.deal(treasury, 1 ether);
+        bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
+        uint256 snapshot = vm.snapshotState();
+        vault.initiateEscapeWithdrawal(_withdrawal(id, 101, false), "", _path(id));
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        vm.warp(deadline);
+        uint256 baseline = _gasUsed(finalize, 30_000_000);
+        assertEq(vault.escapePayoutCredits(user), 0, "baseline pays the destination");
+        vm.revertToState(snapshot);
+
+        Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
+        escape.destination = burner;
+        vault.initiateEscapeWithdrawal(escape, "", _path(id));
+        vm.warp(deadline);
+        // 1M gas of headroom, 63/64 of which an uncapped push would burn.
+        uint256 used = _gasUsed(finalize, baseline + 1_000_000);
+        emit log_named_uint("finalizeEscapeWithdrawal gas with a normal destination", baseline);
+        emit log_named_uint("finalizeEscapeWithdrawal gas with a gas-burning destination", used);
+        assertEq(vault.escapePayoutCredits(burner), 700_000, "payout credited");
+        assertEq(treasury.balance, 1 ether + 300_000 gwei, "treasury paid");
+        assertEq(vault.treasuryArrears(), 0);
+        // Beyond the gas it forwards, a failed push only records the credit (one SSTORE, at most
+        // 22,100) and emits EscapePayoutDeferred.
+        assertLt(used, baseline + DOCUMENTED_PAYOUT_GAS + 30_000);
+    }
+
+    /// A caller cannot starve a destination that accepts within ESCAPE_PAYOUT_GAS to turn its
+    /// payout into a credit: any gas limit either pays it or reverts the whole finalization.
+    function test_underfundedGasCannotForceEscapePayoutCredit() public {
+        uint32 id = _deposit(42);
+        // A funded treasury keeps the rest of the call cheap, so a starved push would leave
+        // enough gas to finish if the vault kept any for the credit.
+        vm.deal(treasury, 1 ether);
+        CostlyTreasury costly = new CostlyTreasury();
+        Types.WithdrawalPublicInputs memory escape = _withdrawal(id, 101, false);
+        escape.destination = address(costly);
+        vault.initiateEscapeWithdrawal(escape, "", _path(id));
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(id);
+        vm.warp(deadline);
+        bytes memory finalize = abi.encodeCall(vault.finalizeEscapeWithdrawal, (id));
+        uint256 snapshot = vm.snapshotState();
+        uint256 used = _gasUsed(finalize, 30_000_000);
+        assertEq(costly.payments(), 1);
+        vm.revertToState(snapshot);
+
+        uint256 paid;
+        uint256 reverted;
+        for (uint256 limit = 25_000; limit <= used + 50_000; limit += 1_000) {
+            (bool ok,) = address(vault).call{gas: limit}(finalize);
+            if (ok) {
+                ++paid;
+                assertEq(costly.payments(), 1);
+            } else {
+                ++reverted;
+                (,,, Types.NoteStatus status) = vault.notes(id);
+                assertEq(uint256(status), uint256(Types.NoteStatus.PendingWithdrawal));
+            }
+            assertEq(vault.escapePayoutCredits(address(costly)), 0);
+            vm.revertToState(snapshot);
+        }
+        assertGt(paid, 0);
+        assertGt(reverted, 0);
+    }
+
+    /// Credited escape payouts accumulate per destination and stay claimable while paused, like
+    /// the escapes they complete.
+    function test_claimEscapePayoutWorksWhilePaused() public {
+        uint32 first = _deposit(42);
+        uint32 second = _deposit(43);
+        ToggleableDestination recipient = new ToggleableDestination();
+        Types.WithdrawalPublicInputs memory escape = _withdrawal(first, 101, false);
+        escape.destination = address(recipient);
+        vault.initiateEscapeWithdrawal(escape, "", _path(first));
+        escape = _withdrawal(second, 102, false);
+        escape.destination = address(recipient);
+        vault.initiateEscapeWithdrawal(escape, "", _path(second));
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(second);
+        vm.warp(deadline);
+        vault.pause();
+        vault.finalizeEscapeWithdrawal(first);
+        vault.finalizeEscapeWithdrawal(second);
+        assertEq(vault.escapePayoutCredits(address(recipient)), 1_400_000);
+        assertEq(treasury.balance, 600_000 gwei);
+
+        vm.expectRevert(Errors.NativeTransferFailed.selector);
+        vault.claimEscapePayout(address(recipient));
+        recipient.setAccepting(true);
+        vm.prank(user);
+        vault.claimEscapePayout(address(recipient));
+        assertTrue(vault.paused());
+        assertEq(address(recipient).balance, 1_400_000 gwei);
+        assertEq(vault.escapePayoutCredits(address(recipient)), 0);
+        assertEq(address(vault).balance, 0);
+    }
+
     // -------------------------------------------------------- guard coverage
 
     /// Every state-changing external function must be classified. Guarded ones
-    /// must revert Paused(); only in-flight escape resolution and owner-recovery
-    /// actions stay open while paused.
+    /// must revert Paused(); only in-flight escape resolution (and claims of its
+    /// credited payouts) and owner-recovery actions stay open while paused.
     function test_pauseGuardCoverage() public {
         string[9] memory guarded = [
             "deposit",
@@ -623,9 +816,10 @@ contract ZkApiVaultPauseTest is Test {
             "renounceOwnership",
             "pause"
         ];
-        string[6] memory exempt = [
+        string[7] memory exempt = [
             "challengeEscapeWithdrawal",
             "finalizeEscapeWithdrawal",
+            "claimEscapePayout",
             "unpause",
             "cancelTreasuryChange",
             "transferOwnership",
@@ -651,6 +845,23 @@ contract ZkApiVaultPauseTest is Test {
             ++mutating;
         }
         assertEq(mutating, guarded.length + exempt.length, "stale pause classification");
+
+        // pause()'s NatSpec is the list operator docs quote; it must match the guards.
+        string[] memory notice = vm.split(
+            vm.parseJsonString(artifact, ".metadata.output.userdoc.methods['pause()'].notice"),
+            "Stay open while paused:"
+        );
+        assertEq(notice.length, 2, "pause() notice must split blocked from open functions");
+        for (uint256 j = 0; j < guarded.length; ++j) {
+            if (_eq(guarded[j], "pause")) continue;
+            assertTrue(vm.contains(notice[0], guarded[j]), string.concat("pause() notice: blocked ", guarded[j]));
+            assertFalse(vm.contains(notice[1], guarded[j]), string.concat("pause() notice: open ", guarded[j]));
+        }
+        for (uint256 j = 0; j < exempt.length; ++j) {
+            if (_eq(exempt[j], "unpause")) continue;
+            assertTrue(vm.contains(notice[1], exempt[j]), string.concat("pause() notice: open ", exempt[j]));
+            assertFalse(vm.contains(notice[0], exempt[j]), string.concat("pause() notice: blocked ", exempt[j]));
+        }
 
         vault.pause();
         string[] memory signatures = vm.parseJsonKeys(artifact, ".methodIdentifiers");
@@ -683,6 +894,40 @@ contract ZkApiVaultPauseTest is Test {
 
     function _deposit(uint256 commitment) private returns (uint32) {
         return _deposit(bytes32(commitment));
+    }
+
+    /// Runs three unpaused-gap-then-pause rounds and deposits note `id` before round
+    /// `depositAfter % 4` (3: after all of them). Unpaused gaps can outlast the TTL. Returns the
+    /// note's expiryTs moved by the pause time since its deposit; ends right after an unpause.
+    function _depositAmidPauses(uint32[6] memory gaps, uint8 depositAfter)
+        private
+        returns (uint32 id, uint256 shiftedExpiry)
+    {
+        uint256 deposited = depositAfter % 4;
+        uint256 pausedSinceDeposit;
+        for (uint256 i = 0; i < 3; ++i) {
+            if (i == deposited) id = _deposit(bytes32(uint256(42)));
+            vm.warp(block.timestamp + (gaps[2 * i] % 20 days));
+            vault.pause();
+            uint256 duration = gaps[2 * i + 1] % 10 days;
+            vm.warp(block.timestamp + duration);
+            vault.unpause();
+            if (i >= deposited) pausedSinceDeposit += duration;
+        }
+        if (deposited == 3) id = _deposit(bytes32(uint256(42)));
+        (,, uint64 expiry,) = vault.notes(id);
+        shiftedExpiry = uint256(expiry) + pausedSinceDeposit;
+    }
+
+    /// effectiveExpiry(id) is `claimAt`, and claimExpired fails a second before it and succeeds at it.
+    function _assertClaimableExactlyAt(uint32 id, uint256 claimAt) private {
+        assertEq(vault.effectiveExpiry(id), claimAt);
+        uint256[32] memory path = _path(id);
+        vm.warp(claimAt - 1);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(id, path);
+        vm.warp(claimAt);
+        vault.claimExpired(id, path);
     }
 
     function _switchTreasury(address next) private {

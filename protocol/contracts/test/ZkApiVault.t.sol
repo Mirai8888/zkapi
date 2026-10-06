@@ -326,20 +326,27 @@ contract ZkApiVaultTest is Test {
         vault.initiateEscapeWithdrawal(withdrawal, "", siblings);
     }
 
-    function test_withdrawalRejectsZeroDestination() public {
+    /// The zero address and the vault itself (which cannot receive ETH) are refused before
+    /// anything changes, so neither can become an escape's payee.
+    function test_withdrawalRejectsZeroOrVaultDestination() public {
         _depositFirstNote();
-        Types.WithdrawalPublicInputs memory escape = _withdrawalInputs(0, 101, false);
-        escape.destination = address(0);
-        vm.expectRevert(Errors.InvalidDestination.selector);
-        vault.initiateEscapeWithdrawal(escape, "", emptySiblings);
-        Types.WithdrawalPublicInputs memory close = _withdrawalInputs(0, 99, true);
-        close.destination = address(0);
-        vm.expectRevert(Errors.InvalidDestination.selector);
-        vault.mutualClose(close, "", emptySiblings);
+        address[2] memory refused = [address(0), address(vault)];
+        for (uint256 i = 0; i < refused.length; ++i) {
+            Types.WithdrawalPublicInputs memory escape = _withdrawalInputs(0, 101, false);
+            escape.destination = refused[i];
+            vm.expectRevert(Errors.InvalidDestination.selector);
+            vault.initiateEscapeWithdrawal(escape, "", emptySiblings);
+            Types.WithdrawalPublicInputs memory close = _withdrawalInputs(0, 99, true);
+            close.destination = refused[i];
+            vm.expectRevert(Errors.InvalidDestination.selector);
+            vault.mutualClose(close, "", emptySiblings);
+        }
         assertFalse(vault.usedNullifiers(101));
         assertFalse(vault.usedNullifiers(99));
         (,,, Types.NoteStatus status) = vault.notes(0);
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
+        (bool exists,,,,,) = vault.pendingWithdrawals(0);
+        assertFalse(exists);
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
@@ -534,6 +541,46 @@ contract ZkApiVaultTest is Test {
         vm.warp(graceEnd);
         vault.claimExpired(0, emptySiblings);
         assertEq(treasury.balance, uint256(DEPOSIT) * 1 gwei);
+    }
+
+    /// The post-challenge grace only ever extends expiry: a challenge early in a note's life
+    /// leaves its expiry where it was, rather than pulling it in to challengePeriod after the
+    /// challenge (which would let claimExpired sweep a note just restored for its owner).
+    function test_earlyChallengeNeverLowersExpiry() public {
+        _depositFirstNote();
+        (,, uint64 expiry,) = vault.notes(0);
+        Types.RequestPublicInputs memory request = _archiveRequest();
+        _initiateEscape(emptySiblings);
+        vault.challengeEscapeWithdrawal(0, request, hex"cafe", emptySiblings);
+        uint256 challengedAt = vm.getBlockTimestamp();
+        assertLt(challengedAt + vault.challengePeriod(), expiry);
+        assertEq(vault.effectiveExpiry(0), expiry);
+
+        vm.warp(challengedAt + vault.challengePeriod());
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, emptySiblings);
+        vm.warp(expiry - 1);
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, emptySiblings);
+        vm.warp(expiry);
+        vault.claimExpired(0, emptySiblings);
+        assertEq(treasury.balance, uint256(DEPOSIT) * 1 gwei);
+    }
+
+    /// The same at the last moment of a challenge window that closes well before expiry.
+    function test_challengeAtDeadlineFarFromExpiryKeepsExpiry() public {
+        _depositFirstNote();
+        (,, uint64 expiry,) = vault.notes(0);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        Types.RequestPublicInputs memory request = _archiveRequest();
+        _initiateEscape(emptySiblings);
+        (,,,,, uint64 deadline) = vault.pendingWithdrawals(0);
+        vm.warp(deadline - 1);
+        vault.challengeEscapeWithdrawal(0, request, hex"cafe", emptySiblings);
+        assertEq(vault.effectiveExpiry(0), expiry);
+        vm.warp(uint256(deadline) - 1 + vault.challengePeriod());
+        vm.expectRevert(Errors.NoteNotExpired.selector);
+        vault.claimExpired(0, emptySiblings);
     }
 
     function _leafOf(uint32 noteId) private view returns (uint256) {

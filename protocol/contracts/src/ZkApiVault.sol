@@ -32,6 +32,16 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     ///      deferral by under-funding gas: when the push gets less than this, the 1/64 of gas the
     ///      vault keeps (under ~1.6k) cannot record arrears, so the whole call reverts.
     uint256 public constant TREASURY_PAYOUT_GAS = 100_000;
+    /// @notice Execution gas forwarded on finalizeEscapeWithdrawal's push to the escape destination.
+    ///         A failed push is credited to escapePayoutCredits; claimEscapePayout forwards all gas.
+    /// @dev The cap bounds what a destination that burns its gas adds to finalization, so the
+    ///      treasury share is paid at a bounded cost. It is far above the 2,300-gas stipend, which
+    ///      smart-contract wallets can exceed; a destination that needs more gets a credit. As with
+    ///      TREASURY_PAYOUT_GAS, under-funding gas cannot force a credit for a destination that
+    ///      accepts within the cap and fails only by running out of gas: the 1/64 the vault keeps
+    ///      cannot record one, so the call reverts. A receive that itself refuses when given less
+    ///      gas returns the rest, so such a destination can be credited; the credit stays claimable.
+    uint256 public constant ESCAPE_PAYOUT_GAS = 100_000;
     /// @dev Lower bound of unpauseClaimGrace; the grace is max(this, challengePeriod).
     uint64 private constant MIN_UNPAUSE_CLAIM_GRACE = 1 days;
 
@@ -77,6 +87,9 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     mapping(uint256 => uint64) public rootRetiredAt;
     /// @dev Expiry on the active (unpaused) clock. Zero means notes[noteId].expiryTs.
     mapping(uint32 => uint64) private _activeExpiry;
+    /// @notice Escape payouts (gwei units) whose push to their destination failed, by destination;
+    ///         see claimEscapePayout.
+    mapping(address => uint128) public escapePayoutCredits;
 
     modifier whenNotPaused() {
         if (paused) revert Errors.Paused();
@@ -162,7 +175,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     ) external nonReentrant whenNotPaused {
         _validateWithdrawalBinding(inputs);
         if (!inputs.hasClearance) revert Errors.InvalidDeploymentBinding();
-        if (inputs.destination == address(0)) revert Errors.InvalidDestination();
+        _requireDestination(inputs.destination);
         if (!isKnownRoot(inputs.activeRoot)) revert Errors.UnknownRoot();
         proofAdapter.assertValidWithdrawal(inputs, proof);
         _closeActive(inputs, siblings);
@@ -176,7 +189,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     ) external nonReentrant whenNotPaused {
         _validateWithdrawalBinding(inputs);
         if (inputs.hasClearance) revert Errors.InvalidDeploymentBinding();
-        if (inputs.destination == address(0)) revert Errors.InvalidDestination();
+        _requireDestination(inputs.destination);
         // A defeated escape stays defeated: its calldata is public, so anyone could replay it.
         // The note exits from its signed successor state (or a clearance-backed mutualClose).
         if (challengedNullifiers[inputs.withdrawalNullifier]) revert Errors.ChallengedNullifier();
@@ -241,6 +254,10 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         emit EscapeWithdrawalChallenged(noteId, nullifier, restoredRoot);
     }
 
+    /// @notice Pays out an unchallenged escape after its deadline and closes the note. Neither
+    ///         payee can block the other or the closure: finalBalance goes to the destination or,
+    ///         if that push fails, to escapePayoutCredits[destination]; the rest of the deposit goes
+    ///         to the treasury or, if that push fails, to treasuryArrears.
     function finalizeEscapeWithdrawal(uint32 noteId) external nonReentrant {
         Types.Note storage note = notes[noteId];
         Types.PendingWithdrawalData storage pending = pendingWithdrawals[noteId];
@@ -255,8 +272,23 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         uint128 operatorShare = note.depositAmount - finalBalance;
         note.status = Types.NoteStatus.Closed;
         delete pendingWithdrawals[noteId];
-        _pay(destination, finalBalance, operatorShare);
+        if (finalBalance != 0 && !_push(destination, finalBalance, ESCAPE_PAYOUT_GAS)) {
+            escapePayoutCredits[destination] += finalBalance;
+            emit EscapePayoutDeferred(noteId, destination, finalBalance);
+        }
+        _payTreasury(operatorShare);
         emit EscapeWithdrawalFinalized(noteId, nullifier, finalBalance, destination);
+    }
+
+    /// @notice Pays `destination` all of its escape payouts whose push failed. Anyone may call it,
+    ///         but only `destination` is paid. The push forwards all available gas; if it fails, the
+    ///         call reverts and the credit is kept. Open while paused, like the escapes it completes.
+    function claimEscapePayout(address destination) external nonReentrant {
+        uint128 amount = escapePayoutCredits[destination];
+        if (amount == 0) revert Errors.ZeroAmount();
+        delete escapePayoutCredits[destination];
+        emit EscapePayoutClaimed(destination, amount);
+        _transfer(destination, amount);
     }
 
     function claimExpired(uint32 noteId, uint256[32] calldata siblings) external nonReentrant whenNotPaused {
@@ -309,6 +341,11 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         emit TreasuryArrearsPaid(recipient, amount);
     }
 
+    /// @notice Blocks deposit, mutualClose, initiateEscapeWithdrawal, claimExpired, setTreasury,
+    ///         acceptTreasury, withdrawTreasuryArrears and renounceOwnership until unpause.
+    ///         Stay open while paused: challengeEscapeWithdrawal, finalizeEscapeWithdrawal and
+    ///         claimEscapePayout, so escapes in flight resolve and credited payouts can be
+    ///         delivered, and cancelTreasuryChange, transferOwnership and acceptOwnership.
     function pause() external onlyOwner whenNotPaused {
         paused = true;
         pausedAt = uint64(block.timestamp);
@@ -361,11 +398,8 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         uint128 operatorShare = note.depositAmount - inputs.finalBalance;
         _setCurrentRoot(newRoot);
         note.status = Types.NoteStatus.Closed;
-        _pay(inputs.destination, inputs.finalBalance, operatorShare);
-    }
-
-    function _pay(address destination, uint128 balance, uint128 operatorShare) private {
-        if (balance != 0) _transfer(destination, balance);
+        // The submitter chose this destination and can prove another, so a failed push reverts.
+        if (inputs.finalBalance != 0) _transfer(inputs.destination, inputs.finalBalance);
         _payTreasury(operatorShare);
     }
 
@@ -374,21 +408,29 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         if (!success) revert Errors.NativeTransferFailed();
     }
 
+    /// @dev Sends `amount` units with at most `gasLimit` execution gas and copies no return data.
+    function _push(address recipient, uint128 amount, uint256 gasLimit) private returns (bool success) {
+        uint256 value = uint256(amount) * nativeAssetWeiPerUnit;
+        assembly ("memory-safe") {
+            success := call(gasLimit, recipient, value, 0, 0, 0, 0)
+        }
+    }
+
     /// @dev A treasury that reverts or runs out of gas cannot freeze mutualClose and
     ///      finalizeEscapeWithdrawal payouts (or claimExpired): its share is retained in
-    ///      treasuryArrears. No return data is copied.
+    ///      treasuryArrears.
     function _payTreasury(uint128 amount) private {
         if (amount == 0) return;
         address recipient = treasury;
-        uint256 value = uint256(amount) * nativeAssetWeiPerUnit;
-        bool success;
-        assembly ("memory-safe") {
-            success := call(TREASURY_PAYOUT_GAS, recipient, value, 0, 0, 0, 0)
-        }
-        if (!success) {
+        if (!_push(recipient, amount, TREASURY_PAYOUT_GAS)) {
             treasuryArrears += amount;
             emit TreasuryPaymentDeferred(recipient, amount);
         }
+    }
+
+    /// @dev Neither zero nor the vault itself, which cannot receive ETH.
+    function _requireDestination(address destination) private view {
+        if (destination == address(0) || destination == address(this)) revert Errors.InvalidDestination();
     }
 
     function _consumeNullifier(uint256 nullifier) private {

@@ -20,6 +20,10 @@ abstract contract Events {
 
     event EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 restoredRoot);
 
+    /// @notice The escape closed. It does not by itself mean `destination` received
+    ///         `finalBalance`: when an EscapePayoutDeferred for the same noteId and destination
+    ///         precedes it in the transaction, the balance was credited to
+    ///         escapePayoutCredits(destination) instead and reaches it via claimEscapePayout.
     event EscapeWithdrawalFinalized(
         uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination
     );
@@ -40,6 +44,13 @@ abstract contract Events {
     event TreasuryPaymentDeferred(address indexed treasury, uint128 amount);
 
     event TreasuryArrearsPaid(address indexed treasury, uint128 amount);
+
+    /// @notice A finalized escape's push to `destination` failed; `amount` gwei units were added to
+    ///         escapePayoutCredits(destination). EscapeWithdrawalFinalized follows in the same call.
+    event EscapePayoutDeferred(uint32 indexed noteId, address indexed destination, uint128 amount);
+
+    /// @notice claimEscapePayout paid `destination` its credited escape payouts.
+    event EscapePayoutClaimed(address indexed destination, uint128 amount);
 
     /// @dev Same signatures as OpenZeppelin Pausable for monitoring compatibility.
     event Paused(address account);

@@ -11,6 +11,7 @@ zkapi-core   = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 hex          = { workspace = true }
+sha2         = { workspace = true }
 sha3         = { workspace = true }
 anyhow          = { workspace = true }
 ark-bn254 = { workspace = true }
@@ -19,6 +20,7 @@ ark-ec = { workspace = true }
 ark-ed-on-bn254 = { workspace = true }
 ark-ff = { workspace = true }
 ark-groth16 = { workspace = true }
+ark-poly = { workspace = true }
 ark-r1cs-std = { workspace = true }
 ark-relations = { workspace = true }
 ark-serialize = { workspace = true }
@@ -26,3 +28,21 @@ ark-snark = { workspace = true }
 ark-std = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
+
+[features]
+# Accept the development setup (`dev`) and expose `compact::setup` and the
+# `dev` fixtures. Release builds leave it off and accept only `mpc-1` keys.
+dev-setup = []
+
+[dev-dependencies]
+# Turns on `dev-setup` for this crate's own tests and examples.
+zkapi-proof = { path = ".", features = ["dev-setup"] }
+
+# Independent implementations for the reduction cross-check, the R1CS
+# fidelity tests and the ceremony import (examples/import_zkey.rs). Never
+# linked into the library or the WebAssembly build.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+ark-circom = { version = "=0.5.0", default-features = false }
+# ark-circom 0.5.0 needs a wasmer engine feature to compile; it is unused here.
+wasmer = { version = "4.4.0", default-features = false, features = ["sys"] }
+wasmer-wasix = { version = "0.28.0", default-features = false, features = ["sys"] }

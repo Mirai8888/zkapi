@@ -30,7 +30,11 @@ obligation on private status endpoints. See
 
 Settlement always finalizes: a lease that never reached the wallet settles at
 zero, and a delivered lease whose usage is still unavailable at its write-once
-deadline settles at the proof's solvency bound. The API server must stay
+deadline settles at the proof's solvency bound. The exceptions are a lease
+whose record is corrupt and a pending lease whose saved request cannot be
+decoded; the operator repairs and reopens the first and restores the second
+([settlement terminality](native-eth-billing.md#settlement-terminality)). The
+API server must stay
 available through every challenge window, because owners recover their next
 signed state from it after a challenge. Mutual close sends the server an
 escape-form withdrawal proof of note ownership before it signs a clearance.

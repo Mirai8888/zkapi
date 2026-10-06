@@ -28,10 +28,17 @@ adds paused time, a post-challenge grace, and a grace after each unpause.
 state and proof statements.
 
 The owner can pause deposits, withdrawals, expiry claims and treasury changes
-without a time limit; challenges and escape finalization stay open. Treasury
-changes are scheduled with `setTreasury`, applied with `acceptTreasury` after
-`treasuryChangeDelay` of unpaused time, and cancellable. A treasury that
-rejects a payment accrues `treasuryArrears` instead of blocking payouts;
-anyone can pay them with `withdrawTreasuryArrears`. The
+without a time limit; challenges, escape finalization and `claimEscapePayout`
+stay open. Treasury changes are scheduled with `setTreasury`, applied with
+`acceptTreasury` after `treasuryChangeDelay` of unpaused time, and
+cancellable. A treasury that rejects a payment accrues `treasuryArrears`
+instead of blocking payouts; anyone can pay them with
+`withdrawTreasuryArrears`. An escape destination that rejects its payout, or
+needs more than 100,000 gas (`ESCAPE_PAYOUT_GAS`), is credited in
+`escapePayoutCredits` instead of blocking the escape; anyone can deliver the
+credit with `claimEscapePayout(destination)`, which forwards all gas. A mutual
+close to a destination that rejects ETH reverts (it forwards all gas, so a
+destination that only needs more gas is paid), and a withdrawal to the zero
+address or the vault itself reverts `InvalidDestination()`. The
 [vault reference](../../../docs-site/content/docs/api-reference/vault.mdx) lists
 every view, error and event.

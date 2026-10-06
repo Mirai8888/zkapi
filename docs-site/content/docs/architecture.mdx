@@ -54,7 +54,11 @@ escape it consults that archive, because an escape from a state that already
 authorized a request can be challenged. For vaults declared as
 `vault_revision: 2` it may escape from such a state once the server reports
 the nullifier `unknown` or `clearance_reserved`, or through an explicit,
-time-gated override; for other vaults it refuses. Only a receipt that verifies
+time-gated override; for other vaults it refuses. On such vaults the wallet
+also never sends a mutual-close ownership proof from such a state, and never
+sends a request proof from a state whose ownership proof it sent: either could
+let whoever holds the other proof escape and challenge, which burns the
+nullifier there. Only a receipt that verifies
 vetoes that override. When the server claims a finalized receipt the browser
 cannot apply (`receipt_journal_missing`), the override stays available behind
 that case's own warning and acknowledgement, because a genuine claim makes the
@@ -149,7 +153,9 @@ after the server finalizes its settlement. It obtains a fresh zero-slot path
 to restore the note in the current tree. Other deposits and closes do not
 require rewriting the old proof's root. A successful challenge releases the
 nullifier but blocks every later escape at it; the owner withdraws from the
-signed successor state. See [Protocol](/docs/protocol#withdrawal) and the
+signed successor state. An unchallenged escape is finalized after its
+deadline; if the destination rejects the payout, the vault credits it to that
+destination for a later `claimEscapePayout`. See [Protocol](/docs/protocol#withdrawal) and the
 [vault API](/docs/api-reference/vault).
 
 The challenge service serves `/livez`, `/health` and `/status` on a private

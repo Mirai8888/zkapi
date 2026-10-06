@@ -97,7 +97,9 @@ clamped to the proven `solvency_bound` before conversion. If its usage cannot
 be settled at all, or is still unavailable when the server's write-once
 settlement deadline passes, the lease settles at `solvency_bound`. The server
 refuses to sign only a lease whose own record is corrupt, until the operator
-verifies, repairs and reopens it. It refuses to start unless the lease lifetime
+verifies, repairs and reopens it; a pending lease whose saved request cannot be
+decoded is not settled at all, not even at its deadline, until the operator
+restores that request. It refuses to start unless the lease lifetime
 plus that deadline fit within half the vault's challenge period, so every
 signed transcript exists well before an escape from the same state could
 finalize.
@@ -132,9 +134,16 @@ the leaf, and pays out.
 
 The ownership proof reveals the note ID, final balance and destination to the
 server when clearance is requested, before `mutualClose` publishes them. It is
-also a valid escape input: whoever holds it, including the server, can start
-an escape with it while its root is accepted. That delays the payout by the
-challenge period but cannot change its amount or destination.
+also a valid escape input: whoever holds it, including the server, can start the
+owner's escape with it while its root is accepted. That escape pays the owner's
+destination at the proven balance one challenge period later, unless a request
+proof for the same state challenges it. On this vault the challenge leaves that
+nullifier open to a clearance-backed mutual close. On a vault without
+non-destructive challenges (any revision before `vault_revision: 2`), the
+challenge consumes the nullifier and the owner can no longer exit at that state.
+On such a vault a wallet must never send an ownership proof from a state whose
+request proof may have left the device, nor a request proof from a state whose
+ownership proof it has sent.
 
 **Escape hatch.** Without clearance, the wallet submits
 `initiateEscapeWithdrawal(inputs, proof, siblings)`. The vault removes the leaf
@@ -165,7 +174,13 @@ request that spent it, which `GET /v2/nullifiers/{nullifier}` returns, and
 withdraws from that state. After a challenge the note keeps at least one
 challenge period of unpaused time before it can be claimed as expired.
 Otherwise, `finalizeEscapeWithdrawal(noteId)` pays the recorded amounts after
-the deadline.
+the deadline. If the destination rejects ETH or needs more than 100,000 gas,
+its amount is credited instead (`EscapePayoutDeferred`), and anyone can
+deliver it later with `claimEscapePayout(destination)`; the treasury share is
+paid either way. A mutual close forwards all gas, so it pays a destination
+that only needs more gas; a mutual close to a destination that rejects ETH
+reverts instead, and the wallet can prove the close again to another
+destination.
 
 An active note that is not withdrawn can be claimed for the treasury with
 `claimExpired(noteId, siblings)` once its effective expiry has passed, while
@@ -207,8 +222,9 @@ the vault has no upgrade path. The deployment script requires an explicit
 
 - **Pause.** `pause()` stops deposits, `mutualClose`,
   `initiateEscapeWithdrawal`, `claimExpired`, scheduling or accepting a treasury
-  change, and `withdrawTreasuryArrears`. Challenges and
-  `finalizeEscapeWithdrawal` stay open, so pending escapes still resolve. A
+  change, and `withdrawTreasuryArrears`. Challenges, `finalizeEscapeWithdrawal`
+  and `claimEscapePayout` stay open, so pending escapes still resolve and a
+  credited escape payout can still be delivered. A
   pause has no time limit: the owner can block every new exit indefinitely, but
   no vault function lets it take user funds. Paused time extends every note's
   claim deadline, and after any `unpause()` no note can be claimed as expired

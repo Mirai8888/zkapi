@@ -36,7 +36,10 @@ releases the nullifier but blocks any further escape at it; the owner recovers
 the request's signed successor state from the server and withdraws from it.
 
 After an uncontested deadline, anyone can finalize the pending withdrawal to
-its previously bound destination. If an active note is not withdrawn, its
-deposit can be claimed for the treasury after its effective expiry, which
-paused time and a challenge extend. Claims are closed while the vault is
-paused.
+its previously bound destination. If the destination rejects the payout or
+needs more than 100,000 gas, the vault still closes the note and pays the
+treasury share, and credits the payout to that destination; anyone can deliver
+it later with `claimEscapePayout(destination)`. If an active note is not
+withdrawn, its deposit can be claimed for the treasury after its effective
+expiry, which paused time and a challenge extend. Expiry claims are closed
+while the vault is paused.

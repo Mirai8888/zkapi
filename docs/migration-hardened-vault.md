@@ -59,10 +59,24 @@ spent gets `503 legacy_clearance_capacity` (with `Retry-After` until the next
 minute). A request with an ownership proof never uses the budget. `/health`
 reports `legacy_clearance_window_used`, `legacy_clearance_window_limit` and
 `legacy_clearance_rejected_total`. The server logs
-`legacy clearance budget exhausted` at most once a minute. The Rust wallet and
-the `zkapi-clientd` companion always send ownership proofs; the browser SDK
-sends one when its profile declares the capability, or after a proof-less
-request is refused. The gateway now limits POST floods per source.
+`legacy clearance budget exhausted` at most once a minute. The Rust wallet
+always sends an ownership proof. The `zkapi-clientd` companion does too, except
+on a vault below `vault_revision` 2 at a note state from which it sent a
+request that never settled (one in its `request_archive/`). There it asks for
+a clearance without a proof. When that is refused it stops with
+`409 unsettled_request_state` (one chat request settles the state) or, when the
+server already holds a clearance for the state,
+`409 unsettled_clearance_reserved`. From such a state it sends the proof only
+after the owner types `send` at the guided withdrawal's risk warning, offered
+once the note has expired or for `unsettled_clearance_reserved`. The browser
+SDK sends one when its profile declares the capability, or after a proof-less
+request is refused, except on a vault without `vault_revision` 2 at a state
+whose request proof left the device: there it sends only the proof-less
+request, and refuses with `409 transmitted_anchor_ownership_unsafe` when the
+server asks for a proof. The reason for both exceptions: an ownership proof is
+a valid escape, and on such a vault a challenge with a request proof for the
+same state burns the nullifier. The gateway now limits POST floods per
+source.
 Reservations stay permanent, because a clearance signature has no expiry.
 
 **Unsettleable leases.** A lease could fail settlement forever, on an
@@ -79,7 +93,17 @@ key issuance lock, so no key is returned for such a lease; `/expire` checks no
 longer hold that lock across their oracle reads, and a lease past its deadline
 queues for it. A
 lease the server cannot sign because its record is corrupt can be repaired and
-reopened with `zkapi settlement reopen`. The CLI default of
+reopened with `zkapi settlement reopen`, and a pending lease whose saved
+request cannot be decoded, which no tick settles, is restored with
+`zkapi settlement reopen --saved-request`. Each settlement tick attempts the
+lease nearest its deadline first, alternating with the least recently
+attempted one; a receipt the OA org reports as pending waits for its retry
+time without counting as a failure; and each lease settles under its own lock,
+so retirements of one lease cannot delay the others. The server refuses to
+start under another lease key source while leases or key deletions of the
+previous one still need its credential
+([Changing the key source](native-eth-billing.md#changing-the-key-source)).
+The CLI default of
 `--native-price-max-age-seconds` is now 4500, matching the container launcher.
 The SDK installs clamped and worst-case receipts. The SDK and the
 `zkapi-clientd` companion (in a release built with the updated
@@ -112,7 +136,8 @@ keeps an append-only archive of transmitted requests, committed with the journal
 before the request is sent, and discards a journal only after corroboration (the
 pinned vault RPC's `currentRoot()`, then `GET /v2/nullifiers/{nullifier}`). On a
 vault without `vault_revision` 2 it refuses any escape at a transmitted anchor
-(strict mode). An archived request keeps its full journal while its note state
+and sends no ownership proof from one (strict mode). An archived request keeps
+its full journal while its note state
 is current. Past 16 unresolved requests at one state the SDK only sets expired,
 corroborated discards aside (`evicted`, still installable). At 64 it refuses
 new chats with `request_archive_limit` instead of discarding anything; chats at
@@ -131,8 +156,23 @@ requirement. "After" is the order in which the browser saved the readings, not
 the device clock. A pre-release build of this archive that predates that save
 order, open in another tab of the same site, drops it from the records it
 writes, which can let `true` suffice again after a failed read; builds from
-earlier releases write no archive records. The companion discards a lease
-journal on `stale_root` only when the server reports the nullifier unknown.
+earlier releases write no archive records.
+
+The `zkapi-clientd` companion no longer deletes a transmitted request journal.
+After `stale_root`, and when withdrawal settlement finds the request unknown to
+the server, it first reads the pinned vault's `currentRoot()`. While that still
+equals the request's root, or cannot be read, the journal stays pending and the
+identical request is resent. Only once the root moved and the server reports
+the request's nullifier unknown does the journal move, whole, into the
+companion's append-only `request_archive/`, from which recovery installs a
+later finalized receipt that verifies. Withdrawal settlement also moves a
+request there, without reading the root, when the server reports its
+nullifier `clearance_reserved`: the server refuses every request at such a
+nullifier, so it can never settle. Chats at such a state stop with
+`409 clearance_reserved_state` and send no new request from it. Journals that
+`zkapi-clientd` 0.1.6 and earlier, or pre-release builds of this companion,
+deleted left no record; such a note reports `receipt_journal_missing` (see
+Operations runbooks).
 
 **Indexer divergence.** The indexer applied unconfirmed logs with no block
 continuity, only warned when its root diverged from the vault, kept reporting
@@ -180,6 +220,22 @@ requires an explicit `OWNER` off local chains. A pause still has
 no time limit: the owner can freeze but not seize. Legacy vaults keep the
 defect; only the owner policy in Phase 0 mitigates it.
 
+**Escape payouts a destination rejects.** On a legacy vault
+`finalizeEscapeWithdrawal` pays the destination and the treasury in one call,
+so an escape to a destination that rejects ETH can never finalize: the note,
+including the operator's share, stays locked. On the hardened vault
+withdrawals to the vault itself revert `InvalidDestination()`, and
+finalization pushes the user's balance with at most `ESCAPE_PAYOUT_GAS()`
+(100,000). If the destination rejects it or needs more gas, the escape still
+closes and the treasury share is paid; the balance is credited to
+`escapePayoutCredits(destination)` with an `EscapePayoutDeferred` event, and
+anyone can deliver it with `claimEscapePayout(destination)`, also while paused.
+A mutual close to a destination that rejects ETH still reverts (it forwards
+all gas, so a destination that only needs more gas is paid): its submitter can
+prove the close again to another destination. Clients from this release do not
+detect a credited payout yet; see
+[Escape payout credits](#operations-runbooks).
+
 **Unpinned funding RPC.** `zkapi-clientd` trusted one third-party RPC for
 receipts and note IDs, and did not compare the companion's RPC with its pinned
 manifest. It now requires the companion's RPC, indexer and protocol server
@@ -194,11 +250,19 @@ tree the deposit was built from. A deposit built on a short-lived fork of the
 indexer's head view can land in that run. It signs a retry only when a bounded
 search of the indexer tree the retry is built from finds none of the note's
 earlier deposits. So a deposit that the RPC withheld, and relayed after its
-revert was retired, cannot land beside the retry. The search misses such a
-deposit in two cases only. Either challenges restored 64 or more escaped notes
-between its slot (or the start of that run) and its landing slot after it
-landed. Or it landed about 63 or more days before the retry. It needs the
-upgraded indexer, whose snapshot carries block metadata.
+revert was retired, cannot land beside the retry. The search runs on chain
+time: from the block time of the indexer view each slot was built from to the
+block time of the view it searches. Each comes from the pinned RPC's header
+for the view's block hash and is accepted only when the header hashes to it.
+It misses such a deposit in three cases only. Either challenges restored 64 or
+more escaped notes between its slot (or the start of that run) and its landing
+slot after it landed. Or it landed about 63 or more days before the retry. Or
+its slot was saved by an earlier release, which recorded only the device
+clock's preparation time, on a clock more than 6 days fast, and the deposit
+landed within that much of its preparation. It needs the
+upgraded indexer, whose snapshot carries block metadata. These checks are only
+as independent as the indexer's own RPC, which must be a provider other than
+the pinned `rpc_url` (Before you start, item 7).
 
 ## Breaking changes
 
@@ -232,6 +296,24 @@ API server (`zkapi serverd`):
   `operator_conceded`) and, for fallbacks and concessions, `settlement_reason`
   (`settlement_deadline`, `unsettleable` or `operator_conceded`). Payload `type`
   strings are unchanged.
+- Lease routes answer a lease row that cannot be decoded with
+  `404 lease_record_unreadable` (not retriable; read
+  `GET /v2/nullifiers/{request_nullifier}`), and a pending lease in that state
+  is not settled, not even at its deadline, until the operator restores its
+  saved request with `zkapi settlement reopen --saved-request`. A store that
+  cannot be read answers recovery (`GET /v2/nullifiers/{nullifier}`,
+  `GET /v2/requests/{id}`), lease status, retirement, a lease retry and
+  `/expire` with retriable `500 database_error`: only a 200 `not_found` with
+  `nullifier_status: "unknown"` means unknown. See the
+  [API specification](api-spec.md).
+- Startup refuses to switch the lease key source (direct OpenRouter or an OA
+  org) while the database holds possibly delivered leases of the other source
+  without a committed charge, or, when leaving direct OpenRouter, queued
+  deletions of unexpired keys. Drain them first, as in
+  [Changing the key source](native-eth-billing.md#changing-the-key-source);
+  `--allow-key-source-switch` (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true`) starts
+  anyway and charges each such lease at its settlement deadline without a
+  usage measurement.
 - `--native-price-max-age-seconds` defaults to 4500 instead of 3600, and the CLI
   reads `ZKAPI_NATIVE_PRICE_MAX_AGE_SECONDS` and
   `ZKAPI_NATIVE_PRICE_FEED_DECIMALS`. Direct launches that relied on 3600 must
@@ -252,6 +334,41 @@ Challenger (`zkapi-challenged`):
 - It listens on `--status-listen`, default `127.0.0.1:3002`; give each daemon on
   one host its own address.
 - Reserved requests are no longer evidence.
+- `missed_total` now also counts an escape found paid out past its deadline
+  with evidence (see
+  [Recovery and verification](challenge-service.md#recovery-and-verification)),
+  and the checkpoint records the nullifier of every miss, so none is counted
+  twice. A checkpoint from an earlier release records only its latest miss's
+  nullifier (`last_missed`). An escape found paid out past its deadline is
+  taken for one of that release's other misses, and not counted again, only
+  while such misses remain and only if that release can have counted it. That
+  means all three of these hold:
+  - it was not pending in the checkpoint at the upgrade;
+  - its deadline is no later than that release's last recorded miss
+    (`last_missed.recorded_at` plus 15 minutes, or that miss's deadline if
+    later);
+  - its event lies below the checkpoint's scan cursor at the upgrade (not
+    checked when the cursor had been reset for a replay).
+
+  This is logged at warn level as `taken for a miss the earlier release
+  counted in missed_total without its nullifier, so not counted again`,
+  typically when a replay tracks such a retired escape again. Any other payout
+  past its deadline is counted (`MISSED`, critical for an hour). That includes
+  an escape initiated and paid out while the earlier daemon was down or its
+  scan failed, which the upgraded daemon's first scan finds: treat it as a
+  real missed challenge. Residuals: an escape the earlier release scanned and
+  retired without counting it (it did not record a payout first seen after
+  the deadline), with a deadline before its last recorded miss, is taken for
+  one of those misses if a replay finds it; if the checkpoint was saved
+  mid-replay, a miss that release counted of an escape between the replay
+  position and the block it had scanned before is counted again. A rollback
+  drops the recorded nullifiers: after a re-upgrade, misses the new daemon had
+  counted are treated like the earlier release's.
+- A zero path that does not hash to the vault's root and comes from an
+  indexer view consistent with the vault at its block is `indexer_path_behind`
+  (a warning that escalates with time), not `indexer_invalid_response`; see
+  [Building and sending a challenge](challenge-service.md#building-and-sending-a-challenge).
+  A checkpoint block that an RPC answers with null is retried, not replayed.
 - Every bid keeps gas limit x `maxFeePerGas` within `--tx-fee-cap-wei` /
   `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` (default 1 ETH, the default `--rpc.txfeecap`
   of geth and reth). It also stays within the signer's `tx_fee_cap_wei` when
@@ -344,8 +461,8 @@ Hardened vault (existing signatures and events are unchanged):
 - `challengeEscapeWithdrawal` clears `usedNullifiers(n)` and sets
   `challengedNullifiers(n)`; `initiateEscapeWithdrawal` reverts
   `ChallengedNullifier()` for such an `n`.
-- Withdrawals revert `InvalidDestination()` for the zero address and
-  `UnknownRoot()` for a root neither current nor retired within
+- Withdrawals revert `InvalidDestination()` for the zero address or the vault
+  itself and `UnknownRoot()` for a root neither current nor retired within
   `ROOT_HISTORY_WINDOW()`.
 - `claimExpired` reverts `Paused()` while paused and `NoteNotExpired()` before
   `effectiveExpiry(noteId)`; `notes(noteId)` keeps the nominal expiry.
@@ -362,6 +479,19 @@ Hardened vault (existing signatures and events are unchanged):
   New: `acceptOwnership()` `0x79ba5097`, `pendingOwner()` `0xe30c3978`, event
   topic `0x38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e22700`.
 - `Deploy.s.sol` requires `OWNER` except on chains 31337 and 1337.
+- `finalizeEscapeWithdrawal` pushes the user's balance with at most
+  `ESCAPE_PAYOUT_GAS()` (100,000, `0x3e210f18`). A destination that rejects it
+  or needs more gas no longer blocks the escape: the note closes, the treasury
+  share is paid, and the balance is credited to `escapePayoutCredits(address)`
+  (`0x91f6e93a`) with
+  `EscapePayoutDeferred(uint32 indexed noteId, address indexed destination, uint128 amount)`
+  (topic `0x1bd006af…a942`), emitted before `EscapeWithdrawalFinalized`. The new
+  `claimEscapePayout(address)` (`0x88c10aee`) pays a credit to its destination
+  with all gas; anyone can call it, also while paused, and it emits
+  `EscapePayoutClaimed(address indexed, uint128)` (topic `0x6bf75371…be27`).
+  `EscapeWithdrawalFinalized` is unchanged but no longer proves on its own that
+  the payout arrived. The full topics are in the
+  [vault reference](../docs-site/content/docs/api-reference/vault.mdx#views-errors-and-events).
 
 Browser SDK:
 
@@ -389,18 +519,56 @@ Browser SDK:
   because a server with legacy clearance on may reserve on it. If the server
   answers `400 clearance_ownership_required` or
   `503 legacy_clearance_capacity`, nothing was reserved: the SDK restores the
-  wallet's previous withdrawal state, checks a transmitted state with the
-  server, proves locally, and only then marks the note withdrawal-only again
-  and sends the ownership proof. A proving failure or a refused check leaves
-  the previous state in place, so a note that was usable stays usable. After
+  wallet's previous withdrawal state. At a state whose request proof never
+  left the device, it proves locally, marks the note withdrawal-only again and
+  sends the ownership proof. At a transmitted state it does so only on a
+  `vault_revision` 2 vault, after the server reports the nullifier `unknown`
+  or `clearance_reserved`. On any other vault it sends no proof there and
+  refuses with `409 transmitted_anchor_ownership_unsafe`. A proving failure, a
+  refused check or that refusal leaves the previous state in place, so a note
+  that was usable stays usable. After
   any other failure of the proof-less request (a lost connection, or a 5xx
   without one of these codes), the note stays withdrawal-only, because the
   server may have reserved it; retrying the mutual close completes it.
+- New `409 transmitted_anchor_ownership_unsafe` (`data.clearance_error_code`
+  names the server's answer): a strict-mode mutual close at a transmitted state
+  that the server would grant only with an ownership proof. The note stays
+  usable for chat; a request from that state that settles moves it to a state
+  that closes normally.
+- `429 gateway_rate_limited` on a mutual close is retried with the same body
+  within a 15 s budget, honouring `retry_after_seconds`. When it outlasts that
+  budget, the previous withdrawal state is restored only for a proof-less
+  request or on a `vault_revision` 2 vault. After an ownership proof on any
+  other vault the note stays withdrawal-only, and the error carries
+  `data.withdrawal_only: true`: offer to try the close again, or to escape,
+  not a chat.
+- `trusted_deployment.deposits` (`"open"` or `"closed"`). Closed deployments
+  refuse new deposits with `409 deposits_closed`, and
+  `snapshot().config.deposits` reports the setting.
+- A `vault_revision` 2 profile is checked on chain at initialization
+  (`ROOT_HISTORY_WINDOW()` must be 86400). A mismatch fails with
+  `vault_revision_mismatch`. JSON-RPC reverts carry `rpc_call_reverted`, and
+  an empty vault word carries `vault_value_invalid`.
+- The store exports `readBrowserWalletHoldings`, `browserWalletHoldings`,
+  `browserRuntimeHoldsState` and `isOpenBrowserWithdrawal`.
+  `readBrowserWalletSnapshot(id)` adds `otherDeploymentWithdrawals`, and
+  `snapshot().config.other_deployment_withdrawals` lists other deployments'
+  open withdrawals.
 
 `zkapi-clientd`:
 
 - The companion must report the pinned `rpc_url`, `indexer_url` and
   `protocol_server_url`; funding stops otherwise.
+- The pinned `rpc_url` must serve `eth_getBlockByHash` for the block of the
+  indexer view a deposit is built from or searched in, with a header format
+  this release can hash, and the device clock must be within one day of that
+  block's time. Otherwise no deposit is signed and no reported revert is
+  retired.
+- The companion reads the vault's `currentRoot()` over the same RPC before it
+  sets aside a lease request rejected as `stale_root`, or reported unknown at
+  withdrawal settlement; while it cannot, the request stays pending
+  (`lease_pending`). A request whose nullifier the server reports
+  `clearance_reserved` is set aside at withdrawal settlement without that read.
 - Deposits and withdrawals wait (`confirming`, stage `verifying`) until the
   vault and the indexer agree; a disagreement is phase
   `verification_conflict`. The indexer must serve snapshot block metadata.
@@ -411,6 +579,22 @@ Browser SDK:
 - Each withdrawal generates two withdrawal proofs. A manifest declaring
   `clearance_ownership_proof` or `vault_revision` 2 requires a companion that
   reports `clearance_ownership_proof_version`.
+- On a vault below `vault_revision` 2, `/oa/v1/withdraw/prepare` at a note
+  state with an unsettled request can answer `409 unsettled_request_state` or
+  `409 unsettled_clearance_reserved`. It accepts
+  `accept_unsettled_request_risk` (advertised as
+  `unsettled_request_override_version` 1 in `/oa/v1/status`). A management
+  client may send it only after showing the owner the challenge risk and
+  getting an explicit acknowledgement. `409 receipt_journal_missing` carries
+  the state's nullifier in `error.nullifier`. The daemon's management API
+  forwards these three codes in its error body's `code` field; its
+  `POST /admin/withdrawal/quote` accepts `accept_unsettled_request_risk`,
+  `POST /admin/withdrawal` refuses it, and withdrawal status adds
+  `note_expiry`.
+- The companion's `/oa/v1/lease` answers `409 clearance_reserved_state` when
+  the server holds a clearance for the note's current state (for example after
+  the operator's release): no chat request can settle it. `zkapi-clientd`
+  shows that code in the chat error with the remedy, **withdraw**.
 
 ## Compatibility
 
@@ -420,11 +604,11 @@ Clients against each server state (`legacy clearance` is
 | Client | Legacy deployment, server not upgraded | Legacy deployment, upgraded, legacy clearance on | Legacy deployment, upgraded, legacy clearance off | Hardened deployment |
 | --- | --- | --- | --- | --- |
 | Browser SDK from earlier releases | All flows, with the old risks | All flows, but mutual close fails with `503 legacy_clearance_capacity` while anyone keeps the shared proof-less budget exhausted; escape still works | Mutual close fails with `400 clearance_ownership_required`; escape still works | Not usable: pinned to the legacy vault |
-| Browser SDK from this release, legacy profile (no capability keys) | All flows; clearance without proof | All flows; when the proof-less budget is spent (`503 legacy_clearance_capacity`) the proof is sent instead | All flows: the proof is sent after the `400` | Not usable |
-| Browser SDK from this release, legacy profile with `"clearance_ownership_proof": "optional"` (required once the server is upgraded, Phase 2) | All flows; the old server ignores the proof | All flows; the proof is always sent, so the shared proof-less budget is never used | All flows | Not usable |
+| Browser SDK from this release, legacy profile (no capability keys) | All flows; clearance without proof | All flows; when the proof-less budget is spent (`503 legacy_clearance_capacity`) the proof is sent instead, except at a state whose request proof left the device and never settled, where mutual close then refuses with `409 transmitted_anchor_ownership_unsafe` | All flows: the proof is sent after the `400`, except at a state whose request proof left the device and never settled, where mutual close refuses with `409 transmitted_anchor_ownership_unsafe` and escape is refused, until a request from that state settles | Not usable |
+| Browser SDK from this release, legacy profile with `"clearance_ownership_proof": "optional"` (required once the server is upgraded, Phase 2) | All flows; the old server ignores the proof | All flows; the proof is sent except at a transmitted state, where only the proof-less clearance is sent (it uses the shared budget, and `503 legacy_clearance_capacity` there refuses with `transmitted_anchor_ownership_unsafe`) | All flows, except at a state whose request proof left the device and never settled, where mutual close refuses with `409 transmitted_anchor_ownership_unsafe` and escape is refused, until a request from that state settles | Not usable |
 | Browser SDK from this release, hardened profile (`vault_revision` 2) | Not usable | Not usable | Not usable | All flows |
 | `zkapi-clientd` 0.1.6 and earlier | All flows | All flows, but withdrawals fail with `503 legacy_clearance_capacity` while anyone keeps the shared proof-less budget exhausted (clientd has no escape) | Withdrawals fail with `400 clearance_ownership_required`; the note stays reserved locally and recovers after an upgrade (clientd has no escape) | Not usable |
-| `zkapi-clientd` built from this release, current manifests | Needs the upgraded indexer; ownership proof ignored by the old server | All flows | All flows | Not usable |
+| `zkapi-clientd` built from this release, current manifests | Needs the upgraded indexer; ownership proof ignored by the old server | All flows | All flows; at a note state with an unsettled request (in `request_archive/`) a withdrawal first needs one chat request, or, once the note expired or the server holds a clearance for the state, the owner's acknowledged ownership proof | Not usable |
 | `zkapi-clientd` pinned to the hardened vault | Not usable | Not usable | Not usable | Needs the manifest work listed under Phase 2 |
 
 Services:
@@ -447,11 +631,16 @@ assume the Docker deployment; set:
 ```sh
 export VAULT=0xREPLACE_WITH_VAULT RPC_URL=https://REPLACE_WITH_READ_RPC DEPLOY_BLOCK=REPLACE
 dc() { sudo docker compose -f docker/aws/compose.yml --profile challenge "$@"; }
+DATA_DIR=/var/lib/zkapi API_URL=http://127.0.0.1:8080
 ```
 
-Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
-`INDEXER_RPC_URL` (the `RPC_URL` of `indexer.env`) and `NATIVE_BILLING_RPC_URL`
-(`ZKAPI_NATIVE_BILLING_RPC_URL` of `deployment.env`).
+Use for `RPC_URL` a read RPC independent of the indexer's. `DATA_DIR` is the
+deployment's data directory (`ZKAPI_DATA_DIR`) and `API_URL` its gateway on the
+VM (`ZKAPI_HTTP_PORT`, 8080 by default). On a VM shared with the hardened
+deployment, `dc`, `DATA_DIR` and `API_URL` change for the legacy deployment in
+Phase 1. Item 7 also uses `INDEXER_RPC_URL` (the `RPC_URL` of `indexer.env`)
+and `NATIVE_BILLING_RPC_URL` (`ZKAPI_NATIVE_BILLING_RPC_URL` of
+`deployment.env`).
 
 1. **Vault state.**
 
@@ -473,17 +662,21 @@ Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
    deadline and the server's record for its nullifier:
 
    ```sh
-   N=$(cast call "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC_URL")
+   N=$(cast call --json "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC_URL" | jq -r '.[0]')
    for i in $(seq 0 $((N - 1))); do
      status=$(cast call --json "$VAULT" 'notes(uint32)(bytes32,uint128,uint64,uint8)' "$i" --rpc-url "$RPC_URL" | jq -r '.[3]')
      [ "$status" = 2 ] || continue
      pending=$(cast call --json "$VAULT" 'pendingWithdrawals(uint32)(bool,uint256,uint256,uint128,address,uint64)' "$i" --rpc-url "$RPC_URL")
      nullifier=$(cast to-hex "$(echo "$pending" | jq -r '.[2]')")
      echo "note $i deadline $(echo "$pending" | jq -r '.[5]') nullifier $nullifier"
-     sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+     sudo sqlite3 -readonly "$DATA_DIR/server.db" \
        "SELECT n.status, n.reservation_kind, l.status, l.key_source, l.key_hash IS NOT NULL FROM nullifiers n LEFT JOIN openrouter_leases l ON l.request_nullifier = n.nullifier WHERE n.nullifier = '$nullifier';"
    done
    ```
+
+   Take numbers for shell arithmetic from `cast call --json`, as here: plain
+   `cast call` annotates a decoded number of 10,000 or more (`10000 [1e4]`),
+   which breaks the arithmetic, and the loop would then list nothing.
 
    The upgraded challenger contests an escape whose nullifier has a `Finalized`
    record. It waits on a `Reserved` record until the upgraded server finalizes
@@ -534,7 +727,7 @@ Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
    for getter in stateSigningKeyX stateSigningKeyY clearanceSigningKeyX clearanceSigningKeyY; do
      cast to-dec "$(cast call "$VAULT" "$getter()" --rpc-url "$RPC_URL")"
    done
-   curl -fsS http://127.0.0.1:8080/v1/attestation \
+   curl -fsS "$API_URL/v1/attestation" \
      | jq -r '.state_signing_key.x, .state_signing_key.y, .clearance_signing_key.x, .clearance_signing_key.y' \
      | while read -r value; do cast to-dec "$value"; done
    ```
@@ -543,7 +736,7 @@ Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
    vault's state key. Run on a copy of the database:
 
    ```sh
-   sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+   sudo sqlite3 -readonly "$DATA_DIR/server.db" \
      "SELECT json_extract(request_inputs_json, '$.state_signing_key_x') AS k, count(*) FROM nullifiers WHERE request_inputs_json IS NOT NULL GROUP BY k;
       SELECT json_extract(api_request_json, '$.public_inputs.state_signing_key_x') AS k, count(*) FROM openrouter_leases GROUP BY k;"
    ```
@@ -555,10 +748,14 @@ Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
 6. **Settlement and clearance snapshot.**
 
    ```sh
-   sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+   sudo sqlite3 -readonly "$DATA_DIR/server.db" \
      "SELECT key_source, status, count(*) FROM openrouter_leases WHERE status <> 'finalized' GROUP BY 1, 2;
       SELECT status, reservation_kind, count(*) FROM nullifiers GROUP BY 1, 2;"
    ```
+
+   If unsettled leases of a key source other than the one this release will
+   run with remain, the upgraded server refuses to start until they drain; see
+   [Changing the key source](native-eth-billing.md#changing-the-key-source).
 
    Proof-less clearance reservations made by the old endpoint stay reserved;
    after the upgrade they are the rows with
@@ -578,6 +775,40 @@ Use for `RPC_URL` a read RPC independent of the indexer's. Item 7 also uses
    cast chain-id --rpc-url "$NATIVE_BILLING_RPC_URL"
    cast block finalized --field number --rpc-url "$NATIVE_BILLING_RPC_URL"
    ```
+
+   The indexer's RPC must also come from a provider other than the `rpc_url`
+   that clients pin. `zkapi-clientd` activates a deposit, and accepts a
+   withdrawal, only when the vault read through its pinned `rpc_url` and the
+   indexer's tree agree; an indexer that reads the chain through the same
+   provider lets that provider control both. Compare the hosts of these pinned
+   values, and of the browser configs that hosts ship, with `INDEXER_RPC_URL`:
+
+   ```sh
+   jq -r .rpc_url zkapi-clientd/internal/zkapi/deployments/*.json
+   jq -r .trusted_deployment.rpc_url sdk/assets/config/*.json
+   ```
+
+   If any of them uses the indexer's provider, move `RPC_URL` in `indexer.env`
+   to another provider before Phase 0, step 4, and repeat the checks above
+   with it.
+
+   The `rpc_url` that `zkapi-clientd` pins must itself serve
+   `eth_getBlockByHash` and `eth_call` of the vault's `currentRoot()` (see
+   [Breaking changes](#breaking-changes)). Check each manifest's own provider:
+
+   ```sh
+   for m in zkapi-clientd/internal/zkapi/deployments/*.json; do
+     R=$(jq -r .rpc_url "$m"); V=$(jq -r .contract_address "$m")
+     H=$(cast block latest --field hash --rpc-url "$R")
+     echo "$m: $(cast rpc eth_getBlockByHash "$H" false --rpc-url "$R" | jq -r .hash) (expect $H)"
+     cast call "$V" 'currentRoot()(uint256)' --rpc-url "$R"
+   done
+   ```
+
+   `cast` does not hash the header; the companion does, with the
+   go-ethereum version in `zkapi-clientd/go.mod`, and signs no deposit when
+   the hash does not match. After a hard fork that changes the block header,
+   confirm one deposit on Sepolia with the release build before shipping it.
 
    Also find the `--rpc.txfeecap` of the node behind the signer (the upstream
    `ZKAPI_CHALLENGE_RPC_URL` of `signer.env`); the node does not report it.
@@ -603,6 +834,11 @@ few minutes during step 6.
    ```sh
    dc build server gateway signer
    ```
+
+   Compose reads that file only if it is its default `.env` file or the `dc`
+   alias passes it with `--env-file`. Otherwise the build replaces the images
+   under the tag Compose already used (`note-bound-v1` when none is set), and
+   the previous images stay reachable only by ID.
 
 2. **Configuration.**
    - `deployment.env`: add `ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS=21600`,
@@ -699,7 +935,8 @@ few minutes during step 6.
      `tx_fee_cap_wei`, and check that again after every fee-cap change.
 
    Lowering `ZKAPI_CHALLENGE_MAX_GAS` in `signer.env` toward the challenge's
-   gas limit, then restarting the signer, clears both, but keep a margin above
+   gas limit, then recreating the signer with
+   `dc up -d --no-deps --wait signer`, clears both, but keep a margin above
    that limit. A challenge's gas limit is its gas estimate plus 20%, about
    7.53M as measured, and the signer refuses a larger one with
    `gas_limit_exceeds_cap`, which the upgraded challenger reports as
@@ -760,19 +997,31 @@ few minutes during step 6.
    Before closing the window, set up alerting for the new signals, as in the
    Docker guide's [Monitoring](../docker/aws/README.md#monitoring) list. The
    earlier release had none of them:
-   - the challenger's `/health` returning 503 and every `critical` alarm on its
-     `/status`: `evidence_invalid`, `evidence_db_error`,
-     `indexer_invalid_response`, `indexer_diverged`, `signer_refused` and
-     `upstream_tx_fee_cap` are critical at once, while every other blocked
-     reason, `fee_reserve_held`, `tx_fee_cap_reached`, `tx_fee_above_cap` and
-     `base_fee_above_max_fee` included, turns critical after
-     `--critical-blocked-seconds`;
+   - the challenger's `/health` answering anything but 200, including no answer
+     at all, and its container not running or unhealthy (`dc ps --all`). A
+     stopped or crash-looping challenger reports nothing itself: the `exec`
+     into it fails, and none of its own signals below can fire;
+   - every `critical` alarm on the challenger's `/status`. A missed deadline,
+     including an escape with evidence found paid out past its deadline, stays
+     an alarm (`missed challenge deadline of note N`) for an hour.
+     `evidence_invalid`, `evidence_db_error`, `indexer_invalid_response`,
+     `indexer_diverged`, `signer_refused` and `upstream_tx_fee_cap` are
+     critical at once, while every other blocked reason, `fee_reserve_held`,
+     `tx_fee_cap_reached`, `tx_fee_above_cap` and `base_fee_above_max_fee`
+     included, turns critical after `--critical-blocked-seconds`;
    - its warnings about the transaction fee ceiling, a fee the signer's node
      refused, and an indexer pending-escapes list that disagrees with the
      vault;
    - any increase of the indexer's `missed_re_escape_count`
      (`zkapi_indexer_missed_re_escapes_total`), paging on `event="finalized"`;
-   - the signer's `challenge_refused` audit lines and its status warnings.
+   - the signer's `challenge_refused` audit lines and its status warnings;
+   - the server log lines `settlement required operator review` and
+     `unreadable OpenRouter lease row cannot be settled` (see Settlement
+     reviews under [Operations runbooks](#operations-runbooks)).
+
+   Also schedule the online database backups described at the end of that
+   section, if none run yet: the settlement runbooks below restore a corrupt
+   saved request, and repair other fields by hand, from a backup.
 
 7. **Settlement after the upgrade.** Every pre-upgrade lease receives its
    deadline. Provisioning leases finalize at zero once due, under the key
@@ -818,8 +1067,22 @@ separate VM. To share a VM, first move the legacy deployment into a second
 Compose project as in
 [Upgrades and running two deployments](../docker/aws/README.md#upgrades-and-running-two-deployments)
 (stop all of its services for the move); the hardened deployment then uses the
-default project and paths. Never repoint the legacy signer or challenger at the
-new vault.
+default project and paths. From then on, run every command for the legacy
+deployment with that project's settings: Phases 3 and 4, the checks they repeat
+from Before you start, and the runbooks for its notes. In the shell you use for
+it, set (with the data directory and HTTP port of that project's
+`compose.env`):
+
+```sh
+dc() { sudo docker compose -p zkapi-legacy --env-file /etc/zkapi-legacy/compose.env -f docker/aws/compose.yml --profile challenge "$@"; }
+DATA_DIR=/var/lib/zkapi-legacy API_URL=http://127.0.0.1:8081
+```
+
+Use the settings of Before you start for the hardened deployment. With them,
+a legacy command reaches the hardened deployment instead: Phase 4's checks
+would then read the hardened database and `/health`, and report legacy
+clearance off while the legacy server still signs proof-less clearances.
+Never repoint the legacy signer or challenger at the new vault.
 
 1. **Parameters.** Decide them before deploying; the vault keeps them forever.
    - `OWNER`: a multisig, ideally behind a timelock. It can block every new
@@ -853,13 +1116,17 @@ new vault.
    ```sh
    for getter in 'owner()(address)' 'pendingOwner()(address)' 'treasury()(address)' 'paused()(bool)' \
        'challengePeriod()(uint64)' 'noteTtl()(uint64)' 'requestChargeCap()(uint128)' \
-       'treasuryChangeDelay()(uint64)' 'unpauseClaimGrace()(uint64)' 'ROOT_HISTORY_WINDOW()(uint64)'; do
+       'treasuryChangeDelay()(uint64)' 'unpauseClaimGrace()(uint64)' 'ROOT_HISTORY_WINDOW()(uint64)' \
+       'ESCAPE_PAYOUT_GAS()(uint256)'; do
      printf '%s ' "$getter"; cast call "$NEW_VAULT" "$getter" --rpc-url "$RPC_URL"
    done
    ```
 
-   `owner()` must be the multisig and `pendingOwner()` must be zero. Compare the
-   four key getters with the printed keys as numbers.
+   `owner()` must be the multisig and `pendingOwner()` must be zero.
+   `ESCAPE_PAYOUT_GAS()` must answer `100000`; a vault built from source
+   without escape payout credits reverts there and would lock escapes to
+   destinations that reject ETH. Compare the four key getters with the printed keys as
+   numbers.
 
 4. **Stack.** Configure the new deployment from the
    [Docker guide](../docker/aws/README.md): the new `VAULT_ADDRESS`,
@@ -874,8 +1141,8 @@ new vault.
    from the Docker guide's [Monitoring](../docker/aws/README.md#monitoring)
    list, as in Phase 0, step 6. Also alert on the new vault's events: any
    `OwnershipTransferStarted` you did not send, `TreasuryChangeScheduled`,
-   `Paused`, `Unpaused` and `TreasuryPaymentDeferred` (see
-   [Operations runbooks](#operations-runbooks)). Monitoring that watched
+   `Paused`, `Unpaused`, `TreasuryPaymentDeferred` and `EscapePayoutDeferred`
+   (see [Operations runbooks](#operations-runbooks)). Monitoring that watched
    `OwnershipTransferred` for a `transferOwnership` call sees only the
    nomination's `OwnershipTransferStarted` until the new owner accepts.
 
@@ -899,6 +1166,22 @@ before Phase 4.
   profiles unchanged runs in strict mode (no `vault_revision`), sends clearance
   without a proof first and with one after `400 clearance_ownership_required`
   or `503 legacy_clearance_capacity`, and keeps the transmitted-request archive.
+  In strict mode the SDK never sends an ownership proof from a note state
+  whose request proof left the device, whatever `clearance_ownership_proof`
+  says. On this vault that proof is an escape that the request proof's holder
+  could challenge, which burns the nullifier. A mutual close at such a state
+  checks the request's status with the server, then sends only the proof-less
+  clearance. If the server asks for a proof, the SDK refuses with
+  `409 transmitted_anchor_ownership_unsafe` and leaves the note usable: a chat
+  from it that settles moves it to a state that closes normally. Suppose a
+  mutual close sent its ownership proof and the gateway answers
+  `429 gateway_rate_limited` beyond the SDK's retries. The note then stays
+  withdrawal-only (`error.data.withdrawal_only: true`), so no request proof
+  follows at that nullifier. Retrying the close, or escaping, completes it. At
+  the Phase 3 cutoff, also set `"deposits": "closed"` in this profile.
+  Tell users that an escape's destination cannot change after initiation and
+  must accept ETH: on this vault an escape to a destination that rejects ETH
+  never finalizes.
   Once the legacy deployment's server is upgraded, declaring
   `"clearance_ownership_proof": "optional"` in the legacy profile's
   `trusted_deployment` (in `sdk/assets/config/mainnet.json` and `sepolia.json`,
@@ -908,9 +1191,10 @@ before Phase 4.
   budget, then falls back to the proof on `503 legacy_clearance_capacity` or
   `400 clearance_ownership_required`, at the cost of one extra round trip. With
   it, every clearance request carries the ownership proof and never uses the
-  budget. Browser SDKs from earlier releases and `zkapi-clientd` 0.1.6 and
-  earlier never send a proof, so their mutual close fails while anyone keeps
-  that budget spent (see
+  budget, except at a state whose request proof left the device: there the SDK
+  sends only the proof-less clearance (see above). Browser SDKs from earlier
+  releases and `zkapi-clientd` 0.1.6 and earlier never send a proof, so their
+  mutual close fails while anyone keeps that budget spent (see
   [residual risks](#residual-risks-and-items-not-fixed)). Hosts update and
   reload every tab; the IndexedDB version is unchanged and older tabs keep
   working, but they do not write archive records. Users must not reset or
@@ -919,8 +1203,18 @@ before Phase 4.
   manifests, whose native companion is rebuilt by
   `zkapi-clientd/scripts/prepare-zkapi.sh` from the unchanged pins in
   `zkapi-clientd/packaging/zkapi-source.env` and the updated `companion.patch`
-  and `protocol-transport.patch`. It needs the indexer from Phase 0. Users stop
-  `serve`, install the release, and start it again. A deposit in
+  and `protocol-transport.patch`. It needs the indexer from Phase 0, reading
+  the chain through a provider other than the manifests' `rpc_url` (Before you
+  start, item 7), and its pinned `rpc_url` must pass that item's
+  `eth_getBlockByHash` and `currentRoot()` checks. Tell users that deposits
+  need a device clock within one day of chain time; otherwise the companion
+  refuses them (`this device's clock differs from Ethereum's block time by
+  more than a day`). Users stop
+  `serve`, install the release, and start it again. The companion keeps
+  set-aside request journals in `request_archive/` in its state directory and
+  never prunes them. Users who back up the wallet must include that directory
+  and must not delete files in it; a damaged record there counts as an
+  unsettled request. A deposit in
   `verification_conflict` is re-checked by `zkapi-clientd config` and repaired
   with `zkapi-clientd config --menu`, then **repair**; this includes a retry
   refused because an earlier deposit of the same note, reported as reverted,
@@ -950,24 +1244,40 @@ before Phase 4.
   `npm run verify:assets`, then build (`npm run build:browser`,
   `npm run build:mainnet`). Keep a legacy-exit build or profile pinned to the
   legacy vault, without `vault_revision` and with
-  `"clearance_ownership_proof": "optional"`, so that owners can still withdraw
-  legacy notes in strict mode. Hosts that offer the escape override show
+  `"clearance_ownership_proof": "optional"` and, after the Phase 3 cutoff,
+  `"deposits": "closed"`, so that owners can still withdraw legacy notes in
+  strict mode. Hosts that offer the escape override show
   `escape_override_warning`, from the refusal or from
   `snapshot().config.escape_override`, and pass the
   `escape_override_acknowledgement` given with it as
   `overrideUnsettledRequest`, never one derived from the refusal code (see
   [Breaking changes](#breaking-changes)): a host that always passes `true`
   leaves its users no exit while a false receipt claim stands. Surface
-  `request_archive_limit` as a prompt to withdraw that balance.
+  `request_archive_limit` as a prompt to withdraw that balance. An escape's
+  destination cannot change after initiation, so tell users to choose one
+  that accepts a plain ETH transfer within 100,000 gas, such as an ordinary
+  account. This release reports an escape whose payout the vault credited
+  (`EscapePayoutDeferred`) as returned; relay the operator's credit
+  announcements to the owner (see
+  [Escape payout credits](#operations-runbooks)).
 - **Wallet ordering in browsers.** The SDK keeps one selected note per origin
   and refuses to open a wallet for another deployment while it holds durable
   state (`This browser contains a wallet for <id>. Switch back to that deployment
-  before using or withdrawing it.`). Before configuring the SDK, hosts read
-  `readBrowserWalletSnapshot()` from `@openanonymity/zkapi-browser-sdk/store`.
-  If `runtime.deploymentId` is the legacy deployment and the runtime still holds
-  a note, journal, lease, pending deposit, prepared withdrawal or unfinished
-  late attempt, configure the legacy profile and offer a withdrawal; otherwise
-  configure the hardened profile. Never clear site data to get past the check.
+  before using or withdrawing it.`). Before configuring the SDK, hosts call
+  `readBrowserWalletHoldings()` from `@openanonymity/zkapi-browser-sdk/store`.
+  It lists each deployment this browser still holds state for: the runtime
+  slot's deployment while that slot holds a note, journal, lease, pending
+  deposit, deposit draft, prepared withdrawal or unfinished late attempt
+  (`runtime: true`), and every deployment with an open withdrawal record (a
+  set-aside mutual close, a pending or challenged escape, a close awaiting
+  finality, or a finalization in flight). While the legacy deployment is
+  listed, configure the legacy profile and offer its withdrawals. Configure the
+  hardened profile only when it is not listed. If both are listed, the entry
+  with `runtime: true` comes first and is the only one that can load. Setting
+  a withdrawal aside is not an exit: the withdrawal stays bound to the legacy
+  deployment. A loaded runtime also lists other deployments' open withdrawals
+  in `snapshot().config.other_deployment_withdrawals`; do not offer a deposit
+  while that list is non-empty. Never clear site data to get past the check.
   Hosts that route protocol calls through a same-origin rewrite need a rewrite
   for the new hostname as well.
 - **`zkapi-clientd`.** A release pinned to the hardened vault needs work that
@@ -984,13 +1294,15 @@ before Phase 4.
 ## Phase 3: stop deposits to the legacy vault and drain it
 
 Clients pin the legacy hostnames, which must keep serving the legacy stack until
-the drain completes. Once the hardened releases are out:
+the drain completes. On a shared VM, run this phase's commands and Phase 4's
+with the legacy deployment's settings (see Phase 1). Once the hardened releases
+are out:
 
 1. **Deposit cutoff.** Announce a date. At the cutoff, stop serving the two
-   routes that deposits need, `/v1/tree/next-note-id` and
-   `/v1/tree/notes/{id}/zero-path`, on the legacy deployment's public gateway,
-   by adding to its `nginx.conf` before `location /v1/tree/` and rebuilding its
-   gateway image under its own tag:
+   routes that `zkapi-clientd` deposits need, `/v1/tree/next-note-id` and
+   `/v1/tree/notes/{id}/zero-path`, on the legacy deployment's public gateway.
+   Add to the `nginx.conf` of the checkout that the legacy deployment is built
+   from, before `location /v1/tree/`:
 
    ```nginx
    # Deposit cutoff: the drained vault no longer offers new deposit paths.
@@ -998,9 +1310,36 @@ the drain completes. Once the hardened releases are out:
    location ~ ^/v1/tree/notes/[0-9]+/zero-path$ { return 410; }
    ```
 
-   Clients then fail before building a deposit transaction. Keep the root,
-   paths, snapshot, clearance, recovery and every other route, and keep the
-   internal indexer unchanged: the challenger reads zero-paths from it
+   Then set a new `ZKAPI_IMAGE_TAG` for the legacy deployment, so that its
+   previous images stay available, and build and start the gateway. That tag
+   names all three images, so build all of them under it:
+
+   ```sh
+   dc build server gateway signer
+   dc up -d --no-deps --wait gateway
+   ```
+
+   On a shared VM, use a checkout of the release that only the legacy
+   deployment builds from, and put its tag in `/etc/zkapi-legacy/compose.env`.
+   The gateway image is built from the checkout's `nginx.conf`, and images are
+   shared by tag across projects: a gateway that the hardened deployment builds
+   or recreates from the same checkout or tag would also answer 410 to its own
+   deposits.
+
+   `zkapi-clientd` then fails before building a deposit transaction. The
+   browser SDK does not use these routes: it takes the deposit slot from
+   `/v1/tree/snapshot`, which withdrawals also need, so the cutoff does not
+   stop its deposits. At the cutoff, ship browser builds whose legacy and
+   legacy-exit profiles set `"deposits": "closed"` in `trusted_deployment`,
+   then sync, verify and build as in Phase 2. The SDK then refuses a new
+   deposit with `409 deposits_closed` before any chain read, note secret or
+   wallet prompt, and reports `snapshot().config.deposits: "closed"` so the
+   host can hide its deposit action. A deposit already started stays
+   completable and recoverable for its original amount. Builds older than this
+   release ignore the setting, so remove the deposit action from them. The
+   drain monitoring below keeps tracking `nextNoteId()`. Keep
+   the root, paths, snapshot, clearance, recovery and every other route, and
+   keep the internal indexer unchanged: the challenger reads zero-paths from it
    directly. Never pause the legacy vault to stop deposits; anyone can still
    deposit by building a path from chain data, and such notes drain like any
    other.
@@ -1011,6 +1350,23 @@ the drain completes. Once the hardened releases are out:
    its `expiryTs`, the deposit time plus `noteTtl()` rounded up to a whole day.
    Plan the legacy stack's end from the latest `expiryTs` among open notes,
    plus one challenge period for escapes started near it.
+
+   Anyone can finalize an escape after its deadline, and the call also pays
+   the treasury, so finalize any that their owners leave pending. For each
+   pending escape past its deadline (from the loop of Before you start, item
+   2), simulate it first:
+
+   ```sh
+   cast call "$VAULT" 'finalizeEscapeWithdrawal(uint32)' <noteId> --rpc-url "$RPC_URL"
+   ```
+
+   It prints `0x` when the finalization would succeed. A revert with data
+   `0xf4b3b1bc` (`NativeTransferFailed()`) while the treasury check of Before
+   you start, item 1, still prints `0x` means the escape's destination rejects
+   ETH: on a legacy vault that escape cannot finalize while it does, and
+   nothing can challenge or change it any more. Record its note ID,
+   destination and final balance (`.[4]` and `.[3]` of that loop's
+   `pendingWithdrawals` output), and tell its owner through the hosts.
 
 3. **Expired notes.** Exits remain possible after expiry until someone calls
    `claimExpired`, which anyone can do; on a legacy vault it pays the full
@@ -1027,22 +1383,43 @@ the drain completes. Once the hardened releases are out:
    recent proof-less reservations:
 
    ```sh
-   sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+   sudo sqlite3 -readonly "$DATA_DIR/server.db" \
      "SELECT count(*) FROM nullifiers WHERE status = 'ClearanceReserved' AND clearance_auth = 'legacy' AND created_at > strftime('%s', 'now', '-7 days');"
    ```
 
-   Then remove `ZKAPI_ALLOW_LEGACY_CLEARANCE` from `deployment.env` (or set it to
-   `false`), run `dc up -d --no-deps --wait server`, and confirm
-   `clearance_ownership_proof_required: true` and
-   `legacy_clearance_window_limit: 0` in `/health`. Older SDK builds can still
+   Then remove `ZKAPI_ALLOW_LEGACY_CLEARANCE` from the legacy deployment's
+   `deployment.env` (`/etc/zkapi-legacy/deployment.env` on a shared VM), or set
+   it to `false`, and recreate the server:
+
+   ```sh
+   dc up -d --no-deps --wait server
+   curl -fsS "$API_URL/health" | jq '{clearance_ownership_proof_required, legacy_clearance_window_limit}'
+   ```
+
+   It must report `true` and `0`. Older SDK builds can still
    escape; `zkapi-clientd` 0.1.6 and earlier cannot withdraw until they
-   upgrade.
+   upgrade. With legacy clearance off, a browser SDK from this release in
+   strict mode cannot mutual-close a note at a state whose request proof left
+   the device and never settled. It refuses with
+   `transmitted_anchor_ownership_unsafe`, and escape there is refused too.
+   Such an owner exits after a chat from that state settles; a state whose row
+   the operator changed under **Receipt journal missing** accepts no chat, so
+   for such an owner the remedy works only while legacy clearance is on. Before
+   disabling, check that no such users remain, or announce this.
+   `zkapi-clientd` from this release asks for the same at a state with an
+   unsettled request: one chat request first, or the owner's typed
+   acknowledgement once the note expired or the server holds a clearance for
+   the state.
 
 2. **Retire the legacy stack** only when every legacy note is closed (status 3,
    by an exit or an expiry claim), no escape is pending, and the last challenge
-   deadline has passed.
+   deadline has passed. The one exception is an escape stuck because its
+   destination rejects ETH (Phase 3, step 2): once its deadline has passed it
+   does not block retirement, since finalizing it needs only the chain should
+   the destination ever accept ETH. Record it as described there first.
    Retiring earlier strands the remaining notes: without the API and indexer,
-   clients can neither close nor build escape paths. Then:
+   clients can neither close nor build escape paths. Then, with the legacy
+   deployment's `dc` (see Phase 1 for a shared VM):
    1. stop the challenger and signer, and move the sender's remaining balance;
    2. stop the server, indexer and gateway, and remove the legacy origin;
    3. archive the data directory as sensitive data (it holds request proofs and
@@ -1051,15 +1428,20 @@ the drain completes. Once the hardened releases are out:
 
 ## Operations runbooks
 
-**Treasury change on the hardened vault.** From the owner:
+**Treasury change on the hardened vault.** From the owner (the commands assume
+an owner key in a Foundry keystore; a Safe owner submits the same calls as Safe
+transactions):
 
 ```sh
-cast send "$NEW_VAULT" 'setTreasury(address)' "$NEW_TREASURY"   # emits TreasuryChangeScheduled
+cast send "$NEW_VAULT" 'setTreasury(address)' "$NEW_TREASURY" \
+  --rpc-url "$RPC_URL" --account "$OWNER_ACCOUNT"   # emits TreasuryChangeScheduled
 cast call "$NEW_VAULT" 'pendingTreasury()(address)' --rpc-url "$RPC_URL"
 cast call "$NEW_VAULT" 'pendingTreasuryReadyAt()(uint64)' --rpc-url "$RPC_URL"
 cast call "$NEW_VAULT" 'totalPausedDuration()(uint64)' --rpc-url "$RPC_URL"
-cast send "$NEW_VAULT" 'acceptTreasury()'                       # emits TreasurySet
-cast send "$NEW_VAULT" 'cancelTreasuryChange()'                 # any time, also while paused
+cast send "$NEW_VAULT" 'acceptTreasury()' \
+  --rpc-url "$RPC_URL" --account "$OWNER_ACCOUNT"   # emits TreasurySet
+cast send "$NEW_VAULT" 'cancelTreasuryChange()' \
+  --rpc-url "$RPC_URL" --account "$OWNER_ACCOUNT"   # any time, also while paused
 ```
 
 `pendingTreasuryReadyAt()` is on the active clock, wall time minus all paused
@@ -1111,12 +1493,35 @@ cast call "$NEW_VAULT" 'pendingOwner()(address)' --rpc-url "$RPC_URL"   # zero
 
 **Treasury arrears.** A `TreasuryPaymentDeferred` event means a treasury payout
 failed and was kept in `treasuryArrears()` (gwei). Fix the treasury (it must
-accept ETH with 100,000 gas), then anyone can pay it out, except while paused:
+accept ETH with 100,000 gas), then any funded account (`PAYER_ACCOUNT` below)
+can pay it out, except while paused:
 
 ```sh
 cast call "$NEW_VAULT" 'treasuryArrears()(uint128)' --rpc-url "$RPC_URL"
-cast send "$NEW_VAULT" 'withdrawTreasuryArrears()'   # emits TreasuryArrearsPaid
+cast send "$NEW_VAULT" 'withdrawTreasuryArrears()' \
+  --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"   # emits TreasuryArrearsPaid
 ```
+
+**Escape payout credits.** An `EscapePayoutDeferred(noteId, destination, amount)`
+event means an escape closed but its push to `destination` failed: the
+destination rejected ETH or needed more than 100,000 gas. The amount (gwei
+units) waits in `escapePayoutCredits(destination)`. Clients from this release
+do not detect this: the browser SDK reports such an escape as returned. Anyone
+can deliver the credit, also while paused, and the claim pays only
+`destination`, whoever sends it, so claim it on the owner's behalf:
+
+```sh
+cast call "$NEW_VAULT" 'escapePayoutCredits(address)(uint128)' <destination> --rpc-url "$RPC_URL"
+cast send "$NEW_VAULT" 'claimEscapePayout(address)' <destination> \
+  --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"   # emits EscapePayoutClaimed
+```
+
+The claim forwards all its gas, so a destination that needed more than
+100,000 gas, such as some smart-contract wallets, is paid at once. The claim
+reverts and keeps the credit while the destination still rejects ETH; the
+credit then waits until that destination's owner makes it accept ETH. The
+server cannot tell who owns a note, so announce such a credit with its note ID
+(the event's first indexed topic) and destination through the hosts.
 
 **Settlement reviews.** Alert on `settlement required operator review`, list
 open reviews, and acknowledge each handled one, as in the
@@ -1152,7 +1557,7 @@ expiry:
    from it may still be pending.
 
    ```sh
-   sudo sqlite3 -readonly /var/lib/zkapi/server.db \
+   sudo sqlite3 -readonly "$DATA_DIR/server.db" \
      "SELECT client_request_id, status FROM openrouter_leases WHERE client_request_id = '$ID';"
    ```
 
@@ -1217,33 +1622,111 @@ expiry:
    installs the signed receipt through ordinary recovery. See
    [Reopening a cancelled lease](native-eth-billing.md#reopening-a-cancelled-lease).
 
+An `unreadable OpenRouter lease row cannot be settled` line in the server log,
+logged at every settlement tick with the row's `client_request_id`, names a
+pending lease whose saved request cannot be decoded. No tick settles it, not
+even at its settlement deadline, and its nullifier stays reserved, which
+leaves its owner without an exit as above. Restore its saved request with the
+reopen command of step 4 and `--saved-request` (from a backup or its owner),
+without waiting for a cancellation: the lease keeps its status and the command
+prints `"result": "restored"`. If its deadline has already passed, it is
+charged its solvency bound on restart; add `--zero-charge` to concede
+instead. Acknowledge the restoration's `binding_reopened` review once the
+lease is `finalized`. See
+[Restoring an unreadable pending lease](native-eth-billing.md#restoring-an-unreadable-pending-lease).
+
 **Receipt journal missing.** A user reporting `receipt_journal_missing` was told
-that the nullifier of their note's current state is finalized for a request the
-browser cannot apply, usually one an older SDK build discarded. Look up that
-nullifier's row. The server stores the nullifier as lowercase `0x` hex without
-leading zeros, which `cast to-hex "$(cast to-dec ...)"` prints from a decimal or
-hex value:
+that the nullifier of their note's current state is finalized for a request
+their client cannot apply, usually one an older SDK build, `zkapi-clientd`
+0.1.6 or earlier, or a pre-release build of this release's companion
+discarded. `zkapi-clientd` shows that nullifier with the code, in the chat
+error and in **withdraw**. Look up that
+nullifier's row and the request's charge in gwei. The server stores the
+nullifier as lowercase `0x` hex without leading zeros, which
+`cast to-hex "$(cast to-dec ...)"` prints from a decimal or hex value:
 
 ```sh
 N=$(cast to-hex "$(cast to-dec REPLACE_WITH_NULLIFIER)")
-sudo sqlite3 -readonly /var/lib/zkapi/server.db \
-  "SELECT nullifier, status, reservation_kind, client_request_id, clearance_auth FROM nullifiers WHERE nullifier = '$N';"
+sudo sqlite3 -readonly "$DATA_DIR/server.db" \
+  "SELECT n.nullifier, n.status, n.reservation_kind, n.client_request_id, n.clearance_auth, n.created_at, n.finalized_at, COALESCE(l.charge_applied, n.charge_applied) AS charge FROM nullifiers n LEFT JOIN openrouter_leases l ON l.request_nullifier = n.nullifier WHERE n.nullifier = '$N';"
 ```
 
 If its `status` is not `Finalized`, the answer was false (check the gateway); on
 a hardened vault the user's exit is then the SDK's escape override after its
-grace period, with the `receipt_journal_missing` acknowledgement. If it is
+grace period, with the `receipt_journal_missing` acknowledgement
+(`zkapi-clientd` has no escape). If it is
 `Finalized`, an escape at that state will be challenged, and
-`POST /v2/withdraw/clearance` answers `nullifier_used`. To let the owner exit,
-verify ownership (for example, with an escape-form ownership proof for that
-nullifier), then turn the row into a clearance reservation. Apart from the hand
-repairs that a refused reopen asks for (see Settlement reviews, above), this is
-the only edit of the `nullifiers` table this guide prescribes, and the only one
-with a tested statement. Run it as the container's user 10001, like the review
-acknowledgements in the Docker guide:
+`POST /v2/withdraw/clearance` answers `nullifier_used`. The only remedy is to
+turn the row into a clearance reservation, and that rests on the owner's word:
+
+- *What it can cost.* A `Finalized` row means that the server signed a
+  successor state for the request, which it serves to anyone who asks by that
+  nullifier. An owner whose browser lost the request's journal cannot install
+  that successor; for that owner the remedy costs the operator the request's
+  charge. An owner who kept the journal can install the successor, keep
+  spending it and the states after it for service, and then close or escape
+  at the reserved state at its earlier balance. The operator then loses up to
+  the note's whole balance at that state, at most its deposit: the service
+  spent since that state goes unpaid. The same holds for any state that was
+  not the last one its owner reached. Nothing tells these cases apart. A
+  request proof reveals neither its note nor the state it spends, so the
+  server cannot link later requests to this one, and an ownership proof shows
+  only that the claimant held the state, which a dishonest owner did too.
+  On a legacy vault, grant it before Phase 4 disables legacy clearance (see
+  *Ownership* below).
+- *When to offer it.* Only where the operator accepts losing up to that
+  balance: for example, for a small deposit, or for an owner it can identify
+  and hold to account outside the protocol. A genuine claim normally concerns
+  a request sent before the host shipped this release's SDK, which keeps a
+  transmitted request's journal while its note state is current; question a
+  claim about a request whose `created_at` is later.
+- *Ownership.* Collect no withdrawal proof before you change the row. On a
+  legacy vault an escape-form ownership proof is a valid escape while its root
+  is the vault's current root. If one leaks while the row is still
+  `Finalized`, the challenger contests the escape it starts, and on a legacy
+  vault the challenge consumes the nullifier: the owner can then neither close
+  nor escape at that state. (On a hardened vault the challenge leaves the
+  mutual close possible.) The change needs no ownership proof of its own: a
+  clearance at that state, and an escape there, are usable only with a
+  withdrawal proof for it, which only the holder of the state can make, and
+  the vault pays that state's balance to the destination in the proof. A
+  claim filed by anyone else gains its filer nothing. The server verifies an
+  ownership proof sent with the clearance request, and requires one where
+  legacy clearance is off; once the row is changed, the challenger no longer
+  contests an escape at that state, so sending that proof no longer risks the
+  challenge above. To tie the claimant to the exit, ask them, before you
+  change the row, for the note ID (`NOTE_ID`) and the destination address, and
+  read the note:
+  `cast call --json "$VAULT" 'notes(uint32)(bytes32,uint128,uint64,uint8)' "$NOTE_ID" --rpc-url "$RPC_URL"`
+  must show status `1` (active) or `2` (escape pending), and a deposit, in
+  gwei, within the loss you accept. A browser SDK from this release at such a
+  state asks for the clearance without an ownership proof on a legacy vault,
+  so the changed row is used only while legacy clearance is on.
+- *Logging.* Record every use outside the database: the claimant and how to
+  reach them, the note ID and destination they gave, the row and charge read
+  above, the note's deposit, who approved it, the loss accepted, and the block
+  number at the change (`FLIP_BLOCK`, from
+  `cast block-number --rpc-url "$RPC_URL"`). Changed rows keep their marker;
+  `SELECT nullifier, created_at, finalized_at FROM nullifiers WHERE clearance_auth = 'operator_receipt_missing';`
+  lists them. After the owner's exit, `usedNullifiers(N)` is true: record the
+  exit's note ID, final balance and destination, and compare them with the
+  claim. A mutual close emits `MutualClose`, an escape
+  `EscapeWithdrawalInitiated`:
+
+  ```sh
+  cast call "$VAULT" 'usedNullifiers(uint256)(bool)' "$N" --rpc-url "$RPC_URL"
+  cast logs --from-block "$FLIP_BLOCK" --address "$VAULT" 'MutualClose(uint32 indexed,uint256,uint128,address)' "$NOTE_ID" --rpc-url "$RPC_URL"
+  cast abi-decode --input 'f(uint256,uint128,address)' REPLACE_WITH_LOG_DATA   # nullifier, final balance, destination
+  ```
+
+To grant the remedy, turn the row into a clearance reservation. Apart from the
+hand repairs that a refused reopen asks for (see Settlement reviews, above),
+this is the only edit of the `nullifiers` table this guide prescribes, and the
+only one with a tested statement. Run it as the container's user 10001, like
+the review acknowledgements in the Docker guide:
 
 ```sh
-sudo setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 /var/lib/zkapi/server.db \
+sudo setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 "$DATA_DIR/server.db" \
   "UPDATE nullifiers SET status = 'ClearanceReserved', clearance_auth = 'operator_receipt_missing' WHERE nullifier = '$N' AND status = 'Finalized'; SELECT changes();"
 ```
 
@@ -1254,11 +1737,27 @@ clearance and makes the challenger wait for a settlement. The server never acts
 on `clearance_auth`; the marker keeps the row apart from the old endpoint's
 reservations (`clearance_auth IS NULL`) and from proof-less ones (`legacy`).
 The server then reports the nullifier `clearance_reserved` and signs the
-owner's mutual-close clearance, and the challenger no longer contests an escape
-at that state. The owner withdraws the balance from before that request, and
-the operator forgoes that request's charge. On a hardened vault this also works
-after the owner's escape was challenged, because a challenge does not burn the
-nullifier.
+owner's mutual-close clearance (while legacy clearance is on, also for a
+request without an ownership proof, which spends no proof-less budget), and
+the challenger no longer contests an escape at that state. Never undo the
+change: a clearance may already have been signed. On a hardened vault this
+also works after the owner's escape was challenged, because a challenge does
+not burn the nullifier.
+
+What the owner's client does after the change:
+
+- *Browser SDK.* On a hardened vault it reads `clearance_reserved` and closes
+  with an ownership proof as usual. On a legacy vault this release's SDK sends
+  only the proof-less clearance from that state, which the server signs only
+  while legacy clearance is on; afterwards it refuses with
+  `transmitted_anchor_ownership_unsafe`, and no chat can move the state.
+- *`zkapi-clientd`.* The owner's chats stop with `clearance_reserved_state`
+  instead of `receipt_journal_missing`, and the owner chooses **withdraw**.
+  The companion first sets aside its own retry that the server refused,
+  whether or not the vault's root has changed since. On a server with legacy
+  clearance off it then reports `unsettled_clearance_reserved`, and the
+  guided withdrawal sends the ownership proof only after the owner types
+  `send`. Tell the owner to expect that prompt.
 
 **Indexer divergence.** Follow
 [Indexer resync](../docker/aws/README.md#indexer-resync). The indexer verifies
@@ -1288,15 +1787,19 @@ index, then resync.
 
 **Fee spikes.** When the challenger reports `base_fee_above_fee_cap`,
 `fee_cap_reached`, `tip_cap_reached`, `fee_reserve_held`, `tx_fee_cap_reached`
-or `insufficient_balance`, raise the signer's caps and restart it, then raise
-the daemon's caps (no higher) and restart it, or fund the sender, with two
-exceptions. For `tx_fee_cap_reached`, or a signer refusal with
-`tx_fee_above_cap` or `upstream_tx_fee_cap`, raising the fee caps changes
-nothing: raise the node's `--rpc.txfeecap` first, then
-`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in `signer.env` (restart the signer) and
-`deployment.env` (restart the challenger, which also clears a bound learned
-from `upstream_tx_fee_cap`); at 1 ETH a 7.53M-gas challenge bids at most about
-132.7 gwei. `fee_reserve_held` means that the pending challenge used the
+or `insufficient_balance`, raise the signer's caps in `signer.env` and recreate
+the signer, then raise the daemon's caps in `challenge.env` (no higher) and
+recreate the challenger, or fund the sender, with two exceptions. A container
+reads its environment files only when it is created, so apply each edit with
+`dc up -d --no-deps --wait signer`, then `dc up -d --no-deps --wait challenger`:
+`docker compose restart` keeps the old values, and `--no-deps` leaves the
+server and indexer, which also read `deployment.env`, running. For
+`tx_fee_cap_reached`, or a signer refusal with `tx_fee_above_cap` or
+`upstream_tx_fee_cap`, raising the fee caps changes nothing: raise the node's
+`--rpc.txfeecap` first, then `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` in `signer.env`
+(recreate the signer) and `deployment.env` (recreate the challenger, which also
+clears a bound learned from `upstream_tx_fee_cap`); at 1 ETH a 7.53M-gas
+challenge bids at most about 132.7 gwei. `fee_reserve_held` means that the pending challenge used the
 replacements allowed before the critical threshold, until which bids stay
 within 100/121 of the tip cap and of the lower of the fee cap and the ceiling /
 gas limit. Raising both caps lets the next poll replace it once 100/121 of the
@@ -1329,15 +1832,19 @@ Roll forward where possible: the earlier binaries bring back the defects.
   the server database and treats reserved leases as evidence, which burns
   nullifiers on a legacy vault. It also ignores `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
   and proposes no fees, so behind this release's signer every challenge bids
-  the signer's fee cap (see [Compatibility](#compatibility)). Prefer fixing
-  forward.
+  the signer's fee cap (see [Compatibility](#compatibility)). It drops the
+  checkpoint's `missed_nullifiers` when it rewrites the checkpoint, so after a
+  re-upgrade the misses the new daemon had counted are treated like an earlier
+  release's (see Breaking changes). Prefer fixing forward.
 - **API server:** the earlier binary ignores the new tables and columns; rows
   finalized at zero or at the worst case stay finalized, queued key cleanups
   pause, and its settlement can stall again. It also restores the seed fallback
   and proof-less clearance. It ignores a lease's committed `charge_basis`
   (`unissued` or `operator_conceded`) and does not verify a reopened lease's
   request again, so first let every such lease, and every reopened lease,
-  settle. Never restore an older database over newer wallet activity.
+  settle. It ignores `next_attempt_at` and does not check the lease key
+  source at startup. Never restore an older database over newer wallet
+  activity.
 - **Indexer:** the earlier binary refuses a version-2 checkpoint and answers 503.
   Stop the indexer, move `indexer.cursor` aside, and start the earlier image
   without a cursor: it replays from `DEPLOY_BLOCK`, which is the only rollback
@@ -1348,7 +1855,8 @@ Roll forward where possible: the earlier binaries bring back the defects.
   against the vault, so keep it for forensics only.
 - **Browser SDK:** earlier builds ignore the archive records, which stay inert;
   the archive's protections are lost, wallet data is not. They send clearance
-  without an ownership proof, as in [Compatibility](#compatibility).
+  without an ownership proof, as in [Compatibility](#compatibility), and ignore
+  `trusted_deployment.deposits`.
 - **`zkapi-clientd`:** the additive state fields are ignored by earlier
   releases, subject to the downgrade warning in Phase 2. An earlier release
   (0.1.6 or before) drops `slot`, `signed_slots` and each slot's
@@ -1358,7 +1866,11 @@ Roll forward where possible: the earlier binaries bring back the defects.
   before this release; this is one more reason for that warning. An earlier
   companion cannot accept an escape payout as withdrawal evidence and has no
   release route, and 0.1.6 and earlier cannot open a wallet whose journaled
-  request was quoted under other native-price pins.
+  request was quoted under other native-price pins. Earlier companions ignore
+  `request_archive/` and delete journals again instead of archiving them; a
+  pre-release build of this companion also sends an ownership proof from a
+  state with a set-aside request. Keep the directory, so that an upgrade sees
+  those requests again.
 - **Contracts:** a deployed vault cannot be rolled back. The legacy vault is
   untouched by this release; an unannounced hardened deployment can simply be
   abandoned before anyone deposits.
@@ -1411,7 +1923,13 @@ outside this release:
     day at the default.
   - Clients that send an ownership proof are unaffected: this release's browser
     SDK (which falls back to its proof on `legacy_clearance_capacity`), the
-    Rust wallet, and `zkapi-clientd` built from this release.
+    Rust wallet, and `zkapi-clientd` built from this release. The exception is
+    a legacy-vault note state whose request left the device and never
+    settled: there this release's SDK and `zkapi-clientd` send only the
+    proof-less request, so while the budget is exhausted their mutual close
+    fails (`409 transmitted_anchor_ownership_unsafe` in the SDK,
+    `409 unsettled_request_state` in `zkapi-clientd`) until one chat request
+    from that state settles or the attack stops.
   - Browser SDKs from earlier releases and `zkapi-clientd` 0.1.6 and earlier
     stay exposed to this denial of service for the whole legacy window: their
     mutual close fails with `503 legacy_clearance_capacity` while the attack
@@ -1422,12 +1940,18 @@ outside this release:
     minute).
 - **Pause has no time limit.** On a hardened vault the owner can block new
   exits and expiry claims indefinitely but cannot move deposits; escapes
-  started before a pause still finalize. Two-step transfers keep a mistyped or
+  started before a pause still finalize, and credited escape payouts can still
+  be claimed. Two-step transfers keep a mistyped or
   unusable nominee from leaving a paused vault without an owner, but if the key
   of an owner that has accepted is lost while the vault is paused, the freeze is
   permanent. Legacy vaults also allow the sweep described above, and a treasury
   that rejects ETH blocks the exits of their spent notes until the owner
   replaces it, so only the owner policy protects them.
+- **Escape destinations that reject ETH.** On legacy vaults an escape to a
+  destination that rejects ETH can never finalize, so the note, including the
+  operator's share, stays locked. Hardened vaults credit the payout instead,
+  and a credit to a destination that keeps rejecting ETH waits until it
+  accepts.
 - **Root races.** Merkle siblings must match the live root on every vault, so a
   challenge, deposit, expiry claim or withdrawal reverts `StaleRoot()` when an
   unrelated root change lands after its siblings were built. A challenge has
@@ -1438,27 +1962,76 @@ outside this release:
 - **Ownership proofs.** An ownership proof is a valid escape while its root is
   accepted (for a day on a hardened vault, until the next root change on a
   legacy vault): whoever holds it, including the server, can start the owner's
-  escape and delay the payout by one challenge period. The
-  payout still goes to the owner's destination at the owner's balance. The
-  proof shows the server the note ID, balance and destination before the close,
-  which the close then publishes anyway.
-- **Client gaps.** `zkapi-clientd` cannot yet abandon an unmined deposit, has no
-  hardened manifests or retired-deployment guard, and does not warn against
-  downgrades; 0.1.6 and earlier cannot open a wallet whose journaled request
-  was quoted under other native-price pins. The browser SDK's expiry display
-  does not use `effectiveExpiry` yet. A wallet whose older SDK already
-  discarded a journal cannot rebuild it, so a finalized receipt it cannot
-  install shows `receipt_journal_missing`; a lying server or gateway can
-  produce the same code. On a hardened vault the SDK still offers its
-  time-gated escape override for that code, behind that code's own warning and
-  acknowledgement. If the claim is genuine, the escape will be challenged, its
-  gas is lost and the note then needs operator help; if it is false, the escape
-  is the only exit. Mutual close is refused at that state, so on a legacy
-  vault, or after such a challenge, only operator remediation helps (see
-  **Receipt journal missing** under Operations runbooks). A note state with 64
-  unsettled requests accepts no new chat. If none of them settles, its balance
-  has to be withdrawn, and on a legacy vault only mutual close, which needs the
-  server, can do that.
+  escape. Unless that escape is challenged, the payout still goes to the
+  owner's destination at the owner's balance, one challenge period later. A
+  challenge needs a request proof for the same state; the server holds the
+  request proofs it receives, and a gateway sees each in transit. On a
+  hardened vault the owner can still close by mutual close after a challenge.
+  On a legacy vault the challenge consumes the nullifier, so the owner can no
+  longer exit at that state; this is why the **Receipt journal missing**
+  runbook collects no ownership proof before the row is changed. The proof
+  shows the server the note ID, balance and destination before the close,
+  which the close then publishes anyway. This release's browser SDK never
+  sends an ownership proof from a legacy-vault state whose request proof left
+  the device. After it has sent one, it never sends a request proof from that
+  state, even when the clearance answer is a gateway 429 or is lost.
+  `zkapi-clientd` from this release also sends no ownership proof from a
+  legacy-vault state with an archived (set-aside) request, unless its owner
+  types `send` at the guided withdrawal's risk warning, which it offers only
+  once the note has expired or the server holds a clearance for the state.
+- **Client gaps.**
+  - `zkapi-clientd` cannot yet abandon an unmined deposit, has no hardened
+    manifests or retired-deployment guard, and does not warn against
+    downgrades; 0.1.6 and earlier cannot open a wallet whose journaled request
+    was quoted under other native-price pins.
+  - On a legacy vault `zkapi-clientd` sends no ownership proof from a note
+    state with an unsettled request. That includes a request it set aside on
+    unsigned answers and a damaged record in `request_archive/`. With legacy
+    clearance off, such a note withdraws only after one chat request settles
+    the state, or, once the note has expired or the server holds a clearance
+    for it, with the owner's typed acknowledgement of the challenge risk. After
+    expiry `claimExpired` can take the note at any time, so owners must act
+    before then. A note whose journal 0.1.6 or earlier discarded reports
+    `receipt_journal_missing` with its nullifier; a lying server or gateway can
+    produce the same code.
+  - `zkapi-clientd` does not record that a withdrawal's clearance request
+    carried an ownership proof: **repair**, when it replaces an unused note,
+    releases that note's reservation after an unsigned `unknown` reading even
+    if the proof already left the device. The replacement note has the same
+    secret and genesis nullifier, so where the replaced note is a real note of
+    that deposit, an escape of it with that proof can be challenged with the
+    replacement's first request proof, which burns the nullifier on a legacy
+    vault.
+  - The browser SDK does not detect a credited escape payout
+    (`EscapePayoutDeferred`) and reports such an escape as returned, so
+    operators alert on the event and deliver the credit (see Escape payout
+    credits under Operations runbooks). Its expiry display does not use
+    `effectiveExpiry` yet.
+  - A wallet whose older SDK already discarded a journal cannot rebuild it, so
+    a finalized receipt it cannot install shows `receipt_journal_missing`; a
+    lying server or gateway can produce the same code. On a hardened vault the
+    SDK still offers its time-gated escape override for that code, behind that
+    code's own warning and acknowledgement. If the claim is genuine, the escape
+    will be challenged, its gas is lost and the note then needs operator help;
+    if it is false, the escape is the only exit. Mutual close is refused at
+    that state, so on a legacy vault, or after such a challenge, only operator
+    remediation helps, and it rests on the owner's word: an owner who kept the
+    request's journal can spend the successor state and still exit at the
+    earlier balance (see **Receipt journal missing** under Operations
+    runbooks). On a legacy vault this release's SDK can use that remediation
+    only while legacy clearance is on.
+  - A note state with 64 unsettled requests accepts no new chat. If none of
+    them settles, its balance has to be withdrawn, and on a legacy vault only
+    mutual close, which needs the server, can do that.
+- **Fee spikes above the transaction fee ceiling.** A challenge bids at most
+  the lower of the fee cap and the ceiling / gas limit, about 132.7 gwei for a
+  7.53M-gas challenge at the default 1 ETH. While the base fee stays above
+  that, nothing is sent (`base_fee_above_fee_cap` or `tx_fee_cap_reached`), and
+  the vault's deadline does not move: a stale escape whose challenge cannot be
+  included before its deadline finalizes. A higher ceiling needs a node whose
+  `--rpc.txfeecap` you control; a hosted provider's cap usually cannot be
+  raised. A longer `challengePeriod()` on the new vault rides out longer
+  spikes. Page on both reasons (see Fee spikes under Operations runbooks).
 - **Gateway limits are per source.** One browser host's users share one source,
   IPv6 clients can rotate addresses, and a client that reaches the origin
   without CloudFront can choose its key.

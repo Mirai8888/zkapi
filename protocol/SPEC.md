@@ -88,9 +88,9 @@ The withdrawal statement contains these 14 field elements:
 The withdrawal proof establishes membership and the note-bound final state,
 reveals the final balance, and binds the nullifier to the destination, balance,
 and clearance mode. Mutual close additionally proves the clearance signature.
-The vault checks the deployment, pinned keys, a nonzero destination, the
-proof's root (the current root, or one replaced within the one-day
-`ROOT_HISTORY_WINDOW`), siblings against the current root, note status,
+The vault checks the deployment, pinned keys, a destination other than zero and
+the vault itself, the proof's root (the current root, or one replaced within the
+one-day `ROOT_HISTORY_WINDOW`), siblings against the current root, note status,
 nullifier use, and final balance before settlement.
 
 ## Wire format and persistence
@@ -122,21 +122,31 @@ must attach exactly `amount * 1 gwei`, have positive amount, and stay within
 `MAX_NATIVE_UNITS = 2^53 - 1`. The vault buckets expiry to daily boundaries.
 
 Mutual close removes the active leaf and pays the user's final balance to the
-chosen destination and the spent amount to the treasury. Escape initiation
-removes the leaf immediately and starts the configured challenge period. A
-valid archived request with the matching nullifier challenges the escape and
-restores the leaf; unrelated root updates do not invalidate that historical
-proof. The challenge clears the nullifier from `usedNullifiers` and sets
-`challengedNullifiers`, so a later escape at it reverts `ChallengedNullifier()`
-while a cleared mutual close remains possible. An uncontested escape can be
-finalized after its deadline. Active notes can be claimed for the treasury
-after `effectiveExpiry`, which adds paused time and a post-challenge grace and
-is never earlier than `unpauseClaimGrace` after an unpause.
+chosen destination and the spent amount to the treasury; a destination that
+rejects the payout reverts the close. Both withdrawal paths revert
+`InvalidDestination()` for the zero address or the vault itself. Escape
+initiation removes the leaf immediately and starts the configured challenge
+period. A valid archived request with the matching nullifier challenges the
+escape and restores the leaf; unrelated root updates do not invalidate that
+historical proof. The challenge clears the nullifier from `usedNullifiers` and
+sets `challengedNullifiers`, so a later escape at it reverts
+`ChallengedNullifier()` while a cleared mutual close remains possible. An
+uncontested escape can be finalized after its deadline. Active notes can be
+claimed for the treasury after `effectiveExpiry`, which adds paused time and a
+post-challenge grace and is never earlier than `unpauseClaimGrace` after an
+unpause.
 
 The owner can pause deposits, withdrawals and expiry claims indefinitely;
-challenges and escape finalization stay open. Treasury changes are scheduled,
-then accepted after `treasuryChangeDelay` of unpaused time, and failed treasury
-payments accrue `treasuryArrears` instead of reverting payouts.
+challenges, escape finalization and `claimEscapePayout` stay open. Treasury
+changes are scheduled, then accepted after `treasuryChangeDelay` of unpaused
+time, and failed treasury payments accrue `treasuryArrears` instead of
+reverting payouts. An escape payout that its destination rejects, or that
+needs more than 100,000 gas to receive, is credited to
+`escapePayoutCredits(destination)` with an `EscapePayoutDeferred` event instead
+of blocking the escape; anyone can deliver it with
+`claimEscapePayout(destination)`. A mutual close to a destination that
+rejects ETH reverts instead (it forwards all gas, so a destination that only
+needs more gas is paid).
 
 ## Source ownership
 

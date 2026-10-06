@@ -147,6 +147,17 @@ zero-slot path against the vault root, and the complete call with `eth_call`. It
 does not rewrite a historical public root. The gas limit is the estimate plus
 20%.
 
+A zero path whose siblings hash to the vault's current root is used whatever
+root the indexer reports. If they do not, and the indexer reports no root or
+the root they hash to, the root comparison in
+[Indexer divergence](#indexer-divergence) decides between
+`indexer_path_behind` and `indexer_diverged`. If they hash to neither root, the
+obligation is `indexer_path_behind` when the vault had the indexer's reported
+root at its reported block (EIP-1898), or when that read fails, for example
+because the RPC does not know the block: a consistent view from before the
+escape still holds the note's leaf. Otherwise, including an indexer that
+reports no block hash, it is `indexer_invalid_response`, critical at once.
+
 Every send carries both `maxFeePerGas` and `maxPriorityFeePerGas`, so the daemon
 needs a signer that accepts them (the bundled signer from this release). The
 first bid is twice the base fee plus the priority fee, within the limits below
@@ -179,9 +190,11 @@ unless the base fee rises above it, so a market that needs a higher tip delays
 its inclusion until then. Like an exhausted cap, the hold therefore warns after
 `--blocked-warning-seconds` and turns critical after
 `--critical-blocked-seconds`. The limit that holds it is 100/121 of the tip cap
-and of the effective fee cap. Raising both caps (the signer's first, restarting
-each service) lets the next poll replace the challenge once 100/121 of the new
-caps is at least 10% above both of its fees. A 10% raise is enough for a bid at
+and of the effective fee cap. Raising both caps (the signer's first, each
+service restarted with its new settings, as in
+[When no valid bid remains](#when-no-valid-bid-remains)) lets the next poll
+replace the challenge once 100/121 of the new caps is at least 10% above both
+of its fees. A 10% raise is enough for a bid at
 that limit. A bid placed higher while the base fee needed it cannot be replaced
 once the base fee falls back: from 10/11 of the caps it is held, and from the
 caps themselves it reports `fee_cap_reached`, `tip_cap_reached` or, when the
@@ -199,8 +212,13 @@ included otherwise. Stale-root replacements do not spend the reserve either:
 when only the reserve is left, a pending challenge with outdated siblings is
 kept, and if it reverts the daemon resubmits on a new nonce after the
 confirmation depth. With the tip cap at twice the first tip, about five
-replacements come before the critical threshold; a tip cap of 5 to 10 times the
-first tip leaves room for more.
+replacements come before the critical threshold; a higher tip cap leaves room
+for more, within the signer's tip cap (10 gwei by default, 5 times the default
+priority fee). The daemon does not read the signer's fee or tip cap: a bid
+above either is refused with `fee_out_of_bounds`, reported as
+`signer_refused` (critical at once), instead of being lowered to the signer's
+cap. Keep the daemon's caps at or below the signer's, and raise the signer's
+first.
 
 A challenge reverts `StaleRoot()` (`0x607447de`) when an unrelated deposit,
 close or expiry claim changes the vault root after the simulation: the vault
@@ -210,10 +228,11 @@ zero-path and replaces or resends within the deadline. Anyone can cause such a
 race at their own gas cost, so fund the sender for reverted attempts.
 `NotPendingWithdrawal()` and `ReplayedNullifier()` mean the withdrawal was
 already resolved (`resolved_unconfirmed`, checked again next poll), and
-`UnknownRoot()`, `ChallengeExpired()` and `ChallengedNullifier()` are reported
-as `simulation_reverted`. The bundled signer does not forward revert data from
-its simulation, so through it these all appear as transient simulation
-failures and are retried.
+`ChallengeExpired()` is reported as `simulation_reverted`. A challenge never
+reverts `UnknownRoot()` or `ChallengedNullifier()`: the vault does not check
+the archived request's root against its root window. The bundled signer does
+not forward revert data from its simulation, so through it these all appear as
+transient simulation failures and are retried.
 
 Private or MEV-protection relays may hide pending transactions from
 `eth_getTransactionByHash` and may delay, refuse or drop same-nonce
@@ -287,9 +306,13 @@ The obligation reports:
 
 Raise the signer's caps in `signer.env` and restart the signer first, then raise
 the daemon's caps (never above the signer's) and restart the daemon; it then
-replaces its pending challenge. For `tx_fee_cap_reached`, raise the ceiling as
-described above, starting with the node's RPC fee cap; raising only the fee cap
-changes nothing. Fund the sender for every challenge that may be pending at
+replaces its pending challenge. Each service reads its settings only at
+startup. In the Docker deployment a container reads its environment files
+only when it is created, so recreate it
+(`docker compose up -d --no-deps signer`, then `challenger`):
+`docker compose restart` keeps the old values. For `tx_fee_cap_reached`, raise
+the ceiling as described above, starting with the node's RPC fee cap; raising
+only the fee cap changes nothing. Fund the sender for every challenge that may be pending at
 once plus reverted attempts: each needs gas limit x fee cap (about 7.6M gas x
 fee cap), but never more than the ceiling. Status warns when the balance cannot
 cover the outstanding obligations at the proposed fee cap, or is below
@@ -325,9 +348,11 @@ reason:
   by at least 9% until the node accepts one, usually within a few polls. The
   bound stays above 10/11 of the node's cap, so at most about 9% of that cap
   goes unused. It lasts until the daemon restarts, with a
-  `/status` warning that names the refused fee. Lower
+  `/status` warning that names the refused fee and the remedy. Lower
   `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` for both services to the node's cap and
-  restart both, or raise the node's cap and restart the daemon.
+  restart both with the new value (in the Docker deployment, recreate both,
+  as above), or raise the node's cap and restart the daemon, which clears the
+  bound.
 - `insufficient_balance`, and `signer_refused` for any other refusal.
 
 A nonce on which no attempt was broadcast is released, as long as neither the
@@ -344,13 +369,16 @@ without an attempt record is never released this way.
 The checkpoint records the deployment and sender, next scan block, block hash,
 pending nullifiers and deadlines, reserved transaction nonces, every candidate
 transaction hash with the latest attempt's fees and gas limit, the evidence
-digest, and the missed-deadline count. It is written before each send, with
+digest, the missed-deadline count and the nullifiers of the misses it counted.
+It is written before each send, with
 atomic replacement after syncing the file. Older checkpoints load unchanged;
 older binaries ignore the new fields. Never delete it: it holds reserved nonces.
 The service refuses checkpoints from another chain, vault or starting block.
-Scans are bounded to 1,000 blocks. A changed checkpoint block hash causes replay
-from the deployment block; pending entries are reconciled against the current
-vault state before submission.
+Scans are bounded to 1,000 blocks. A checkpoint block that has another hash on
+two reads causes replay from the deployment block. A null or hash-less answer
+for it, as from a load-balanced backend that has not reached the block, fails
+the poll and is retried instead. Pending entries are reconciled against the
+current vault state before submission.
 
 Returned transaction hashes suppress duplicate submissions while the RPC still
 knows the unmined transaction; confirmed nonce consumption allows an outstanding
@@ -359,6 +387,23 @@ resubmitted on their reserved nonce once the RPC no longer knows their hashes.
 Ambiguous send errors retain the nonce across restart. Successful challenges are
 retired only after the pending withdrawal also disappears at the configured
 confirmation depth, preventing a tip reorg from silently losing the obligation.
+
+When a tracked withdrawal is gone at the confirmation depth after its deadline
+and its escape had evidence, or expected evidence, the daemon reads how the
+escape ended before retiring it. A note that is not closed was not paid out.
+For a closed note, a hardened vault's `challengedNullifiers(nullifier)` tells.
+On a vault deployed before this release, or when that read fails, the escape's
+`EscapeWithdrawalChallenged` or `EscapeWithdrawalFinalized` log does. The
+daemon searches for that log from a block no later than the escape's end (its
+event's block, or a block where it was read pending, once that block is
+confirmed) up to the confirmed block, 1,000 blocks per request and at most 8
+requests per poll, resuming after a restart. A closed note with no logged
+challenge is taken as paid out. Here "paid out" means finalized: on a hardened
+vault a finalized escape whose destination rejected the payout was credited to
+`escapePayoutCredits(destination)` instead, which changes nothing for the
+challenger. A payout is recorded as a missed deadline before the obligation
+retires. While the evidence database cannot be read, the obligation stays
+tracked, blocked by `evidence_db_error`, and the poll fails.
 
 Nonce reconciliation runs before checking a withdrawal's deadline, evidence or
 continued existence. A reserved nonce consumed in the latest block no longer
@@ -479,7 +524,9 @@ The status listener serves three internal routes, all with
   healthchecks only.
 - `GET /health`: 503 when anything is critical, otherwise 200 (`ok` or
   `warning`), with `{status, generated_at, poll_age_seconds, obligations,
-  critical_obligations, alarms}`. Alert on it.
+  critical_obligations, alarms}`. Alert on any answer other than 200, and on
+  no answer at all: a stopped or crash-looping daemon reports nothing itself,
+  so also watch that its process or container is running.
 - `GET /status`: the full snapshot, schema `zkapi-challenged-status/v1`: overall
   `status` and `alarms`, the thresholds in force, chain head and scan progress,
   poll timing, sender balance and nonces, the fee caps and the transaction fee
@@ -498,6 +545,19 @@ stall. Each obligation has a `state`: `unevaluated`, `no_evidence`,
 is:
 
 - critical for `missed`;
+- for `resolved_unconfirmed` (the withdrawal is gone at the latest block):
+  - ok when it was already gone at a head before its deadline, so no payout is
+    possible (detail `withdrawal ended before its challenge deadline, so it was
+    not paid out; retirement waits for confirmations`), also for an obligation
+    only observed behind a blocked queue, and ok without evidence;
+  - otherwise, with evidence or expected evidence, the severity it had by
+    remaining time, until the daemon knows at confirmation depth whether the
+    escape was paid out (detail `withdrawal no longer pending at the latest
+    block; at confirmation depth it is retired, or recorded missed if it was
+    paid out`);
+  - critical, blocked by `evidence_db_error`, while the evidence database
+    cannot be read: the obligation stays tracked until a read decides whether
+    a payout was a missed deadline;
 - for obligations with evidence, or expected evidence, by remaining time:
   warning within `--warning-remaining-seconds`, critical within
   `--critical-remaining-seconds`;
@@ -524,8 +584,15 @@ restarts. State changes are logged as
 `challenge obligation status changed` at info, warn or error level, and critical
 items are logged again every 300 seconds. A deadline that passes while evidence
 existed or was expected logs `MISSED escape challenge deadline` once and
-increments `missed_total`. The window cannot be extended: page a human at the
-warning threshold.
+increments `missed_total`. So does an escape with such evidence that the daemon
+finds paid out past its deadline at confirmation depth, including one it first
+sees after the payout (for example after downtime longer than the challenge
+period); see [Recovery and verification](#recovery-and-verification). Each
+escape's miss is counted once, keyed by its nullifier, also across replays and
+restarts. The latest miss (`last_missed`) stays a critical alarm,
+`missed challenge deadline of note N (reason)`, on `/status` and `/health` for
+an hour after it was recorded. The window cannot be extended: page a human at
+the warning threshold.
 
 Never route the status listener through a public proxy; it tells an attacker
 when challenges are blocked.

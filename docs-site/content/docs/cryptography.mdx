@@ -105,7 +105,10 @@ clearance only after verifying an escape-form withdrawal proof for the same
 nullifier and deployment keys, which proves knowledge of the note secret,
 unless it runs with the transitional `--allow-legacy-clearance` setting. A
 request proof is never accepted for this. That ownership proof is itself a
-valid escape input for its destination and balance.
+valid escape input for its destination and balance. A request proof with the
+same nullifier can challenge that escape, which on a vault without
+`vault_revision: 2` consumes the nullifier, so wallets there send no ownership
+proof from a state whose request proof may have left the device.
 
 The withdrawal tag binds the nullifier to the payout destination, final
 balance and clearance mode:

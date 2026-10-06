@@ -130,9 +130,12 @@ ideally behind a timelock, never a single deployer key:
 
 - `pause()` stops `deposit`, `mutualClose`, `initiateEscapeWithdrawal`,
   `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears`
-  and `renounceOwnership`. `challengeEscapeWithdrawal` and
-  `finalizeEscapeWithdrawal` stay open, so disputes in flight still resolve, and
-  `transferOwnership` and `acceptOwnership` stay open for key rotation.
+  and `renounceOwnership`. `challengeEscapeWithdrawal`,
+  `finalizeEscapeWithdrawal` and `claimEscapePayout` stay open, so disputes in
+  flight still resolve and credited escape payouts can be delivered, and
+  `cancelTreasuryChange`, `transferOwnership` and `acceptOwnership` stay open.
+  The NatSpec of `pause()` in `ZkApiVault.sol` lists both sets, and
+  `test_pauseGuardCoverage` checks that list against the vault's pause guards.
   `pause()` and `unpause()` emit `Paused(address)` and `Unpaused(address)` and
   revert when redundant.
 - Ownership transfers are two-step. `transferOwnership(address)` only sets
@@ -164,7 +167,15 @@ ideally behind a timelock, never a single deployer key:
   the larger of `challengePeriod()` and two days, counted in unpaused time;
   `pendingTreasuryReadyAt()` is on that same clock. `cancelTreasuryChange()`
   works at any time. A treasury that rejects a payout cannot block exits: its
-  share accrues to `treasuryArrears()`.
+  share accrues to `treasuryArrears()`. Likewise an escape destination that
+  rejects its payout, or needs more than 100,000 gas to receive it, cannot
+  block the escape: the amount is credited to `escapePayoutCredits(destination)`
+  with an `EscapePayoutDeferred` event, and anyone can deliver it with
+  `claimEscapePayout(destination)`, also while paused. Alert on
+  `EscapePayoutDeferred` and follow the
+  [escape payout credit runbook](migration-hardened-vault.md#operations-runbooks).
+  A mutual close to a destination that rejects ETH reverts, and withdrawals to
+  the zero address or the vault itself revert `InvalidDestination()`.
 
 Withdrawal proofs may use the current root or one replaced within
 `ROOT_HISTORY_WINDOW()` (one day), while their Merkle siblings must match the
@@ -201,7 +212,14 @@ The indexer (`zkapi-indexerd` or `zkapi indexer`) needs an RPC with EIP-1898
 `eth_call` by block hash, `eth_getBlockByHash`, and state for its confirmation
 depth (`--confirmations`, default 12), plus an NTP-synchronized clock
 (`--max-head-age-secs`, default 180; 0 disables it for chains that mine on
-demand). Pass `--chain-id`. It serves only a view verified against the vault and
+demand). Use a provider other than the `rpc_url` that client manifests pin:
+`zkapi-clientd` corroborates deposits and withdrawals against this indexer's
+tree, and that check is only as independent as the indexer's RPC. That pinned
+`rpc_url` must itself serve `eth_getBlockByHash` for recent blocks, which
+`zkapi-clientd` uses to date its deposit search on chain time, and `eth_call`
+for the vault's `currentRoot()`, which it reads before setting a request
+aside. Pass
+`--chain-id`. It serves only a view verified against the vault and
 answers 503 otherwise; `--resync`, or a `<cursor>.resync` file before a restart,
 rebuilds it from `--from-block`. The reference gateway limits POST requests per
 source; see [request limits](../docker/aws/README.md#request-limits).

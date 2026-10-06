@@ -281,7 +281,7 @@ to the contract.
 
 5. The contract verifies $\pi_{\text{wd}}$ and $\sigma_{\text{clear}}$, then immediately settles the note.
 
-The ownership proof's public statement shows the server the note ID, $B_{\text{final}}$ and $\text{Dest}$ when clearance is requested, slightly before the contract publishes them. $\pi_{\text{own}}$ is also a valid escape-hatch payload, so whoever holds it can start an escape for the same destination and balance; that delays the payout by the challenge window but cannot redirect it.
+The ownership proof's public statement shows the server the note ID, $B_{\text{final}}$ and $\text{Dest}$ when clearance is requested, slightly before the contract publishes them. $\pi_{\text{own}}$ is also a valid escape-hatch payload, so whoever holds it can start the owner's escape for the same destination and balance, which pays $\text{Dest}$ one challenge window later unless a request proof for the same state challenges it. On this contract a challenge leaves $x_w$ usable by a cleared mutual close. On a contract without non-destructive challenges (any vault deployed before the hardened revision that client manifests declare as `vault_revision` 2), the challenge consumes $x_w$ and the owner can no longer exit at that state. On such a contract a client must never send an ownership proof from a state whose request proof may have left the device, nor a request proof from a state whose ownership proof it has sent.
 
 ### Escape Hatch (Fallback Path)
 
@@ -293,7 +293,7 @@ $$
 
 The contract verifies $\pi_{\text{wd}}$, removes the active note leaf immediately, and starts the configured challenge window (24 hours by default). The proof may use the current Merkle root or one replaced within the last day; the leaf removal always applies to the current tree.
 
-If the withdrawal is not challenged during that window, the contract settles the note exactly as in the mutual-close path.
+If the withdrawal is not challenged during that window, the contract settles the note as in the mutual-close path, except that a payout the destination does not accept is held for it as a credit (see How the Server Gets Paid).
 
 ## Challenge Rule for Escape-Hatch Withdrawal
 
@@ -333,6 +333,8 @@ $$
 $$
 
 and closes the note / removes the commitment.
+
+On an escape, if the transfer of $B_{\text{final}}$ to Dest fails (Dest rejects ETH or needs more than 100,000 gas), the contract still closes the note and pays $D - B_{\text{final}}$ to the server; it holds $B_{\text{final}}$ as a credit for Dest that anyone can push to Dest later (`claimEscapePayout`). A mutual close to a destination that cannot receive ETH reverts instead, and the user proves the close again to another destination.
 
 This means the server is paid for the user's entire lifetime of API usage in one aggregated settlement transaction, including any optional policy deductions reflected in the final private balance.
 

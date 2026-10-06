@@ -20,7 +20,7 @@ Create these root-owned, mode `0600` files without printing their contents:
 | --- | --- |
 | `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
-| `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
+| `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. To switch an existing database between these key sources, follow [Changing the key source](../../docs/native-eth-billing.md#changing-the-key-source): the server refuses to start while leases or key deletions of the other source still need its credential (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true` starts anyway and strands them). For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
 | `/etc/zkapi/signer.env` | Copy [`signer.env.example`](signer.env.example): `ZKAPI_CHALLENGE_PRIVATE_KEY`, `ZKAPI_CHALLENGE_CHAIN_ID`, `ZKAPI_CHALLENGE_RPC_URL` (the upstream RPC for the chain), `ZKAPI_CHALLENGE_VAULT` (the configured vault), the fee cap and the transaction fee cap (below). Only the signer container receives this file. |
 
@@ -35,6 +35,15 @@ Compose reads these as environment files; quote values containing `$`, `#` or
 other Compose env-file syntax appropriately. Keep credentials out of compose
 command arguments and images. `docker compose config` expands secrets, so use
 `config --quiet` for validation.
+
+A container reads its environment files only when Compose creates it. After
+editing one, recreate each service that reads it, for example
+`sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --no-deps --wait signer`;
+`docker compose restart` keeps the old values. Leave an optional variable out
+rather than setting it empty: `signer.env` treats an empty value as the
+default, and so does the launcher for the settings it passes on, but the
+daemons refuse an empty value for others at startup, for example
+`ZKAPI_ALLOW_LEGACY_CLEARANCE` and `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI`.
 
 ### Signing seeds
 
@@ -87,7 +96,7 @@ Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`; it must also support the
 | `eth_call` `0x15fa2a9a`, `0x230e2a24` | vault | `latest` | `stateSigningKeyX()`, `stateSigningKeyY()` |
 | `eth_call` `0xdc41d636`, `0x112cd6bc` | vault | `latest` | `clearanceSigningKeyX()`, `clearanceSigningKeyY()` |
 | `eth_call` `0xf3f480d9` | vault | `latest` | `challengePeriod()` |
-| `eth_call` `0xfdab463d` | vault | `latest` | `currentRoot()`, for clearance ownership proofs |
+| `eth_call` `0xfdab463d` | vault | `latest` | `currentRoot()`, for clearance ownership proofs and the starting root while the indexer has no verified one |
 | `eth_call` `0x4d1352fd` | vault | `latest` | `nativeAssetWeiPerUnit()` |
 | `eth_call` `0xaad24061` | vault | `latest` | `usedNullifiers(uint256)` before key issuance |
 | `eth_call` `0x313ce567` | feed | `latest` | `decimals()` |
@@ -126,6 +135,9 @@ head and serves a head view verified against the vault's `currentRoot()` and
 `{"status":"unavailable","error_code":"indexer_unavailable",...}` and
 `Retry-After: 5` until a view verifies, and again whenever it is stale, diverged
 or rebuilding. The server and the challenger start without waiting for it.
+When the indexer has no verified root at the server's start, the server starts
+from the vault's `currentRoot()`, read over the native billing RPC, until the
+indexer serves one.
 
 ### Challenge signer and daemon
 
@@ -160,11 +172,12 @@ limit:
 
 For a higher fee cap, raise the node's `--rpc.txfeecap` and
 `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`
-to at least the middle column (2.28 ETH for a 300 gwei fee cap), or keep the
-fee cap within the ceiling. A hosted provider's cap usually cannot be raised.
-A value above the node's cap makes the signer report `upstream_tx_fee_cap`,
-which the daemon treats as critical at once. It then bids within 10/11 of the
-lowest refused fee until it restarts, and its `/status` warns with that fee
+to at least the middle column (2.28 ETH for a 300 gwei fee cap), then recreate
+the signer and the challenger (above), or keep the fee cap within the ceiling.
+A hosted provider's cap usually cannot be raised. A value above the node's cap
+makes the signer report `upstream_tx_fee_cap`, which the daemon treats as
+critical at once. It then bids within 10/11 of the lowest refused fee until it
+restarts, and its `/status` warns with that fee
 ([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
 signer also warns `tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x
 its fee cap exceeds the ceiling; see
@@ -191,7 +204,7 @@ challenge 0.9% costlier than measured is refused.
 | Variable | Requirement |
 | --- | --- |
 | `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | Required. At most the signer's `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`. |
-| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; 5 to 10 times the priority fee leaves several more before it. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
+| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; a higher tip cap leaves more before it, within the signer's tip cap (10 gwei by default, 5 times the default priority fee; raise the signer's first). The daemon does not read the signer's fee or tip cap, so a cap above the signer's makes escalated bids fail with `fee_out_of_bounds` (`signer_refused`, critical at once) instead of bidding at the signer's cap. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
 
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the
@@ -279,6 +292,11 @@ A throttled request never reaches the API. The gateway answers `429` with
 `{"status":"error","client_request_id":"","error_code":"gateway_rate_limited","error_message":"...","retriable":true,"retry_after_seconds":5}`.
 Retry the same request unchanged after the delay; nothing was processed or
 reserved. The API's own errors, including its 429s, pass through unchanged.
+The browser SDK retries a throttled clearance request within 15 seconds and
+cannot tell an honest 429 from a forged one. After a clearance request that
+carried an ownership proof, on a vault without `vault_revision` 2, it keeps the
+note withdrawal-only (`error.data.withdrawal_only: true`); retrying the close
+completes it.
 
 To change a limit, edit `nginx.conf` and rebuild and restart the gateway:
 
@@ -296,11 +314,15 @@ address or path.
 
 None of these checks is configured for you. Run them from the VM and alert on
 the conditions listed. For the second project of a VM that runs two deployments,
-add `-p` and `--env-file` as described under Upgrades.
+add `-p` and `--env-file` as described under Upgrades, and use that project's
+data directory and HTTP port.
 
 ```sh
 dc() { sudo docker compose -f docker/aws/compose.yml --profile challenge "$@"; }
-# Challenger: 503 means a critical obligation or stale polling; /status has the detail.
+# Containers: each service's state and healthcheck (the challenger's reads /livez).
+dc ps --all
+# Challenger: 200 is ok or warning; 503 means a critical obligation or stale
+# polling (/status has the detail); a failed exec means the daemon is not running.
 dc exec -T challenger curl -sS -w '\n%{http_code}\n' http://127.0.0.1:3002/health
 dc exec -T challenger curl -sS http://127.0.0.1:3002/status
 # Indexer: 200 only while a verified view is served.
@@ -309,7 +331,8 @@ dc exec -T indexer curl -sS http://127.0.0.1:3001/metrics
 # Signer: fee policy, balance and warnings.
 dc exec -T challenger curl -sS -X POST http://signer:8547 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"zkapi_signerStatus","params":[]}'
-# API: false while legacy clearance is enabled.
+# API, on the gateway's ZKAPI_HTTP_PORT (8080 by default): false while legacy
+# clearance is enabled.
 curl -fsS http://127.0.0.1:8080/health | jq .clearance_ownership_proof_required
 # API: the legacy proof-less clearance budget and its refusals.
 curl -fsS http://127.0.0.1:8080/health | jq '{legacy_clearance_window_used, legacy_clearance_window_limit, legacy_clearance_rejected_total}'
@@ -323,9 +346,17 @@ for example
 
 Alert on:
 
-- challenger `/health` returning 503, and any `critical` entry in its `/status`
-  `alarms`: a missed deadline; an obligation with evidence whose deadline is
-  within a quarter of `challengePeriod()`; an obligation blocked by
+- challenger `/health` answering anything but 200, including no answer at all,
+  and the challenger container not running or not healthy in `dc ps --all`. A
+  stopped, restarting or crash-looping challenger (for example one that exits
+  on a deployment-binding mismatch and is restarted by Compose) reports
+  nothing itself: the `exec` fails, and none of its other signals below can
+  fire;
+- any `critical` entry in the challenger's `/status` `alarms` (it then answers
+  503 on `/health`): a missed deadline, including an escape with evidence
+  found paid out past its deadline (the latest miss stays critical for an
+  hour); an obligation with evidence whose
+  deadline is within a quarter of `challengePeriod()`; an obligation blocked by
   `evidence_invalid`, `evidence_db_error`, `indexer_invalid_response`,
   `indexer_diverged`, `signer_refused` or `upstream_tx_fee_cap`, or by any
   other reason (including `fee_reserve_held`) for 1800 seconds; stale polls; a
@@ -352,8 +383,8 @@ Alert on:
   (below). Each is counted once per escape, logged at warn level for a
   challenge and at error level for a finalization, and the counts restart with
   the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
-  the vault paid out that escape, so also confirm that the challenger tracked
-  it;
+  the vault finalized that escape (it paid the destination or credited the
+  payout to it), so also confirm that the challenger tracked it;
 - the indexer's `root` differing from `currentRoot()` read at its `served_block`
   through a different RPC than the indexer's own, and a note that its
   `/v1/escapes/pending` lists while the vault holds no escape for it (both
@@ -365,10 +396,20 @@ Alert on:
   `head_age_seconds` checks above catch a stalled list;
 - `settlement required operator review` in the server log, and a nonzero
   `open_reviews` in `/v1/dashboard/settlement`;
-- on a hardened vault, its owner and treasury events: any
+- `unreadable OpenRouter lease row cannot be settled` in the server log (logged
+  at every settlement tick, naming the row's `client_request_id`): that pending
+  lease is not settled, not even at its settlement deadline, and its nullifier
+  stays reserved until you restore its saved request; see
+  [Restoring an unreadable pending lease](../../docs/native-eth-billing.md#restoring-an-unreadable-pending-lease);
+- on a hardened vault, its owner, treasury and payout events: any
   `OwnershipTransferStarted` you did not send, `TreasuryChangeScheduled`,
-  `Paused`, `Unpaused` and `TreasuryPaymentDeferred` (see the migration guide's
-  [Operations runbooks](../../docs/migration-hardened-vault.md#operations-runbooks));
+  `Paused`, `Unpaused`, `TreasuryPaymentDeferred` and `EscapePayoutDeferred`
+  (see the migration guide's
+  [Operations runbooks](../../docs/migration-hardened-vault.md#operations-runbooks),
+  Treasury arrears and Escape payout credits). `EscapePayoutDeferred` means an
+  escape closed without paying its destination. The browser SDK from this
+  release does not detect that and reports such an escape as returned, so this
+  alert can be the only signal;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
   `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
   suppress the last only while the signer's
@@ -456,6 +497,13 @@ adds one. Each reopening or concession itself acknowledges the lease's open
 `binding_corrupt` reviews. See
 [Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease).
 
+A pending lease whose saved request cannot be read (the log line above, or
+`lease_record_unreadable` on its status) is restored with the same command,
+`-T` after `run` and `--saved-request - < request.json`, without waiting for a
+cancellation: it keeps its status and the command prints
+`"result": "restored"`; see
+[Restoring an unreadable pending lease](../../docs/native-eth-billing.md#restoring-an-unreadable-pending-lease).
+
 Back up the server database regularly with sqlite3's online backup; the server
 keeps running:
 
@@ -517,6 +565,10 @@ from `DEPLOY_BLOCK`.
    sudo touch "${ZKAPI_DATA_DIR:-/var/lib/zkapi}/indexer.cursor.resync"
    sudo docker compose -f docker/aws/compose.yml restart indexer
    ```
+
+   A plain restart is enough here because no environment file changed; after
+   an edit to `indexer.env` or `deployment.env`, recreate the indexer instead
+   (`up -d --no-deps indexer`).
 
    A directly launched `zkapi-indexerd` or `zkapi indexer` can be restarted with
    `--resync` instead; remove the flag afterwards, or every restart resyncs.
@@ -580,7 +632,11 @@ move `/etc/zkapi` and `/var/lib/zkapi` to the new paths with `mv` (keeping
 ownership and the SQLite lock file with its database), start it under the new
 project name, and point its CloudFront origin at the new port. The newer
 deployment then uses the default paths and project. The two projects never
-share a data directory, signer key, sender or hostname.
+share a data directory, signer key, sender or hostname. Images are shared by
+name and tag across projects, and the gateway image contains the checkout's
+`nginx.conf`: when one project needs a change the other must not get, such as
+the drained deployment's deposit cutoff, build it from its own checkout under
+its own `ZKAPI_IMAGE_TAG`.
 
 ## Acceptance checks
 

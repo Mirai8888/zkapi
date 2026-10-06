@@ -38,8 +38,13 @@ Lease status is `provisioning`, `active`, `retiring`, `disabled`, `revoking`,
 `finalized`, or `cancelled`. Until the lease is terminal, the status response
 carries `settlement_deadline`, a write-once UNIX time fixed when the lease
 record is created (issuance plus TTL, grace and
-`--openrouter-settlement-deadline-seconds`, default 21600). A finalized lease
-reports `charge_basis`:
+`--openrouter-settlement-deadline-seconds`, default 21600). Lease status
+returns 404 only for a lease the store does not hold (an empty body), or with
+`error_code: "lease_record_unreadable"` (`retriable: false`) for a lease row
+the store holds but cannot decode. That row never heals by itself, and lease
+retirement and a lease retry or `/expire` that need it answer the same. In
+either 404 case, read `GET /v2/nullifiers/{request_nullifier}`, which stays
+authoritative. A finalized lease reports `charge_basis`:
 
 | `charge_basis` | Charge |
 |---|---|
@@ -55,9 +60,18 @@ settlements, and keeps the frozen `billing_quote`. Settlement never
 re-validates that quote against the server's current price configuration.
 `cancelled` marks a server record whose binding is corrupt: it is never signed
 until the operator verifies, repairs and reopens the lease; its nullifier stays
-reserved meanwhile, and a retry returns `409 nullifier_used`. The server
-refuses to start unless TTL, grace, settlement deadline and polling slack fit
-within half of the vault's `challengePeriod()`. See
+reserved meanwhile. A retry is refused with `409 nullifier_used`, or with
+`409 replay` when the corrupt field is one the retry is compared with (the
+lease row's saved request, if it still parses, or the reservation's request
+ID, payload hash, kind or binding), or with `500 internal_error` when it is
+the lease row's `request_nullifier`, or with `404 lease_record_unreadable`
+(not retriable) when the lease row cannot be decoded, for example a saved
+request that is not a readable request. A pending lease whose row cannot be
+decoded is not settled either, not even at its settlement deadline, and its
+nullifier reads `reserved`, until the operator restores its saved request
+([restoring an unreadable pending lease](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#restoring-an-unreadable-pending-lease)).
+The server refuses to start unless TTL, grace, settlement deadline and polling
+slack fit within half of the vault's `challengePeriod()`. See
 [settlement terminality](https://github.com/ethereum/zkapi/blob/main/docs/native-eth-billing.md#settlement-terminality)
 for the operator review records.
 
@@ -93,7 +107,22 @@ optional `request_response`. Nullifier statuses are `reserved`, `finalized`,
 `status: "not_found"` without a transcript. `request_response` is present
 only once the request is finalized. A `reserved` lease request also carries
 `settlement_deadline`, the time by which the server finalizes it; wait for that
-response instead of escaping from the same state.
+response instead of escaping from the same state. The exception is a pending
+lease whose row the server cannot decode, such as one whose saved request is
+unreadable: its recovery omits `settlement_deadline`, and it is not settled,
+not even at that deadline, until the operator repairs it.
+
+Recovery answers are authoritative only when the server could read its store.
+Only HTTP 200 with `status: "not_found"` and `nullifier_status: "unknown"`
+means unknown, and `POST .../expire` attests non-acceptance only with HTTP 200
+`expired_unaccepted` or `superseded_unaccepted`. A store that cannot be read
+(an I/O error, a corrupt page, a lock held past the busy timeout) answers
+these routes, lease status and retirement, and a lease retry with retriable
+`500 database_error`: retry later, and never read it as unknown, unaccepted or
+not found. An undecodable lease row answers `404 lease_record_unreadable`
+(not retriable); read `GET /v2/nullifiers/{request_nullifier}` instead. The
+[API specification](https://github.com/ethereum/zkapi/blob/main/docs/api-spec.md)
+has the full contract.
 
 After usage settlement, `request_response` contains:
 
@@ -132,7 +161,11 @@ Its `public_inputs` use the JSON form of the 14 withdrawal inputs, with
 array of 20 byte values. An `ownership_proof` with fields other than
 `public_inputs` and `proof` is rejected.
 Build it for the real destination and current balance of the intended close,
-because it is also a valid escape input for whoever holds it.
+because it is also a valid escape input for whoever holds it. On a vault
+without `vault_revision` 2, a challenge with a request proof for the same state
+burns the nullifier. There the browser SDK from this release sends no
+ownership proof from a state whose request proof may have left the device, and
+`zkapi-clientd` sends one only after its owner acknowledges that risk.
 
 The server first rejects a nullifier it has already used for a request
 (`409 nullifier_used`). It then requires the proof's nullifier,
@@ -165,8 +198,10 @@ junk nullifiers, each of which stays reserved. A proof-less request for a new
 nullifier that finds it spent gets retriable `503 legacy_clearance_capacity`,
 with `Retry-After` (and `retry_after_seconds`) set to the seconds until the
 next minute, and nothing is reserved. Answer it, like
-`clearance_ownership_required`, with the ownership proof: a request with a
-proof never uses the budget. Only a server that verifies ownership proofs
+`clearance_ownership_required`, with the ownership proof, except from a state
+whose request proof may have left the device on a vault without
+`vault_revision` 2 (see above): a request with a proof never uses the
+budget. Only a server that verifies ownership proofs
 returns this code; `capacity_exhausted` means only that ownership-proof
 verification is saturated. The server logs the exhaustion at most once a
 minute.
@@ -214,9 +249,10 @@ reference gateway does not expose them.
 Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
-`400 clearance_ownership_required`, `409 stale_root`, `409 replay`,
-`409 nullifier_used`, `410 note_expired`, `503 capacity_exhausted`, and
-`503 legacy_clearance_capacity`.
+`400 clearance_ownership_required`, `404 lease_record_unreadable`
+(not retriable), `409 stale_root`, `409 replay`, `409 nullifier_used`,
+`410 note_expired`, `500 database_error` (retriable), `503 capacity_exhausted`,
+and `503 legacy_clearance_capacity`.
 Throttled responses also carry `Retry-After` when available. A deployment's
 reverse proxy defines which protocol routes the browser may access. The
 reference gateway also limits `POST /v2/*` per network source and answers a

@@ -39,7 +39,7 @@ bucket.
 |---|---|
 | Method | `mutualClose(WithdrawalPublicInputs inputs, bytes proof, uint256[32] siblings)` |
 | Caller | User's wallet or another transaction submitter, while not paused |
-| Effect | Verifies the withdrawal proof with `hasClearance = true`, checks deployment and immutable signing-key bindings, requires a nonzero destination and a known `activeRoot`, removes the leaf at the current root, consumes the nullifier, closes the note, and pays the user and treasury |
+| Effect | Verifies the withdrawal proof with `hasClearance = true`, checks deployment and immutable signing-key bindings, requires a destination other than zero and the vault, and a known `activeRoot`, removes the leaf at the current root, consumes the nullifier, closes the note, and pays the user and treasury |
 
 The withdrawal's Schnorr clearance and state signatures are private proof
 witnesses. `WithdrawalPublicInputs` contains these 14 fields in order:
@@ -62,8 +62,11 @@ root replaced within `ROOT_HISTORY_WINDOW` (one day of wall-clock time,
 recorded in `rootRetiredAt(root)`). Otherwise the call reverts `UnknownRoot()`.
 The `siblings` must reproduce the **current** root; stale siblings revert
 `StaleRoot()` and can be replaced with a fresh path for the same proof. A
-zero destination reverts `InvalidDestination()`. A nullifier recorded in
-`challengedNullifiers` can still close with a valid clearance.
+zero destination or the vault itself reverts `InvalidDestination()`; a
+destination that rejects the payout reverts the close with
+`NativeTransferFailed()`, and the user can prove the close again to another
+destination. A nullifier recorded in `challengedNullifiers` can still close
+with a valid clearance.
 
 ## Initiate escape withdrawal
 
@@ -75,7 +78,8 @@ zero destination reverts `InvalidDestination()`. A nullifier recorded in
 
 The challenge period is configured at deployment; the default constant is 24
 hours. No payout occurs until finalization. The call reverts
-`InvalidDestination()` for a zero destination, `ChallengedNullifier()` when an
+`InvalidDestination()` for a zero destination or the vault itself,
+`ChallengedNullifier()` when an
 earlier escape at the same nullifier was challenged, `UnknownRoot()` for an
 unknown `activeRoot`, and `StaleRoot()` for siblings that do not match the
 current root.
@@ -111,7 +115,30 @@ least one `challengePeriod` of unpaused time remains after the challenge.
 |---|---|
 | Method | `finalizeEscapeWithdrawal(uint32 noteId)` |
 | Caller | Anyone at or after the stored deadline, including while paused |
-| Effect | Closes the note and pays the destination and final balance already recorded during initiation, with the remainder paid to treasury |
+| Effect | Closes the note, pushes the recorded final balance to the recorded destination with at most `ESCAPE_PAYOUT_GAS` (100,000) gas, and pays the remainder to treasury |
+
+If the push fails (the destination rejects ETH or needs more gas), the escape
+still closes and the treasury is paid: the balance is added to
+`escapePayoutCredits(destination)` (gwei units) and
+`EscapePayoutDeferred(noteId, destination, amount)` is emitted just before
+`EscapeWithdrawalFinalized`. `EscapeWithdrawalFinalized` alone therefore does
+not prove that the destination was paid. Limiting gas cannot force a credit on
+a destination that accepts within 100,000 gas and fails only by running out of
+gas (the call reverts instead); a receive that itself refuses when given less
+gas can be credited. An escape's destination cannot change after initiation,
+so prefer one that accepts a plain ETH transfer within 100,000 gas, such as an
+ordinary account.
+
+## Claim escape payout
+
+| Field | Value |
+|---|---|
+| Method | `claimEscapePayout(address destination)` (`0x88c10aee`) |
+| Caller | Anyone, including while paused |
+| Effect | Pays `destination` all of its credited escape payouts, forwarding all gas, and emits `EscapePayoutClaimed(destination, amount)` |
+| Reverts | `ZeroAmount()` (`0x1f2a2005`) when there is no credit; `NativeTransferFailed()` (`0xf4b3b1bc`) while the destination still rejects ETH, and the credit is kept |
+
+Only `destination` is paid, whoever calls.
 
 ## Claim expired note
 
@@ -152,7 +179,8 @@ the bundle carries a pre-signed Safe `execTransaction` calling
 [owner key rotation runbook](https://github.com/ethereum/zkapi/blob/main/docs/migration-hardened-vault.md#operations-runbooks).
 
 Pauses are unbounded; they block new exits and expiry claims (escapes already
-started still finalize) but cannot move user funds.
+started still finalize, and credited escape payouts can still be claimed) but
+cannot move user funds.
 `readyAt` and `pendingTreasuryReadyAt` count on the vault's active clock (wall
 clock minus all paused time), so a change waits `treasuryChangeDelay` of
 unpaused time. `acceptTreasury()` reverts `NoPendingTreasuryChange()` without a
@@ -184,6 +212,8 @@ that deferral by limiting gas; the whole transaction reverts instead.
 | `ROOT_HISTORY_WINDOW()` | `0x1fe72de0` | `86400` |
 | `MIN_TREASURY_CHANGE_DELAY()` | `0x1fe63b96` | `172800` |
 | `TREASURY_PAYOUT_GAS()` | `0x2fa3037e` | `100000` |
+| `escapePayoutCredits(address)` | `0x91f6e93a` | Credited escape payouts for a destination, in gwei units |
+| `ESCAPE_PAYOUT_GAS()` | `0x3e210f18` | `100000` |
 
 `usedNullifiers(uint256)` (`0xaad24061`) is `false` again after a successful
 challenge. `notes(uint32)` and `pendingWithdrawals(uint32)` keep their four-
@@ -194,7 +224,9 @@ and six-word layouts.
 | `UnknownRoot()` | `0x8c520116` | A withdrawal's `activeRoot` is neither current nor recent |
 | `StaleRoot()` | `0x607447de` | The supplied siblings do not reproduce the current root |
 | `ChallengedNullifier()` | `0x2845df70` | An escape at this nullifier was challenged; exit from the successor state |
-| `InvalidDestination()` | `0xac6b05f5` | The withdrawal destination is the zero address |
+| `InvalidDestination()` | `0xac6b05f5` | The withdrawal destination is the zero address or the vault |
+| `ZeroAmount()` | `0x1f2a2005` | A zero deposit, `withdrawTreasuryArrears()` without arrears, or `claimEscapePayout` for a destination without a credit |
+| `NativeTransferFailed()` | `0xf4b3b1bc` | A payout that must succeed failed: a mutual close's destination, a `claimEscapePayout` destination or the treasury in `withdrawTreasuryArrears()` rejected ETH |
 | `Paused()` | `0x9e87fac8` | The vault is paused |
 | `NotPaused()` | `0x6cd60201` | `unpause()` while not paused |
 | `NoteNotExpired()` | `0x206d751c` | `claimExpired` before `effectiveExpiry` |
@@ -210,6 +242,8 @@ and six-word layouts.
 | `TreasuryChangeCancelled(address)` | `0x126edc9f10a40adff641028274713504fd84689745c30ee6ce1a196cc5259bc1` |
 | `TreasuryPaymentDeferred(address,uint128)` | `0xa9e48d8fad50644ba563492da0b64e3b5cb7d3c5f4ab14ebb3d94a7f621220d2` |
 | `TreasuryArrearsPaid(address,uint128)` | `0xa24052435429e36243394e78674c17c4d8599aee5766e5cf3f5b095f0ec54dbe` |
+| `EscapePayoutDeferred(uint32,address,uint128)` | `0x1bd006afb1f419c06bdcfcba16d47a9c4c8569f843228da165bdaec644bfa942` (`noteId` and `destination` indexed) |
+| `EscapePayoutClaimed(address,uint128)` | `0x6bf75371d42e9753c0913bf8fcecb651e8db173d99d7da0e4d836e91512bbe27` (`destination` indexed) |
 
 ## Deployment compatibility
 

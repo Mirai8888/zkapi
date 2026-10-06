@@ -44,6 +44,16 @@ reorganization that changed the vault state, or a mirror that keeps
 disagreeing with the vault, takes the tree routes out of service and rebuilds
 the mirror from the deployment block. Automatic rebuilds are rate-limited.
 
+A shallow reorganization can also orphan the block of the view being served.
+The indexer keeps serving that view, with `/health` `ok`, until it publishes a
+new one: while its RPC cannot verify the new head, for up to
+`--stale-after-secs` (120 s) before it reports `stale`; while the re-derived
+view disagrees with the vault, until it declares the mirror diverged, after
+three polls and at least 30 seconds. Deposits and withdrawals built from such a
+view revert `StaleRoot()` or `UnknownRoot()`; build them again from a fresh
+path. The challenger compares paths with the vault's live root and is not
+misled.
+
 While no verified view is available, every tree route and
 `/v1/escapes/pending` return `503` with `Retry-After: 5` and the same public
 body:

@@ -256,6 +256,29 @@ func (h *FundingHandler) requireUnsettledRequestOverride(ctx context.Context) er
 	return nil
 }
 
+// errWithdrawalToVault refuses the deployment's own vault as a withdrawal
+// destination. The vault cannot pay itself: a vault with vault_revision 2
+// reverts InvalidDestination, and a legacy vault cannot receive the payout,
+// so every close reverts. The companion's clearance is permanent and its
+// reservation pins the destination, so the note could then only expire.
+var errWithdrawalToVault = errors.New("withdrawal destination cannot be the zkAPI vault contract, which cannot receive its own payout")
+
+// CheckWithdrawalDestination refuses the vault of this release's packaged
+// deployment on chainID as a withdrawal destination, before any note is
+// reserved for it.
+func CheckWithdrawalDestination(chainID uint64, destination string) error {
+	for _, network := range []string{"mainnet", "sepolia"} {
+		if chain, _ := ChainID(network); chain != chainID {
+			continue
+		}
+		deployment, _, err := pinnedDeployment(network)
+		if err == nil && isHex(destination, 20) && common.HexToAddress(destination) == common.HexToAddress(deployment.Contract) {
+			return errWithdrawalToVault
+		}
+	}
+	return nil
+}
+
 // NormalizeWithdrawalDestination rejects zero and bad mixed-case checksums.
 // Lower/upper-case addresses remain accepted, as with standard Ethereum tools.
 func NormalizeWithdrawalDestination(value string) (string, error) {
@@ -446,6 +469,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	} else {
 		if retryHash != "" || confirmationHash != "" {
 			return status, errors.New("there is no saved withdrawal attempt to retry or confirm")
+		}
+		if common.HexToAddress(destination) == common.HexToAddress(config.Contract) {
+			return status, errWithdrawalToVault
 		}
 		if !*wallet.HasNote {
 			return status, nil

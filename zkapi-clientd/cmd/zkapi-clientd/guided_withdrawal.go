@@ -89,6 +89,9 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 			}
 			destination, err = zkapi.NormalizeWithdrawalDestination(strings.TrimSpace(answer))
 			if err == nil {
+				err = zkapi.CheckWithdrawalDestination(initial.ChainID, destination)
+			}
+			if err == nil {
 				break
 			}
 			ui.Printf("%s. Please enter the destination address.\n", err)

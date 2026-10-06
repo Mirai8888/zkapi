@@ -77,6 +77,10 @@ and OA key before retiring it; that recovered credential never enters the
 inference cache or bridge response. A confirmed unissued cancellation advances
 the wallet only through the normal matching signed response. Missing keys,
 expiry, HTTP errors and ambiguous issuance never authorize clearing a journal.
+The journal is written and synced to disk, under a temporary name and then
+under its own, before its request is sent, and the note state it settles into
+is synced the same way before the journal is cleared, so a power loss leaves
+neither a sent request without its journal nor an empty journal file.
 A journal that was sent is never deleted without installing its signed
 response. When an unsigned answer sets one aside, it moves, whole, into an
 append-only archive (`request_archive/` in the companion's state directory,
@@ -97,7 +101,10 @@ reserved for a clearance (an earlier withdrawal, or the operator's release
 of a stuck state), without reading the root: the server refuses every
 request at such a nullifier whatever the root, so it could never settle.
 Chats at such a state stop with `clearance_reserved_state` and keep the
-request, so they send no new request proof from that state. A journal is
+request, resending only it. Once withdrawal settlement has set it aside, a
+chat first asks the server's record of that nullifier again and proves
+nothing while the server still reports the reservation, or cannot be asked,
+so chats send no new request proof from that state. A journal is
 also set aside after the server's
 `/expire` acknowledgement of a never-admitted native request, when a wallet
 reset replaces an unspent note, and, as superseded, when the note has

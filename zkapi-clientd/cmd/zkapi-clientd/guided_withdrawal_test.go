@@ -144,6 +144,28 @@ func TestGuidedWithdrawalFundedNeedsNoPaymentQR(t *testing.T) {
 	}
 }
 
+// The vault cannot receive its own payout, so its address is refused at the
+// prompt and asked for again, before any quote reserves the note for it.
+func TestGuidedWithdrawalAsksAgainForTheVaultAddress(t *testing.T) {
+	f := &withdrawalWizardFixture{}
+	vault := strings.ToLower(withdrawalWizardQuote().Contract)
+	u := &fundingWizardUI{answers: []string{vault, withdrawalTestDestination}, confirmations: []bool{true}}
+	f.quote = func(call int, destination string, note uint64, retry string) (zkapi.AddressPaymentQuote, error) {
+		if destination != withdrawalTestDestination {
+			t.Fatalf("quoted a withdrawal to %s", destination)
+		}
+		q := withdrawalWizardQuote()
+		q.ID = fmt.Sprintf("%064x", call)
+		return q, nil
+	}
+	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
+		t.Fatal(err)
+	}
+	if u.asks != 2 || f.approveCalls != 1 || !strings.Contains(u.String(), "cannot be the zkAPI vault contract") {
+		t.Fatalf("asks=%d approvals=%d: %s", u.asks, f.approveCalls, u.String())
+	}
+}
+
 func TestGuidedWithdrawalDeclineOrCancellationCannotApprove(t *testing.T) {
 	for _, cancel := range []bool{false, true} {
 		t.Run(fmt.Sprint(cancel), func(t *testing.T) {

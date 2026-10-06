@@ -271,8 +271,9 @@ is unsigned): **repair** stops, explaining that the withdrawal sent or may
 have sent its ownership proof, and the management API's error body carries
 `"code": "ownership_proof_sent"` beside that explanation. The companion
 makes no chat request from that state either (the chat API answers 409
-`ownership_proof_sent`). Choose **withdraw** again to finish the close,
-which sends the proof again.
+`withdrawal_pending` while the reservation stands, and 409
+`ownership_proof_sent` after a generic `/wallet/withdraw` close). Choose
+**withdraw** again to finish the close, which sends the proof again.
 
 A reservation saved before the companion recorded this does not say whether
 a proof left. No tagged release up to 0.1.6 sent one: their clearance
@@ -348,7 +349,9 @@ ownership proof, asks for the acknowledgement described above.
 ## Withdrawals
 
 Choose `withdraw` in `config --menu`. A new withdrawal asks for the destination
-once and shows its full private payout. If gas is insufficient, it shows the
+once and shows its full private payout. The vault's own contract address is
+refused as a destination, before anything is reserved: the vault cannot
+receive its own payout, so every close to it would revert. If gas is insufficient, it shows the
 same address/QR and live balance UI as a deposit, but requests only public ETH
 for fees. The QR pays the local signing address, not the withdrawal destination.
 Partial incoming payments update the remaining top-up. Normal gas fluctuations

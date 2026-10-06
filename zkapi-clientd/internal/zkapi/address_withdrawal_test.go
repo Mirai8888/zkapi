@@ -919,6 +919,41 @@ func TestAddressWithdrawalPreconditionsRejectBeforeProofOrBroadcast(t *testing.T
 	}
 }
 
+// The vault cannot receive its own payout: a vault with vault_revision 2
+// reverts InvalidDestination, and a legacy vault cannot receive ETH. A
+// withdrawal to it used to save the destination and have the companion
+// reserve the note and its permanent clearance for it, so every close
+// reverted and the note could only expire. It is now refused before
+// anything is saved or reserved, in any spelling, for both billing assets.
+func TestAddressWithdrawalRefusesTheVaultAsDestination(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		f := newWithdrawalFixture(t, native)
+		config, err := f.h.config(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, destination := range []string{strings.ToLower(config.Contract), common.HexToAddress(config.Contract).Hex()} {
+			var err error
+			if native {
+				_, err = f.h.QuoteAddressWithdrawal(context.Background(), destination, f.noteID, "", false)
+			} else {
+				_, err = f.h.WithdrawAddress(context.Background(), destination, f.noteID)
+			}
+			if !errors.Is(err, errWithdrawalToVault) {
+				t.Fatalf("native=%v %s: %v", native, destination, err)
+			}
+		}
+		if f.prepareCalls != 0 || f.reservedDestination != "" || f.journal(t).Withdrawal != nil {
+			t.Fatalf("native=%v: a withdrawal to the vault was saved or reserved", native)
+		}
+		// Any other destination still withdraws.
+		f.withdraw(t)
+		if !strings.EqualFold(f.reservedDestination, withdrawalTestDestination) {
+			t.Fatalf("native=%v: reserved %q", native, f.reservedDestination)
+		}
+	}
+}
+
 func TestAddressWithdrawalWaitsForOutstandingInferenceSettlement(t *testing.T) {
 	f := newWithdrawalFixture(t)
 	f.pending = true

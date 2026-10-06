@@ -105,8 +105,14 @@ On macOS install Xcode command-line tools and the corresponding Homebrew tools.
 
 ```sh
 ./scripts/prepare-zkapi.sh /tmp/clientd-wallet-source
+./scripts/test-companion.sh /tmp/clientd-wallet-source
 ./scripts/build-native.sh 0.1.6 /tmp/clientd-artifacts /tmp/clientd-wallet-source
 ```
+
+`test-companion.sh` runs the tests of every crate that the two maintained
+patches change. It reads the crates from the patches. Companion crates are
+tested in the prepared workspace. The patched protocol crates are tested in
+`protocol/rust`, because the companion workspace excludes that directory.
 
 Run on the native target. Supported release targets are macOS 13+ and Linux
 with glibc 2.39+, on amd64 or arm64. Linux runtime dependencies are OpenSSL 3,

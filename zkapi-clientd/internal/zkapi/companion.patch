@@ -1310,10 +1310,10 @@ index 0000000..1756288
 +}
 diff --git a/crates/zkapi-clientd/src/oa_withdrawal.rs b/crates/zkapi-clientd/src/oa_withdrawal.rs
 new file mode 100644
-index 0000000..dc56f6e
+index 0000000..8d48d40
 --- /dev/null
 +++ b/crates/zkapi-clientd/src/oa_withdrawal.rs
-@@ -0,0 +1,1329 @@
+@@ -0,0 +1,1358 @@
 +//! Durable OA withdrawal reservation. Every call runs under the wallet lock.
 +//! The snapshot is local recovery material and is never returned over HTTP.
 +use std::fs::{self, File, OpenOptions};
@@ -1440,6 +1440,26 @@ index 0000000..dc56f6e
 +        ));
 +    }
 +    Ok(result)
++}
++
++/// A withdrawal destination the vault can pay: neither the zero address nor
++/// the vault itself. A vault with `vault_revision` 2 refuses its own address
++/// (`InvalidDestination`), and a legacy vault cannot receive the payout, so
++/// every close to it reverts. Checked before any note is reserved or any
++/// clearance is requested: a clearance is permanent, and the reservation
++/// pins its destination.
++pub(crate) fn check_destination(config: &AuthConfig, destination: &[u8; 20]) -> Result<(), AuthError> {
++    if *destination == [0; 20] {
++        return Err(AuthError::InvalidInput(
++            "withdrawal destination cannot be the zero address".into(),
++        ));
++    }
++    if zkapi_types::serialization::address_to_felt(destination) == config.contract_address {
++        return Err(AuthError::InvalidInput(
++            "withdrawal destination cannot be the vault contract, which cannot pay itself".into(),
++        ));
++    }
++    Ok(())
 +}
 +
 +fn hex_bytes(value: &str, size: usize) -> Result<Vec<u8>, AuthError> {
@@ -2632,6 +2652,15 @@ index 0000000..dc56f6e
 +
 +    #[test]
 +    fn destination_is_an_explicit_nonzero_evm_address() {
++        let (_directory, config, _note) = fixture();
++        assert!(check_destination(&config, &[1; 20]).is_ok());
++        let vault = zkapi_types::serialization::felt_to_address(&config.contract_address).unwrap();
++        for refused in [[0; 20], vault] {
++            assert!(matches!(
++                check_destination(&config, &refused),
++                Err(AuthError::InvalidInput(_))
++            ));
++        }
 +        assert_eq!(destination(&hex(&[1; 20])).unwrap(), [1; 20]);
 +        for bad in [
 +            hex(&[0; 20]),
@@ -3207,7 +3236,7 @@ index bebd5c4..c63b904 100644
                      .body(Body::empty())
                      .unwrap(),
 diff --git a/crates/zkapi-clientd/src/service.rs b/crates/zkapi-clientd/src/service.rs
-index 6b0305d..cad5179 100644
+index 6b0305d..c81a9c7 100644
 --- a/crates/zkapi-clientd/src/service.rs
 +++ b/crates/zkapi-clientd/src/service.rs
 @@ -12,6 +12,7 @@
@@ -3535,7 +3564,7 @@ index 6b0305d..cad5179 100644
 +        destination: [u8; 20],
 +        accept_unsettled_request_risk: bool,
 +    ) -> Result<WithdrawalPlan, AuthError> {
-+        if destination == [0; 20] { return Err(AuthError::InvalidInput("withdrawal destination cannot be zero".into())); }
++        crate::oa_withdrawal::check_destination(&self.config, &destination)?;
 +        // A lease journal without a live key in this daemon (after a restart,
 +        // or one the server can no longer admit, as after the operator
 +        // released a stuck state) was otherwise settled only by the next
@@ -4121,7 +4150,7 @@ index 6b0305d..cad5179 100644
                  }
                  return Err(AuthError::LeasePending(format!(
                      "request {client_request_id} is finalized but not yet recoverable"
-@@ -1022,12 +1672,33 @@ impl AuthService {
+@@ -1022,12 +1672,35 @@ impl AuthService {
              let nullifier_recovery = self
                  .fetch_nullifier_recovery(&request.public_inputs.request_nullifier)
                  .await?;
@@ -4155,12 +4184,14 @@ index 6b0305d..cad5179 100644
 +                // journal aside only moves it into the archive, from where
 +                // a later finalized receipt still installs; on a vault below
 +                // revision 2 the state then sends no ownership proof without
-+                // the owner's acknowledgement.
++                // the owner's acknowledgement. Chats prove no new request
++                // from the state while the server reports the reservation
++                // (`prepare_direct_lease_request`).
 +                return Ok(PendingLease::SetAside("discarded_clearance_reserved"));
              }
              if nullifier_recovery.status != "not_found"
                  || nullifier_recovery.nullifier_status != "unknown"
-@@ -1041,7 +1712,29 @@ impl AuthService {
+@@ -1041,7 +1714,29 @@ impl AuthService {
                  tokio::time::sleep(Duration::from_millis(500)).await;
              }
          }
@@ -4191,7 +4222,7 @@ index 6b0305d..cad5179 100644
      }
 
      async fn execute_direct_openrouter(
-@@ -1091,6 +1784,7 @@ impl AuthService {
+@@ -1091,6 +1786,7 @@ impl AuthService {
          &self,
          lease_slot: &mut Option<ActiveOpenRouterLease>,
          session_id: &str,
@@ -4199,7 +4230,7 @@ index 6b0305d..cad5179 100644
      ) -> Result<(), AuthError> {
          if lease_slot
              .as_ref()
-@@ -1123,7 +1817,7 @@ impl AuthService {
+@@ -1123,7 +1819,7 @@ impl AuthService {
          // explicit settlement, credit exhaustion, or a key rejection.
          let _ = self.recover().await?;
          *lease_slot = Some(
@@ -4208,7 +4239,7 @@ index 6b0305d..cad5179 100644
                  .await?,
          );
          Ok(())
-@@ -1197,7 +1891,7 @@ impl AuthService {
+@@ -1197,7 +1893,7 @@ impl AuthService {
          loop {
              let request_guard = self.direct_request_mutex.clone().read_owned().await;
              let mut lease_slot = self.direct_lease.lock().await;
@@ -4217,7 +4248,7 @@ index 6b0305d..cad5179 100644
                  .await?;
              let lease = lease_slot
                  .as_mut()
-@@ -1208,15 +1902,17 @@ impl AuthService {
+@@ -1208,15 +1904,17 @@ impl AuthService {
                          "OA lease lost its verification evidence".to_string(),
                      )
                  })?;
@@ -4237,7 +4268,7 @@ index 6b0305d..cad5179 100644
              let client_request_id = lease.client_request_id.clone();
              let mut reserved_lease = lease.clone();
              lease.requests_served = lease.requests_served.saturating_add(1);
-@@ -1290,24 +1986,39 @@ impl AuthService {
+@@ -1290,24 +1988,39 @@ impl AuthService {
          }
      }
 
@@ -4279,7 +4310,7 @@ index 6b0305d..cad5179 100644
          }
          let url = format!(
              "{}{}",
-@@ -1326,8 +2037,7 @@ impl AuthService {
+@@ -1326,8 +2039,7 @@ impl AuthService {
          expires_at: u64,
      ) -> Result<reqwest::Response, AuthError> {
          for attempt in 1..=DIRECT_REMOTE_MAX_ATTEMPTS {
@@ -4289,7 +4320,7 @@ index 6b0305d..cad5179 100644
                  .post(url)
                  .bearer_auth(api_key)
                  .header("content-type", "application/json")
-@@ -1387,94 +2097,131 @@ impl AuthService {
+@@ -1387,94 +2099,131 @@ impl AuthService {
      async fn issue_direct_openrouter_lease(
          &self,
          session_id: String,
@@ -4486,7 +4517,7 @@ index 6b0305d..cad5179 100644
                  if error.error_code == "lease_pending" {
                      let lease_status = self
                          .fetch_direct_lease_status(&request.client_request_id)
-@@ -1530,122 +2277,206 @@ impl AuthService {
+@@ -1530,122 +2279,206 @@ impl AuthService {
          }
      }
 
@@ -4796,7 +4827,7 @@ index 6b0305d..cad5179 100644
          let config = self.config.clone();
          let wallet_mutex = self.wallet_mutex.clone();
          let indexer = self.indexer.clone();
-@@ -1655,6 +2486,7 @@ impl AuthService {
+@@ -1655,6 +2488,7 @@ impl AuthService {
                  .map_err(|error| AuthError::Wallet(error.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, Vec::new())?;
@@ -4804,7 +4835,7 @@ index 6b0305d..cad5179 100644
              let authorization = serde_json::to_string(&OpenRouterLeaseAuthorization::default())
                  .map_err(|error| AuthError::Serialization(error.to_string()))?;
              if wallet.has_pending_request() {
-@@ -1663,7 +2495,7 @@ impl AuthService {
+@@ -1663,7 +2497,7 @@ impl AuthService {
                          "an older pending request has no retryable request body".to_string(),
                      )
                  })?;
@@ -4813,13 +4844,43 @@ index 6b0305d..cad5179 100644
                      return Err(AuthError::LeasePending(
                          "a non-lease zkAPI request is still pending".to_string(),
                      ));
-@@ -1671,11 +2503,19 @@ impl AuthService {
+@@ -1671,11 +2505,49 @@ impl AuthService {
                  return Ok(request);
              }
              let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
 +            crate::oa_withdrawal::check_request_state(&config, state)?;
              let note_id = state.note_id;
              let runtime = current_thread_runtime()?;
++            // Withdrawal settlement sets aside a retry whose nullifier the
++            // server reports reserved for a clearance
++            // (`discarded_clearance_reserved`), leaving no pending journal.
++            // The server refuses every request at such a nullifier, so a
++            // new proof from this state could never settle it and would
++            // only hand out one more request proof at that nullifier. Ask
++            // again: while the server still reports the reservation, or
++            // cannot be asked, no request is proved from this state.
++            if wallet
++                .archive_at_current_state()?
++                .records
++                .iter()
++                .any(|record| record.disposition == "discarded_clearance_reserved")
++            {
++                let nullifier = core_v2::nullifier(&state.secret_s, &state.current_anchor);
++                match runtime.block_on(nullifier_recovery(&config, &nullifier)) {
++                    Ok(recovery)
++                        if recovery.nullifier_status == "clearance_reserved"
++                            && recovery.request_response.is_none() =>
++                    {
++                        return Err(AuthError::ClearanceReservedState);
++                    }
++                    Ok(_) => {}
++                    Err(error) => {
++                        return Err(AuthError::Wallet(format!(
++                            "the server's record of this note state's nullifier, which it reported reserved for a clearance, could not be read ({error}); no request is proved from this state"
++                        )));
++                    }
++                }
++            }
              let (active_root, siblings) = runtime.block_on(async move {
                  Ok::<_, AuthError>((indexer.root().await?, indexer.note_path(note_id).await?))
              })?;
@@ -4833,7 +4894,7 @@ index 6b0305d..cad5179 100644
              let payload_hash = compute_payload_hash(authorization.as_bytes());
              wallet
                  .prepare_request(&authorization, payload_hash, active_root, siblings)
-@@ -1684,16 +2524,107 @@ impl AuthService {
+@@ -1684,16 +2556,107 @@ impl AuthService {
          .await
      }
 
@@ -4943,7 +5004,7 @@ index 6b0305d..cad5179 100644
              Ok(())
          })
          .await
-@@ -1703,16 +2634,15 @@ impl AuthService {
+@@ -1703,16 +2666,15 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<OpenRouterLeaseStatusResponse, AuthError> {
@@ -4963,7 +5024,7 @@ index 6b0305d..cad5179 100644
              .json()
              .await
              .map_err(|error| AuthError::Serialization(error.to_string()))
-@@ -1722,12 +2652,10 @@ impl AuthService {
+@@ -1722,12 +2684,10 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<Option<OpenRouterLeaseStatusResponse>, AuthError> {
@@ -4978,7 +5039,7 @@ index 6b0305d..cad5179 100644
              .send()
              .await
              .map_err(|error| AuthError::Wallet(error.to_string()))?;
-@@ -1736,7 +2664,7 @@ impl AuthService {
+@@ -1736,7 +2696,7 @@ impl AuthService {
          }
          let response = response
              .error_for_status()
@@ -4987,7 +5048,7 @@ index 6b0305d..cad5179 100644
          response
              .json()
              .await
-@@ -1748,16 +2676,15 @@ impl AuthService {
+@@ -1748,16 +2708,15 @@ impl AuthService {
          &self,
          client_request_id: &str,
      ) -> Result<RecoveryResponseV2, AuthError> {
@@ -5007,7 +5068,7 @@ index 6b0305d..cad5179 100644
              .json()
              .await
              .map_err(|error| AuthError::Serialization(error.to_string()))
-@@ -1767,44 +2694,44 @@ impl AuthService {
+@@ -1767,44 +2726,44 @@ impl AuthService {
          &self,
          nullifier: &Felt252,
      ) -> Result<RecoveryResponseV2, AuthError> {
@@ -5071,7 +5132,7 @@ index 6b0305d..cad5179 100644
              let http_status = response.status();
              let body = response
                  .text()
-@@ -1815,15 +2742,13 @@ impl AuthService {
+@@ -1815,15 +2774,13 @@ impl AuthService {
                      .map_err(|error| AuthError::Serialization(error.to_string()))?;
              }
              if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
@@ -5089,7 +5150,7 @@ index 6b0305d..cad5179 100644
                  }
                  return Err(AuthError::Wallet(format!(
                      "{}: {}",
-@@ -1832,18 +2757,22 @@ impl AuthService {
+@@ -1832,18 +2789,22 @@ impl AuthService {
              }
              return Err(AuthError::Wallet(format!("HTTP {http_status}: {body}")));
          };
@@ -5114,7 +5175,7 @@ index 6b0305d..cad5179 100644
      }
 
      async fn finish_direct_openrouter_lease(&self, client_request_id: String) {
-@@ -1903,6 +2832,7 @@ impl AuthService {
+@@ -1903,6 +2864,7 @@ impl AuthService {
          self.ensure_scheme_agreement().await?;
          let config = self.config.clone();
          let wallet_mutex = self.wallet_mutex.clone();
@@ -5122,7 +5183,7 @@ index 6b0305d..cad5179 100644
          let indexer = self.indexer.clone();
          let trusted_roots = self.trusted_roots();
          spawn_blocking(move || {
-@@ -1911,6 +2841,7 @@ impl AuthService {
+@@ -1911,6 +2873,7 @@ impl AuthService {
                  .map_err(|err| AuthError::Wallet(err.to_string()))?;
              let _lockfile = acquire_wallet_lock(&config.state_dir)?;
              let mut wallet = load_wallet(&config, trusted_roots)?;
@@ -5130,7 +5191,7 @@ index 6b0305d..cad5179 100644
              let payload = serde_json::to_string(&request)
                  .map_err(|err| AuthError::Serialization(err.to_string()))?;
              let payload_hash = hash_payload(&payload);
-@@ -1918,10 +2849,14 @@ impl AuthService {
+@@ -1918,10 +2881,14 @@ impl AuthService {
 
              runtime.block_on(async move {
                  if wallet.has_pending_request() {
@@ -5147,7 +5208,15 @@ index 6b0305d..cad5179 100644
                  let started = Instant::now();
                  tracing::info!(
                      note_id,
-@@ -2027,24 +2962,75 @@ impl AuthService {
+@@ -1989,6 +2956,7 @@ impl AuthService {
+         mode: WithdrawalMode,
+         destination: [u8; 20],
+     ) -> Result<WithdrawalPlan, AuthError> {
++        crate::oa_withdrawal::check_destination(&self.config, &destination)?;
+         let mut prepared = self.prepared_withdrawal.lock().await;
+         if let Some(plan) = prepared.as_ref() {
+             let same_destination = plan.public_inputs.destination == destination;
+@@ -2027,24 +2995,85 @@ impl AuthService {
          let wallet_mutex = self.wallet_mutex.clone();
          let indexer = self.indexer.clone();
          let trusted_roots = self.trusted_roots();
@@ -5163,16 +5232,26 @@ index 6b0305d..cad5179 100644
              let runtime = current_thread_runtime()?;
 
              runtime.block_on(async move {
-+                // As in oa_prepare_withdrawal: a request set aside at this
-+                // state may since have been finalized; install its verified
-+                // receipt before the gate below.
-+                if wallet.get_pending_journal()?.is_none()
-+                    && !wallet.archive_at_current_state()?.is_empty()
++                // As in oa_prepare_withdrawal: install a verified receipt for
++                // the pending request, or for a request set aside at this
++                // state that has since been finalized, before the checks
++                // below.
++                if wallet.get_pending_journal()?.is_some()
++                    || !wallet.archive_at_current_state()?.is_empty()
 +                {
 +                    if let Some(response) = wallet.recover().await? {
 +                        session_events
 +                            .settled(&response, wallet.state().map(|state| state.current_balance));
 +                    }
++                }
++                // As in oa_prepare_withdrawal: a request still pending at this
++                // state may yet be admitted, so no withdrawal proof is made
++                // from the state. On a vault below revision 2 an escape-form
++                // proof from it (an escape, or a clearance's ownership proof)
++                // could be challenged with that request, which burns the
++                // nullifier; the gate below sees only archived requests.
++                if wallet.get_pending_journal()?.is_some() {
++                    return Err(AuthError::PendingSettlement);
 +                }
                  let note_id = wallet.state().ok_or(AuthError::NoActiveNote)?.note_id;
 +                // As in oa_prepare_withdrawal: at a state with an unsettled
@@ -5227,7 +5306,7 @@ index 6b0305d..cad5179 100644
                      }
                      WithdrawalMode::Escape => {
                          wallet.withdrawal_escape_hatch(destination, root, siblings)?
-@@ -2158,14 +3144,22 @@ impl AuthService {
+@@ -2158,14 +3187,22 @@ impl AuthService {
          }
      }
 
@@ -5252,7 +5331,7 @@ index 6b0305d..cad5179 100644
              .post(rpc_url)
              .json(&serde_json::json!({
                  "jsonrpc": "2.0",
-@@ -2397,7 +3391,7 @@ fn hash_payload(payload: &str) -> Felt252 {
+@@ -2397,7 +3434,7 @@ fn hash_payload(payload: &str) -> Felt252 {
      compute_payload_hash(payload.as_bytes())
  }
 
@@ -5261,7 +5340,7 @@ index 6b0305d..cad5179 100644
      SystemTime::now()
          .duration_since(UNIX_EPOCH)
          .unwrap_or_default()
-@@ -2674,7 +3668,18 @@ fn load_wallet(
+@@ -2674,7 +3711,18 @@ fn load_wallet(
      config: &AuthConfig,
      trusted_epoch_roots: Vec<EpochRoots>,
  ) -> Result<Wallet, AuthError> {
@@ -5281,14 +5360,10 @@ index 6b0305d..cad5179 100644
  }
 
  fn acquire_wallet_lock(state_dir: &Path) -> Result<std::fs::File, AuthError> {
-@@ -2698,6 +3703,90 @@ fn current_thread_runtime() -> Result<tokio::runtime::Runtime, AuthError> {
+@@ -2698,6 +3746,91 @@ fn current_thread_runtime() -> Result<tokio::runtime::Runtime, AuthError> {
          .map_err(|err| AuthError::Wallet(err.to_string()))
  }
 
-+/// On a vault below revision 2, true when a request proof sent from the
-+/// wallet's current state was set aside without settling (an archived
-+/// request). An ownership proof there is a submittable escape that whoever
-+/// kept that request proof could have challenged, burning the nullifier.
 +/// Whether the server reports `nullifier` settled by a request this wallet
 +/// holds neither as its pending journal (`pending_id`) nor in its request
 +/// archive: an earlier release deleted that request's journal, so its receipt
@@ -5331,9 +5406,14 @@ index 6b0305d..cad5179 100644
 +        })
 +}
 +
-+/// A state with an archived request on a vault below revision 2. A record
-+/// that cannot be read still counts: something was archived at this state,
-+/// and it may be a transmitted request.
++/// On a vault below revision 2, true when a request proof sent from the
++/// wallet's current state was set aside without settling (an archived
++/// request). An ownership proof there is a submittable escape that whoever
++/// kept that request proof could have challenged, burning the nullifier. A
++/// record that cannot be read still counts: something was archived at this
++/// state, and it may be a transmitted request. A request still pending is
++/// not counted here: every withdrawal path refuses while one is pending
++/// (`PendingSettlement`).
 +fn unsettled_legacy_state(config: &AuthConfig, wallet: &Wallet) -> Result<bool, AuthError> {
 +    if config.vault_revision >= 2 {
 +        return Ok(false);
@@ -5372,7 +5452,7 @@ index 6b0305d..cad5179 100644
  async fn fetch_json<T>(url: &str) -> Result<T, String>
  where
      T: DeserializeOwned,
-@@ -2917,7 +4006,7 @@ mod wallet_lifecycle_tests {
+@@ -2917,7 +4050,7 @@ mod wallet_lifecycle_tests {
 
      #[tokio::test]
      async fn low_balance_note_is_preserved_and_active_slot_is_cleared() {
@@ -5381,7 +5461,7 @@ index 6b0305d..cad5179 100644
 
          let retired = service
              .retire_low_balance_note()
-@@ -2926,22 +4015,22 @@ mod wallet_lifecycle_tests {
+@@ -2926,22 +4059,22 @@ mod wallet_lifecycle_tests {
              .expect("low-balance note should be retired");
 
          assert_eq!(retired.note_id, 18);
@@ -5408,7 +5488,7 @@ index 6b0305d..cad5179 100644
          PendingRequestJournal::write(
              &pending_directory.path().join("pending_journal.json"),
              &PendingRequestJournal {
-@@ -3346,3 +4435,3991 @@ mod tests {
+@@ -3346,3 +4479,4114 @@ mod tests {
          assert!(!commitment.is_zero());
      }
  }
@@ -5453,6 +5533,37 @@ index 6b0305d..cad5179 100644
 +            Err(AuthError::WithdrawalConflict)
 +        ));
 +        assert!(config.state_dir.join("note_state.json").exists());
++    }
++
++    /// The vault cannot pay itself: a vault with vault_revision 2 reverts
++    /// InvalidDestination, and a legacy vault cannot receive the payout. A
++    /// withdrawal to the vault's address used to reserve the note and ask
++    /// for a permanent clearance pinned to that destination, so every close
++    /// reverted and the note waited for expiry. Both routes now refuse it
++    /// before anything is reserved, proved or sent.
++    #[tokio::test]
++    async fn the_vault_address_is_refused_as_a_destination_before_anything_is_reserved() {
++        let (_directory, config, _note) = fixture();
++        let service = AuthService::new(config.clone()).unwrap();
++        let vault = zkapi_types::serialization::felt_to_address(&config.contract_address).unwrap();
++        // The indexer fixture is unreachable, so a withdrawal that got past
++        // the destination would fail later, after reserving the note.
++        let refused = service.oa_prepare_withdrawal(vault, false).await;
++        assert!(matches!(refused, Err(AuthError::InvalidInput(_))), "{refused:?}");
++        assert!(oa_withdrawal::load(&config).unwrap().is_none());
++        for mode in [WithdrawalMode::Mutual, WithdrawalMode::Escape] {
++            let refused = service.create_withdrawal(mode, vault).await;
++            assert!(matches!(refused, Err(AuthError::InvalidInput(_))), "{mode:?}: {refused:?}");
++        }
++        // Any other address still reaches the indexer.
++        assert!(matches!(
++            service.create_withdrawal(WithdrawalMode::Escape, [1; 20]).await,
++            Err(AuthError::Indexer(_))
++        ));
++        assert!(matches!(
++            service.oa_prepare_withdrawal([1; 20], false).await,
++            Err(AuthError::Indexer(_))
++        ));
 +    }
 +
 +    #[tokio::test]
@@ -6289,6 +6400,38 @@ index 6b0305d..cad5179 100644
 +            "{:?}",
 +            run.result
 +        );
++    }
++
++    /// The generic `/wallet/withdraw` used to build an escape, or send an
++    /// escape-form ownership proof with a clearance request, at the
++    /// nullifier of a transmitted request that was still pending rather
++    /// than archived: its gate read only the archive. Whoever withheld that
++    /// request could escape with the proof and challenge the escape with it,
++    /// which burns the nullifier on a vault below revision 2. The route now
++    /// refuses while a request is pending, as the OA route does, and sends
++    /// nothing.
++    #[tokio::test]
++    async fn the_generic_withdrawal_route_refuses_while_a_request_is_pending() {
++        for vault_revision in [0, 2] {
++            for mode in [WithdrawalMode::Escape, WithdrawalMode::Mutual] {
++                let run = prepare_with_setup(Setup {
++                    route: Route::Generic(mode),
++                    vault_revision,
++                    pending_retry: true,
++                    vault_root_moved: false,
++                    ..Setup::new(Archive::Empty, Clearance::Grant, "unknown")
++                })
++                .await;
++                let case = format!("revision {vault_revision}, {mode:?}");
++                assert!(
++                    matches!(run.result, Err(AuthError::PendingSettlement)),
++                    "{case}: {:?}",
++                    run.result
++                );
++                assert!(run.requests.is_empty(), "{case}");
++                assert!(run.pending && run.archived.is_empty(), "{case}");
++            }
++        }
 +    }
 +
 +    /// A damaged archive record, or a file another program left in the
@@ -7394,7 +7537,10 @@ index 6b0305d..cad5179 100644
 +    /// claiming the next request would resend it. Chats now report
 +    /// clearance_reserved_state and keep resending the same bytes (never a
 +    /// new proof from that state); settlement sets the retry aside without
-+    /// asking the vault.
++    /// asking the vault. Once it is set aside no journal is pending, and
++    /// chats used to prove a fresh request at the same nullifier: they now
++    /// ask the server again and prove nothing while it still reports the
++    /// reservation, or cannot be asked.
 +    #[tokio::test]
 +    async fn a_released_state_stops_chats_with_an_actionable_code_and_settles_its_retry() {
 +        let directory = tempfile::tempdir().unwrap();
@@ -7458,6 +7604,8 @@ index 6b0305d..cad5179 100644
 +        let journal = std::fs::read(&journal_path).unwrap();
 +        let events = Events::default();
 +        let transmitted = serde_json::to_value(&request).unwrap();
++        // What the server's record of the state's nullifier answers.
++        let reading: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("clearance_reserved"));
 +        let router = Router::new()
 +            .route(
 +                "/v2/openrouter/leases",
@@ -7498,9 +7646,30 @@ index 6b0305d..cad5179 100644
 +            )
 +            .route(
 +                &format!("/v2/nullifiers/{nullifier}"),
++                get({
++                    let reading = reading.clone();
++                    move |State(events): State<Events>| async move {
++                        events.lock().unwrap().push("nullifier");
++                        match *reading.lock().unwrap() {
++                            "unreadable" => (StatusCode::BAD_GATEWAY, Json(json!({}))),
++                            "unknown" => (
++                                StatusCode::OK,
++                                Json(json!({"status":"not_found","nullifier_status":"unknown"})),
++                            ),
++                            status => (
++                                StatusCode::OK,
++                                Json(json!({"status":"ok","nullifier_status":status})),
++                            ),
++                        }
++                    }
++                }),
++            )
++            .route(
++                "/v1/tree/root",
 +                get(|State(events): State<Events>| async move {
-+                    events.lock().unwrap().push("nullifier");
-+                    Json(json!({"status":"ok","nullifier_status":"clearance_reserved"}))
++                    // Every new request proof starts by reading the root.
++                    events.lock().unwrap().push("root");
++                    StatusCode::SERVICE_UNAVAILABLE
 +                }),
 +            )
 +            .with_state(events.clone());
@@ -7552,6 +7721,40 @@ index 6b0305d..cad5179 100644
 +            serde_json::to_value(&archived[0].journal).unwrap(),
 +            serde_json::from_slice::<Value>(&journal).unwrap()
 +        );
++
++        // Later chats prove nothing new from this state: not while the
++        // server still reports the reservation, and not while its record
++        // cannot be read.
++        for answer in ["clearance_reserved", "unreadable", "clearance_reserved"] {
++            *reading.lock().unwrap() = answer;
++            events.lock().unwrap().clear();
++            let issued = service
++                .issue_direct_openrouter_lease("chat".into(), None)
++                .await;
++            let error = issued.err().expect("no request is proved from a released state");
++            if answer == "unreadable" {
++                assert!(matches!(error, AuthError::Wallet(_)), "{error:?}");
++            } else {
++                assert!(matches!(error, AuthError::ClearanceReservedState), "{error:?}");
++            }
++            assert_eq!(*events.lock().unwrap(), ["nullifier"], "{answer}");
++            assert!(!journal_path.exists(), "{answer}");
++            assert_eq!(
++                zkapi_client::journal::archived_requests(&archive, &nullifier)
++                    .unwrap()
++                    .len(),
++                1
++            );
++        }
++        // A server that no longer reports the reservation lets a chat prove
++        // a request again, as at any state whose retry was set aside.
++        *reading.lock().unwrap() = "unknown";
++        events.lock().unwrap().clear();
++        let issued = service
++            .issue_direct_openrouter_lease("chat".into(), None)
++            .await;
++        assert!(matches!(issued, Err(AuthError::Indexer(_))), "{:?}", issued.err());
++        assert_eq!(*events.lock().unwrap(), ["nullifier", "root"]);
 +        server.abort();
 +    }
 +}

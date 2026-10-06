@@ -8,10 +8,19 @@
 //!   uses.
 //! * [`r1cs`]: export of the circuits as circom `.r1cs` files for the
 //!   multi-party setup.
-//! * [`dev`] (feature `dev-setup`): deterministic development fixtures.
+//! * [`dev`] (feature `dev-fixtures`): deterministic development fixtures.
+//!
+//! Features:
+//! * `dev-setup` makes the build *accept* development and rehearsal keys
+//!   ([`compact::check_setup_accepted`]). Only tests, CI and the drill vault
+//!   enable it; production binaries never do, directly or through feature
+//!   unification.
+//! * `dev-fixtures` exposes [`dev`]. It changes no acceptance policy.
+//!
+//! Generating development keys ([`compact::setup`]) needs neither feature.
 
 pub mod compact;
-#[cfg(feature = "dev-setup")]
+#[cfg(feature = "dev-fixtures")]
 pub mod dev;
 pub mod groth16;
 pub mod r1cs;

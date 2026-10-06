@@ -1,6 +1,7 @@
-//! Development fixtures (feature `dev-setup`, which this crate's own tests
-//! and examples always enable): a deployment signed with the published
-//! development keys, notes, and the honest state chain
+//! Development fixtures (feature `dev-fixtures`, which this crate's own tests
+//! and examples always enable; it does not change which keys load): a
+//! deployment signed with the published development keys, notes, and the
+//! honest state chain
 //!
 //! ```text
 //! S_0 (τ = 1, B = D) --request at N_0--> S_1 (τ_1 = succ(N_0), B - Δ_0) --request at N_1--> ...

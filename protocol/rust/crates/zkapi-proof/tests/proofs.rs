@@ -15,10 +15,10 @@ use ark_std::rand::{rngs::StdRng, SeedableRng};
 use common::*;
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::{
-    circuit_shape, decode_compressed, decode_compressed_accepting, keccak256, proof_from_wire,
+    circuit_shape, decode_compressed, decode_compressed_for, keccak256, proof_from_wire,
     proof_to_wire, request_circuit, sha256, verifying_key_keccak256, withdrawal_circuit, KeyKind,
     RequestProver, RequestVerifier, SetupManifest, WithdrawalProver, WithdrawalVerifier,
-    DEV_SETUP_ID, RELEASE_SETUP_IDS,
+    CEREMONY_VK_KECCAK256, DEV_SETUP_ID,
 };
 use zkapi_proof::dev::DevState;
 use zkapi_proof::groth16::verify_field_elements;
@@ -133,10 +133,11 @@ fn key_kinds_and_setup_ids() {
         ("request.pk", KeyKind::Request),
         ("withdrawal.vk", KeyKind::Withdrawal),
     ] {
-        let error = decode_compressed_accepting::<ark_groth16::VerifyingKey<Bn254>>(
+        let error = decode_compressed_for::<ark_groth16::VerifyingKey<Bn254>>(
             &read(file),
             kind,
-            RELEASE_SETUP_IDS,
+            false,
+            CEREMONY_VK_KECCAK256.as_ref(),
         )
         .unwrap_err()
         .to_string();

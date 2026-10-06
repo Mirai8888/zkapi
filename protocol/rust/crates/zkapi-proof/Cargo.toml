@@ -30,13 +30,21 @@ base64 = { workspace = true }
 rand = { workspace = true }
 
 [features]
-# Accept the development setup (`dev`) and expose `compact::setup` and the
-# `dev` fixtures. Release builds leave it off and accept only `mpc-1` keys.
+# Accept the single-party development and rehearsal setups (`dev`,
+# `rehearsal`) and unpinned `mpc-1` keys. Only tests, CI and the drill vault
+# enable it. Never enable it on a dependency of a production binary: Cargo
+# unifies features across the packages of one build. Release builds leave it
+# off and accept only the pinned `mpc-1` keys (`compact::CEREMONY_VK_KECCAK256`;
+# `cargo run -p zkapi-proof --bin release_policy_check` checks this).
 dev-setup = []
+# The `dev` fixtures (published development signing keys, notes and state
+# chains). Changes no acceptance policy. Key generation (`compact::setup`)
+# needs no feature.
+dev-fixtures = []
 
 [dev-dependencies]
-# Turns on `dev-setup` for this crate's own tests and examples.
-zkapi-proof = { path = ".", features = ["dev-setup"] }
+# Turns on both features for this crate's own tests and examples.
+zkapi-proof = { path = ".", features = ["dev-setup", "dev-fixtures"] }
 
 # Independent implementations for the reduction cross-check, the R1CS
 # fidelity tests and the ceremony import (examples/import_zkey.rs). Never

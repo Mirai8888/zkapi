@@ -84,6 +84,11 @@ jobs:
       - name: Test protocol Rust workspace
         run: cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace -- --test-threads=1
 
+      # Built on its own so that no dev-dependency turns on `dev-setup`: the
+      # library as production binaries see it must refuse development keys.
+      - name: Release builds refuse development keys
+        run: cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --bin release_policy_check
+
   contracts:
     runs-on: ubuntu-latest
     steps:

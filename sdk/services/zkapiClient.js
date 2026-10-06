@@ -101,6 +101,9 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     request_settlement_pending: 'A private chat payment for this balance is still settling. Try the withdrawal again after it settles.',
     transmitted_anchor_unconfirmed: 'This balance was used for a private request whose status the server could not confirm. Try again shortly.',
     transmitted_anchor_escape_unsafe: 'This balance’s current state was already used for a private request, and this vault would burn a challenged escape. Wait for the request to settle, or withdraw by mutual close.',
+    transmitted_anchor_ownership_unsafe: 'This balance’s current state was already used for a private request, and on this vault the ownership proof the server asks for could be used to burn the balance, so it cannot be closed from this state. A private chat that settles moves it to a state that can be withdrawn; otherwise wait for the request to settle or contact the operator.',
+    gateway_rate_limited: 'The service is receiving too many requests right now. Nothing was reserved; try the withdrawal again in a moment.',
+    vault_revision_mismatch: 'This app’s configuration does not match its vault, so withdrawals are paused in this app. Your balance is unchanged; contact the site operator.',
     anchor_challenged: 'An escape at this balance state was already challenged. Withdraw from the server-signed next state once its receipt is recovered.',
     nullifier_challenged: 'The vault already challenged an escape at this balance state. Withdraw from the server-signed next state once its receipt is recovered.',
     challenged_nullifier: 'The vault already challenged an escape at this balance state, so it cannot escape again. Withdraw from the server-signed next state once its receipt is recovered.',
@@ -115,8 +118,14 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.'
 });
 
+// A throttled mutual close whose ownership proof was already sent keeps the
+// note withdrawal-only on a vault that burns a challenged nullifier.
+const GATEWAY_RATE_LIMITED_WITHDRAWAL_ONLY_MESSAGE = 'The service is receiving too many requests right now. This balance’s ownership proof was already sent, so the balance stays withdrawal-only; try the withdrawal again in a moment, or escape.';
+
 function withdrawalErrorWithMessage(error) {
-    const message = WITHDRAWAL_ERROR_MESSAGES[error?.code];
+    const message = error?.code === 'gateway_rate_limited' && error?.data?.withdrawal_only === true
+        ? GATEWAY_RATE_LIMITED_WITHDRAWAL_ONLY_MESSAGE
+        : WITHDRAWAL_ERROR_MESSAGES[error?.code];
     if (message && error && typeof error === 'object') error.shortMessage = message;
     return error;
 }
@@ -653,6 +662,8 @@ class ZkapiClient extends EventTarget {
     }
 
     async quoteDepositUsd(usd, { signal } = {}) {
+        // A quote is for a new deposit, which a closed deployment refuses.
+        if (browserWalletRuntime.depositsClosed()) throw browserWalletRuntime.depositsClosedError();
         const price = await this.refreshEthUsdPrice({ signal });
         const amount = nativeUnitsForUsd(usd, price);
         return Object.freeze({ amount: String(amount), ethAmount: formatUnits(amount, 9),
@@ -670,6 +681,7 @@ class ZkapiClient extends EventTarget {
         if (typeof from !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(from) || /^0x0{40}$/i.test(from)) {
             throw new Error('Choose a valid funding address before estimating this deposit.');
         }
+        await this.assertDepositMayStart();
         const funding = this.config.funding;
         const amount = parseUnits(amountInput, 9);
         if (amount <= 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -1814,9 +1826,22 @@ class ZkapiClient extends EventTarget {
         }
     }
 
+    /**
+     * On a deployment the pinned profile closed to deposits, refuse before any
+     * chain read or wallet prompt unless a deposit was already started (it
+     * stays completable and recoverable). The runtime enforces the same rule
+     * under its wallet lock.
+     */
+    async assertDepositMayStart() {
+        if (browserWalletRuntime.depositsClosed() && !(await browserWalletRuntime.pendingDeposit())) {
+            throw browserWalletRuntime.depositsClosedError();
+        }
+    }
+
     async performDeposit(amountInput, onStatus = () => {}, { preparedOperationId = null } = {}) {
         await this.ensureTestnetAccess({ interactive: true });
         if (this.hasNote) throw new Error('This client already has an active private note.');
+        await this.assertDepositMayStart();
         const funding = this.config?.funding;
         validateNativeFunding(funding);
         await assertNativeVault(funding);

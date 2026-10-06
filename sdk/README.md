@@ -217,8 +217,10 @@ never accepted (for example, a quote that expired before acceptance) never
 settles, so waiting does not help and the balance has to be withdrawn: by
 mutual close, which needs the server's clearance, or on a `vault_revision` 2
 vault also by escape. A strict vault never escapes at a transmitted state, so
-there mutual close is the only exit from that note. Reaching the ceiling takes
-at least 64 failed chats at one state, spread over at least an hour.
+there mutual close is the only exit from that note, and it needs a clearance
+the server grants without an ownership proof (below); otherwise only the
+operator can help. Reaching the ceiling takes at least 64 failed chats at one
+state, spread over at least an hour.
 
 Each record keeps its newest eight server observations. Of its older ones it
 keeps at most one: the newest that is a receipt claim or a reading that ends
@@ -264,7 +266,12 @@ trust anchor and never from the served manifest:
   Withdrawal proofs are reused with refreshed Merkle siblings when only the
   vault root moved. Without it (strict mode) an escape at a transmitted state is
   always refused (`transmitted_anchor_escape_unsafe`), and a moved root always
-  re-proves.
+  re-proves. A declared `2` is checked on chain before it takes effect:
+  initialization reads the vault's `ROOT_HISTORY_WINDOW()`, a view only that
+  vault has, and refuses with `vault_revision_mismatch` if the read reverts,
+  returns no word or is not 86400. Later, a hardened-only view that reverts
+  (`challengedNullifiers` or `effectiveExpiry`) is the same configuration
+  error, never read as "not challenged" or "not about to expire".
 - `clearance_ownership_proof` (`"required"` or `"optional"`). Mutual close
   then sends an escape-form ownership proof (a second withdrawal proof, to the
   user's real destination and current balance) with
@@ -279,11 +286,42 @@ trust anchor and never from the served manifest:
   proof. A proving failure or a refused transmitted-state check (below) leaves
   that previous state, so a note that was usable for chat stays usable. After
   any other failure of the proof-less request the note stays withdrawal-only,
-  because the server may have reserved it. `503 capacity_exhausted` is retried
-  with the same body. An ownership proof is never generated for a transmitted
-  state unless the server reports its nullifier `unknown` or
-  `clearance_reserved`. It is never persisted. The returned clearance is
-  persisted with the plan and reused while the state's nullifier is unchanged.
+  because the server may have reserved it. The ownership proof is never
+  persisted. The returned clearance is persisted with the plan and reused
+  while the state's nullifier is unchanged.
+
+Clearance retries: a gateway's `429 gateway_rate_limited` (the request never
+reached the API) is retried with the same body after its `retry_after_seconds`,
+and so are `409 stale_root` and `503 capacity_exhausted` for a request with a
+proof (the server sends neither for a proof-less one). All waits share one
+budget of 15 seconds, and a wait that does not fit ends the retries. A 429 that
+outlasts them fails the close with `gateway_rate_limited`; trying again later
+completes it. From an honest gateway it reserved nothing, but it is unsigned,
+and whoever sent it may have read the body. So the wallet restores its previous
+withdrawal state only when the request carried no ownership proof, or when
+`vault_revision` is 2. After a request with an ownership proof on any other
+vault, the note stays withdrawal-only and the error carries
+`error.data.withdrawal_only: true`. That proof is an escape at the state's
+nullifier, and a request proof from the same state could challenge it, which
+on such a vault burns the nullifier, so the wallet never makes one from that
+state. Closing again or escaping still works. The wallet does not re-prove on
+its own: a `stale_root` that outlasts the budget fails the close, and the next
+attempt proves at the then-current root.
+
+An ownership proof is itself a valid escape at the state's nullifier. On a
+`vault_revision` 2 vault it is generated for a transmitted state only when the
+server reports that nullifier `unknown` or `clearance_reserved`. On any other
+vault a challenge burns the nullifier, and whoever holds a request proof sent
+from that state (for example a gateway that withheld it) could submit the
+ownership proof as an escape and challenge it. There the wallet never generates
+one for a transmitted state, whatever `clearance_ownership_proof` says: after
+the same server reading, mutual close sends only the proof-less request. If the
+server answers it with `400 clearance_ownership_required` or
+`503 legacy_clearance_capacity`, the wallet restores its previous withdrawal
+state and refuses with `409 transmitted_anchor_ownership_unsafe`
+(`error.data.clearance_error_code` names the server's answer). The note stays
+usable for chat: a request that settles moves it to a new state, which closes
+normally with a proof. A state that never left the device is unaffected.
 
 On a revision-2 vault, `client.withdraw('escape', onStatus, { destination,
 overrideUnsettledRequest: true })` is an explicit, separately keyed escape
@@ -317,7 +355,8 @@ strict vaults, where no override exists. Escape gates contact the server only
 for a transmitted state; on Sepolia that read may prompt for the password.
 
 New 409 codes: `request_settlement_pending`, `transmitted_anchor_unconfirmed`,
-`transmitted_anchor_escape_unsafe`, `anchor_challenged`, `nullifier_challenged`,
+`transmitted_anchor_escape_unsafe`, `transmitted_anchor_ownership_unsafe`,
+`anchor_challenged`, `nullifier_challenged`,
 `receipt_journal_missing`, `receipt_response_missing`, `receipt_pending_install`,
 `request_archive_limit` and `withdrawal_submission_pending`. Vault reverts map to
 `unknown_root`, `challenged_nullifier`, `invalid_destination` and
@@ -365,11 +404,46 @@ vaults have no override, so there only the operator can help. For a genuine
 claim, the operator can, for example, mark that state's nullifier
 `ClearanceReserved` and sign its mutual-close clearance (forgoing that
 request's charge), after which `withdraw('mutual')` withdraws the current
-balance. On a revision-2 vault this also works after a challenged escape,
-because a challenge does not burn the nullifier.
+balance. On a strict vault the wallet asks for that clearance without an
+ownership proof (above), so the server must grant it proof-less, which needs
+its legacy clearance on; ownership is then verified outside the protocol. On a
+revision-2 vault this also works after a challenged escape, because a
+challenge does not burn the nullifier.
 
-The runtime holds one selected note per origin, so exit or set aside a note on
-an older deployment before selecting a newly pinned one.
+## Moving to a newly pinned deployment
+
+The runtime holds one selected note per origin, and it lists and acts only on
+its own deployment's withdrawal records. Exit an older deployment completely
+before funding a note on a newly pinned one: withdraw its selected note and
+finish or finalize every one of its withdrawals. Setting a withdrawal aside is
+not an exit. A set-aside mutual close, a pending or challenged escape, a close
+awaiting finality and a finalization in flight all stay bound to the older
+deployment: only a runtime configured with that deployment's profile can
+submit, finalize or restore them. Once a note on the new deployment is funded,
+the older profile refuses to load in this browser (`This browser contains a
+wallet for <id>`) until that note is withdrawn, while an older note that is
+active again (a set-aside mutual close, or a challenged escape on a vault that
+burns the nullifier) can be claimed at its expiry.
+
+Hosts choose the profile before configuring the SDK, from
+`readBrowserWalletHoldings()` in `@openanonymity/zkapi-browser-sdk/store`. It
+reads the stored wallet once and returns
+`[{ deploymentId, runtime, withdrawals: [{ recordId, noteId, mode, phase }] }]`:
+the runtime slot's deployment while that slot holds durable state (`runtime:
+true`; a note, journal, lease, pending deposit, deposit draft, prepared
+withdrawal or unfinished late attempt), and every deployment with an open
+withdrawal record (any record except a finalized close with no finalization in
+flight). Configure an older deployment's profile while it is listed, and offer
+its withdrawals; configure the newer profile only when it is not. When several
+deployments are listed, the entry with `runtime: true` comes first and is the
+only one that can load until its slot is empty. `browserWalletHoldings(snapshot)`,
+`browserRuntimeHoldsState(runtime)` and `isOpenBrowserWithdrawal(record)` apply
+the same rules to a `readBrowserWalletSnapshot()` the host already read. A
+loaded runtime also reports what it cannot reach:
+`snapshot().config.other_deployment_withdrawals` lists the open withdrawal
+records of other deployments (`deployment_id`, `record_id`, `note_id`, `mode`,
+`phase`; no note state). A host should not offer a deposit while it is
+non-empty. Never clear site data to get past these checks.
 
 ## Native ETH deployments
 
@@ -506,3 +580,29 @@ proof-less requests share a legacy budget that anyone can exhaust (see the
 The runtime checks that active notes, pending deposits, leases, and unfinished
 recovery state match the selected deployment. Preserve wallet state and recovery
 journals with their matching configuration.
+
+## Closing a deployment to deposits
+
+`trusted_deployment.deposits` (`"open"`, the default when absent, or
+`"closed"`) is the browser half of a deposit cutoff for a deployment being
+drained. Like the keys above it is read only from the build-pinned profile and
+validated with it; any other value fails initialization. With `"closed"`:
+
+- `quoteDepositUsd`, `prepareDepositQuote` and `deposit` refuse to start a new
+  deposit with `409 deposits_closed`, before any chain read, note secret or
+  wallet prompt. `snapshot().config.deposits` is `"closed"` (otherwise
+  `"open"`), so the host can hide its deposit action.
+- An unused `depositQuote` draft is discarded at initialization and on a
+  refused attempt. It was never signed, and it would otherwise count as this
+  deployment's wallet state.
+- A deposit already started is never stranded. A pending deposit, signed or
+  not, stays tracked, completable and recoverable for its original amount
+  (`deposit`, `prepareDepositRetry`, `retryUnknownDeposit`,
+  `retryDroppedDeposit`, `recoverBrowserDeposit`); only replacing it with a
+  different amount is refused. Withdrawals, chats and recovery are unaffected.
+
+The SDK builds a deposit's Merkle path from `/v1/tree/snapshot`, which
+withdrawals also need, so a gateway that stops serving the deposit-only tree
+routes does not stop browser deposits. Set this flag in every browser profile
+of the drained deployment, legacy-exit builds included. Builds older than this
+release ignore it and keep offering deposits.

@@ -34,6 +34,8 @@ const LATE_WITHDRAWAL_TERMINAL_STATUSES = new Set([
     'quarantined'
 ]);
 
+const LATE_DEPOSIT_TERMINAL_STATUSES = new Set(['confirmed', 'reverted', 'superseded']);
+
 const EMPTY_RUNTIME = Object.freeze({
     version: 1,
     deploymentId: null,
@@ -400,6 +402,81 @@ export function projectBrowserDeposits(runtime, records, deploymentId, depositCo
         Number(right.createdAt || right.confirmedAt || 0) - Number(left.createdAt || left.confirmedAt || 0));
 }
 
+/**
+ * Whether a stored runtime slot holds durable wallet state: a note, journal,
+ * lease, pending deposit, deposit draft, prepared withdrawal or unfinished late
+ * attempt. A runtime for another deployment refuses to load over such a slot.
+ */
+export function browserRuntimeHoldsState(runtime) {
+    const value = runtime || {};
+    return Boolean(
+        value.state
+        || value.journal
+        || value.pendingDeposit
+        || value.depositQuote
+        || value.preparedWithdrawal
+        || value.lease
+        || (Array.isArray(value.lateWithdrawalAttempts)
+            && value.lateWithdrawalAttempts.some(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt?.status)))
+        || (Array.isArray(value.lateDepositAttempts)
+            && value.lateDepositAttempts.some(attempt => !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt?.status)))
+    );
+}
+
+/**
+ * Whether a withdrawal record can still hold, return or pay out a note: every
+ * record except a finalized close (phase 'closed' with no finalization in
+ * flight). That covers set-aside mutual closes, pending and challenged
+ * escapes, closes awaiting finality and finalizations in flight. Only its own
+ * deployment's runtime can act on it.
+ */
+export function isOpenBrowserWithdrawal(record) {
+    if (!record || record.phase !== 'closed') return Boolean(record);
+    const hashes = Array.isArray(record.finalizeTransactionHashes)
+        ? record.finalizeTransactionHashes
+        : record.finalizeTransactionHash ? [record.finalizeTransactionHash] : [];
+    return Boolean(record.finalizeSubmissionId || hashes.length);
+}
+
+/** The public identity of an open withdrawal record: no note state or proof. */
+function withdrawalHolding(record) {
+    return {
+        recordId: record.recordId,
+        noteId: record.noteId == null ? null : Number(record.noteId),
+        mode: record.mode || null,
+        phase: record.phase || null
+    };
+}
+
+/**
+ * The deployments this browser still holds funds or unfinished recovery for,
+ * from one readBrowserWalletSnapshot(): the runtime slot's deployment while
+ * browserRuntimeHoldsState(runtime), and every deployment with an open
+ * withdrawal record (isOpenBrowserWithdrawal). Returns
+ * [{ deploymentId, runtime, withdrawals: [{ recordId, noteId, mode, phase }] }],
+ * the runtime slot's deployment first: only that one can load while its slot
+ * holds state. Hosts select a deployment's profile while it is listed.
+ */
+export function browserWalletHoldings(snapshot) {
+    const holdings = new Map();
+    const entry = deploymentId => {
+        if (!holdings.has(deploymentId)) holdings.set(deploymentId, { deploymentId, runtime: false, withdrawals: [] });
+        return holdings.get(deploymentId);
+    };
+    const runtime = snapshot?.runtime;
+    if (browserRuntimeHoldsState(runtime)) entry(runtime.deploymentId || null).runtime = true;
+    for (const record of snapshot?.withdrawals || []) {
+        if (isOpenBrowserWithdrawal(record)) entry(record.deploymentId || null).withdrawals.push(withdrawalHolding(record));
+    }
+    return [...holdings.values()].sort((left, right) => Number(right.runtime) - Number(left.runtime)
+        || String(left.deploymentId).localeCompare(String(right.deploymentId)));
+}
+
+/** browserWalletHoldings of the current stored wallet (every deployment). */
+export async function readBrowserWalletHoldings() {
+    return browserWalletHoldings(await readBrowserWalletSnapshot());
+}
+
 export async function readBrowserWallet() {
     const database = await openDatabase();
     const transaction = database.transaction(RUNTIME_STORE, 'readonly');
@@ -446,6 +523,13 @@ export async function readBrowserWalletSnapshot(deploymentId = null) {
         withdrawals: records
             .filter(record => !deploymentId || record.deploymentId === deploymentId)
             .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0)),
+        // Open withdrawals of other deployments, which this deployment's
+        // runtime can neither see nor act on (empty without a filter).
+        otherDeploymentWithdrawals: deploymentId
+            ? records.filter(record => record.deploymentId !== deploymentId && isOpenBrowserWithdrawal(record))
+                .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+                .map(record => ({ deploymentId: record.deploymentId || null, ...withdrawalHolding(record) }))
+            : [],
         requestArchive: requestArchiveRecords(requestArchive, deploymentId)
     };
 }

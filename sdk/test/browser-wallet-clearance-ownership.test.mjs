@@ -40,6 +40,13 @@ async function discardFirstRequest(h) {
 const escapeProofs = h => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'escape');
 const mutualProofs = h => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'mutual');
 const clearancePosts = h => h.serverCalls('POST', '/v2/withdraw/clearance');
+const markerOf = async () => {
+    const marker = (await store.readBrowserWallet()).preparedWithdrawal;
+    return marker && { phase: marker.phase, mode: marker.mode, clearanceReserved: marker.clearanceReserved,
+        withdrawalNullifier: marker.withdrawalNullifier };
+};
+const RESERVING = Object.freeze({ phase: 'reserving', mode: 'mutual', clearanceReserved: true,
+    withdrawalNullifier: nullifierFor(GENESIS_ANCHOR) });
 
 test('mutual clearance sends an escape-form ownership proof for the same nullifier and destination', async () => {
     const h = await freshWallet({ clearanceOwnershipProof: 'required' });
@@ -123,6 +130,7 @@ test('a request proof is never sent as an ownership proof', async () => {
 
 test('an ownership proof is generated at a transmitted state only after the server reports it unknown or clearance-reserved', async () => {
     for (const capability of [{ vaultRevision: 2 }, { clearanceOwnershipProof: 'required' }, {}]) {
+        const strict = capability.vaultRevision !== 2;
         const h = await freshWallet(capability);
         await discardFirstRequest(h);
         h.server.clearance = body => {
@@ -137,14 +145,112 @@ test('an ownership proof is generated at a transmitted state only after the serv
             await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), { code });
             assert.equal(escapeProofs(h).length, 0, 'no ownership proof is generated');
             assert.ok(clearancePosts(h).every(call => !call.body.ownership_proof));
+            assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'a refused gate leaves the note usable');
         }
-        await store.writeBrowserWallet({ ...(await store.readBrowserWallet()), preparedWithdrawal: null });
-        await h.runtime.reload();
         h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'clearance_reserved' });
+        if (strict) {
+            // A vault that burns a challenged nullifier: the ownership proof is
+            // a submittable escape, so the state gets only a proof-less request.
+            await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION),
+                { code: 'transmitted_anchor_ownership_unsafe', status: 409 });
+            assert.equal(escapeProofs(h).length, 0, 'a strict vault never proves ownership at a transmitted state');
+            assert.ok(clearancePosts(h).every(call => !call.body.ownership_proof));
+            assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'nothing was reserved');
+            continue;
+        }
         const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
         assert.equal(plan.mode, 'mutual');
         assert.equal(escapeProofs(h).length, 1);
         assert.ok(clearancePosts(h).at(-1).body.ownership_proof);
+    }
+});
+
+// The gateway that withheld a lease POST at this state holds a request proof
+// for its nullifier. On a vault whose challenge burns the nullifier, it could
+// submit an ownership proof as an escape and challenge it with that request.
+test('a strict vault answers a forged or honest proof requirement at a transmitted state with a refusal, never a proof', async () => {
+    for (const profile of [{}, { clearanceOwnershipProof: 'optional' }, { clearanceOwnershipProof: 'required' }]) {
+        for (const [status, code] of LEGACY_REFUSALS) {
+            const label = `${JSON.stringify(profile)} after ${code}`;
+            const h = await freshWallet(profile);
+            await discardFirstRequest(h);
+            proofOnlyServer(h, status, code);
+            for (const reading of ['unknown', 'clearance_reserved']) {
+                h.server.nullifier = () => reading === 'unknown'
+                    ? { status: 'not_found', nullifier_status: 'unknown' }
+                    : { status: 'ok', nullifier_status: 'clearance_reserved' };
+                await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error => {
+                    assert.equal(error.code, 'transmitted_anchor_ownership_unsafe', label);
+                    assert.equal(error.status, 409, label);
+                    assert.equal(error.data.transmitted, true, label);
+                    assert.equal(error.data.clearance_error_code, code, label);
+                    return true;
+                });
+            }
+            assert.equal(escapeProofs(h).length, 0, `${label}: no escape-form proof exists`);
+            assert.deepEqual(clearancePosts(h).map(post => post.body),
+                [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }, { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }],
+                `${label}: only proof-less requests leave the device`);
+            assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, `${label}: the marker is rolled back`);
+            // The note is not withdrawal-only: a chat from this state that
+            // settles moves it to a new state, which closes normally.
+            const request = await h.runtime.prepareLeaseRequest(() => {});
+            assert.equal(request.public_inputs.request_nullifier, nullifierFor(GENESIS_ANCHOR), label);
+        }
+    }
+
+    // The background exit of a set-aside balance follows the same rule.
+    const h = await freshWallet({ clearanceOwnershipProof: 'optional' });
+    await discardFirstRequest(h);
+    const state = noteState();
+    await store.writeBrowserWallet({ ...(await store.readBrowserWallet()),
+        state: noteState({ note_id: 8, current_anchor: '0x8888' }) });
+    await store.putBrowserWithdrawal({ recordId: RECORD_ID, deploymentId: DEPLOYMENT, chainId: 11155111,
+        contractAddress: VAULT, noteId: 7, mode: 'mutual', destination: DESTINATION, phase: 'parked',
+        clearanceReserved: true, state, finalBalance: state.current_balance, withdrawalNullifier: nullifierFor(GENESIS_ANCHOR),
+        preparedWithdrawal: { phase: 'reserving', mode: 'mutual', noteId: 7, operationId: 'old',
+            destination: DESTINATION, clearanceReserved: true, withdrawalNullifier: nullifierFor(GENESIS_ANCHOR) } });
+    await h.runtime.reload();
+    proofOnlyServer(h, 503, 'legacy_clearance_capacity');
+    await assert.rejects(h.runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: h.chain.root }),
+        { code: 'transmitted_anchor_ownership_unsafe' });
+    assert.equal(escapeProofs(h).length, 0);
+    assert.ok(clearancePosts(h).every(post => !post.body.ownership_proof));
+
+    // The prover itself refuses such a state, whoever asks.
+    await assert.rejects(h.runtime.generateOwnershipProof({ state, destination: DESTINATION,
+        nullifier: nullifierFor(GENESIS_ANCHOR), path: await h.runtime.treePath(7) }),
+    { code: 'transmitted_anchor_ownership_unsafe' });
+    assert.equal(escapeProofs(h).length, 0);
+});
+
+test('a strict vault closes a transmitted state through a proof-less clearance the server grants', async () => {
+    for (const profile of [{}, { clearanceOwnershipProof: 'optional' }, { clearanceOwnershipProof: 'required' }]) {
+        const h = await freshWallet(profile);
+        await discardFirstRequest(h);
+        h.server.clearance = body => clearanceFor(body);
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'mutual');
+        assert.deepEqual(clearancePosts(h).map(post => post.body), [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }]);
+        assert.equal(escapeProofs(h).length, 0);
+        assert.deepEqual(plan.clearance, clearanceFor({ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }));
+    }
+});
+
+test('a strict vault still proves ownership at a state that never left the device', async () => {
+    for (const [profile, expected] of [[{}, [false, true]], [{ clearanceOwnershipProof: 'optional' }, [true]],
+        [{ clearanceOwnershipProof: 'required' }, [true]]]) {
+        for (const [status, code] of LEGACY_REFUSALS) {
+            const h = await freshWallet(profile);
+            proofOnlyServer(h, status, code);
+            const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+            assert.equal(plan.mode, 'mutual');
+            assert.deepEqual(clearancePosts(h).map(post => Boolean(post.body.ownership_proof)), expected,
+                `${JSON.stringify(profile)} after ${code}`);
+            assert.equal(escapeProofs(h).length, 1);
+            assert.equal(h.server.calls.filter(call => call.path.startsWith('/v2/nullifiers/')).length, 0,
+                'an untransmitted state needs no server reading');
+        }
     }
 });
 
@@ -217,22 +323,164 @@ test('a legacy profile answers a spent legacy-clearance budget with its ownershi
     assert.equal(plan.mode, 'mutual');
     assert.deepEqual(plan.clearance, clearanceFor(body));
 
-    // Saturated verification is still retried with the same proof-less body.
+    // capacity_exhausted comes only from proof verification, so a proof-less
+    // body answered with it is not retried, and nothing says it reserved nothing.
     const saturated = await freshWallet();
     const delays = [];
     saturated.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
         saturated.runtime, body, nullifier, signal, { delays: [1, 2, 4, 8], sleep: async milliseconds => { delays.push(milliseconds); } });
-    let attempts = 0;
-    saturated.server.clearance = body => {
-        attempts += 1;
-        if (attempts === 1) throw new HttpError('Verification is saturated.', 503, 'capacity_exhausted');
-        return clearanceFor(body);
+    saturated.server.clearance = () => { throw new HttpError('Verification is saturated.', 503, 'capacity_exhausted'); };
+    await assert.rejects(saturated.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'capacity_exhausted' });
+    assert.deepEqual(clearancePosts(saturated).map(post => post.body), [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }]);
+    assert.deepEqual(delays, []);
+    assert.deepEqual(await markerOf(), RESERVING);
+});
+
+// The reference gateway's own answer to a throttled POST, before the API.
+const gatewayThrottle = () => new HttpError('Too many requests from this network source; retry the same request later.',
+    429, 'gateway_rate_limited', { retriable: true, retry_after_seconds: 5 });
+const withRecordedBackoff = h => {
+    const sleeps = [];
+    h.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
+        h.runtime, body, nullifier, signal, { sleep: async milliseconds => { sleeps.push(milliseconds); } });
+    return sleeps;
+};
+
+test('a gateway 429 on the clearance is retried with the same body after its retry-after delay', async () => {
+    for (const [profile, proofs] of [[{}, false], [{ clearanceOwnershipProof: 'required' }, true], [{ vaultRevision: 2 }, true]]) {
+        const label = JSON.stringify(profile);
+        const h = await freshWallet(profile);
+        const sleeps = withRecordedBackoff(h);
+        const markers = [];
+        let posts = 0;
+        h.server.clearance = async body => {
+            markers.push((await store.readBrowserWallet()).preparedWithdrawal?.phase ?? null);
+            posts += 1;
+            if (posts <= 2) throw gatewayThrottle();
+            return clearanceFor(body);
+        };
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'mutual', label);
+        const bodies = clearancePosts(h).map(post => post.raw);
+        assert.equal(bodies.length, 3, label);
+        assert.ok(bodies.every(body => body === bodies[0]), `${label}: the identical body is retried`);
+        assert.equal(Boolean(JSON.parse(bodies[0]).ownership_proof), proofs, label);
+        assert.deepEqual(sleeps, [5_000, 5_000], `${label}: Retry-After outranks the shorter backoff`);
+        assert.deepEqual(markers, ['reserving', 'reserving', 'reserving'], label);
+        assert.equal(escapeProofs(h).length, proofs ? 1 : 0, `${label}: one ownership proof at most`);
+    }
+});
+
+test('a gateway 429 that outlasts the backoff budget restores the note only when no proof could be captured', async () => {
+    // [profile, ownership proof sent, note usable afterwards]
+    for (const [profile, proofs, usable] of [[{}, false, true], [{ clearanceOwnershipProof: 'required' }, true, false],
+        [{ clearanceOwnershipProof: 'optional' }, true, false], [{ vaultRevision: 2 }, true, true]]) {
+        const label = JSON.stringify(profile);
+        const h = await freshWallet(profile);
+        const sleeps = withRecordedBackoff(h);
+        h.server.clearance = () => { throw gatewayThrottle(); };
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error => {
+            assert.equal(error.code, 'gateway_rate_limited', label);
+            assert.equal(error.status, 429, label);
+            assert.equal(error.data.retry_after_seconds, 5, label);
+            assert.equal(error.data.withdrawal_only === true, !usable, label);
+            return true;
+        });
+        // 5 + 5 + 5 seconds fill the 15 second budget; the fourth wait would not fit.
+        assert.deepEqual(sleeps, [5_000, 5_000, 5_000], label);
+        assert.equal(clearancePosts(h).length, 4, label);
+        assert.ok(clearancePosts(h).every(post => Boolean(post.body.ownership_proof) === proofs), label);
+        if (usable) {
+            // Nothing that could be submitted left the device, or the vault
+            // restores a challenged note: the marker is rolled back.
+            assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, `${label}: the marker is rolled back`);
+            const request = await h.runtime.prepareLeaseRequest(() => {});
+            assert.equal(request.public_inputs.request_nullifier, nullifierFor(GENESIS_ANCHOR), `${label}: chat is still available`);
+            continue;
+        }
+        // Whoever answered the 429 may hold the ownership proof, a submittable
+        // escape at this nullifier; this vault burns a nullifier whose escape a
+        // request proof challenges. No request proof is made from this state.
+        assert.deepEqual(await markerOf(), RESERVING, `${label}: the note stays withdrawal-only`);
+        await assert.rejects(h.runtime.prepareLeaseRequest(() => {}), /Finish the prepared withdrawal/, label);
+        assert.equal(h.workerOperations('prepareRequest').length, 0, `${label}: no request proof exists`);
+        await assert.rejects(h.runtime.clearPreparedWithdrawal(), /must remain withdrawal-only/, label);
+        // Closing again completes the close.
+        h.server.clearance = body => clearanceFor(body);
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'mutual', label);
+        assert.deepEqual(plan.clearance, clearanceFor(clearancePosts(h).at(-1).body), label);
+    }
+
+    // A retry-after longer than the whole budget is not waited out.
+    const slow = await freshWallet();
+    const sleeps = withRecordedBackoff(slow);
+    slow.server.clearance = () => {
+        throw new HttpError('Throttled.', 429, 'gateway_rate_limited', { retriable: true, retry_after_seconds: 60 });
     };
-    await saturated.runtime.prepareWithdrawal('mutual', DESTINATION);
-    assert.deepEqual(clearancePosts(saturated).map(post => post.body), [
-        { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }, { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }]);
-    assert.deepEqual(delays, [1]);
-    assert.equal(escapeProofs(saturated).length, 0);
+    await assert.rejects(slow.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'gateway_rate_limited' });
+    assert.deepEqual(sleeps, []);
+    assert.equal(clearancePosts(slow).length, 1);
+    assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null);
+
+    // An earlier attempt's marker may stand for a reservation: it is restored, never dropped.
+    const earlier = await freshWallet();
+    withRecordedBackoff(earlier);
+    await store.writeBrowserWallet({ ...(await store.readBrowserWallet()), preparedWithdrawal: {
+        phase: 'reserving', mode: 'mutual', operationId: 'earlier', noteId: 7, destination: DESTINATION,
+        withdrawalNullifier: nullifierFor(GENESIS_ANCHOR), clearanceReserved: true, createdAt: 1 } });
+    await earlier.runtime.reload();
+    const saved = (await store.readBrowserWallet()).preparedWithdrawal;
+    earlier.server.clearance = () => { throw gatewayThrottle(); };
+    await assert.rejects(earlier.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'gateway_rate_limited' });
+    assert.deepEqual(clearancePosts(earlier).map(post => Boolean(post.body.ownership_proof)), [false, false, false, false]);
+    assert.deepEqual((await store.readBrowserWallet()).preparedWithdrawal, saved);
+});
+
+// The gateway that answers 429 may also read the body: it holds the ownership
+// proof of a mutual close (an escape at nullifier N to the real destination).
+// If the note then sent a request proof at N, that gateway could submit the
+// escape on a strict vault and challenge it with the request, which burns N.
+test('a strict vault keeps the note withdrawal-only after a throttled proof that followed a refused proof-less request', async () => {
+    for (const [status, code] of LEGACY_REFUSALS) {
+        const label = `after ${code}`;
+        const h = await freshWallet();
+        withRecordedBackoff(h);
+        const captured = [];
+        h.server.clearance = body => {
+            if (!body.ownership_proof) throw new HttpError('Nothing was reserved.', status, code, { retriable: status === 503 });
+            captured.push(body.ownership_proof.public_inputs);
+            throw new HttpError('Throttled.', 429, 'gateway_rate_limited', { retriable: true, retry_after_seconds: 60 });
+        };
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error =>
+            error.code === 'gateway_rate_limited' && error.data.withdrawal_only === true, label);
+        assert.deepEqual(clearancePosts(h).map(post => Boolean(post.body.ownership_proof)), [false, true], label);
+        assert.equal(captured[0].has_clearance, false, label);
+        assert.equal(captured[0].withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR), label);
+        assert.deepEqual(await markerOf(), RESERVING, `${label}: the note stays withdrawal-only`);
+        await assert.rejects(h.runtime.issueLease('chat'), /Finish the prepared withdrawal/, label);
+        assert.equal(h.serverCalls('POST', '/v2/openrouter/leases').length + h.workerOperations('prepareRequest').length, 0,
+            `${label}: no request proof at the captured nullifier`);
+
+        // A refused proof-less request on the next attempt keeps that marker.
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'gateway_rate_limited' }, label);
+        assert.deepEqual(await markerOf(), RESERVING, label);
+        // Escaping from the untransmitted state stays available.
+        const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+        assert.equal(escape.mode, 'escape', label);
+        assert.equal(escape.clearanceReserved, true, `${label}: the escape plan stays withdrawal-only`);
+    }
+
+    // A hardened vault recovers a challenged nullifier, so the note is restored.
+    const hardened = await freshWallet({ vaultRevision: 2 });
+    withRecordedBackoff(hardened);
+    hardened.server.clearance = () => {
+        throw new HttpError('Throttled.', 429, 'gateway_rate_limited', { retriable: true, retry_after_seconds: 60 });
+    };
+    await assert.rejects(hardened.runtime.prepareWithdrawal('mutual', DESTINATION), error =>
+        error.code === 'gateway_rate_limited' && !error.data.withdrawal_only);
+    assert.ok(clearancePosts(hardened).every(post => post.body.ownership_proof));
+    assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null);
 });
 
 test('a local ownership-proof failure never makes the note withdrawal-only on a legacy profile either', async () => {
@@ -331,13 +579,6 @@ const LOST_ANSWERS = [
     ['a 504 without an error code', () => new HttpError('Gateway timeout', 504, undefined)],
     ['500 internal_error', () => new HttpError('The server failed.', 500, 'internal_error')]
 ];
-const markerOf = async () => {
-    const marker = (await store.readBrowserWallet()).preparedWithdrawal;
-    return marker && { phase: marker.phase, mode: marker.mode, clearanceReserved: marker.clearanceReserved,
-        withdrawalNullifier: marker.withdrawalNullifier };
-};
-const RESERVING = Object.freeze({ phase: 'reserving', mode: 'mutual', clearanceReserved: true,
-    withdrawalNullifier: nullifierFor(GENESIS_ANCHOR) });
 
 test('an answer lost after a proof-less clearance keeps the note withdrawal-only until the close completes', async () => {
     for (const [label, lostAnswer] of LOST_ANSWERS) {
@@ -407,7 +648,7 @@ test('an answer lost after the proof-carrying clearance keeps the note withdrawa
     }
 });
 
-test('a lagging clearance root retries the same ownership proof with backoff, then fails for the outer re-prove', async () => {
+test('a lagging clearance root retries the same ownership proof with backoff, then fails the close', async () => {
     const h = await freshWallet({ clearanceOwnershipProof: 'required' });
     const sleeps = [];
     h.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
@@ -429,9 +670,21 @@ test('a lagging clearance root retries the same ownership proof with backoff, th
     const stuck = await freshWallet({ clearanceOwnershipProof: 'required' });
     stuck.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
         stuck.runtime, body, nullifier, signal, { delays: [1, 2, 4, 8], sleep: async () => {} });
-    stuck.server.clearance = () => { throw new HttpError('The ownership root is not known yet.', 409, 'ownership_root_unknown'); };
-    await assert.rejects(stuck.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'ownership_root_unknown' });
+    // The server rejects a clearance root it does not know with stale_root.
+    stuck.server.clearance = () => {
+        throw new HttpError('The ownership root is not known yet.', 409, 'stale_root', { latest_root: '0x76' });
+    };
+    await assert.rejects(stuck.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'stale_root' });
     assert.equal(clearancePosts(stuck).length, 5);
+    assert.equal(escapeProofs(stuck).length, 1, 'the runtime never re-proves on its own');
+
+    // Codes the server never sends for a clearance are not retried.
+    const invented = await freshWallet({ clearanceOwnershipProof: 'required' });
+    invented.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
+        invented.runtime, body, nullifier, signal, { delays: [1, 2, 4, 8], sleep: async () => {} });
+    invented.server.clearance = () => { throw new HttpError('Unknown root.', 409, 'ownership_root_unknown'); };
+    await assert.rejects(invented.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'ownership_root_unknown' });
+    assert.equal(clearancePosts(invented).length, 1);
 });
 
 test('nullifier_used from the clearance endpoint is advisory and never becomes challenge evidence', async () => {
@@ -633,4 +886,21 @@ test('withdraw keys the escape override separately and prompts for the Sepolia p
     });
     await assert.rejects(client.withdraw('escape', () => {}, { destination: DESTINATION }), error =>
         /still settling/.test(error.shortMessage) && error.data.escape_override_after === 5);
+});
+
+test('withdraw explains a refused transmitted-state close and a throttled clearance', async t => {
+    const client = new ZkapiClient();
+    client.config = { funding: { chain_id: 11155111, contract_address: VAULT } };
+    client.wallet = { has_note: true, note: { note_id: 7 } };
+    t.mock.method(client, 'ensureTestnetAccess', async () => {});
+    for (const [code, data, pattern] of [['transmitted_anchor_ownership_unsafe', { transmitted: true }, /cannot be closed from this state/],
+        ['gateway_rate_limited', { retry_after_seconds: 5 }, /Nothing was reserved/],
+        ['gateway_rate_limited', { retry_after_seconds: 5, withdrawal_only: true }, /stays withdrawal-only/]]) {
+        t.mock.method(client, 'performWithdrawal', async () => {
+            throw Object.assign(new Error(code), { code, data });
+        });
+        await assert.rejects(client.withdraw('mutual', () => {}, { destination: DESTINATION }), error =>
+            pattern.test(error.shortMessage) && error.code === code
+            && (data.withdrawal_only ? !/Nothing was reserved/.test(error.shortMessage) : true));
+    }
 });

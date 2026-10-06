@@ -1,5 +1,5 @@
 import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport } from '../configure.js';
-import { assertNativeVault, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
+import { assertHardenedVault, assertNativeVault, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote, vaultRevisionMismatch, vaultViewMissing } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
 import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
@@ -23,6 +23,7 @@ import {
 import {
     archiveBrowserWallet,
     assertBrowserBackgroundWithdrawalAvailable,
+    browserRuntimeHoldsState,
     authorizeBrowserWithdrawalFinalizationRetry,
     claimBrowserWithdrawalStartReplacement,
     claimBrowserBackgroundWithdrawalSubmission,
@@ -87,9 +88,16 @@ const RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT = 'receipt_journal_missing';
 const RECEIPT_JOURNAL_MISSING_MESSAGE = 'The server reports a finalized private request for this balance that this browser cannot apply.';
 // The same refusal when it rests on a claim that an earlier read saved.
 const RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE = 'The server earlier reported a finalized private request for this balance that this browser cannot apply.';
+const DEPOSITS_CLOSED_MESSAGE = 'This deployment no longer accepts new deposits. Existing balances and deposits already started can still be completed, recovered and withdrawn.';
 const REQUEST_ARCHIVE_LIMIT_MESSAGE = 'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.';
 const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
 const CLEARANCE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000]);
+// The reference gateway's own 429: the request never reached the API.
+const CLEARANCE_GATEWAY_THROTTLED = 'gateway_rate_limited';
+// Server refusals of a proof-less clearance that reserved nothing.
+const CLEARANCE_NOTHING_RESERVED = new Set(['clearance_ownership_required', 'legacy_clearance_capacity']);
+const CLEARANCE_THROTTLED_WITHDRAWAL_ONLY_MESSAGE = 'The service is receiving too many requests and did not grant this mutual close. Its ownership proof was already sent, and on this vault a private request from this balance could let that proof burn the balance, so the balance stays withdrawal-only. Try the withdrawal again in a moment, or escape.';
+const TRANSMITTED_OWNERSHIP_MESSAGE = 'This balance’s current state was already sent with a private request, and this vault can permanently burn a challenged escape. The server asks for an ownership proof, which works as such an escape, so this wallet does not send one from this state. A private chat that settles moves the balance to a new state that can be withdrawn; otherwise wait for the pending request to settle or ask the operator.';
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
 const SETTLEMENT_RETRY_MAX_MS = 60_000;
 const VAULT_SELECTORS = Object.freeze({
@@ -209,6 +217,40 @@ class BrowserWalletHttpError extends Error {
         this.code = code;
         this.data = data;
     }
+}
+
+/** A 429's retry_after_seconds (body or Retry-After header) in milliseconds, else 0. */
+function retryAfterMilliseconds(error) {
+    const seconds = Number(error?.data?.retry_after_seconds);
+    return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1_000) : 0;
+}
+
+/**
+ * The refusal of a mutual close at a transmitted state of a vault without
+ * non-destructive challenges, when the server will not grant a proof-less
+ * clearance: `error` is that answer (null when refused before asking).
+ */
+function transmittedOwnershipRefusal(error) {
+    return new BrowserWalletHttpError(TRANSMITTED_OWNERSHIP_MESSAGE, 409, 'transmitted_anchor_ownership_unsafe', {
+        transmitted: true,
+        clearance_error_code: error?.code || null
+    });
+}
+
+/**
+ * A gateway 429 that outlasted the retries of a clearance carrying an
+ * ownership proof, on a vault whose challenge burns the nullifier: the same
+ * code and retry hint, with `withdrawal_only` because the note keeps its
+ * withdrawal-only marker.
+ */
+function clearanceThrottledAfterOwnershipProof(error) {
+    const throttled = new BrowserWalletHttpError(CLEARANCE_THROTTLED_WITHDRAWAL_ONLY_MESSAGE,
+        error?.status ?? 429, CLEARANCE_GATEWAY_THROTTLED, {
+            ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+            withdrawal_only: true
+        });
+    throttled.cause = error;
+    return throttled;
 }
 
 class WorkerBridge {
@@ -418,6 +460,7 @@ class BrowserWalletRuntime extends EventTarget {
         this.runtime = null;
         this.withdrawals = [];
         this.deposits = [];
+        this.otherDeploymentWithdrawals = [];
         // Transmitted-request archive cache. Decisions use it only after
         // reload() under the global wallet lock.
         this.requestArchive = [];
@@ -487,6 +530,10 @@ class BrowserWalletRuntime extends EventTarget {
             requestPassword: browserSdkOptions().requestTestnetPassword
         });
         await assertNativeVault(this.config.funding);
+        // A build-pinned vault_revision 2 enables the escape override and
+        // proof reuse, which are safe only on a vault whose challenge does not
+        // burn the nullifier. Require the hardened interface on chain first.
+        if (this.vaultCapabilities().hardenedVault) await assertHardenedVault(this.config.funding);
         this.worker = new WorkerBridge();
         // Initialization participates in the same global lock as every later
         // mutation. This prevents two same-origin deployment tabs from both
@@ -500,6 +547,7 @@ class BrowserWalletRuntime extends EventTarget {
                     billingAsset: 'native_eth'
                 });
             }
+            await this.discardClosedDepositDraftLocked();
             await this.recoverPendingLocked({ retireLostKey: true, quiet: true });
         });
         this.channel = createWalletChannel(this.manifest.deployment_id, () => {
@@ -663,6 +711,36 @@ class BrowserWalletRuntime extends EventTarget {
             && !['required', 'optional'].includes(trusted.clearance_ownership_proof)) {
             throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof.');
         }
+        // The deposit cutoff of a deployment being drained, also from the
+        // build-pinned profile only.
+        if (trusted.deposits != null && !['open', 'closed'].includes(trusted.deposits)) {
+            throw new Error('browser-config.json contains an invalid trusted deposits setting.');
+        }
+    }
+
+    /**
+     * Whether the build-pinned profile closed this deployment to new deposits
+     * (trusted_deployment.deposits "closed"). Deposits already started stay
+     * tracked, completable and recoverable; nothing new can be quoted or
+     * prepared.
+     */
+    depositsClosed() {
+        return this.browserConfig?.trusted_deployment?.deposits === 'closed';
+    }
+
+    depositsClosedError() {
+        return new BrowserWalletHttpError(DEPOSITS_CLOSED_MESSAGE, 409, 'deposits_closed');
+    }
+
+    /**
+     * On a closed deployment an unused deposit draft can never be promoted or
+     * sent, so drop it: it would otherwise count as this deployment's wallet
+     * state. A draft is never signed and holds no funds. Call under the lock.
+     */
+    async discardClosedDepositDraftLocked() {
+        if (!this.depositsClosed() || !this.runtime?.depositQuote) return false;
+        await this.commit({ ...this.runtime, depositQuote: null });
+        return true;
     }
 
     /**
@@ -795,6 +873,14 @@ class BrowserWalletRuntime extends EventTarget {
             .map(attempt => `${attempt.from.toLowerCase()}:${Number(attempt.nonce)}`));
         const config = this.config ? {
             ...this.config,
+            deposits: this.depositsClosed() ? 'closed' : 'open',
+            other_deployment_withdrawals: (this.otherDeploymentWithdrawals || []).map(record => ({
+                deployment_id: record.deploymentId,
+                record_id: record.recordId,
+                note_id: record.noteId,
+                mode: record.mode,
+                phase: record.phase
+            })),
             active_lease: active,
             late_withdrawal_attempts: (this.runtime?.lateWithdrawalAttempts || [])
                 .filter(attempt => !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status))
@@ -976,20 +1062,7 @@ class BrowserWalletRuntime extends EventTarget {
         const deploymentId = this.manifest?.deployment_id || this.runtime?.deploymentId || null;
         const snapshot = await readBrowserWalletSnapshot(deploymentId);
         const storedRuntime = snapshot.runtime;
-        const hasDurableState = Boolean(
-            storedRuntime.state
-            || storedRuntime.journal
-            || storedRuntime.pendingDeposit
-            || storedRuntime.depositQuote
-            || storedRuntime.preparedWithdrawal
-            || storedRuntime.lease
-            || (Array.isArray(storedRuntime.lateWithdrawalAttempts)
-                && storedRuntime.lateWithdrawalAttempts.some(attempt =>
-                    !LATE_WITHDRAWAL_TERMINAL_STATUSES.has(attempt.status)))
-            || (Array.isArray(storedRuntime.lateDepositAttempts)
-                && storedRuntime.lateDepositAttempts.some(attempt =>
-                    !LATE_DEPOSIT_TERMINAL_STATUSES.has(attempt.status)))
-        );
+        const hasDurableState = browserRuntimeHoldsState(storedRuntime);
         if (this.manifest && hasDurableState
             && (!storedRuntime.deploymentId || storedRuntime.deploymentId !== this.manifest.deployment_id
                 || (storedRuntime.billingAsset != null && storedRuntime.billingAsset !== 'native_eth'))) {
@@ -1001,6 +1074,9 @@ class BrowserWalletRuntime extends EventTarget {
             ? { ...storedRuntime, deploymentId: this.manifest.deployment_id }
             : storedRuntime;
         this.withdrawals = snapshot.withdrawals;
+        // Only another deployment's runtime can finish these; the snapshot
+        // reports them so a host can switch profiles before funding here.
+        this.otherDeploymentWithdrawals = snapshot.otherDeploymentWithdrawals || [];
         this.deposits = snapshot.deposits;
         this.requestArchive = snapshot.requestArchive || [];
         return this.runtime;
@@ -1183,6 +1259,11 @@ class BrowserWalletRuntime extends EventTarget {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const pending = this.runtime.pendingDeposit;
+            if (!pending && this.depositsClosed()) {
+                // Only a deposit already started may still be quoted.
+                await this.discardClosedDepositDraftLocked();
+                throw this.depositsClosedError();
+            }
             if (this.runtime.state || (pending && !this.canQuotePendingDeposit(pending))) {
                 throw new Error('Recover the existing private balance or deposit before preparing another quote.');
             }
@@ -1236,6 +1317,10 @@ class BrowserWalletRuntime extends EventTarget {
                     || draft.amount !== amount) {
                     throw new Error('The deposit quote changed in another tab. Refresh the quote before continuing.');
                 }
+                if (this.depositsClosed()) {
+                    await this.discardClosedDepositDraftLocked();
+                    throw this.depositsClosedError();
+                }
                 const promoted = { ...draft, phase: 'prepared' };
                 // Promotion is the explicit deposit action, atomic with the
                 // stale-quote check under the same cross-tab wallet lock.
@@ -1260,11 +1345,17 @@ class BrowserWalletRuntime extends EventTarget {
                         || pending.transactionHash || pending.transactionHashes?.length) {
                         throw new Error('A previous deposit may already be in MetaMask. Recover it before changing the amount.');
                     }
+                    // Replacing it would start a new deposit; it stays as it is.
+                    if (this.depositsClosed()) throw this.depositsClosedError();
                     await this.commit({ ...this.runtime, pendingDeposit: null });
                     await this.reload();
                 } else {
                     return pending;
                 }
+            }
+            if (this.depositsClosed()) {
+                await this.discardClosedDepositDraftLocked();
+                throw this.depositsClosedError();
             }
             const params = await this.worker.call('generateDeposit');
             const path = await this.nextDepositPath();
@@ -3378,6 +3469,8 @@ class BrowserWalletRuntime extends EventTarget {
                 + BigInt(ESCAPE_OVERRIDE_EXPIRY_MARGIN_SECONDS) >= expiry;
         } catch (error) {
             if (isAbortError(error, signal)) throw error;
+            this.assertHardenedViewRead(error);
+            // An unreadable expiry only waits for the grace.
             return false;
         }
     }
@@ -3387,9 +3480,19 @@ class BrowserWalletRuntime extends EventTarget {
             return await this.vaultWord(`${VAULT_SELECTORS.challengedNullifiers}${abiWordHex(nullifier)}`, signal) !== 0n;
         } catch (error) {
             if (isAbortError(error, signal)) throw error;
+            this.assertHardenedViewRead(error);
             // The gas estimate still reverts ChallengedNullifier() if it was.
             return false;
         }
+    }
+
+    /**
+     * Under a vault_revision 2 profile, a hardened-only view that reverts (or
+     * returns no word) means the pinned vault is not hardened: a configuration
+     * error, never a "false" that would open the escape override.
+     */
+    assertHardenedViewRead(error) {
+        if (this.vaultCapabilities().hardenedVault && vaultViewMissing(error)) throw vaultRevisionMismatch();
     }
 
     /**
@@ -3512,7 +3615,13 @@ class BrowserWalletRuntime extends EventTarget {
 
     async generateOwnershipProof({ state, destination, nullifier, path }) {
         // An escape-form proof to the user's REAL destination at the current
-        // balance: it is a submittable escape, so never a placeholder.
+        // balance: it is a submittable escape, so never a placeholder. On a
+        // vault whose challenge burns the nullifier, anyone holding a request
+        // proof sent from this state could submit it and challenge it there,
+        // so such a state never gets one (obtainClearance refuses first).
+        if (!this.vaultCapabilities().hardenedVault && this.archivedRequestsAt(state).length) {
+            throw transmittedOwnershipRefusal(null);
+        }
         const ownership = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
@@ -3530,11 +3639,25 @@ class BrowserWalletRuntime extends EventTarget {
         return { public_inputs: ownership.public_inputs, proof: ownership.proof };
     }
 
+    /**
+     * POST one clearance body, retrying the same bytes only for answers that
+     * reserved nothing and may pass on their own: the gateway's 429
+     * gateway_rate_limited (the request never reached the API; its
+     * retry_after_seconds is honoured), and for a proof the server's
+     * stale_root (its root lags the vault) or capacity_exhausted (proof
+     * verification is saturated). The server sends neither of the last two
+     * for a proof-less request. All waits share one backoff budget; a wait the
+     * budget cannot hold ends the retries. The caller does not re-prove: a
+     * stale_root that outlasts the budget fails the close, which a retry
+     * prepares again at the then-current root.
+     */
     async postClearance(body, nullifier, signal = null, {
         delays = CLEARANCE_RETRY_DELAYS_MS,
         sleep = delay
     } = {}) {
         const serialized = JSON.stringify(body);
+        const budget = delays.reduce((total, value) => total + value, 0);
+        let waited = 0;
         for (let attempt = 0; ; attempt += 1) {
             try {
                 const clearance = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
@@ -3549,13 +3672,14 @@ class BrowserWalletRuntime extends EventTarget {
                 }
                 return clearance;
             } catch (error) {
-                // A lagging server root or verification capacity is transient:
-                // retry the SAME proof; the caller re-reads the root and re-proves.
-                const retriable = (body.ownership_proof
-                    && ['stale_root', 'ownership_root_unknown'].includes(error?.code))
-                    || error?.code === 'capacity_exhausted';
+                const throttled = error?.code === CLEARANCE_GATEWAY_THROTTLED;
+                const retriable = throttled || (Boolean(body.ownership_proof)
+                    && ['stale_root', 'capacity_exhausted'].includes(error?.code));
                 if (!retriable || attempt >= delays.length) throw error;
-                await sleep(delays[attempt], signal);
+                const wait = Math.max(delays[attempt], throttled ? retryAfterMilliseconds(error) : 0);
+                if (waited + wait > budget) throw error;
+                waited += wait;
+                await sleep(wait, signal);
             }
         }
     }
@@ -3567,37 +3691,74 @@ class BrowserWalletRuntime extends EventTarget {
      * (400 clearance_ownership_required, or 503 legacy_clearance_capacity from
      * an upgraded server whose shared proof-less budget is spent) rolls the
      * withdrawal-only marker back, then the proof is generated and sent once
-     * exactly as with the capability. An ownership proof is never generated
-     * for a transmitted state unless the server reports that nullifier
-     * unknown or clearance_reserved.
+     * exactly as with the capability. A gateway 429 that outlasts the retries
+     * fails the close; it rolls the marker back for a proof-less body or on a
+     * hardened vault, but after an ownership proof was sent to a vault that
+     * burns a challenged nullifier the note stays withdrawal-only, since the
+     * 429 is unsigned and its sender may hold that proof. An ownership proof is
+     * never generated for a transmitted state unless the vault is hardened
+     * (vault_revision 2) and the server reports that nullifier unknown or
+     * clearance_reserved. On any other vault such a state, once its gate
+     * passes, gets only the proof-less request; a refusal that asks for a
+     * proof is answered with transmitted_anchor_ownership_unsafe.
      */
     async obtainClearance({
         state, destination, nullifier, path, selected = true, signal = null,
         commitMarker = null, rollbackMarker = null
     }) {
-        const proved = async () => {
-            const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
-            if (gate.advanced) return WITHDRAWAL_RESTART;
-            return this.generateOwnershipProof({ state, destination, nullifier, path });
-        };
-        if (!this.vaultCapabilities().sendOwnershipProof) {
-            // A server with legacy clearance on may reserve on this request.
+        const { hardenedVault, sendOwnershipProof } = this.vaultCapabilities();
+        // On a vault that burns a challenged nullifier the ownership proof is
+        // a submittable escape at this nullifier, and whoever holds a request
+        // proof sent from this state can challenge it there. Neither a server
+        // reading nor a server refusal is signed, so neither may decide that.
+        const strictTransmitted = !hardenedVault && this.archivedRequestsAt(state).length > 0;
+        const send = async body => {
             if (commitMarker) await commitMarker();
             try {
-                return await this.postClearance({ withdrawal_nullifier: nullifier }, nullifier, signal);
+                return await this.postClearance(body, nullifier, signal);
             } catch (error) {
-                if (!['clearance_ownership_required', 'legacy_clearance_capacity'].includes(error?.code)) throw error;
+                if (error?.code !== CLEARANCE_GATEWAY_THROTTLED) throw error;
+                // An honest gateway answered before the API, so the server
+                // reserved nothing. A proof-less body gave whoever answered
+                // nothing, so the note may be usable again.
+                if (!body.ownership_proof || hardenedVault) {
+                    if (rollbackMarker) await rollbackMarker();
+                    throw error;
+                }
+                // The 429 is unsigned, and whoever answered it now holds an
+                // ownership proof: a submittable escape at this nullifier. On
+                // a vault whose challenge burns the nullifier, a request proof
+                // from this state would let that holder escape and challenge,
+                // so the note stays withdrawal-only (closing again or an
+                // escape still works) and no request proof is ever made here.
+                throw clearanceThrottledAfterOwnershipProof(error);
             }
-            // This request reserved nothing: until the proof is ready, a gate
-            // refusal, a proving failure or a closed tab leaves the note as it was.
-            if (rollbackMarker) await rollbackMarker();
+        };
+        if (strictTransmitted) {
+            // Settle, install or refuse as for any transmitted state before
+            // the note is marked withdrawal-only.
+            const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
+            if (gate.advanced) return WITHDRAWAL_RESTART;
         }
-        const ownership = await proved();
-        if (ownership === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;
+        if (!sendOwnershipProof || strictTransmitted) {
+            // A server with legacy clearance on may reserve on this request,
+            // so the marker is committed before it is sent.
+            try {
+                return await send({ withdrawal_nullifier: nullifier });
+            } catch (error) {
+                if (!CLEARANCE_NOTHING_RESERVED.has(error?.code)) throw error;
+                // This request reserved nothing: until the proof is ready, a gate
+                // refusal, a proving failure or a closed tab leaves the note as it was.
+                if (rollbackMarker) await rollbackMarker();
+                if (strictTransmitted) throw transmittedOwnershipRefusal(error);
+            }
+        }
+        const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
+        if (gate.advanced) return WITHDRAWAL_RESTART;
+        const ownership = await this.generateOwnershipProof({ state, destination, nullifier, path });
         // Commit the withdrawal-only marker only after local proving, so a
         // proving failure never makes the note withdrawal-only.
-        if (commitMarker) await commitMarker();
-        return this.postClearance({ withdrawal_nullifier: nullifier, ownership_proof: ownership }, nullifier, signal);
+        return send({ withdrawal_nullifier: nullifier, ownership_proof: ownership });
     }
 
     async claimPreparedWithdrawalSubmission() {

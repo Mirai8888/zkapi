@@ -21,8 +21,30 @@ pub const REQUEST_TIME: u64 = 2_000_000_000;
 pub const VALID_UNTIL: u64 = REQUEST_TIME + 10_800;
 pub const DESTINATION: [u8; 20] = [0x11; 20];
 
-pub fn setup_dir() -> std::path::PathBuf {
+/// The committed development setup.
+pub fn dev_setup_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2-concession-dev")
+}
+
+/// The setup under test: `ZKAPI_SETUP_DIR` if set (absolute, or relative to
+/// `protocol/rust`, where the setup READMEs run their commands), otherwise
+/// the development setup. G-SETUP step 7 runs `tests/proofs.rs` on the
+/// imported ceremony keys this way:
+/// `ZKAPI_SETUP_DIR=../setup/v2-concession cargo test --release -p zkapi-proof --test proofs`.
+pub fn setup_dir() -> std::path::PathBuf {
+    match std::env::var_os("ZKAPI_SETUP_DIR") {
+        Some(dir) if !dir.is_empty() => {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(dir)
+            }
+        }
+        _ => dev_setup_dir(),
+    }
 }
 
 /// Note A's honest chain `S0 -R0-> S1 -R1-> S2`, plus note B with A's secret.

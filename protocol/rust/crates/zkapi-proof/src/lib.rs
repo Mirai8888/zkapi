@@ -8,6 +8,8 @@
 //!   uses.
 //! * [`r1cs`]: export of the circuits as circom `.r1cs` files for the
 //!   multi-party setup.
+//! * [`ceremony`] (not on wasm32): powers-of-tau reading and the check that
+//!   imported phase-2 keys belong to this build's circuits.
 //! * [`dev`] (feature `dev-fixtures`): deterministic development fixtures.
 //!
 //! Features:
@@ -19,6 +21,8 @@
 //!
 //! Generating development keys ([`compact::setup`]) needs neither feature.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ceremony;
 pub mod compact;
 #[cfg(feature = "dev-fixtures")]
 pub mod dev;

@@ -1,8 +1,15 @@
-//! Round trip of the ceremony import on the development setup: the dev
-//! proving keys are written as snarkjs `.zkey` files, imported by
-//! `examples/import_zkey.rs` (which reads them with `ark_circom::read_zkey`
-//! and runs the fidelity, shape and proving gates), and the resulting setup
-//! directory must equal the committed one byte for byte.
+//! The ceremony import (`examples/import_zkey.rs`, G-SETUP step 6).
+//!
+//! A toy ceremony with known `τ, α, β, δ` stands in for snarkjs: its powers of
+//! tau is written in the snarkjs `.ptau` layout and its keys are computed the
+//! way `snarkjs groth16 setup` derives them (then rescaled by `δ` like a
+//! contribution) and written as `.zkey` files. The import must accept those
+//! keys, write a loadable setup directory, and refuse every key that is not
+//! the circuit's: in particular keys set up from an R1CS whose C matrix
+//! differs, which pass every gate but the binding one.
+//!
+//! The development keys (whose toxic waste is discarded, so no powers of tau
+//! matches them) are checked through the zkey reader and the directory writer.
 #![cfg(not(target_arch = "wasm32"))]
 
 mod common;
@@ -12,16 +19,28 @@ mod common;
 mod import_zkey;
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use ark_bn254::{Bn254, Fq, Fr, G1Affine, G2Affine};
-use ark_ff::{Field, PrimeField};
-use ark_groth16::ProvingKey;
+use ark_bn254::{Bn254, Fq, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, ScalarMul};
+use ark_ff::{Field, PrimeField, UniformRand, Zero};
+use ark_groth16::{ProvingKey, VerifyingKey};
+use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_relations::r1cs::ConstraintMatrices;
 use ark_serialize::CanonicalSerialize;
-use common::setup_dir;
-use import_zkey::{import, ImportArgs};
-use zkapi_proof::compact::{decode_compressed, KeyKind, SetupProvenance, DEV_SETUP_ID};
-use zkapi_proof::r1cs::circuit_matrices;
+use ark_std::rand::{rngs::StdRng, SeedableRng};
+use common::*;
+use import_zkey::{check_coefficients, check_proving, check_shape, check_zkey, import, ImportArgs};
+use zkapi_proof::ceremony::{check_key_binding, g1_to_lem, g2_to_lem, LagrangeBases, Ptau};
+use zkapi_proof::compact::{
+    circuit_shape, decode_compressed, decode_compressed_for, sha256, write_setup_directory,
+    KeyKind, RequestProver, RequestVerifier, SetupManifest, SetupProvenance, WithdrawalProver,
+    WithdrawalVerifier, CEREMONY_SETUP_ID, DEV_SETUP_ID, REHEARSAL_SETUP_ID,
+};
+use zkapi_proof::r1cs::{circuit_matrices, r1cs_bytes};
+use zkapi_types::WithdrawalKind;
+
+// ---- snarkjs file layouts ----
 
 /// snarkjs stores base-field coordinates in Montgomery form, little-endian.
 fn put_fq(out: &mut Vec<u8>, value: &Fq) {
@@ -52,13 +71,19 @@ fn section(out: &mut Vec<u8>, id: u32, body: Vec<u8>) {
     out.extend_from_slice(&body);
 }
 
-/// A snarkjs Groth16 zkey (sections 1–9) for `pk` over `matrices`.
-fn write_zkey(pk: &ProvingKey<Bn254>, matrices: &ConstraintMatrices<Fr>) -> Vec<u8> {
+/// A snarkjs Groth16 zkey for `pk` whose coefficient section (4) lists the A
+/// and B coefficients of `matrices`, and, when given, a contributions section
+/// (10) recording contributions of these types (0 contribution, 1 beacon).
+fn write_zkey(
+    pk: &ProvingKey<Bn254>,
+    matrices: &ConstraintMatrices<Fr>,
+    contributions: Option<&[u32]>,
+) -> Vec<u8> {
     let n_public = matrices.num_instance_variables - 1;
     let n_vars = matrices.num_instance_variables + matrices.num_witness_variables;
     let mut out = b"zkey".to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&9u32.to_le_bytes());
+    out.extend_from_slice(&(9 + u32::from(contributions.is_some())).to_le_bytes());
     section(&mut out, 1, 1u32.to_le_bytes().to_vec());
 
     let mut header = Vec::new();
@@ -123,8 +148,257 @@ fn write_zkey(pk: &ProvingKey<Bn254>, matrices: &ConstraintMatrices<Fr>) -> Vec<
     section(&mut out, 7, b2);
     section(&mut out, 8, g1_section(&pk.l_query));
     section(&mut out, 9, g1_section(&pk.h_query));
+    if let Some(types) = contributions {
+        let mut body = vec![0u8; 64];
+        body.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        for kind in types {
+            body.extend_from_slice(&[0u8; 3 * 64 + 128 + 64]);
+            body.extend_from_slice(&kind.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+        }
+        section(&mut out, 10, body);
+    }
     assert_eq!(pk.a_query.len(), n_vars);
     out
+}
+
+/// The sections of a prepared powers of tau of `power` (snarkjs `prepare
+/// phase2` layout) in which the blocks of `bases` hold their points and every
+/// other Lagrange point is zero (the import reads only its circuits' blocks).
+fn ptau_sections(power: u32, bases: &[&LagrangeBases]) -> Vec<(u32, Vec<u8>)> {
+    let points = |top: u32| (1usize << (top + 1)) - 1;
+    let mut tau_g1 = vec![0u8; points(power + 1) * 64];
+    let mut tau_g2 = vec![0u8; points(power) * 128];
+    let mut alpha = vec![0u8; points(power) * 64];
+    let mut beta = vec![0u8; points(power) * 64];
+    let put = |section: &mut Vec<u8>, size: usize, at: usize, bytes: &[u8]| {
+        let start = (size - 1 + at) * bytes.len();
+        section[start..start + bytes.len()].copy_from_slice(bytes);
+    };
+    for base in bases {
+        let n = base.domain_size();
+        for (j, point) in base.h_g1.iter().enumerate() {
+            put(&mut tau_g1, 2 * n, 2 * j + 1, &g1_to_lem(point));
+        }
+        for j in 0..n {
+            put(&mut tau_g1, n, j, &g1_to_lem(&base.tau_g1[j]));
+            put(&mut tau_g2, n, j, &g2_to_lem(&base.tau_g2[j]));
+            put(&mut alpha, n, j, &g1_to_lem(&base.alpha_tau_g1[j]));
+            put(&mut beta, n, j, &g1_to_lem(&base.beta_tau_g1[j]));
+        }
+    }
+    let zero1 = G1Affine::zero();
+    let zero2 = G2Affine::zero();
+    let first = bases.first().copied();
+    let mut header = 32u32.to_le_bytes().to_vec();
+    Fq::MODULUS.serialize_uncompressed(&mut header).unwrap();
+    header.extend_from_slice(&power.to_le_bytes());
+    header.extend_from_slice(&power.to_le_bytes());
+    vec![
+        (1, header),
+        (4, g1_to_lem(first.map_or(&zero1, |b| &b.alpha_g1)).to_vec()),
+        (5, g1_to_lem(first.map_or(&zero1, |b| &b.beta_g1)).to_vec()),
+        (6, g2_to_lem(first.map_or(&zero2, |b| &b.beta_g2)).to_vec()),
+        (12, tau_g1),
+        (13, tau_g2),
+        (14, alpha),
+        (15, beta),
+    ]
+}
+
+fn binfile(magic: &[u8; 4], sections: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+    let mut out = magic.to_vec();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+    for (id, body) in sections {
+        section(&mut out, id, body);
+    }
+    out
+}
+
+fn write_ptau(power: u32, bases: &[&LagrangeBases]) -> Vec<u8> {
+    binfile(b"ptau", ptau_sections(power, bases))
+}
+
+// ---- the toy ceremony ----
+
+struct Secrets {
+    tau: Fr,
+    alpha: Fr,
+    beta: Fr,
+    delta: Fr,
+}
+
+struct ToyCircuit {
+    matrices: ConstraintMatrices<Fr>,
+    bases: LagrangeBases,
+    /// The honest key: what `snarkjs groth16 setup` plus one contribution
+    /// produce for this build's circuit.
+    pk: ProvingKey<Bn254>,
+}
+
+struct Toy {
+    secrets: Secrets,
+    request: ToyCircuit,
+    withdrawal: ToyCircuit,
+}
+
+impl Toy {
+    fn circuit(&self, kind: KeyKind) -> &ToyCircuit {
+        match kind {
+            KeyKind::Request => &self.request,
+            KeyKind::Withdrawal => &self.withdrawal,
+        }
+    }
+}
+
+fn lagrange(tau: Fr, size: usize) -> Vec<Fr> {
+    Radix2EvaluationDomain::<Fr>::new(size)
+        .unwrap()
+        .evaluate_all_lagrange_coefficients(tau)
+}
+
+fn g1_batch(scalars: &[Fr]) -> Vec<G1Affine> {
+    G1Projective::generator().batch_mul(scalars)
+}
+
+fn g2_batch(scalars: &[Fr]) -> Vec<G2Affine> {
+    G2Projective::generator().batch_mul(scalars)
+}
+
+fn scaled(scalars: &[Fr], by: Fr) -> Vec<Fr> {
+    scalars.iter().map(|value| *value * by).collect()
+}
+
+fn odd(scalars: Vec<Fr>) -> Vec<Fr> {
+    scalars.into_iter().skip(1).step_by(2).collect()
+}
+
+fn toy_bases(secrets: &Secrets, n: usize) -> LagrangeBases {
+    let l = lagrange(secrets.tau, n);
+    let g1 = G1Projective::generator();
+    let g2 = G2Projective::generator();
+    LagrangeBases {
+        tau_g1: g1_batch(&l),
+        tau_g2: g2_batch(&l),
+        alpha_tau_g1: g1_batch(&scaled(&l, secrets.alpha)),
+        beta_tau_g1: g1_batch(&scaled(&l, secrets.beta)),
+        h_g1: g1_batch(&odd(lagrange(secrets.tau, 2 * n))),
+        alpha_g1: (g1 * secrets.alpha).into_affine(),
+        beta_g1: (g1 * secrets.beta).into_affine(),
+        beta_g2: (g2 * secrets.beta).into_affine(),
+    }
+}
+
+/// The key `snarkjs groth16 setup` derives for `matrices` (with the
+/// instance rows it adds), after a contribution that set `δ`.
+fn toy_key(secrets: &Secrets, matrices: &ConstraintMatrices<Fr>, n: usize) -> ProvingKey<Bn254> {
+    let l = lagrange(secrets.tau, n);
+    let instance = matrices.num_instance_variables;
+    let wires = instance + matrices.num_witness_variables;
+    let evaluate = |matrix: &[Vec<(Fr, usize)>]| {
+        let mut values = vec![Fr::zero(); wires];
+        for (row, terms) in matrix.iter().enumerate() {
+            for (coefficient, wire) in terms {
+                values[*wire] += *coefficient * l[row];
+            }
+        }
+        values
+    };
+    let mut a = evaluate(&matrices.a);
+    for (wire, value) in a.iter_mut().enumerate().take(instance) {
+        *value += l[matrices.num_constraints + wire];
+    }
+    let b = evaluate(&matrices.b);
+    let c = evaluate(&matrices.c);
+    let k: Vec<Fr> = (0..wires)
+        .map(|wire| secrets.beta * a[wire] + secrets.alpha * b[wire] + c[wire])
+        .collect();
+    let delta_inverse = secrets.delta.inverse().unwrap();
+    let g1 = G1Projective::generator();
+    let g2 = G2Projective::generator();
+    ProvingKey {
+        vk: VerifyingKey {
+            alpha_g1: (g1 * secrets.alpha).into_affine(),
+            beta_g2: (g2 * secrets.beta).into_affine(),
+            gamma_g2: G2Affine::generator(),
+            delta_g2: (g2 * secrets.delta).into_affine(),
+            gamma_abc_g1: g1_batch(&k[..instance]),
+        },
+        beta_g1: (g1 * secrets.beta).into_affine(),
+        delta_g1: (g1 * secrets.delta).into_affine(),
+        a_query: g1_batch(&a),
+        b_g1_query: g1_batch(&b),
+        b_g2_query: g2_batch(&b),
+        h_query: g1_batch(&scaled(&odd(lagrange(secrets.tau, 2 * n)), delta_inverse)),
+        l_query: g1_batch(&scaled(&k[instance..], delta_inverse)),
+    }
+}
+
+fn toy() -> &'static Toy {
+    static TOY: OnceLock<Toy> = OnceLock::new();
+    TOY.get_or_init(|| {
+        let mut rng = StdRng::seed_from_u64(0x7a6b6579);
+        let secrets = Secrets {
+            tau: Fr::rand(&mut rng),
+            alpha: Fr::rand(&mut rng),
+            beta: Fr::rand(&mut rng),
+            delta: Fr::rand(&mut rng),
+        };
+        let circuit = |kind| {
+            let matrices = circuit_matrices(kind).unwrap();
+            let n = circuit_shape(kind).unwrap().domain_size;
+            ToyCircuit {
+                bases: toy_bases(&secrets, n),
+                pk: toy_key(&secrets, &matrices, n),
+                matrices,
+            }
+        };
+        Toy {
+            request: circuit(KeyKind::Request),
+            withdrawal: circuit(KeyKind::Withdrawal),
+            secrets,
+        }
+    })
+}
+
+/// The red-team's weakening: on up to `limit` rows where A or B is a
+/// constant, replace C by the linear form A·B. Honest assignments still
+/// satisfy those rows, but they no longer constrain anything (every
+/// `enforce_equal` there becomes vacuous).
+fn weaken(matrices: &ConstraintMatrices<Fr>, limit: usize) -> (ConstraintMatrices<Fr>, usize) {
+    let constant = |terms: &[(Fr, usize)]| match terms {
+        [] => Some(Fr::zero()),
+        [(value, 0)] => Some(*value),
+        _ => None,
+    };
+    let times = |terms: &[(Fr, usize)], k: Fr| -> Vec<(Fr, usize)> {
+        terms
+            .iter()
+            .map(|(value, wire)| (*value * k, *wire))
+            .filter(|(value, _)| !value.is_zero())
+            .collect()
+    };
+    let mut weak = matrices.clone();
+    let mut changed = 0;
+    for row in 0..matrices.num_constraints {
+        if changed == limit {
+            break;
+        }
+        let product = if let Some(k) = constant(&matrices.a[row]) {
+            times(&matrices.b[row], k)
+        } else if let Some(k) = constant(&matrices.b[row]) {
+            times(&matrices.a[row], k)
+        } else {
+            continue;
+        };
+        if product != matrices.c[row] {
+            weak.c[row] = product;
+            changed += 1;
+        }
+    }
+    weak.c_num_non_zero = weak.c.iter().map(Vec::len).sum();
+    (weak, changed)
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -135,34 +409,409 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn dev_zkeys(dir: &Path) -> (PathBuf, PathBuf) {
-    let mut paths = Vec::new();
-    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
-        let bytes = std::fs::read(setup_dir().join(kind.proving_key_file())).unwrap();
-        let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(&bytes, kind).unwrap();
-        let zkey = write_zkey(&pk, &circuit_matrices(kind).unwrap());
-        // ark-circom reads back exactly the development key.
-        let (read, _) = ark_circom::read_zkey(&mut std::io::Cursor::new(&zkey)).unwrap();
-        assert_eq!(read, pk, "{kind}");
-        let path = dir.join(format!("{kind}.zkey"));
-        std::fs::write(&path, zkey).unwrap();
-        paths.push(path);
+const CEREMONY_CONTRIBUTIONS: &[u32] = &[0, 0, 0, 1];
+
+// ---- tests ----
+
+/// The binding gate is the regression for keys set up from an R1CS with the
+/// circuit's A and B but another C: such keys pass the coefficient, shape and
+/// proving gates (an honest witness satisfies the weakened rows), yet prove
+/// false statements. The binding gate refuses them, through `check_zkey`.
+#[test]
+fn keys_set_up_from_another_c_matrix_are_refused() {
+    let toy = toy();
+    for (kind, limit) in [(KeyKind::Request, usize::MAX), (KeyKind::Withdrawal, 1)] {
+        let honest = toy.circuit(kind);
+        let (weak, changed) = weaken(&honest.matrices, limit);
+        assert!(changed > 0, "{kind}");
+        assert_eq!((&weak.a, &weak.b), (&honest.matrices.a, &honest.matrices.b));
+        let n = honest.bases.domain_size();
+        let pk = toy_key(&toy.secrets, &weak, n);
+        // The zkey's coefficient section is the honest one (A and B agree).
+        let zkey = write_zkey(&pk, &honest.matrices, Some(CEREMONY_CONTRIBUTIONS));
+        let (read, coefficients) = ark_circom::read_zkey(&mut std::io::Cursor::new(&zkey)).unwrap();
+        assert_eq!(read, pk);
+        // Every other gate passes.
+        check_coefficients(&coefficients, &pk, kind, &honest.matrices).unwrap();
+        check_shape(&pk, kind).unwrap();
+        check_proving(&pk, kind).unwrap();
+        // The binding gate does not.
+        let error = check_key_binding(&pk, &honest.matrices, &honest.bases)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not match the circuit"),
+            "{kind}: {error}"
+        );
+        let error = format!("{:#}", check_zkey(&zkey, kind, &honest.bases).unwrap_err());
+        assert!(
+            error.contains("is not a key of this build's") && error.contains("does not match"),
+            "{kind}: {error}"
+        );
+        // The honest key over the same bases passes all of them.
+        let honest_zkey = write_zkey(&honest.pk, &honest.matrices, None);
+        assert_eq!(
+            check_zkey(&honest_zkey, kind, &honest.bases).unwrap(),
+            honest.pk
+        );
     }
-    (paths[0].clone(), paths[1].clone())
+}
+
+/// Every point the binding gate covers is checked: changing any one of them
+/// is refused with a precise message.
+#[test]
+fn binding_gate_checks_every_key_point() {
+    let toy = toy();
+    let circuit = &toy.request;
+    let check = |pk: &ProvingKey<Bn254>| {
+        check_key_binding(pk, &circuit.matrices, &circuit.bases)
+            .err()
+            .map(|error| error.to_string())
+    };
+    assert_eq!(check(&circuit.pk), None);
+    fn bump1(point: &G1Affine) -> G1Affine {
+        (*point + G1Affine::generator()).into_affine()
+    }
+    fn times(delta: u64) -> (G1Affine, G2Affine) {
+        (
+            (G1Affine::generator() * Fr::from(delta)).into_affine(),
+            (G2Affine::generator() * Fr::from(delta)).into_affine(),
+        )
+    }
+    type Mutation = fn(&mut ProvingKey<Bn254>);
+    let cases: [(&str, Mutation); 11] = [
+        ("alpha or beta", |pk| {
+            pk.vk.alpha_g1 = bump1(&pk.vk.alpha_g1)
+        }),
+        ("alpha or beta", |pk| pk.beta_g1 = bump1(&pk.beta_g1)),
+        ("gamma", |pk| pk.vk.gamma_g2 = times(2).1),
+        ("delta", |pk| pk.delta_g1 = times(5).0),
+        ("A query", |pk| pk.a_query[40] = bump1(&pk.a_query[40])),
+        ("B query (G1)", |pk| {
+            pk.b_g1_query[3] = bump1(&pk.b_g1_query[3])
+        }),
+        ("B query (G2)", |pk| {
+            pk.b_g2_query[3] = (pk.b_g2_query[3] + G2Affine::generator()).into_affine()
+        }),
+        ("IC", |pk| {
+            pk.vk.gamma_abc_g1[12] = bump1(&pk.vk.gamma_abc_g1[12])
+        }),
+        ("L query", |pk| pk.l_query[1000] = bump1(&pk.l_query[1000])),
+        ("H query", |pk| pk.h_query[7] = bump1(&pk.h_query[7])),
+        // Re-randomizing δ alone is what a contribution does: the L and H
+        // queries must follow it.
+        ("L query", |pk| (pk.delta_g1, pk.vk.delta_g2) = times(5)),
+    ];
+    for (expected, mutate) in cases {
+        let mut pk = circuit.pk.clone();
+        mutate(&mut pk);
+        let error = check(&pk).unwrap_or_else(|| panic!("{expected}: accepted"));
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    // A key for one circuit over the other circuit's bases is refused.
+    assert!(check_key_binding(&toy.withdrawal.pk, &circuit.matrices, &circuit.bases).is_err());
 }
 
 #[test]
-fn import_zkey_round_trips_the_development_setup() {
-    let dir = scratch("roundtrip");
-    let (request_zkey, withdrawal_zkey) = dev_zkeys(&dir);
+fn foreign_or_recoefficiented_zkeys_are_refused() {
+    let toy = toy();
+    let request = &toy.request;
+    // A request key offered as the withdrawal key fails the coefficient gate.
+    let zkey = write_zkey(&request.pk, &request.matrices, None);
+    let error = format!(
+        "{:#}",
+        check_zkey(&zkey, KeyKind::Withdrawal, &toy.withdrawal.bases).unwrap_err()
+    );
+    assert!(error.contains("withdrawal zkey has"), "{error}");
+    // One changed A coefficient in section 4 fails it too.
+    let mut matrices = request.matrices.clone();
+    let row = matrices.a.iter().position(|row| !row.is_empty()).unwrap();
+    matrices.a[row][0].0 += Fr::ONE;
+    let zkey = write_zkey(&request.pk, &matrices, None);
+    let error = format!(
+        "{:#}",
+        check_zkey(&zkey, KeyKind::Request, &request.bases).unwrap_err()
+    );
+    assert!(error.contains("A matrix differs"), "{error}");
+}
+
+/// The whole import on files: powers of tau, R1CS exports and zkeys.
+#[test]
+fn toy_ceremony_imports_end_to_end() {
+    let toy = toy();
+    let dir = scratch("toy");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let ptau_bytes = write_ptau(16, &[&toy.request.bases, &toy.withdrawal.bases]);
+    let ptau_sha256 = hex::encode(sha256(&ptau_bytes));
+    let ptau = write("toy.ptau", &ptau_bytes);
+    drop(ptau_bytes);
+    // The file reader returns exactly the bases the keys were made from.
+    let opened = Ptau::open(&ptau).unwrap();
+    assert_eq!(opened.power(), 16);
+    assert_eq!(hex::encode(opened.sha256()), ptau_sha256);
+    assert_eq!(
+        opened.lagrange_bases(1 << 15).unwrap(),
+        toy.request.bases,
+        "request bases"
+    );
+    let request_r1cs = write("request.r1cs", &r1cs_bytes(KeyKind::Request).unwrap());
+    let withdrawal_r1cs = write("withdrawal.r1cs", &r1cs_bytes(KeyKind::Withdrawal).unwrap());
+    let zkey = |name: &str, kind: KeyKind, contributions: Option<&[u32]>| {
+        let circuit = toy.circuit(kind);
+        let bytes = write_zkey(&circuit.pk, &circuit.matrices, contributions);
+        let digest = hex::encode(sha256(&bytes));
+        (write(name, &bytes), digest)
+    };
+    let (request_zkey, request_digest) = zkey(
+        "request.zkey",
+        KeyKind::Request,
+        Some(CEREMONY_CONTRIBUTIONS),
+    );
+    let (withdrawal_zkey, withdrawal_digest) = zkey(
+        "withdrawal.zkey",
+        KeyKind::Withdrawal,
+        Some(CEREMONY_CONTRIBUTIONS),
+    );
+    let args = ImportArgs {
+        setup_id: REHEARSAL_SETUP_ID.to_string(),
+        ptau: ptau.clone(),
+        expected_ptau_sha256: None,
+        request_r1cs: request_r1cs.clone(),
+        withdrawal_r1cs: withdrawal_r1cs.clone(),
+        request_zkey: request_zkey.clone(),
+        withdrawal_zkey: withdrawal_zkey.clone(),
+        transcript_sha256: None,
+        output: dir.join("rehearsal"),
+    };
+    let manifest = import(&args).unwrap();
+    assert_eq!(manifest.setup_id, REHEARSAL_SETUP_ID);
+    assert_eq!(manifest.ptau_sha256.as_deref(), Some(ptau_sha256.as_str()));
+    let zkeys = manifest.zkey_sha256.clone().unwrap();
+    assert_eq!(
+        (zkeys.request, zkeys.withdrawal),
+        (request_digest, withdrawal_digest)
+    );
+    for (kind, path) in [
+        (KeyKind::Request, &request_r1cs),
+        (KeyKind::Withdrawal, &withdrawal_r1cs),
+    ] {
+        assert_eq!(
+            manifest.r1cs_sha256.get(kind),
+            hex::encode(sha256(&std::fs::read(path).unwrap()))
+        );
+    }
+    let written: SetupManifest =
+        serde_json::from_slice(&std::fs::read(args.output.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(written, manifest);
+    // The directory loads (rehearsal keys load in dev-setup builds only) and
+    // its keys prove.
+    let output = &args.output;
+    let (pk, setup_id): (ProvingKey<Bn254>, _) = decode_compressed(
+        &std::fs::read(output.join("request.pk")).unwrap(),
+        KeyKind::Request,
+    )
+    .unwrap();
+    assert_eq!(
+        (pk, setup_id.as_str()),
+        (toy.request.pk.clone(), REHEARSAL_SETUP_ID)
+    );
+    for (file, kind) in [
+        ("request.vk", KeyKind::Request),
+        ("withdrawal.pk", KeyKind::Withdrawal),
+    ] {
+        let error = decode_compressed_for::<VerifyingKey<Bn254>>(
+            &std::fs::read(output.join(file)).unwrap(),
+            kind,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not accepted"), "{error}");
+    }
+    let c = chain();
+    let (public, witness) = c.request_of(&c.s1, &c.r1);
+    let proof = RequestProver::load(output)
+        .unwrap()
+        .prove(&public, witness)
+        .unwrap();
+    assert!(RequestVerifier::load(output)
+        .unwrap()
+        .verify(&public, &proof)
+        .unwrap());
+    let (public, witness) =
+        c.withdrawal_of(&c.s1, &withdrawal(WithdrawalKind::Escape, DESTINATION, 1));
+    let proof = WithdrawalProver::load(output)
+        .unwrap()
+        .prove(&public, witness)
+        .unwrap();
+    assert!(WithdrawalVerifier::load(output)
+        .unwrap()
+        .verify(&public, &proof)
+        .unwrap());
+
+    let refused = |args: &ImportArgs, expected: &str| {
+        let error = format!("{:#}", import(args).unwrap_err());
+        assert!(error.contains(expected), "{expected}: {error}");
+        for file in ["request.pk", "manifest.json"] {
+            assert!(
+                args.output == dir.join("rehearsal") || !args.output.join(file).exists(),
+                "{expected}: wrote {file}"
+            );
+        }
+    };
+    // Never overwrite.
+    refused(&args, "refusing to overwrite");
+    let fresh = |name: &str| ImportArgs {
+        output: dir.join(name),
+        ..args.clone()
+    };
+    // The R1CS the ceremony used must be this build's export.
+    refused(
+        &ImportArgs {
+            request_r1cs: withdrawal_r1cs.clone(),
+            ..fresh("r1cs")
+        },
+        "is not this build's request R1CS export",
+    );
+    // A key set up from a weakened R1CS is refused by the import too.
+    let (weak, _) = weaken(&toy.request.matrices, usize::MAX);
+    let weak_pk = toy_key(&toy.secrets, &weak, toy.request.bases.domain_size());
+    let weak_zkey = write(
+        "weak.zkey",
+        &write_zkey(
+            &weak_pk,
+            &toy.request.matrices,
+            Some(CEREMONY_CONTRIBUTIONS),
+        ),
+    );
+    refused(
+        &ImportArgs {
+            request_zkey: weak_zkey,
+            ..fresh("weak")
+        },
+        "does not match the circuit",
+    );
+    // The ceremony setup id needs the pinned powers of tau, the transcript
+    // and zkeys that record the ceremony's contributions.
+    let ceremony = |name: &str| ImportArgs {
+        setup_id: CEREMONY_SETUP_ID.to_string(),
+        expected_ptau_sha256: Some(ptau_sha256.clone()),
+        transcript_sha256: Some("ab".repeat(32)),
+        ..fresh(name)
+    };
+    refused(
+        &ImportArgs {
+            transcript_sha256: None,
+            ..ceremony("no-transcript")
+        },
+        "--transcript-sha256",
+    );
+    refused(
+        &ImportArgs {
+            expected_ptau_sha256: Some("00".repeat(32)),
+            ..ceremony("other-ptau")
+        },
+        "not the pinned",
+    );
+    let (single, _) = zkey("single.zkey", KeyKind::Request, Some(&[0, 1]));
+    refused(
+        &ImportArgs {
+            request_zkey: single,
+            ..ceremony("single")
+        },
+        "needs at least 3 contributions followed by a beacon",
+    );
+    let (bare, _) = zkey("bare.zkey", KeyKind::Withdrawal, None);
+    refused(
+        &ImportArgs {
+            withdrawal_zkey: bare,
+            ..ceremony("bare")
+        },
+        "no contributions section",
+    );
+    let manifest = import(&ceremony("mpc")).unwrap();
+    assert_eq!(manifest.setup_id, CEREMONY_SETUP_ID);
+    assert_eq!(manifest.transcript_sha256, Some("ab".repeat(32)));
+    // Labelled mpc-1 but not pinned: release builds still refuse it.
+    let error = decode_compressed_for::<VerifyingKey<Bn254>>(
+        &std::fs::read(dir.join("mpc").join("request.vk")).unwrap(),
+        KeyKind::Request,
+        false,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("pinned"), "{error}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn malformed_powers_of_tau_are_refused() {
+    let dir = scratch("ptau");
+    let open = |bytes: &[u8]| {
+        let path = dir.join("bad.ptau");
+        std::fs::write(&path, bytes).unwrap();
+        Ptau::open(&path).map_err(|error| format!("{error:#}"))
+    };
+    let small = write_ptau(3, &[]);
+    let ptau = open(&small).unwrap();
+    assert_eq!(ptau.power(), 3);
+    assert!(ptau.lagrange_bases(8).is_ok());
+    for size in [16, 6] {
+        assert!(ptau.lagrange_bases(size).is_err(), "{size}");
+    }
+    // Wrong magic, truncated, another curve.
+    let mut wrong = small.clone();
+    wrong[0] = b'z';
+    assert!(open(&wrong).unwrap_err().contains("not a ptau file"));
+    assert!(open(&small[..small.len() - 1]).is_err());
+    let mut other_curve = small.clone();
+    other_curve[12 + 12 + 4] ^= 1;
+    assert!(open(&other_curve).unwrap_err().contains("not a BN254"));
+    // A Lagrange section of the wrong size (another power), or missing (a
+    // powers of tau not prepared for phase 2).
+    let mut sections = ptau_sections(3, &[]);
+    sections.last_mut().unwrap().1.truncate(64 * 14);
+    let error = open(&binfile(b"ptau", sections)).unwrap_err();
+    assert!(error.contains("section 15 has"), "{error}");
+    let mut sections = ptau_sections(3, &[]);
+    sections.retain(|(id, _)| *id != 13);
+    let error = open(&binfile(b"ptau", sections)).unwrap_err();
+    assert!(error.contains("no section 13"), "{error}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The development keys survive the snarkjs zkey layout exactly, pass the
+/// coefficient and shape gates, and the directory writer reproduces the
+/// committed development setup byte for byte from them.
+#[test]
+fn development_keys_round_trip_through_zkeys() {
+    let dir = scratch("dev");
+    let mut keys = Vec::new();
+    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
+        let bytes = std::fs::read(dev_setup_dir().join(kind.proving_key_file())).unwrap();
+        let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(&bytes, kind).unwrap();
+        let matrices = circuit_matrices(kind).unwrap();
+        let zkey = write_zkey(&pk, &matrices, None);
+        let (read, coefficients) = ark_circom::read_zkey(&mut std::io::Cursor::new(&zkey)).unwrap();
+        assert_eq!(read, pk, "{kind}");
+        check_coefficients(&coefficients, &read, kind, &matrices).unwrap();
+        check_shape(&read, kind).unwrap();
+        keys.push(read);
+    }
     let output = dir.join("setup");
-    import(&ImportArgs {
-        request_zkey,
-        withdrawal_zkey,
-        setup_id: DEV_SETUP_ID.to_string(),
-        provenance: SetupProvenance::default(),
-        output: output.clone(),
-    })
+    write_setup_directory(
+        &output,
+        DEV_SETUP_ID,
+        &keys[0],
+        &keys[1],
+        &SetupProvenance::default(),
+    )
     .unwrap();
     for file in [
         "request.pk",
@@ -175,64 +824,32 @@ fn import_zkey_round_trips_the_development_setup() {
     ] {
         assert!(
             std::fs::read(output.join(file)).unwrap()
-                == std::fs::read(setup_dir().join(file)).unwrap(),
+                == std::fs::read(dev_setup_dir().join(file)).unwrap(),
             "{file} differs after the zkey round trip"
         );
     }
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The import gates on real ceremony output, before running the import
+/// itself (README step 6):
+/// `ZKAPI_PTAU=... ZKAPI_REQUEST_ZKEY=... ZKAPI_WITHDRAWAL_ZKEY=... cargo test
+/// --release -p zkapi-proof --test zkey_import ceremony_zkeys_pass_the_import_gates -- --ignored`.
 #[test]
-fn import_zkey_refuses_foreign_constraints() {
-    let dir = scratch("foreign");
-    let (request_zkey, withdrawal_zkey) = dev_zkeys(&dir);
-    // Swapped circuits fail the fidelity gate.
-    let error = import(&ImportArgs {
-        request_zkey: withdrawal_zkey.clone(),
-        withdrawal_zkey: request_zkey.clone(),
-        setup_id: "mpc-1".to_string(),
-        provenance: SetupProvenance::default(),
-        output: dir.join("swapped"),
-    })
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("request zkey"), "{error}");
-    // One changed A coefficient fails it too.
-    let bytes = std::fs::read(setup_dir().join("request.pk")).unwrap();
-    let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(&bytes, KeyKind::Request).unwrap();
-    let mut matrices = circuit_matrices(KeyKind::Request).unwrap();
-    let row = matrices.a.iter().position(|row| !row.is_empty()).unwrap();
-    matrices.a[row][0].0 += Fr::ONE;
-    let tampered = dir.join("tampered.zkey");
-    std::fs::write(&tampered, write_zkey(&pk, &matrices)).unwrap();
-    let error = import(&ImportArgs {
-        request_zkey: tampered,
-        withdrawal_zkey,
-        setup_id: "mpc-1".to_string(),
-        provenance: SetupProvenance::default(),
-        output: dir.join("tampered-setup"),
-    })
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("A matrix differs"), "{error}");
-    assert!(!dir.join("tampered-setup").exists());
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Fidelity gate (c) on real ceremony output: the A and B matrices of the
-/// final zkeys (read by `ark_circom::read_zkey`) equal the synthesized ones,
-/// and the shipping prover's proofs verify under them. Run after the
-/// ceremony with
-/// `ZKAPI_REQUEST_ZKEY=... ZKAPI_WITHDRAWAL_ZKEY=... cargo test --release
-/// -p zkapi-proof --test zkey_import zkey_matrices_match -- --ignored`.
-#[test]
-#[ignore = "needs ceremony zkeys in ZKAPI_REQUEST_ZKEY and ZKAPI_WITHDRAWAL_ZKEY"]
-fn zkey_matrices_match() {
-    for (variable, kind) in [
+#[ignore = "needs ceremony files in ZKAPI_PTAU, ZKAPI_REQUEST_ZKEY and ZKAPI_WITHDRAWAL_ZKEY"]
+fn ceremony_zkeys_pass_the_import_gates() {
+    let variable = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+    let ptau = Ptau::open(variable("ZKAPI_PTAU")).unwrap();
+    println!("ptau sha256 {}", hex::encode(ptau.sha256()));
+    for (name, kind) in [
         ("ZKAPI_REQUEST_ZKEY", KeyKind::Request),
         ("ZKAPI_WITHDRAWAL_ZKEY", KeyKind::Withdrawal),
     ] {
-        let path = std::env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
-        import_zkey::read_checked_zkey(Path::new(&path), kind).unwrap();
+        let bases = ptau
+            .lagrange_bases(circuit_shape(kind).unwrap().domain_size)
+            .unwrap();
+        import_zkey::read_checked_zkey(Path::new(&variable(name)), kind, &bases)
+            .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
+        println!("{kind} zkey passes the import gates");
     }
 }

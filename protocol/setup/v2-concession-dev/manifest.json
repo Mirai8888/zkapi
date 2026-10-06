@@ -14,8 +14,13 @@
     "request": "0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872",
     "withdrawal": "0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd"
   },
+  "r1cs_sha256": {
+    "request": "08af67fadd2ab850e5085948fa31f8db68990bcaa58cb97701d58b1be9ae4f9d",
+    "withdrawal": "c3713cf8f8ea3bd8be87a406e1d3c52414e1c59d80aaf387f23c6da1e2f72bfb"
+  },
   "ptau_sha256": null,
   "transcript_sha256": null,
+  "zkey_sha256": null,
   "circuits": {
     "request": {
       "constraints": 31670,

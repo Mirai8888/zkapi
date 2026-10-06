@@ -5,8 +5,9 @@ They are single-party Groth16 keys generated with OS randomness, so whoever
 ran the generator could have kept the toxic waste. **Release builds refuse
 them**: every key file starts with the header
 `zkapi-v2-concession-v1/dev/<request|withdrawal>\0`, and only builds of
-`zkapi-proof` with the `dev-setup` feature accept the `dev` setup id. The
-production setup is the multi-party ceremony in
+`zkapi-proof` with the `dev-setup` feature accept the `dev` setup id
+(`cargo run --release -p zkapi-proof --bin release_policy_check` checks the
+release side). The production setup is the multi-party ceremony in
 [`../v2-concession`](../v2-concession/README.md) (setup id `mpc-1`).
 
 ## Contents
@@ -15,7 +16,7 @@ production setup is the multi-party ceremony in
 | --- | --- |
 | `request.pk`, `request.vk` | Request circuit keys (12 public inputs, 13 IC points) |
 | `withdrawal.pk`, `withdrawal.vk` | Withdrawal circuit keys (16 public inputs, 17 IC points) |
-| `manifest.json` | `setup_id`, `reduction: "circom"`, SHA-256 of the four key files, `vk_keccak256` per kind, circuit shapes, the verifying keys and the Poseidon parameters. `ptau_sha256` and `transcript_sha256` are `null`: there was no ceremony. |
+| `manifest.json` | `setup_id`, `reduction: "circom"`, SHA-256 of the four key files, `vk_keccak256` per kind, `r1cs_sha256` (this build's `.r1cs` exports), circuit shapes, the verifying keys and the Poseidon parameters. `ptau_sha256`, `transcript_sha256` and `zkey_sha256` are `null`: there was no ceremony. |
 | `Groth16ProofAdapter.sol` | The generated Solidity verifier, with `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH` |
 | `Bn254Poseidon.sol` | The generated Poseidon library (unchanged from `setup/v2`) |
 
@@ -35,13 +36,19 @@ reduction's `h_query_scalars`, so these keys have the snarkjs-style H query
 and are used by the same `CircomReduction` prover as the ceremony keys
 (checked by `tests/reduction_cross_check.rs` and `tests/proofs.rs`).
 
-Re-importing these keys through the ceremony path (`.zkey` export, then
-`examples/import_zkey.rs --setup-id dev`) reproduces every generated file in
-this directory byte for byte (`tests/zkey_import.rs`). A dry run of the full
-ceremony pipeline (exported `.r1cs`, snarkjs 0.7.5 with a throwaway 2^16
-powers of tau, one contribution and a beacon, `import_zkey --setup-id mpc-1`)
-passed the import gates, and snarkjs `groth16 verify` accepted the shipping
-prover's proofs under those keys.
+No powers of tau matches these keys (the generator discards `τ`), so they
+cannot pass the import's binding check. `tests/zkey_import.rs` checks the
+rest of the path on them: written as snarkjs `.zkey` files, they read back
+exactly, pass the coefficient and shape gates, and the directory writer
+reproduces every file here byte for byte. The binding and proving gates
+are tested on a toy ceremony with known `τ, α, β, δ`.
+
+A dry run of the full ceremony pipeline used snarkjs 0.7.5 with a throwaway
+2^16 powers of tau, one contribution and a beacon, on the exported `.r1cs`
+with the SHA-256 in `manifest.json`. It was imported with `import_zkey
+--setup-id rehearsal`, passed every import gate including the binding check,
+and passed `tests/proofs.rs` with `ZKAPI_SETUP_DIR` pointing at it. snarkjs
+`groth16 verify` accepted the shipping prover's proofs under those keys.
 
 ## Regenerating
 

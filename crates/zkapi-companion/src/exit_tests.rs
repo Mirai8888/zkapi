@@ -1331,6 +1331,39 @@ async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
     );
 }
 
+/// E0 before the escape decision: a live key is retired first, and a
+/// retirement that hangs (here a chat in flight holds the request lock)
+/// delays the decision by one `RECOVERY_BUDGET`, never longer.
+#[tokio::test]
+async fn a_live_key_whose_retirement_hangs_delays_the_escape_by_one_budget() {
+    let harness = Harness::new(true).await;
+    *harness.service.direct_lease.lock().await = Some(super::super::ActiveOpenRouterLease {
+        session_id: "oa-single-use".into(),
+        client_request_id: "live".into(),
+        api_key: "fixture-key".into(),
+        openrouter_api_base: "https://openrouter.ai/api/v1".into(),
+        expires_at: now_seconds() + 300,
+        settle_after: now_seconds() + 360,
+        verification: None,
+        verified: true,
+        verification_detail: None,
+        requests_served: 0,
+    });
+    let _chat = harness.service.direct_request_mutex.read().await;
+    let started = Instant::now();
+    let decision = tokio::time::timeout(
+        RECOVERY_BUDGET + Duration::from_secs(30),
+        harness.prepare(None, None),
+    )
+    .await
+    .expect("the escape decision waited on the hanging retirement")
+    .unwrap();
+    assert_eq!(decision["status"], "decision", "{decision}");
+    assert!(started.elapsed() >= RECOVERY_BUDGET);
+    // A decision leaves no key behind.
+    assert!(harness.service.direct_lease.lock().await.is_none());
+}
+
 /// A reservation that keeps its close and the clearance signature for an
 /// earlier state of the note (its closes dead, E6 released the lock, a late
 /// successor installed: a dishonest operator's O4 then E6) neither hands

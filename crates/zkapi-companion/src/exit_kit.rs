@@ -149,6 +149,11 @@ pub fn encrypt_with_iterations(
     passphrase: &str,
     iterations: u32,
 ) -> anyhow::Result<KitFile> {
+    seal(&serde_json::to_vec(contents)?, passphrase, iterations)
+}
+
+/// Seal the JSON contents `plain` into a kit file.
+fn seal(plain: &[u8], passphrase: &str, iterations: u32) -> anyhow::Result<KitFile> {
     if passphrase.chars().count() < 12 {
         return Err(kit_error("the passphrase must have at least 12 characters"));
     }
@@ -163,7 +168,7 @@ pub fn encrypt_with_iterations(
     let key = LessSafeKey::new(
         UnboundKey::new(&AES_256_GCM, &key).map_err(|_| kit_error("invalid key"))?,
     );
-    let mut sealed = serde_json::to_vec(contents)?;
+    let mut sealed = plain.to_vec();
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(iv),
         Aad::from(KIT_FORMAT.as_bytes()),
@@ -1108,6 +1113,61 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The SDK writes a note's amounts and counters as JSON numbers, or as
+    /// decimal strings for values beyond a double, and the bound either
+    /// way: a kit whose note amounts, bound and counters are decimal
+    /// strings, and whose top-level bound is a number, decrypts to the same
+    /// contents and escapes.
+    #[tokio::test]
+    async fn a_kit_with_decimal_string_amounts_decrypts_and_escapes() {
+        let file: KitFile = serde_json::from_str(SDK_KIT).unwrap();
+        let kit = decrypt(&file, SDK_KIT_PASSPHRASE).unwrap();
+        let mut plain = serde_json::to_value(&kit).unwrap();
+        let note = plain["note"].as_object_mut().unwrap();
+        for field in [
+            "protocol_version",
+            "chain_id",
+            "note_id",
+            "deposit_amount",
+            "expiry_ts",
+            "current_balance",
+            "bound_at_state",
+            "state_seq",
+        ] {
+            let entry = note.get_mut(field).unwrap();
+            *entry = json!(entry.as_u64().unwrap().to_string());
+        }
+        assert_eq!(note["current_balance"], "5000000");
+        plain["bound_at_state"] = json!(1_000_000u64);
+        for field in ["state_seq", "exported_at"] {
+            plain[field] = json!(plain[field].as_u64().unwrap().to_string());
+        }
+        let passphrase = "decimal strings for every amount";
+        let sealed = seal(&serde_json::to_vec(&plain).unwrap(), passphrase, 1_000).unwrap();
+        let opened = decrypt(&sealed, passphrase).unwrap();
+        assert_eq!(
+            serde_json::to_value(&opened).unwrap(),
+            serde_json::to_value(&kit).unwrap()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let result = escape(
+            &opened,
+            &EscapeOptions {
+                destination: [0x44; 20],
+                conceded: 1_000_000,
+                rpc_url: None,
+                work_dir: directory.path().join("kit"),
+                proof_setup_dir: SETUP_DIR.into(),
+                offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["payout"], "4000000");
+        let data = hex::decode(result["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        assert_eq!(data.len(), 836);
     }
 
     /// E7 "with the companion's bundled keys and the codehash pins": a kit's

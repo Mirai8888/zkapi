@@ -4,6 +4,7 @@ members = [
     "crates/zkapi-cli",
     "crates/zkapi-serverd",
     "crates/zkapi-indexerd",
+    "crates/zkapi-auth",
 ]
 default-members = ["crates/zkapi-cli"]
 exclude = ["protocol", "protocol/rust", "sdk"]

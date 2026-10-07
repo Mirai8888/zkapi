@@ -1144,6 +1144,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "lambdaworks-crypto"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b1a1c1102a5a7fbbda117b79fb3a01e033459c738a3c1642269603484fd1c1"
+dependencies = [
+ "lambdaworks-math",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "serde",
+ "sha2",
+ "sha3",
+]
+
+[[package]]
+name = "lambdaworks-math"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "018a95aa873eb49896a858dee0d925c33f3978d073c64b08dd4f2c9b35a017c6"
+dependencies = [
+ "getrandom 0.2.17",
+ "num-bigint",
+ "num-traits",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1855,6 +1883,22 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "starknet-types-core"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90d23b1bc014ee4cce40056ab3114bcbcdc2dbc1e845bbfb1f8bd0bab63507d4"
+dependencies = [
+ "lambdaworks-crypto",
+ "lambdaworks-math",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "rand 0.9.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "strsim"
@@ -2800,6 +2844,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkapi-auth"
+version = "0.1.0"
+dependencies = [
+ "num-bigint",
+ "rand 0.8.5",
+ "sha3",
+ "starknet-types-core",
+ "thiserror",
+ "zkapi-core",
+ "zkapi-proof",
+ "zkapi-types",
+]
+
+[[package]]
 name = "zkapi-browser"
 version = "0.1.0"
 dependencies = [
@@ -2875,16 +2933,19 @@ dependencies = [
  "ark-ed-on-bn254",
  "ark-ff",
  "ark-groth16",
+ "ark-poly",
  "ark-r1cs-std",
  "ark-relations",
  "ark-serialize",
  "ark-snark",
  "ark-std",
  "base64",
+ "blake2",
  "hex",
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "zkapi-core",
  "zkapi-types",

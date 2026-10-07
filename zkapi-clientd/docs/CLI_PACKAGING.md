@@ -109,10 +109,17 @@ On macOS install Xcode command-line tools and the corresponding Homebrew tools.
 ./scripts/build-native.sh 0.1.6 /tmp/clientd-artifacts /tmp/clientd-wallet-source
 ```
 
-`test-companion.sh` runs the tests of every crate that the two maintained
-patches change. It reads the crates from the patches. Companion crates are
-tested in the prepared workspace. The patched protocol crates are tested in
-`protocol/rust`, because the companion workspace excludes that directory.
+`prepare-zkapi.sh` checks out this repository at the commit pinned as
+`ZKAPI_SOURCE_COMMIT` in `packaging/zkapi-source.env`, from this checkout when
+it holds that commit and otherwise from `https://github.com/ethereum/zkapi`
+(`ZKAPI_SOURCE_REPOSITORY` overrides it). `verify-zkapi-source.py` requires
+exactly that commit with a clean tree, before and after the build.
+`test-companion.sh` runs `cargo test -p zkapi-companion -p zkapi-auth` in the
+prepared root workspace and `cargo test -p zkapi-client` in `protocol/rust`,
+because the root workspace excludes that directory. `build-native.sh` builds
+`cargo build --release --locked -p zkapi-companion --bin zkapi-walletd` and
+bundles `protocol/setup/v2-concession`; a release build loads only the pinned
+ceremony keys, so it stops while that directory holds none.
 
 Run on the native target. Supported release targets are macOS 13+ and Linux
 with glibc 2.39+, on amd64 or arm64. Linux runtime dependencies are OpenSSL 3,
@@ -145,13 +152,13 @@ It supports install/update with the same prefix and optional `--setup`.
 `--setup` runs configuration after activation; no configuration is performed
 by default. Update the pinned README URL when publishing another client release.
 
-The root Rust workspace uses a native-only operator layout.
-The frontend prepares pinned companion commit
-`20aa542ae98e767c0507133fd34b12a56f5ccd3d` with protocol commit
-`8b2d4e3da921f956e1eb6b93afbf722a877c060c` in a separate build directory and applies
-its reviewed bridge/transport patches. Source verification checks exact commits
-and diffs. These patches must not be applied to the root workspace. Proving
-assets remain deployment-pinned; never regenerate them for installation.
+The wallet companion (`zkapi-walletd`) is this repository's
+`crates/zkapi-companion`, built with the protocol crates of the same commit, so
+the circuit, the operator's server and the companion never come from two
+sources. Releases build it from the pinned `ZKAPI_SOURCE_COMMIT` in a separate
+build directory; move the pin to a commit holding every companion, protocol and
+`Cargo.lock` change a release must ship. Proving assets remain
+deployment-pinned; never regenerate them for installation.
 
 ## Checks
 

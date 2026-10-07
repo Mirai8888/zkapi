@@ -24,13 +24,13 @@ import (
 const (
 	MainnetManifest         = "https://zkapi-mainnet.openanonymity.ai/config.json"
 	SepoliaManifest         = "https://zkapi-sepolia.openanonymity.ai/config.json"
-	CompanionRevision       = "20aa542ae98e767c0507133fd34b12a56f5ccd3d"
 	DefaultClientURL        = "http://127.0.0.1:43134"
 	DefaultInferenceBaseURL = "https://openrouter.ai/api/v1"
 )
 
-// Config is the Go-side bridge configuration. A companion must be built with
-// companion.patch; unpatched or unauthenticated daemons are rejected.
+// Config is the Go-side bridge configuration. The companion is this
+// repository's zkapi-walletd (crates/zkapi-companion); a daemon that does not
+// speak the bridge protocol or authenticate is rejected.
 type Config struct {
 	ClientURL        string        `json:"client_url"`
 	BridgeToken      string        `json:"bridge_token"`

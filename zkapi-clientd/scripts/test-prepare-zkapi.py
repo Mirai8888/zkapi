@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Offline preparation regressions: patch-added files must pass exact-source checks,
-and the companion test run must cover every crate the maintained patches change."""
+"""Offline preparation regressions: prepare-zkapi.sh checks out exactly the
+pinned commit of this repository, verify-zkapi-source.py refuses anything else,
+and test-companion.sh tests the companion crates of both workspaces."""
 import os
 from pathlib import Path
 import shutil
@@ -10,133 +11,153 @@ import unittest
 
 
 SCRIPTS = Path(__file__).resolve().parent
+PUBLIC_REPOSITORY = "https://github.com/ethereum/zkapi.git"
+COMPANION_FILES = ("Cargo.toml", "Cargo.lock", "crates/zkapi-companion/Cargo.toml",
+                   "crates/zkapi-auth/Cargo.toml", "protocol/rust/Cargo.lock",
+                   "protocol/rust/crates/zkapi-client/Cargo.toml")
 
 
 class Fixture:
-    """Pinned fixture upstreams, a fixture checkout of this repository's scripts
-    and patches, and a tree prepared from them by prepare-zkapi.sh."""
+    """A fixture repository with a commit holding the companion, a later tip,
+    and a copy of this repository's packaging scripts pinned to that commit."""
 
-    def __init__(self, root, companion_files, protocol_files):
-        """Each *_files maps a path to (original text or None for a file the
-        patch adds, patched text)."""
+    def __init__(self, root, local_checkout=False, pin=None):
         self.root = root
-        global_config = root / "gitconfig"
-        self.environment = dict(os.environ, GIT_CONFIG_GLOBAL=str(global_config),
+        root.mkdir(parents=True, exist_ok=True)
+        self.global_config = root / "gitconfig"
+        self.environment = dict(os.environ, GIT_CONFIG_GLOBAL=str(self.global_config),
                                 GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Fixture",
                                 GIT_AUTHOR_EMAIL="fixture@example.invalid",
                                 GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        self.environment.pop("ZKAPI_SOURCE_REPOSITORY", None)
 
-        protocol = root / "protocol-upstream"
-        protocol.mkdir()
-        self.git(protocol, "init", "-q")
-        self.write_originals(protocol, protocol_files, "unchanged protocol\n")
-        self.git(protocol, "add", ".")
-        self.git(protocol, "commit", "-qm", "fixture protocol")
-        self.protocol_commit = self.git(protocol, "rev-parse", "HEAD")
+        upstream = root / "zkapi-upstream"
+        upstream.mkdir()
+        self.git(upstream, "init", "-q")
+        (upstream / "unchanged.txt").write_text("unchanged\n")
+        self.git(upstream, "add", ".")
+        self.git(upstream, "commit", "-qm", "before the companion")
+        self.without_companion = self.git(upstream, "rev-parse", "HEAD")
+        for name in COMPANION_FILES:
+            (upstream / name).parent.mkdir(parents=True, exist_ok=True)
+            (upstream / name).write_text(f"pinned {name}\n")
+        self.git(upstream, "add", ".")
+        self.git(upstream, "commit", "-qm", "the companion")
+        self.commit = self.git(upstream, "rev-parse", "HEAD")
+        (upstream / "Cargo.toml").write_text("a later change\n")
+        self.git(upstream, "commit", "-qam", "after the pin")
+        self.tip = self.git(upstream, "rev-parse", "HEAD")
 
-        source = root / "companion-upstream"
-        source.mkdir()
-        self.git(source, "init", "-q")
-        self.write_originals(source, companion_files, "unchanged companion\n")
-        self.git(source, "add", ".")
-        self.git(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", protocol.as_uri(), "protocol")
-        self.git(source, "commit", "-qm", "fixture companion")
-        self.companion_commit = self.git(source, "rev-parse", "HEAD")
-
-        fixture_repo = root / "zkapi-clientd"
-        self.scripts = fixture_repo / "zkapi-clientd/scripts"
+        if local_checkout:
+            # This checkout holds the pinned commit; the public URL is broken.
+            self.checkout = root / "checkout"
+            self.git(root, "clone", "-q", str(upstream), str(self.checkout))
+            public = root / "missing-repository"
+        else:
+            # A checkout without Git history (for example a release tarball).
+            self.checkout = root / "tarball"
+            self.checkout.mkdir()
+            public = upstream
+        self.global_config.write_text(
+            '[protocol "file"]\n\tallow = always\n'
+            f'[url "{public.as_uri()}"]\n\tinsteadOf = {PUBLIC_REPOSITORY}\n')
+        self.scripts = self.checkout / "zkapi-clientd/scripts"
         self.scripts.mkdir(parents=True)
-        patches = fixture_repo / "zkapi-clientd/internal/zkapi"
-        patches.mkdir(parents=True)
-        packaging = fixture_repo / "zkapi-clientd/packaging"
+        packaging = self.checkout / "zkapi-clientd/packaging"
         packaging.mkdir()
         for name in ("prepare-zkapi.sh", "verify-zkapi-source.py", "test-companion.sh"):
             shutil.copy2(SCRIPTS / name, self.scripts / name)
-        (packaging / "zkapi-source.env").write_text(
-            f"OA_COMPANION_COMMIT={self.companion_commit}\nOA_PROTOCOL_COMMIT={self.protocol_commit}\n")
-        (patches / "companion.patch").write_text(self.patch(source, companion_files))
-        (patches / "protocol-transport.patch").write_text(self.patch(protocol, protocol_files))
-        # Clone the fixture revisions via an isolated Git URL rewrite. There
-        # are no external downloads and no changes to the user's Git config.
-        global_config.write_text(
-            '[protocol "file"]\n\tallow = always\n'
-            f'[url "{source.as_uri()}"]\n\tinsteadOf = https://github.com/ethereum/zkapi.git\n')
+        (packaging / "zkapi-source.env").write_text(f"ZKAPI_SOURCE_COMMIT={pin or self.commit}\n")
         self.prepared = root / "prepared"
-        self.preparation = subprocess.run(["bash", str(self.scripts / "prepare-zkapi.sh"), str(self.prepared)],
-                                          env=self.environment, text=True, capture_output=True, timeout=30)
+        self.preparation = self.prepare(self.prepared)
+
+    def prepare(self, destination, environment=None):
+        return subprocess.run(["bash", str(self.scripts / "prepare-zkapi.sh"), str(destination)],
+                              env=environment or self.environment, text=True, capture_output=True, timeout=60)
+
+    def verify(self, source, commit):
+        return subprocess.run(["python3", str(self.scripts / "verify-zkapi-source.py"), str(source), commit],
+                              env=self.environment, text=True, capture_output=True, timeout=60)
 
     def git(self, path, *args):
         return subprocess.check_output(["git", "-C", str(path), *args],
                                        env=self.environment, stderr=subprocess.PIPE).decode().strip()
 
-    @staticmethod
-    def write_originals(directory, files, unchanged):
-        (directory / "unchanged.txt").write_text(unchanged)
-        for name, (original, _) in files.items():
-            if original is not None:
-                (directory / name).parent.mkdir(parents=True, exist_ok=True)
-                (directory / name).write_text(original)
-
-    def patch(self, directory, files):
-        for name, (original, patched) in files.items():
-            (directory / name).parent.mkdir(parents=True, exist_ok=True)
-            (directory / name).write_text(patched)
-            if original is None:
-                self.git(directory, "add", "-N", name)
-        return self.git(directory, "diff", "--binary", "HEAD") + "\n"
-
 
 class PreparationTests(unittest.TestCase):
-    def test_added_sources_are_verified_and_unexpected_changes_rejected(self):
+    def test_prepares_exactly_the_pinned_commit_and_refuses_any_change(self):
         with tempfile.TemporaryDirectory(prefix="zkapi-prepare-test-") as directory:
-            fixture = Fixture(
-                Path(directory),
-                {"main.txt": ("original companion\n", "patched companion\n"),
-                 "withdrawal.txt": (None, "new withdrawal implementation\n")},
-                {"transport.txt": ("original transport\n", "patched transport\n"),
-                 "bridge.txt": (None, "new bridge implementation\n")})
-            prepared, git = fixture.prepared, fixture.git
+            fixture = Fixture(Path(directory))
             result = fixture.preparation
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Verified exact companion/protocol", result.stdout)
-            self.assertEqual(git(prepared, "ls-files", "--others", "--exclude-standard"), "")
-            self.assertEqual(git(prepared / "protocol", "ls-files", "--others", "--exclude-standard"), "")
-            self.assertEqual((prepared / "withdrawal.txt").read_text(), "new withdrawal implementation\n")
-            self.assertEqual((prepared / "protocol/bridge.txt").read_text(), "new bridge implementation\n")
-            self.assertEqual(git(prepared, "ls-files", "--error-unmatch", "unchanged.txt"), "unchanged.txt")
-            self.assertEqual(git(prepared / "protocol", "ls-files", "--error-unmatch", "unchanged.txt"), "unchanged.txt")
+            self.assertIn("Verified the exact pinned companion source", result.stdout)
+            prepared, git = fixture.prepared, fixture.git
+            # The pinned commit, not the repository's later tip.
+            self.assertEqual(git(prepared, "rev-parse", "HEAD"), fixture.commit)
+            self.assertNotEqual(fixture.commit, fixture.tip)
+            self.assertEqual((prepared / "Cargo.toml").read_text(), "pinned Cargo.toml\n")
+            self.assertEqual(git(prepared, "status", "--porcelain", "--untracked-files=all"), "")
 
-            # These patches change no crate, so there is nothing to test; the
-            # companion test run refuses instead of reporting them tested.
-            untested = subprocess.run(["bash", str(fixture.scripts / "test-companion.sh"), str(prepared)],
-                                      env=fixture.environment, text=True, capture_output=True, timeout=30)
-            self.assertNotEqual(untested.returncode, 0, untested.stdout + untested.stderr)
-            self.assertIn("companion.patch changes no crate under crates/", untested.stderr)
+            # The destination must be new.
+            again = fixture.prepare(prepared)
+            self.assertNotEqual(again.returncode, 0)
+            self.assertIn("Destination already exists", again.stderr)
 
-            command = ["python3", str(fixture.scripts / "verify-zkapi-source.py"),
-                       str(prepared), fixture.companion_commit, fixture.protocol_commit]
-            for mutation in (prepared / "unexpected.txt", prepared / "protocol/bridge.txt"):
-                mutation.write_text("unexpected source\n")
-                rejected = subprocess.run(command, env=fixture.environment, text=True, capture_output=True, timeout=30)
-                self.assertNotEqual(rejected.returncode, 0, "unexpected source was accepted")
-                if mutation.name == "unexpected.txt":
-                    mutation.unlink()
+            self.assertEqual(fixture.verify(prepared, fixture.commit).returncode, 0)
+            for commit in (fixture.tip, fixture.commit[:12], fixture.commit.upper()):
+                refused = fixture.verify(prepared, commit)
+                self.assertNotEqual(refused.returncode, 0, commit)
+            for mutation in ("untracked", "modified", "staged", "deleted"):
+                target = prepared / ("unexpected.rs" if mutation == "untracked" else "crates/zkapi-companion/Cargo.toml")
+                if mutation == "deleted":
+                    target.unlink()
+                else:
+                    target.write_text("unexpected source\n")
+                if mutation == "staged":
+                    git(prepared, "add", str(target))
+                refused = fixture.verify(prepared, fixture.commit)
+                self.assertNotEqual(refused.returncode, 0, mutation)
+                self.assertIn("differs from the pinned commit", refused.stderr, mutation)
+                git(prepared, "reset", "-q", "--hard")
+                (prepared / "unexpected.rs").unlink(missing_ok=True)
+            self.assertEqual(fixture.verify(prepared, fixture.commit).returncode, 0)
+            # A subdirectory of the checkout is not the checkout.
+            refused = fixture.verify(prepared / "crates", fixture.commit)
+            self.assertNotEqual(refused.returncode, 0)
 
-    def test_companion_tests_run_every_crate_the_patches_change(self):
-        # The companion workspace excludes protocol/rust, so testing only the
-        # companion crates would never run the patched protocol crates' tests.
+    def test_a_checkout_holding_the_pinned_commit_needs_no_network(self):
+        with tempfile.TemporaryDirectory(prefix="zkapi-prepare-local-test-") as directory:
+            fixture = Fixture(Path(directory), local_checkout=True)
+            result = fixture.preparation
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(fixture.git(fixture.prepared, "rev-parse", "HEAD"), fixture.commit)
+            # A commit the checkout does not hold comes from the public
+            # repository, which this fixture breaks.
+            (fixture.checkout / "zkapi-clientd/packaging/zkapi-source.env").write_text(
+                f"ZKAPI_SOURCE_COMMIT={'0' * 40}\n")
+            missing = fixture.prepare(Path(directory) / "missing")
+            self.assertNotEqual(missing.returncode, 0)
+
+    def test_the_pin_is_a_full_hash_of_a_commit_holding_the_companion(self):
+        with tempfile.TemporaryDirectory(prefix="zkapi-prepare-pin-test-") as directory:
+            root = Path(directory)
+            short = Fixture(root / "short", pin="abc123")
+            self.assertNotEqual(short.preparation.returncode, 0)
+            self.assertIn("full 40-character", short.preparation.stderr)
+            self.assertFalse(short.prepared.exists())
+            old = Fixture(root / "old")
+            old_pin = old.without_companion
+            (old.checkout / "zkapi-clientd/packaging/zkapi-source.env").write_text(f"ZKAPI_SOURCE_COMMIT={old_pin}\n")
+            refused = old.prepare(root / "old-prepared")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("does not hold the wallet companion", refused.stderr)
+
+    def test_companion_tests_run_in_both_workspaces(self):
+        # The root workspace excludes protocol/rust, so testing only the root
+        # crates would never run zkapi-client's tests.
         with tempfile.TemporaryDirectory(prefix="zkapi-companion-test-") as directory:
             root = Path(directory)
-            fixture = Fixture(
-                root,
-                {"crates/wallet/src/lib.rs": ("original wallet\n", "patched wallet\n"),
-                 "crates/wallet/src/routes.rs": ("original routes\n", "patched routes\n"),
-                 "crates/bridge/tests/new.rs": (None, "new bridge test\n"),
-                 "Cargo.lock": ("original lock\n", "patched lock\n")},
-                {"rust/crates/client/src/journal.rs": ("original journal\n", "durable journal\n"),
-                 "rust/crates/client/src/note_state.rs": ("original state\n", "durable state\n"),
-                 "rust/crates/types/src/wire.rs": ("original wire\n", "patched wire\n"),
-                 "README.md": ("original readme\n", "patched readme\n")})
+            fixture = Fixture(root)
             self.assertEqual(fixture.preparation.returncode, 0,
                              fixture.preparation.stdout + fixture.preparation.stderr)
 
@@ -158,17 +179,17 @@ class PreparationTests(unittest.TestCase):
                 environment = dict(fixture.environment, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                                    FAKE_CARGO_LOG=str(log), FAKE_CARGO_FAIL_IN=fail_in)
                 result = subprocess.run(["bash", str(fixture.scripts / "test-companion.sh"), str(fixture.prepared)],
-                                        env=environment, text=True, capture_output=True, timeout=30)
+                                        env=environment, text=True, capture_output=True, timeout=60)
                 calls = [tuple(line.split("\t")) for line in log.read_text().splitlines()] if log.exists() else []
                 return result, calls
 
             result, calls = run_tests()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(calls, [
-                (str(prepared), "test --release --locked -p bridge -p wallet"),
-                (str(protocol_rust), "test --release --locked -p client -p types"),
+                (str(prepared), "test --release --locked -p zkapi-companion -p zkapi-auth"),
+                (str(protocol_rust), "test --release --locked -p zkapi-client"),
             ])
-            self.assertIn("Tested every crate changed by", result.stdout)
+            self.assertIn("Tested zkapi-companion, zkapi-auth and zkapi-client", result.stdout)
 
             # A failing protocol crate test fails the run.
             result, calls = run_tests(fail_in=str(protocol_rust))
@@ -180,12 +201,12 @@ class PreparationTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(len(calls), 1)
 
-            # A tree that is not exactly the pinned sources plus the patches is
-            # refused before anything is tested.
-            (fixture.prepared / "protocol/rust/crates/client/src/journal.rs").write_text("original journal\n")
+            # A tree that is not exactly the pinned commit is refused before
+            # anything is tested.
+            (fixture.prepared / "protocol/rust/crates/zkapi-client/Cargo.toml").write_text("changed\n")
             result, calls = run_tests()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("differ from its maintained patch", result.stderr)
+            self.assertIn("differs from the pinned commit", result.stderr)
             self.assertEqual(calls, [])
 
 

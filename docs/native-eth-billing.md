@@ -17,8 +17,8 @@ units back to wei and enforce proof, nullifier, destination, timing
 and reentrancy protections. A failed transfer to a mutual-close destination
 reverts the complete close; the user can prove the close again to another
 destination. A mutual close forwards all gas, so only a destination that
-rejects ETH reverts it. On vaults deployed from this release
-`finalizeEscapeWithdrawal` pushes the balance with at most 100,000 gas
+rejects ETH reverts it. `finalizeEscapeWithdrawal` pushes the payout with at
+most 100,000 gas
 (`ESCAPE_PAYOUT_GAS`); if the destination rejects it or needs more gas, the
 escape still closes and the treasury share is paid, and the balance is
 credited to `escapePayoutCredits(destination)` (`EscapePayoutDeferred`) for a
@@ -30,20 +30,22 @@ SDK builds report such an escape as returned, and clients detect a credit
 only for an escape that the same browser started (the browser SDK) or a
 relayed escape whose transaction hash the user enters (`zkapi-clientd`), so
 operators still announce credits; see
-[Escape payout credits](migration-hardened-vault.md#operations-runbooks).
-On older vaults an escape to a destination that rejects ETH cannot finalize,
-so the SDK refuses to start one unless the caller overrides its destination
-check.
-Likewise, on vaults deployed from this release a treasury that rejects its
+[Escape payout credits](migration-concession-vault.md#escape-payout-credits).
+On the legacy vaults an escape to a destination that rejects ETH cannot
+finalize.
+Likewise, a treasury that rejects its
 share, or needs more than 100,000 gas to receive it, cannot block a close: the share accrues to `treasuryArrears()` with a
 `TreasuryPaymentDeferred` event, and anyone can pay it out later with
 `withdrawTreasuryArrears()`.
 
 The deployment manifest pins the vault address, native asset, and circuit
-`zkapi-v2-note-bound-v1` with its exact setup/WASM/key hashes. The circuit binds
-each signed balance to its deposit note. Challenges preserve the historical
-request root and use a current restoration path. See
-[Note-bound commitments](note-bound-commitments.md).
+`zkapi-v2-concession-v1` with its setup, its exact WASM and key hashes, and the
+runtime code hashes of the vault, adapter and Poseidon library. The circuit
+binds each signed balance to its deposit note. An escape concedes an amount up
+to its state's request budget; the challenger raises it to what the request at
+that state owes, or defeats it with a request proof at the state's successor.
+See [Note-bound commitments](note-bound-commitments.md) and the
+[concession exit design](design/concession-exit.md).
 
 ## Pinned configuration
 
@@ -63,8 +65,9 @@ The public deployment manifest and browser trust configuration must agree on:
 
 Pin the RPC URL, chain, vault and protocol/signing/proof-asset
 fields too. Both manifest `proof_setup.circuit_id` and browser
-`trusted_deployment.circuit_id` must equal `zkapi-v2-note-bound-v1`, and all
-request/withdrawal proving and verifying key hashes must match that setup. The example feed is Sepolia; it does not select a production feed.
+`trusted_deployment.circuit_id` must equal `zkapi-v2-concession-v1`, the setup
+IDs must agree, and all request/withdrawal proving and verifying key hashes
+must match that setup. The example feed is Sepolia; it does not select a production feed.
 The server checks chain ID, feed decimals and the vault's native-unit getter
 before answering or accepting a quote. There is no symbol-only fallback.
 
@@ -149,10 +152,9 @@ withdrawal keep working, and a `zkapi-clientd` withdrawal settlement discards
 the request once the server knows neither the request nor its nullifier. Prefer
 to change native-price pins when no wallet has a request in flight.
 `zkapi-clientd` 0.1.6 and earlier check journaled quotes against the pinned
-manifest and cannot open such a wallet at all, so ship a pin change only in a
-clientd release built with the updated `companion.patch`. Until then, clientd
-wallets must have no request in flight when the pins change. The clientd
-companion converts only 8-decimal ETH/USD answers.
+manifest and cannot open such a wallet at all; later releases, whose
+companion is built from this repository, check them only for consistency.
+The clientd companion converts only 8-decimal ETH/USD answers.
 
 An accepted reservation does not authorize new access after its state has been
 withdrawn. Before contacting either provider to create a key, including an exact
@@ -187,12 +189,14 @@ key revocation: an OA key that was never returned was seen only by the org, its
 station and this server, and lapses at its TTL.
 
 A withdrawal started after key delivery still requires timely operation of the
-challenger. The challenger contests an escape at a lease's state only after
-settlement finalizes it, which the settlement deadline below bounds. These
-checks do not replace the configured challenge window, a trustworthy view of the
-selected chain, or sufficient operational time to observe and challenge a stale
-escape. The challenge window is fixed when the vault is deployed (24 hours in
-the current deployments).
+challenger. An escape from a lease's state is raised to the lease's charge once
+settlement fixes it, which the settlement deadline below bounds, or to its
+solvency bound at the raise lead; an escape from an older state is defeated by
+the request proof at its successor, whatever that request's settlement status.
+These checks do not replace the configured challenge window, a trustworthy view
+of the selected chain, or sufficient operational time to observe and act on an
+escape. The challenge window is fixed when the vault is deployed (172,800
+seconds planned for mainnet, 43,200 for Sepolia).
 
 For ledger units `U`, oracle integer answer `P`, and decimals `D`, the upstream
 budget in micro-USD is:
@@ -239,6 +243,20 @@ after expiry. Other errors do not authorize discarding a
 pending journal. `POST /v2/requests` has been removed; all new authorizations
 require prompt-private leases with a proof-bound native quote.
 
+## Clearance
+
+`POST /v2/withdraw/clearance` signs a mutual-close clearance only against a
+kind-2 ownership proof of the same nullifier (`ClearanceRequestV2C`): its
+destination, conceded amount and successor nullifier are zero, its
+`valid_until` lies between now and an hour ahead, and its root is one the
+server saw within `--clearance-root-window-seconds`, the vault's
+`currentRoot()`, or any root the vault ever held (`knownRoots`), so a wallet's
+deposit-time path serves. This circuit has no proof-less clearance: the
+legacy clearance budget is gone, and `--allow-legacy-clearance` refuses
+startup. A nullifier with any request row is refused (`nullifier_used`); a
+granted clearance reserves it for good, and asking again signs again. See the
+[API reference](../docs-site/content/docs/api-reference/serverd.mdx).
+
 ## Deployment
 
 The deploy script creates a native-only vault and accepts `REQUEST_CHARGE_CAP`
@@ -263,19 +281,29 @@ The server requires native oracle and prompt-private lease configuration, with
 one key source; to change it, see
 [Changing the key source](#changing-the-key-source).
 `--openrouter-settlement-deadline-seconds` (default 21600) sets the settlement
-deadline described below. Operate the compatible v2
+deadline described below. The server also requires `--deployment` (the
+deployment manifest the database was initialized from with `zkapi db init`),
+admits a request only at the exact current root while its indexer's root and
+the vault's `currentRoot()` agreed within `--root-max-staleness-seconds`
+(default 60; otherwise `503 root_unavailable`), and, with
+`--request-limit-max-usd-micros` (6,000,000 during the canary, and recommended
+permanently), refuses a request whose lease budget exceeds that ceiling before
+anything is reserved (`400 request_limit_exceeded`). This ceiling bounds the
+operator's per-request exposure.
+
+The reservation is written in one SQLite transaction with the provisioning
+lease row and an append-only `request_evidence` row holding the request's
+public inputs and proof. Triggers refuse any update or delete of that table;
+keep it until the deployment retires. Operate the
 [challenge daemon](challenge-service.md) alongside server and indexer, with a
-dedicated funded signer restricted to the configured vault. Its only evidence is
-the server's finalized transcript: the exact historical request root, inputs and
-proof of a request whose settlement is signed. A reserved request, including an
-issued lease whose usage is not settled yet, is not evidence; the daemon waits
-for settlement, which the deadline bounds, and uses a current zero-slot
-restoration path. Native usage settlement preserves the original proof/public
-inputs required for that challenge. After a successful challenge on a vault
-deployed from this release, `usedNullifiers(nullifier)` reads `false` and
-`challengedNullifiers(nullifier)` reads `true`: no escape can use that
-nullifier again, and the owner exits from the signed successor state. On vaults
-deployed before this release the nullifier stays consumed.
+dedicated funded signer restricted to the configured vault. It defeats an
+escape with any verified evidence row at the escape's successor nullifier, and
+raises an escape's concession with the row at its nullifier, to the settled
+charge, or to the solvency bound of a request that may have been delivered and
+is still unsettled near the deadline. After a defeat,
+`usedNullifiers(nullifier)` reads `false` and
+`challengedNullifiers(nullifier)` reads `true`: no escape can use that state
+again, and the owner exits from its newer state.
 Do not reuse a daemon, verifier or setup from another circuit. Configure the published manifest separately; these flags do
 not rewrite static frontend manifests. The browser SDK handles funding and
 withdrawals; the operator CLI runs setup, signing-key, server and indexer
@@ -347,8 +375,29 @@ treats it as evidence.
 
 ## Settlement terminality
 
-Every accepted lease reaches a signed transcript by a deadline, so a lease can
-no longer hold its note state reserved indefinitely:
+Every accepted lease's charge is fixed by a deadline, so a lease can no longer
+hold its note state reserved indefinitely. Settlement and signing are two
+steps:
+
+- **Settle.** The charge is computed as below and written once, with its basis
+  and time, on the nullifier row (`settled_charge`, `settled_basis`,
+  `settled_at`), which stays `Reserved`. The lease row already reads
+  `finalized` from then on; a client reads the nullifier's recovery status to
+  learn when the successor is signed.
+- **Sign.** The successor is signed at the anchor derived from the request's
+  nullifier, and only while the vault reports that nullifier unused
+  (`usedNullifiers` at `latest`). When an exit has consumed it, the signature
+  is deferred: the row records `exit_deferred_since` and the lease reads
+  `exit_deferred`. Every pass checks it again. If the exit is defeated, the
+  successor is signed with the settled charge; if the nullifier is still
+  consumed one challenge period plus 3,600 seconds after the first
+  observation, the row becomes `ExitedUnsigned` (lease `exited_unsigned`) and
+  no successor is ever signed. The challenger raises such an escape to the
+  settled charge. Each signing pass pages never-deferred and deferred requests
+  separately, at most 200 of each per pass, so a deferred request is checked
+  again within a few passes rather than on every one.
+
+The charge itself:
 
 - The deadline (`settlement_deadline_at`) is written once, when the lease row is
   created: issuance + TTL + grace + `--openrouter-settlement-deadline-seconds`
@@ -420,9 +469,9 @@ no longer hold its note state reserved indefinitely:
   usage, or an invalid saved TTL, namespace or limit, is finalized at the
   solvency bound at once (`settlement_reason: "unsettleable"`, review
   `unsettleable_worst_case`).
-- A charge is final once signed; there is no refund transaction. The solvency
-  bound is the most the user's own proof authorized, and the provider key's
-  spending limit was derived from it.
+- A charge is final once settled; there is no refund transaction. The
+  solvency bound is the most the user's own proof authorized, and the provider
+  key's spending limit was derived from it.
 - `cancelled` is used only for a lease whose saved binding does not match its
   nullifier record. The server never signs it and records a `binding_corrupt`
   review naming the first mismatching field, and a retry of the request returns
@@ -431,22 +480,20 @@ no longer hold its note state reserved indefinitely:
   capture is retried like any settlement until the deadline; the corruption is
   reviewed as soon as it is found, and the lease is cancelled, with a second
   review, once its usage is read, or at its deadline without it. The
-  cancellation queues the key's deletion. Its nullifier stays reserved without
-  evidence, which blocks most owners: SDK builds on a vault without
-  `vault_revision` 2 (strict mode, every shipped profile) refuse
-  to escape at that state, zkapi-clientd has no escape, and a reserved nullifier
-  never receives a mutual-close clearance. Only an SDK on a `vault_revision` 2
-  vault can escape there, through the explicit override once
-  `unsettled_request_escape_after_seconds` has passed; the challenger does not
-  contest it. The operator's remedy is to
-  [reopen the lease](#reopening-a-cancelled-lease) once its binding is
-  repaired. Conceding its charge (`--zero-charge`) is a choice of charge within
-  that remedy, not a way around the repair.
+  cancellation queues the key's deletion. Its nullifier stays reserved and
+  unsettled, and a reserved nullifier never receives a mutual-close clearance.
+  The owner's client therefore escapes at its time `T`, conceding the state's
+  bound, and the challenger raises nothing beyond the solvency bound. The
+  operator's remedy is to [reopen the lease](#reopening-a-cancelled-lease) once
+  its binding is repaired, so that the owner installs the real successor and
+  pays only its charge. Conceding its charge (`--zero-charge`) is a choice of
+  charge within that remedy, not a way around the repair.
 - A pending lease row that cannot be decoded, normally because its saved
   request (`api_request_json`) cannot be, is skipped by every tick: neither
   provider I/O, nor its settlement deadline, nor a cancellation reaches it,
   and its nullifier stays reserved, with the same consequences for its owner
-  as a cancellation. Each tick logs
+  as a cancellation (and the challenger treats an unreadable lease row as
+  possibly delivered). Each tick logs
   `unreadable OpenRouter lease row cannot be settled` at error level with the
   row's `client_request_id`; alert on that line. Lease routes answer it with
   `lease_record_unreadable`. The dashboard counts include it, but its `pending`
@@ -466,11 +513,15 @@ lease request carry `settlement_deadline` too. Every settlement payload carries
 
 The server refuses to start unless TTL + grace + deadline + twice the settlement
 poll interval + 600 seconds is at most half the vault's `challengePeriod()`
-(read with the startup key check), and unless the deadline leaves at least 900
-seconds of retries after the grace. Finalized evidence therefore exists before
-half of the challenge window has passed. With a 24-hour challenge period and
-the defaults (300 + 5 + 21600 + 4 + 600 seconds) the check passes; a shorter
-challenge period needs a smaller deadline.
+(read with the startup key check), unless the deadline leaves at least 900
+seconds of retries after the grace, and unless TTL + grace + deadline is at
+most the manifest's `settlement_window_seconds`, the window clients wait for
+before they escape conceding a request's bound. A settled charge therefore
+exists before half of the challenge window has passed. The challenger
+separately checks that a raise decided at its raise lead still lands within
+the window. Use a deadline of 21,600 seconds for the planned mainnet challenge
+period of 172,800, 14,400 for Sepolia's 43,200 and 1,800 for the drill vault's
+7,200 (`settlement_window_seconds` 21,905, 14,705 and 2,105).
 
 ## Operator review
 
@@ -492,8 +543,8 @@ corruption is found and another when it is cancelled.
 gateway; password-gated like the other dashboard routes on Sepolia) returns:
 
 - `counts`: `pending`, `retrying`, `provisioning`, `cancelled`,
-  `unknown_status`, `open_reviews`, `pending_key_cleanups` and
-  `next_deadline_in_seconds`;
+  `exit_deferred`, `exited_unsigned`, `unknown_status`, `open_reviews`,
+  `pending_key_cleanups` and `next_deadline_in_seconds`;
 - `pending`: each unsettled lease with its status, delivery, charge basis
   already committed (`unissued` or `operator_conceded`, otherwise null),
   deadline, seconds remaining, attempts, first error time and last error;
@@ -654,7 +705,7 @@ dc start server
 
 `$ID` is the `client_request_id` the review names. The container sees the
 database as `/data/server.db`, and the default `--proof-setup-dir`
-(`protocol/setup/v2` under the image's working directory, or
+(`protocol/setup/v2-concession` under the image's working directory, or
 `ZKAPI_PROOF_SETUP_DIR` from the deployment) is the server's setup. On a host
 install, run
 `zkapi --proof-setup-dir <the server's setup> settlement reopen --db-path <the server's --db-path> --client-request-id "$ID"`;
@@ -665,7 +716,12 @@ with a `binding_corrupt` review and passes these checks in order; a refusal
 names the first field that fails and its repair:
 
 1. The nullifier is not `ClearanceReserved`: that owner already holds a
-   clearance and exits by mutual close.
+   clearance and exits by mutual close. Its charge is not settled yet: a
+   settled charge (`nullifiers.settled_charge`) is refused with
+   `AlreadySettled` (its successor is signed at that charge once its nullifier
+   is unspent on chain, and the charge cannot be conceded), and `--rebind` of
+   such a reservation with `RebindSettled` (restore the `nullifiers` row from a
+   backup first).
 2. The saved request verifies as admission verified it: its payload hashes to
    its `payload_hash`, its proof's authorization tag binds its
    `client_request_id` and payload, and its Groth16 proof verifies against its
@@ -769,9 +825,9 @@ The restarted server verifies a reopened lease's saved request again, and
 checks its binding, deployment and signing key, before it signs anything; a
 lease that fails is cancelled again with a new review. The owner's wallet
 installs the signed receipt through its ordinary recovery, as for any finalized
-lease. Once signed, the transcript is challenge evidence: an escape the owner
-started at that state is contested, and the owner exits from the signed
-successor state. Reopen before the note expires, or its deposit goes to the
+lease. If the owner already escaped from that state, the server defers the
+signature while the escape is pending and the challenger raises the escape to
+the settled charge. Reopen before the note expires, or its deposit goes to the
 treasury.
 
 ## Restoring an unreadable pending lease

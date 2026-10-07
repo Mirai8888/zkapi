@@ -246,8 +246,11 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
 
         Types.Note storage note = notes[inputs.noteId];
         if (note.status != Types.NoteStatus.Active) revert Errors.NoteNotActive();
-        uint256 stateBalance = uint256(inputs.finalBalance) + inputs.conceded;
-        if (stateBalance > note.depositAmount) revert Errors.InvalidBalance();
+        uint256 total = uint256(inputs.finalBalance) + inputs.conceded;
+        if (total > note.depositAmount) revert Errors.InvalidBalance();
+        // casting to 'uint128' is safe because total is at most the uint128 depositAmount
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint128 stateBalance = uint128(total);
         _consumeNullifier(nullifier);
         _consumeNullifier(nextNullifier);
 
@@ -262,12 +265,12 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
             challengeDeadline: deadline
         });
         pendingConcessions[inputs.noteId] = Types.PendingConcession({
-            nextNullifier: nextNullifier, stateBalance: uint128(stateBalance), conceded: inputs.conceded
+            nextNullifier: nextNullifier, stateBalance: stateBalance, conceded: inputs.conceded
         });
         emit EscapeWithdrawalInitiated(
             inputs.noteId, nullifier, inputs.finalBalance, inputs.destination, deadline, currentRoot
         );
-        emit EscapeConcessionRecorded(inputs.noteId, nextNullifier, uint128(stateBalance), inputs.conceded);
+        emit EscapeConcessionRecorded(inputs.noteId, nextNullifier, stateBalance, inputs.conceded);
     }
 
     /// @notice Defeats a pending escape with a request proof at its successor nullifier N_{k+1},

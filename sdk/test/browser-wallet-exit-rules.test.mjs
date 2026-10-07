@@ -961,11 +961,28 @@ test('the deposit-time path is saved only when it leads to the root the deposit 
         assert.equal(Boolean(state.deposit_path), matches);
         if (matches) assert.deepEqual(state.deposit_path.siblings, pending.zero_path);
         assert.equal((await saved()).stateSeq, 1);
-        // Request proofs keep it through the WebAssembly's state.
+        // Request proofs and installs keep it, although the WebAssembly's
+        // state drops every field it does not know (the harness's worker
+        // returns only BrowserNoteState's fields, as the real one does).
         if (matches) {
             h.server.leasePost = body => h.activeLease(body);
             await h.runtime.issueLease('chat');
-            assert.deepEqual((await saved()).state.deposit_path, state.deposit_path);
+            const requested = await saved();
+            assert.equal(h.workerOperations('prepareRequest')[0].payload.state.deposit_path != null, true);
+            assert.deepEqual(requested.state.deposit_path, state.deposit_path, 'after a request proof');
+            h.server.requests = () => ({ status: 'ok', request_response: h.receiptFor(requested.journal) });
+            assert.equal(await h.runtime.installRecoveredResponse(requested.journal.client_request_id), true);
+            const installed = (await saved()).state;
+            assert.equal(installed.current_anchor, '0x9999');
+            assert.deepEqual(installed.deposit_path, state.deposit_path, 'after an install');
+            // The escape from the installed successor uses the deposit-time
+            // path, with no indexer and no log rebuild.
+            h.runtime.treePath = () => assert.fail('no indexer with a saved deposit path');
+            h.runtime.pinnedRpc = () => assert.fail('no log rebuild with a saved deposit path');
+            const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+            assert.equal(escape.pathSource, 'deposit');
+            assert.equal(BigInt(escape.public_inputs.active_root), 0x6161n);
+            assert.equal(escape.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'));
         }
     }
 });

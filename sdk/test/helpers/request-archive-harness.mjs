@@ -188,6 +188,20 @@ export function noteState(changes = {}) {
     };
 }
 
+// The fields of the WebAssembly's BrowserNoteState (zkapi-browser lib.rs).
+// Serde drops every other field of a state that passes through it, so the
+// fake worker returns only these: host-side fields such as deposit_path
+// survive only where the runtime carries them over itself.
+export const BROWSER_NOTE_STATE_FIELDS = Object.freeze(['protocol_version', 'chain_id', 'contract_address', 'note_id',
+    'secret_s', 'deposit_amount', 'expiry_ts', 'current_balance', 'balance_blinding', 'current_commitment_x',
+    'current_commitment_y', 'current_anchor', 'is_genesis', 'state_signature', 'prev_anchor', 'bound_at_state']);
+
+/** A note state as the WebAssembly returns it. */
+export function wasmNoteState(state) {
+    return Object.fromEntries(BROWSER_NOTE_STATE_FIELDS.filter(field => state?.[field] !== undefined)
+        .map(field => [field, structuredClone(state[field])]));
+}
+
 /** The deposit-time path a note saves (Amendment A1). */
 export const depositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
 
@@ -383,7 +397,7 @@ export function createHarness(BrowserWalletRuntime, {
                 };
                 return {
                     request: structuredClone(request),
-                    state: { ...structuredClone(state), bound_at_state: Number(config.request_charge_cap) },
+                    state: { ...wasmNoteState(state), bound_at_state: Number(config.request_charge_cap) },
                     journal: {
                         exists: true,
                         client_request_id: args.client_request_id,
@@ -416,7 +430,7 @@ export function createHarness(BrowserWalletRuntime, {
                     || BigInt(journal.prepared_request.public_inputs.solvency_bound) !== BigInt(state.bound_at_state))) {
                     throw new Error('invalid_successor: S3: charge or journal bound differs from the state bound');
                 }
-                return { ...state, current_balance: state.current_balance - Number(response.charge_applied),
+                return { ...wasmNoteState(state), current_balance: state.current_balance - Number(response.charge_applied),
                     current_anchor: response.next_anchor, is_genesis: false, state_signature: 'signed',
                     prev_anchor: state.current_anchor, bound_at_state: 0 };
             }

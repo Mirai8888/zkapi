@@ -352,7 +352,8 @@ Two optional keys tune the timing:
   (`exit_locked`).
 - No request once `now + W + 4500` seconds passes `must_initiate_by`
   (`note_near_expiry`). `must_initiate_by` is 12 hours before the note's local
-  `expiry_ts`; withdraw such a note instead.
+  `expiry_ts`, or before a later `effectiveExpiry` when the exit RPC and the
+  pinned RPC both report one. Withdraw such a note instead.
 - A settled request's successor installs only after its nullifier, payload
   hash, next anchor and server signature are checked.
 
@@ -522,7 +523,7 @@ Each of these errors carries a `shortMessage` for display.
 | Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
 | Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `wrong_network` |
-| Exit RPC | `exit_rpc_invalid` |
+| Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
 
 ## Credited escape payouts
 

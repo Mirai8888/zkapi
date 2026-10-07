@@ -7,49 +7,53 @@ Host app -> browser SDK -> zkAPI server (proof-backed lease authorization)
                    |-> Ethereum native ETH vault
                    |-> indexer (current Merkle root and paths)
 
-Challenger -> finalized server transcripts + indexer -> restricted EIP-1559 signer -> vault
+Challenger -> server request evidence + vault (+ indexer for retirements) -> restricted EIP-1559 signer -> vault
 ```
 
 The browser keeps note secrets, blindings, signing evidence and recovery journals.
 It creates Groth16 proofs locally with the packaged WASM and matching keys.
-The server verifies each exact authorization, reserves its nullifier, issues a
-bounded key and persists settlement before returning a new signed balance.
+The server verifies each exact authorization, reserves its nullifier with an
+append-only copy of its proof, issues a bounded key, settles the charge, and
+signs the next balance at the anchor derived from the spent nullifier while
+that nullifier is unspent on chain.
 
 The authorization includes a pinned finalized ETH/USD quote. Notes and signed
 balances are integer gwei; provider costs are micro-USD converted using that
 saved quote. Exact retries preserve the original proof and quote. See
 [native billing](native-eth-billing.md) for rounding and recovery rules.
 
-The indexer mirrors deposits, closes and escape transitions, and serves only a
-view it has verified against the vault's root and next note ID. The
-challenger uses a request as evidence only after its settlement is finalized,
-preserves historical request proofs while obtaining current restoration paths,
-and retries through durable deployment-bound checkpoints. It reports each
-obligation on private status endpoints. See
-[challenge operation](challenge-service.md).
+The indexer mirrors deposits and leaf retirements (the tree is append-only
+otherwise), records every root and every published nullifier, and serves only
+a view it has verified against the vault's root and next note ID. The
+challenger defeats an escape with a verified request proof at its successor
+nullifier, raises an under-conceded escape with the request at its nullifier,
+retires a closed note's leaf after a missed defeat, and retries through
+durable deployment-bound checkpoints. It reports each obligation on private
+status endpoints. See [challenge operation](challenge-service.md).
 
-Settlement always finalizes: a lease that never reached the wallet settles at
-zero, and a delivered lease whose usage is still unavailable at its write-once
-deadline settles at the proof's solvency bound. The exceptions are a lease
+Settlement always fixes a charge: a lease that never reached the wallet
+settles at zero, and a delivered lease whose usage is still unavailable at its
+write-once deadline settles at the proof's solvency bound. The exceptions are a lease
 whose record is corrupt and a pending lease whose row cannot be decoded; the
 operator repairs and reopens the first, and repairs the second, restoring an
 unreadable saved request with the reopen command
-([settlement terminality](native-eth-billing.md#settlement-terminality)). The
-API server must stay
-available through every challenge window, because owners recover their next
-signed state from it after a challenge. Mutual close sends the server an
-escape-form withdrawal proof of note ownership before it signs a clearance.
-The vault owner can pause exits without a time limit and schedule time-locked
-treasury changes; in this vault revision a pause cannot move funds or expire
-notes. See
+([settlement terminality](native-eth-billing.md#settlement-terminality)). Owners
+recover signed states from the API server; an exit never needs it. Mutual
+close sends the server a kind-2 ownership proof of the note, which cannot
+start an escape, before it signs a clearance. An escape needs no operator:
+its Merkle path comes from the deposit, the indexer or the vault's logs, and
+it concedes at most the state's request budget. The vault owner can pause
+exits for at most `maxPauseDuration` and schedule time-locked treasury
+changes; a pause cannot move funds or expire notes. See
 [owner and operator powers](../docs-site/content/docs/protocol.mdx#owner-and-operator-powers)
-and the [hardened vault migration](migration-hardened-vault.md).
+and the [concession-vault migration](migration-concession-vault.md).
 
 Only the v2 Groth16/Baby-JubJub proof path and native ETH payment path are active.
 The operator CLI supplies server/indexer/setup/signing-key commands; the host
 application integrates the browser SDK directly. The separate [zkapi-clientd](../zkapi-clientd/README.md) frontend provides a local
-OpenAI-compatible API backed by private native ETH balances. It packages a
-pinned Rust wallet/prover with reviewed patches, separately from
-this operator workspace. It has no ticket mode or token wallet. It checks
-deposits and withdrawals against the vault and the operator's indexer before
-changing private state.
+OpenAI-compatible API backed by private native ETH balances. Its Rust
+wallet/prover companion, `zkapi-walletd`, is built from this repository's
+`crates/zkapi-companion` at a pinned commit. It has no ticket mode or token
+wallet. It checks deposits and withdrawals against the vault and the
+operator's indexer before changing private state, and escapes without the
+operator, through the user's own exit RPC when one is configured.

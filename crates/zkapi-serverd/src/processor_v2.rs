@@ -4652,10 +4652,14 @@ mod tests {
                 reserved.api_request_binding.as_deref(),
                 Some(api_request_binding(&request).unwrap().as_str())
             );
-            assert!(
+            // Its key was never issued: nothing is owed for it if its owner
+            // escapes (§5.4 Ω).
+            assert_eq!(
                 crate::watcher::ChallengeWatcher::new(processor.store.clone())
-                    .challenge_transcript(&request.public_inputs.request_nullifier)
-                    .is_none()
+                    .owed(&request.public_inputs.request_nullifier)
+                    .unwrap()
+                    .basis,
+                crate::watcher::OwedBasis::Nothing(crate::watcher::NothingOwed::NeverDelivered)
             );
             server.abort();
         }
@@ -4688,16 +4692,28 @@ mod tests {
                     api_request_binding(&lease.api_request).unwrap(),
                     api_request_binding(&request).unwrap()
                 );
-                // An issued but unsettled lease is not challenge evidence; the
-                // retained active row lets bounded settlement finalize it.
+                // The key was issued but never returned: nothing is owed for it
+                // if its owner escapes (§5.4 Ω); the retained active row lets
+                // bounded settlement settle it at zero.
                 let watcher = crate::watcher::ChallengeWatcher::new(processor.store.clone());
                 let nullifier = request.public_inputs.request_nullifier;
-                assert!(watcher.challenge_transcript(&nullifier).is_none());
-                assert!(matches!(
-                    watcher.evidence_status(&nullifier),
-                    Ok(crate::watcher::EvidenceStatus::AwaitingSettlement(progress))
-                        if progress.lease_status.as_deref() == Some("active") && progress.key_issued
-                ));
+                let owed = watcher.owed(&nullifier).unwrap();
+                let progress = owed.settlement.clone().unwrap();
+                assert_eq!(progress.lease_status.as_deref(), Some("active"));
+                assert!(progress.key_issued);
+                // A key recorded as never returned owes nothing; one without
+                // delivery provenance counts as possibly delivered (§5.4 Ω).
+                if lease.delivered == Some(false) {
+                    assert_eq!(
+                        owed.basis,
+                        crate::watcher::OwedBasis::Nothing(
+                            crate::watcher::NothingOwed::NeverDelivered
+                        )
+                    );
+                    assert!(!progress.possibly_delivered);
+                } else {
+                    assert_eq!(owed.basis, crate::watcher::OwedBasis::Unsettled);
+                }
                 // Recovery of already activated access needs no fresh chain
                 // read and cannot repeat provider issuance after either error.
                 assert!(matches!(

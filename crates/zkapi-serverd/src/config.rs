@@ -193,6 +193,48 @@ impl OpenRouterLeaseConfig {
     }
 }
 
+/// The challenger's startup timing checks (§5.4) against the vault's
+/// challenge period `cp`, for the server's settlement window `W = ttl + grace
+/// + settlement deadline` (the deployment manifest's
+/// `settlement_window_seconds`) and settlement poll interval:
+///
+/// * G5: `W + 2·poll + 600 <= cp / 2`, so a request that may have been
+///   delivered settles well inside every escape's window;
+/// * raise: `W + raise_lead + 4·poll + 1200 <= cp`, so a raise decided
+///   `raise_lead` before the deadline follows the settlement of any request
+///   reserved before the escape.
+pub fn validate_challenger_timing(
+    settlement_window_seconds: u64,
+    settlement_poll_seconds: u64,
+    raise_lead_seconds: u64,
+    challenge_period_seconds: u64,
+) -> anyhow::Result<()> {
+    let poll = settlement_poll_seconds.max(1);
+    let g5 = settlement_window_seconds
+        .checked_add(poll.saturating_mul(2))
+        .and_then(|value| value.checked_add(SETTLEMENT_SWEEP_SLACK_SECONDS))
+        .ok_or_else(|| anyhow::anyhow!("settlement timing overflows"))?;
+    anyhow::ensure!(
+        g5 <= challenge_period_seconds / 2,
+        "refusing to start: settlement window ({settlement_window_seconds} s) + 2 x poll \
+         ({poll} s) + {SETTLEMENT_SWEEP_SLACK_SECONDS} s = {g5} s exceeds half of the vault \
+         challengePeriod() ({challenge_period_seconds} s)"
+    );
+    let raise = settlement_window_seconds
+        .checked_add(raise_lead_seconds)
+        .and_then(|value| value.checked_add(poll.checked_mul(4)?))
+        .and_then(|value| value.checked_add(RAISE_TIMING_SLACK_SECONDS))
+        .ok_or_else(|| anyhow::anyhow!("raise timing overflows"))?;
+    anyhow::ensure!(
+        raise <= challenge_period_seconds,
+        "refusing to start: settlement window ({settlement_window_seconds} s) + raise lead \
+         ({raise_lead_seconds} s) + 4 x poll ({poll} s) + {RAISE_TIMING_SLACK_SECONDS} s = \
+         {raise} s exceeds the vault challengePeriod() ({challenge_period_seconds} s); lower \
+         --raise-lead-seconds"
+    );
+    Ok(())
+}
+
 /// Configuration for the zkAPI server.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -708,5 +750,49 @@ mod tests {
         // The drill vault's settlement does not fit a mainnet-sized raise lead.
         let drill = PARAMETER_SETS[2].lease_config(crate::test_support::lease_config().source);
         assert!(drill.validate_raise_timing(21_600, 7_200).is_err());
+    }
+
+    /// §10.4: zkapi-challenged's own startup check, from the manifest's
+    /// settlement window, agrees with the server's on every documented
+    /// network and fails one second past either bound.
+    #[test]
+    fn challenger_timing_check_passes_the_documented_parameter_sets() {
+        for set in PARAMETER_SETS {
+            let lease = set.lease_config(crate::test_support::lease_config().source);
+            let window = lease.settlement_window_seconds();
+            let (poll, lead, period) = (
+                set.settlement_poll_seconds,
+                set.raise_lead_seconds,
+                set.challenge_period_seconds,
+            );
+            validate_challenger_timing(window, poll, lead, period)
+                .unwrap_or_else(|error| panic!("{}: {error}", set.name));
+            let raise = window + lead + 4 * poll + RAISE_TIMING_SLACK_SECONDS;
+            let error = validate_challenger_timing(window, poll, lead + period - raise + 1, period)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("--raise-lead-seconds"),
+                "{}: {error}",
+                set.name
+            );
+            let g5 = window + 2 * poll + SETTLEMENT_SWEEP_SLACK_SECONDS;
+            let late_window = window + period / 2 - g5 + 1;
+            assert!(
+                validate_challenger_timing(late_window, poll, 0, period).is_err(),
+                "{}",
+                set.name
+            );
+            validate_challenger_timing(late_window - 1, poll, 0, period).unwrap();
+        }
+        // Each network's challenger refuses the next tighter network's period.
+        let mainnet = PARAMETER_SETS[0];
+        assert!(validate_challenger_timing(
+            21_905,
+            mainnet.settlement_poll_seconds,
+            mainnet.raise_lead_seconds,
+            PARAMETER_SETS[1].challenge_period_seconds
+        )
+        .is_err());
     }
 }

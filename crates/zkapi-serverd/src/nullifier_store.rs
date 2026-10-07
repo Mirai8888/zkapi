@@ -1021,6 +1021,40 @@ impl NullifierStore {
             .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))
     }
 
+    /// The evidence rows at `nullifier`, oldest first, each decoded on its
+    /// own: a row that does not decode is reported with its id and why,
+    /// without hiding the others (the challenger may defeat with any row
+    /// that verifies). A failed read is an error.
+    pub fn request_evidence_rows(
+        &self,
+        nullifier: &Felt252,
+    ) -> Result<Vec<Result<RequestEvidence, String>>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let mut statement = conn
+            .prepare("SELECT * FROM request_evidence WHERE nullifier = ?1 ORDER BY id ASC")
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        let mut rows = statement
+            .query(params![nullifier.to_hex()])
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        let mut decoded = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?
+        {
+            let id: i64 = row
+                .get("id")
+                .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+            decoded
+                .push(row_to_evidence(row).map_err(|error| {
+                    format!("request_evidence row {id} does not decode: {error}")
+                }));
+        }
+        Ok(decoded)
+    }
+
     /// The earliest evidence row the reservation of `nullifier` wrote (source
     /// "reserve"), as `GET /v2/nullifiers/{N}/evidence` serves it.
     pub fn earliest_reserve_evidence(

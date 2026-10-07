@@ -365,10 +365,42 @@ pub enum ProbeError {
     Mismatch(String),
 }
 
+/// Reads getters and runtime code at "latest": serverd's native-billing
+/// oracle, or the challenger's RPC.
+pub trait ContractReader {
+    /// The single ABI word a no-argument getter `selector` of `address`
+    /// returns.
+    fn contract_word(
+        &self,
+        address: &str,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<[u8; 32], String>> + Send;
+    /// keccak256 of the runtime code at `address`; an address without code
+    /// is an error.
+    fn code_hash(
+        &self,
+        address: &str,
+    ) -> impl std::future::Future<Output = Result<[u8; 32], String>> + Send;
+}
+
+impl ContractReader for NativeBillingOracle {
+    async fn contract_word(&self, address: &str, selector: &str) -> Result<[u8; 32], String> {
+        NativeBillingOracle::contract_word(self, address, selector)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn code_hash(&self, address: &str) -> Result<[u8; 32], String> {
+        NativeBillingOracle::code_hash(self, address)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// The startup probes (§5.5), all at "latest" over the configured RPC. Any
 /// failure, unreadable value or mismatch is an error.
-pub async fn probe_deployment(
-    oracle: &NativeBillingOracle,
+pub async fn probe_deployment<R: ContractReader + Sync>(
+    oracle: &R,
     manifest: &DeploymentManifest,
     loaded: &StatementIdentity,
 ) -> Result<ProbeReport, ProbeError> {

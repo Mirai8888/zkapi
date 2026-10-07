@@ -38,6 +38,9 @@ const MOCK_PRICE = 250_000_000_000n; // $2,500 / ETH, eight decimal places.
 // One accepted inference ($0.001 at $2,500) costs ceil(1e3 µUSD → gwei) = 400.
 export const INFERENCE_CHARGE = Number((BigInt(MOCK_USAGE_MICRO_USD) * GWEI * 100_000_000n + MOCK_PRICE * 1_000_000n - 1n)
     / (MOCK_PRICE * 1_000_000n));
+// The SDK agent's spending limit ($1, its default) at the mock price: the
+// solvency bound (C2) of every SDK request, 400,000 gwei.
+export const SDK_REQUEST_BOUND = Number(1_000_000n * GWEI * 100_000_000n / (MOCK_PRICE * 1_000_000n));
 const MODEL = 'local/mock-model';
 const PROMPT = 'Reply with the word OK.';
 // Drill timing, scaled down so a challenge period is skipped with
@@ -423,7 +426,8 @@ async function main() {
         console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/acceptance/release] [--output-dir .zkapi/acceptance] [--stop-after STEP]\n'
             + 'Runs only disposable loopback services, with mock provider, OA org and price feed. See docs/v2-acceptance.md.\n'
             + '--stop-after ends a development run early, after one of: deploy, stack, honest, stale, clients, mismatch, sdk-honest,\n'
-            + 'raise, companion, pause, pause-max, anchors, lie-expired, withhold, missed.');
+            + 'sdk-close, raise, companion, companion-close, pause, pause-max, anchors, lie-expired, withhold, rebuild, hang, missed,\n'
+            + 'late-successor.');
         return;
     }
     const { AbiCoder, Interface } = await import(
@@ -747,7 +751,9 @@ async function main() {
         // The operator's public endpoint in front of serverd: clients only
         // ever see this URL, so serverd can restart (in another adversary
         // mode) behind it, be taken unreachable, or have its answers replaced.
-        const gate = { target: null, mode: 'pass', intercept: null, log: [] };
+        // In `stream` mode it relays each answer as it arrives and never ends
+        // a call itself, so a hanging serverd hangs the client's call.
+        const gate = { target: null, mode: 'pass', intercept: null, log: [], stream: false };
         const gateUrl = await serve(async (req, res) => {
             const chunks = [];
             for await (const chunk of req) chunks.push(chunk);
@@ -756,6 +762,17 @@ async function main() {
             if (gate.mode === 'down' || !gate.target) {
                 res.writeHead(503, { 'content-type': 'application/json' });
                 return res.end(JSON.stringify({ error_code: 'service_unavailable', error: 'local operator outage' }));
+            }
+            if (gate.stream) {
+                const outgoing = http.request(new URL(req.url, gate.target), { method: req.method, agent: localAgent,
+                    headers: { ...req.headers, host: new URL(gate.target).host } }, incoming => {
+                    res.writeHead(incoming.statusCode, incoming.headers);
+                    incoming.pipe(res);
+                });
+                res.on('close', () => outgoing.destroy());
+                outgoing.on('error', () => res.destroy());
+                outgoing.end(payload);
+                return;
             }
             const upstream = await new Promise((resolve, reject) => {
                 const outgoing = http.request(new URL(req.url, gate.target), { method: req.method, agent: localAgent,
@@ -1163,11 +1180,13 @@ async function main() {
             // S_k's successor nullifier is S_{k+1}'s nullifier.
             for (let k = 0; k < 3; k++) assert.equal(BigInt(snapshots[k].successor_nullifier), BigInt(snapshots[k + 1].withdrawal_nullifier));
             const before = await balances(vaultAddress, treasury, account.destination);
-            // Stale-device pre-check (E4.2): the operator serves the request at
-            // S2's successor, which verifies: another device is newer.
+            // The evidence a stale device's pre-check (E4.2) reads: the operator
+            // serves the request at S2's successor, and it verifies. (This
+            // wallet core has no exit rules, so it escapes from S2 anyway; the
+            // companion scenario runs the pre-check in a real client.)
             const served = await get(`${gateUrl}/v2/nullifiers/${snapshots[2].successor_nullifier}/evidence`);
             assert.equal((await client('verify_request', { args: { public_inputs: served.public_inputs, proof: served.proof.proof } })).valid, true,
-                'device_not_newest: the evidence at the successor verifies');
+                'the evidence at the successor verifies');
             // 1. Escape from S2 after spending S3: defeated by the request at N3.
             const merkle = await treePath(client, note.noteId);
             const fromS2 = await driverEscape(client, note.noteId, { snapshot: 'S2', path: merkle });
@@ -1223,7 +1242,7 @@ async function main() {
             assert.equal((await noteView(note.noteId)).status, NOTE.Closed);
             const final = await client('status');
             assert.equal(final.state.note.current_balance, payout);
-            return { note_id: note.noteId, stale_device_precheck: 'device_not_newest (evidence at S2⁺ verifies)',
+            return { note_id: note.noteId, evidence_at_s2_successor: 'served (200) and verifies under the request key',
                 evidence_after_publication: '410 published (indexer published-nullifier table)',
                 defeats: [defeat.event.transactionHash, second.event.transactionHash], superseded_revert: 'SupersededState',
                 replay_after_defeat: 'ChallengedNullifier', newest_state_close: close.receipt.transactionHash, payout_gwei: payout,
@@ -1308,11 +1327,14 @@ async function main() {
 
         // ---------------------------------------------------------------- the clientd companion
         // zkapi-walletd as zkapi-clientd runs it: a bridge token, and every
-        // outbound connection through an authenticated loopback proxy.
+        // outbound connection through an authenticated loopback proxy. The
+        // proxy tags each request it relays, so the companion's own entrances
+        // (startCompanion) can tell relayed requests from direct ones.
         async function forwardProxy(name) {
             const user = 'clientd';
             const password = randomBytes(24).toString('hex');
-            const record = { requests: 0, refused: 0, hosts: new Set() };
+            const tag = randomBytes(16).toString('hex');
+            const record = { requests: 0, refused: 0, bypassed: 0, hosts: new Set(), through: {} };
             const proxy = http.createServer();
             proxy.on('connect', (req, socket) => {
                 const [host, port] = req.url.split(':');
@@ -1337,7 +1359,7 @@ async function main() {
                 }
                 record.requests++;
                 record.hosts.add(target.host);
-                const headers = { ...req.headers };
+                const headers = { ...req.headers, 'x-acceptance-proxy': tag };
                 delete headers['proxy-authorization'];
                 delete headers['proxy-connection'];
                 await new Promise((resolve, reject) => {
@@ -1354,7 +1376,7 @@ async function main() {
             const parsed = new URL(url);
             parsed.username = user;
             parsed.password = password;
-            return { url: parsed.href, record, name };
+            return { url: parsed.href, record, name, tag };
         }
         const companionManifest = { deployment_id: trusted.deployment_id, protocol_version: 2, chain_id: CHAIN_ID,
             rpc_url: trusted.rpc_url, contract_address: vaultAddress, billing_token_address: null, billing_asset: 'native_eth',
@@ -1365,19 +1387,47 @@ async function main() {
             proof_setup: { circuit_id: trusted.circuit_id, setup_id: trusted.setup_id },
             state_signing_key: trusted.state_signing_key, clearance_signing_key: trusted.clearance_signing_key,
             models: [{ id: MODEL, owned_by: 'local', tags: ['chat'] }] };
-        const companionManifestPath = path.join(runDir, 'companion-deployment.json');
         await save('companion-deployment.json', companionManifest);
-        async function startCompanion(name) {
+        async function startCompanion(name, { stateDir = path.join(runDir, `companion-${name}`) } = {}) {
             const token = randomBytes(24).toString('hex');
             const proxy = await forwardProxy(name);
             const port = await freePort();
-            const stateDir = path.join(runDir, `companion-${name}`);
             const proxyEnv = Object.fromEntries(['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']
                 .map(key => [key, proxy.url]));
+            // The companion reaches the operator, the indexer and both RPCs
+            // only through entrances of its own. Each answers only requests
+            // its authenticated proxy relayed (tagged): one that reached it
+            // directly is refused and counted, so the run shows that no
+            // connection bypassed the proxy. (The OA verifier keeps its URL:
+            // a lease names it and the companion checks that name.)
+            const entrance = (label, upstream) => serve(async (req, res) => {
+                if (req.headers['x-acceptance-proxy'] !== proxy.tag) {
+                    proxy.record.bypassed++;
+                    return respond(res, 403, { error: `${label} reached without the companion's proxy` });
+                }
+                proxy.record.through[label] = (proxy.record.through[label] ?? 0) + 1;
+                const headers = { ...req.headers, host: new URL(upstream).host };
+                delete headers['x-acceptance-proxy'];
+                await new Promise(resolve => {
+                    const outgoing = http.request(new URL(req.url, upstream), { method: req.method, headers, agent: localAgent }, incoming => {
+                        res.writeHead(incoming.statusCode, incoming.headers);
+                        incoming.pipe(res);
+                        incoming.on('end', resolve);
+                        incoming.on('error', resolve);
+                    });
+                    outgoing.on('error', error => { if (!res.headersSent) respond(res, 502, { error: error.message }); else res.destroy(); resolve(); });
+                    req.pipe(outgoing);
+                });
+            });
+            const entrances = { operator: await entrance('operator', gateUrl), indexer: await entrance('indexer', indexerUrl),
+                exit_rpc: await entrance('exit_rpc', rpcUrl), pinned_rpc: await entrance('pinned_rpc', pinnedRpcUrl) };
+            const manifestFile = path.join(runDir, `companion-deployment-${name}.json`);
+            await save(path.basename(manifestFile), { ...companionManifest, rpc_url: entrances.pinned_rpc,
+                protocol_server_url: entrances.operator, indexer_url: entrances.indexer });
             // The arguments zkapi-clientd passes (CompanionCommand), with the
             // user's own exit RPC (here the Anvil node itself).
             const child = launch(path.join(opts.binDir, 'zkapi-walletd'), ['--require-oa-org-key-source', '--oa-verifier-url', oaOptions.verifierUrl,
-                '--openrouter-inference-base', `${providerUrl}/v1`, '--exit-rpc-url', rpcUrl, 'client', '--deployment', companionManifestPath,
+                '--openrouter-inference-base', `${providerUrl}/v1`, '--exit-rpc-url', entrances.exit_rpc, 'client', '--deployment', manifestFile,
                 '--mode', 'direct-openrouter', '--no-fund', '--listen', `127.0.0.1:${port}`, '--state-dir', stateDir],
             `companion-${name}.log`, { env: { OA_ZKAPI_BRIDGE_TOKEN: token, OA_ZKAPI_CHAIN_ID: String(CHAIN_ID),
                 ZKAPI_PROOF_SETUP_DIR: SETUP_DIR, NO_PROXY: '', no_proxy: '', RAYON_NUM_THREADS: '4', ...proxyEnv } });
@@ -1388,6 +1438,18 @@ async function main() {
             const unauthenticated = await request(`${base}/oa/v1/status`);
             assert.equal(unauthenticated.status, 401, 'the companion answers only its bridge token');
             return { child, call, stateDir, proxy, name };
+        }
+        // Every request the companion made went through its proxy, and each
+        // of `needed` saw some.
+        function companionTraffic(companion, needed) {
+            const { record } = companion.proxy;
+            assert.equal(record.bypassed, 0, `${companion.name}: a connection bypassed the companion's proxy`);
+            assert.equal(record.refused, 0, `${companion.name}: the proxy refused a request`);
+            for (const label of needed) {
+                const reached = label === 'verifier' ? record.hosts.has(new URL(oaOptions.verifierUrl).host) : record.through[label] > 0;
+                assert.ok(reached, `${companion.name}: nothing reached ${label} through the proxy: ${json(record.through)}`);
+            }
+            return { proxied_requests: record.requests, through: record.through, bypassed: record.bypassed };
         }
         stopAfter('clients');
 
@@ -1453,19 +1515,70 @@ async function main() {
             assert.equal(root, depositRoot, 'the escape proves at the note\'s deposit root, not the current one');
             assert.equal(await vaultRead('isKnownRoot', [root]), true);
             await save('sdk-honest-escape.json', escaped);
-            const pathSource = escaped.prepared?.pathSource ?? record.pathSource ?? record.preparedWithdrawal?.pathSource ?? null;
-            if (pathSource !== null) assert.equal(pathSource, 'deposit');
+            const pathSource = escaped.result?.pathSource;
+            assert.equal(pathSource, 'deposit', 'the SDK took the deposit-time path');
+            assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
             // Restart the indexer from its checkpoint.
             indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-2.log');
             await synchronizedTree();
             pendingEscapes.push({ name: 'sdk-honest', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
-                payout: DEPOSIT - INFERENCE_CHARGE, before });
+                payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT - INFERENCE_CHARGE, before });
             return { note_id: noteId, deposit: depositTx.hash, escape: escapeTx.hash, path_source: pathSource,
                 decision: escaped.result?.decision ?? null, sdk_statuses: escaped.statuses,
                 proof_root: felt(root), proof_root_is_the_deposit_root: true, deposit_root_is_not_current: true, conceded: 0,
                 indexer_down_during_escape: true, sdk_settled_balance: Number(settled.note.current_balance) };
         });
         stopAfter('sdk-honest');
+
+        // The Phase C smoke test through the SDK: its own E2 sequence (exit
+        // lock, ownership proof, clearance, close proof, mutualClose, payout
+        // match), against the real serverd and vault.
+        const sdkMutualClose = async (sdk, noteId, destination, payout, stateBalance) => {
+            const before = await balances(vaultAddress, treasury, destination);
+            const closed = await sdk('withdraw', { mode: 'mutual', destination });
+            const closeTx = closed.sent.find(item => item.data === vault.getFunction('mutualClose').selector);
+            assert.ok(closeTx, `no mutualClose sent: ${json(closed.statuses)}`);
+            assert.ok(!closed.sent.some(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector), 'no escape was sent');
+            assert.equal(closed.result?.status, 'closed', json(closed.result));
+            const receipt = await waitReceipt(closeTx.hash);
+            assert.equal(receipt.status, '0x1', 'the SDK mutual close reverted');
+            gas.record('mutual_close', receipt, { client: 'sdk' });
+            const event = eventOf(receipt, 'MutualClose');
+            assert.equal(Number(event.args.noteId), noteId);
+            assert.equal(event.args.finalBalance, BigInt(payout));
+            const after = await balances(vaultAddress, treasury, destination);
+            assert.equal(after[destination] - before[destination], BigInt(payout) * GWEI);
+            assert.equal(after[treasury] - before[treasury], BigInt(DEPOSIT - payout) * GWEI);
+            assert.equal(before[vaultAddress] - after[vaultAddress], BigInt(DEPOSIT) * GWEI);
+            assert.equal((await noteView(noteId)).status, NOTE.Closed);
+            // The close's nullifier is the one the clearance reserved.
+            assert.equal(await vaultRead('usedNullifiers', [event.args.nullifier]), true);
+            assert.equal((await get(`${gateUrl}/v2/nullifiers/${felt(event.args.nullifier)}`)).nullifier_status, 'clearance_reserved');
+            const synced = await waitFor('the SDK closes the mutual record', async () => {
+                const state = await sdk('sync');
+                const record = state.withdrawals.find(item => Number(item.noteId) === noteId);
+                return record?.phase === 'closed' && { state, record };
+            }, 90_000, 2_000);
+            assert.equal(synced.state.note, null, 'the SDK holds no note after the close');
+            assert.equal(synced.state.exit_lock, null, 'no exit lock is left');
+            return { close: closeTx.hash, payout_gwei: payout, treasury_gwei: DEPOSIT - payout, state_balance: stateBalance,
+                statuses: closed.statuses, client_final_state: { phase: synced.record.phase, mode: synced.record.mode, note: null } };
+        };
+        await scenario('SDK honest close (Phase C smoke): deposit, request, settle, mutual close through the SDK', async () => {
+            const sdk = await sdkAgent('close', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const noteId = Number(deposited.note.note_id);
+            const chat = await sdk('chat', { sessionId: 'acceptance-sdk-close', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            const settled = await sdk('settle');
+            assert.equal(Number(settled.note.current_balance), DEPOSIT - INFERENCE_CHARGE, json(settled.note));
+            const destination = '0x000000000000000000000000000000000000c105';
+            const closed = await sdkMutualClose(sdk, noteId, destination, DEPOSIT - INFERENCE_CHARGE, DEPOSIT - INFERENCE_CHARGE);
+            await sdk.close();
+            return { note_id: noteId, ...closed };
+        });
+        stopAfter('sdk-close');
 
         // A destination whose receive() needs more than ESCAPE_PAYOUT_GAS
         // (five fresh SSTOREs): finalization credits it, claimEscapePayout
@@ -1506,8 +1619,9 @@ async function main() {
             const status = await client('status');
             assert.equal(status.state.note.bound_at_state, CAP);
             assert.equal(status.archived.at(-1).disposition, 'abandoned_for_escape');
-            pendingEscapes.push({ name: 'driver-raise', client: 'driver', noteId: note.noteId, destination: slowReceiver,
-                payout: DEPOSIT - INFERENCE_CHARGE, deferred: true, before: await balances(slowReceiver) });
+            pendingEscapes.push({ name: 'driver-raise', client: 'driver', wallet: client, noteId: note.noteId, destination: slowReceiver,
+                payout: DEPOSIT - INFERENCE_CHARGE, deferred: true, before: await balances(slowReceiver),
+                exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier, stateBalance: DEPOSIT });
             return { note_id: note.noteId, conceded_at_init: conceded, raised_to: INFERENCE_CHARGE, raise: raised.event.transactionHash,
                 server_status: deferred.nullifier_status };
         });
@@ -1551,6 +1665,7 @@ async function main() {
                     { destination: account.companionDestination, conceded: String(decision.value.conceded ?? '0'), early_exit: 'concede_nothing' })).value;
                 assert.equal(prepared.status, 'prepared', json(prepared));
                 assert.equal(String(prepared.conceded), '0');
+                assert.equal(prepared.path_source, 'deposit', 'the escape proves from the deposit-time path');
             } finally {
                 gate.mode = 'pass';
             }
@@ -1573,10 +1688,121 @@ async function main() {
             pendingEscapes.push({ name: 'companion-forced', client: 'companion', companion, noteId, destination: account.companionDestination,
                 payout: DEPOSIT - INFERENCE_CHARGE, before: await balances(account.companionDestination) });
             return { note_id: noteId, decision: { rule: prepared.reason ?? null, conceded: prepared.conceded, bound: prepared.bound_at_state },
-                path_source: prepared.path_source ?? null, escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
-                proxied_requests: companion.proxy.record.requests, escape_status_phase: status.value.phase ?? status.value.record?.phase ?? null };
+                path_source: prepared.path_source, escape: escapeReceipt.transactionHash, raise: raised.event.transactionHash,
+                traffic: companionTraffic(companion, ['operator', 'indexer', 'exit_rpc', 'verifier']),
+                escape_status_phase: status.value.phase ?? status.value.record?.phase ?? null };
         });
         stopAfter('companion');
+
+        // The companion's own cooperative close (kind 2, clearance, kind 1),
+        // and the stale-device pre-check (E4.2) run by a real client: a copy
+        // of the companion's wallet taken before two requests is the stale
+        // device, and its escape is refused before any proof leaves it.
+        const companionError = answer => answer.value?.error?.code ?? answer.value?.code ?? null;
+        async function companionDeposit(companion) {
+            const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
+            assert.equal(plan.status, 200, json(plan.value));
+            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT, plan.value.zero_path],
+                { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
+            const deposited = eventOf(receipt, 'NoteDeposited');
+            const noteId = Number(deposited.args.noteId);
+            const note = await noteView(noteId);
+            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount: DEPOSIT,
+                expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
+            assert.equal(confirmed.status, 200, json(confirmed.value));
+            await synchronizedTree();
+            return noteId;
+        }
+        async function companionRequest(companion) {
+            const lease = await companion.call('POST', '/oa/v1/lease', { request_limit_micro_usd: 1_000_000 });
+            assert.equal(lease.status, 200, json(lease.value));
+            assert.equal(lease.value.verified, true, json(lease.value));
+            await inference({ openrouter_api_base: lease.value.base_url, api_key: lease.value.api_key });
+        }
+        await scenario('companion: honest close through its mutual route; a stale copy of its wallet is refused (device_not_newest) before proving', async () => {
+            await startServer(null, { keySource: 'oa_org' });
+            const companion = await startCompanion('close');
+            const noteId = await companionDeposit(companion);
+            // The stale device: this wallet as it is now (a backup taken at
+            // the genesis state).
+            const staleDir = path.join(runDir, 'companion-close-stale-copy');
+            await fs.cp(companion.stateDir, staleDir, { recursive: true });
+            // The newest device spends the genesis state (request at N0), its
+            // successor installs, and it spends that state too (request at
+            // N1 = N0⁺): the operator now holds evidence at the stale state's
+            // successor nullifier.
+            await companionRequest(companion);
+            const installed = await waitFor('the companion installs the first successor', async () => {
+                const recovered = await companion.call('POST', '/wallet/recover', {});
+                const wallet = recovered.status === 200 ? recovered.value.wallet : null;
+                return wallet && !wallet.pending_request && Number(wallet.note?.current_balance) === DEPOSIT - INFERENCE_CHARGE && wallet;
+            }, (TIMING.leaseTtl + 240) * 1000, 2_000);
+            await companionRequest(companion);
+            // E4.2 through the stale copy's own walletd.
+            const stale = await startCompanion('stale', { stateDir: staleDir });
+            const staleWallet = await stale.call('GET', '/status');
+            assert.equal(Number(staleWallet.value.note.current_balance), DEPOSIT, 'the copy holds the genesis state');
+            const refused = await stale.call('POST', '/oa/v1/withdraw/escape/prepare',
+                { destination: account.companionDestination, conceded: '0' });
+            assert.equal(refused.status, 409, json(refused.value));
+            assert.equal(companionError(refused), 'device_not_newest', json(refused.value));
+            const staleStatus = await stale.call('GET', '/oa/v1/withdraw/escape/status');
+            assert.equal(staleStatus.status, 200, json(staleStatus.value));
+            assert.equal(staleStatus.value.exit_lock, null, 'no proof left the stale device and no lock is held');
+            assert.equal(staleStatus.value.phase, 'none', 'the stale device saved no escape');
+            const staleTraffic = companionTraffic(stale, ['operator']);
+            await stop(stale.child);
+            // The newest device closes cooperatively once its second request
+            // settles: kind-2 ownership proof, clearance, kind-1 close proof.
+            const destination = '0x000000000000000000000000000000000000c106';
+            const attempts = [];
+            const prepared = await waitFor('the companion prepares a mutual close', async () => {
+                const answer = await companion.call('POST', '/oa/v1/withdraw/prepare', { destination });
+                attempts.push({ status: answer.status, code: companionError(answer) });
+                return answer.status === 200 && answer.value;
+            }, (TIMING.leaseTtl + 240) * 1000, 5_000).catch(async error => {
+                await save('companion-close-attempts.json', attempts); throw error; });
+            const pi = prepared.public_inputs;
+            assert.equal(Number(pi.kind), 1, json(pi));
+            assert.equal(Number(pi.conceded), 0);
+            const asHex = value => Array.isArray(value) ? `0x${Buffer.from(value).toString('hex')}` : String(value);
+            const asAddress = value => `0x${BigInt(asHex(value)).toString(16).padStart(40, '0')}`;
+            const tuple = [pi.protocol_version, pi.chain_id, asAddress(pi.contract_address), asHex(pi.active_root),
+                asHex(pi.state_signing_key_x), asHex(pi.state_signing_key_y), asHex(pi.clearance_signing_key_x), asHex(pi.clearance_signing_key_y),
+                pi.note_id, BigInt(pi.final_balance), asAddress(pi.destination), asHex(pi.withdrawal_nullifier), pi.kind,
+                asHex(pi.next_nullifier), BigInt(pi.conceded), pi.valid_until];
+            const proofHex = `0x${Buffer.from(prepared.proof.proof, 'base64').toString('hex')}`;
+            // zkapi-clientd signs this call; the harness sends it.
+            const before = await balances(vaultAddress, treasury, destination);
+            const closeReceipt = await sendTx({ from: account.companion, to: vaultAddress,
+                data: vault.encodeFunctionData('mutualClose', [tuple, proofHex]) });
+            assert.equal(closeReceipt.status, '0x1', 'the companion mutual close reverted');
+            gas.record('mutual_close', closeReceipt, { client: 'companion' });
+            const event = eventOf(closeReceipt, 'MutualClose');
+            const payout = DEPOSIT - 2 * INFERENCE_CHARGE;
+            assert.equal(Number(event.args.noteId), noteId);
+            assert.equal(event.args.finalBalance, BigInt(payout));
+            const after = await balances(vaultAddress, treasury, destination);
+            assert.equal(after[destination] - before[destination], BigInt(payout) * GWEI);
+            assert.equal(after[treasury] - before[treasury], BigInt(2 * INFERENCE_CHARGE) * GWEI);
+            assert.equal((await noteView(noteId)).status, NOTE.Closed);
+            assert.equal(await vaultRead('usedNullifiers', [event.args.nullifier]), true);
+            const confirmed = await waitFor('the companion confirms the finalized close', async () => {
+                const answer = await companion.call('POST', '/oa/v1/withdraw/confirm', { transaction_hash: closeReceipt.transactionHash });
+                return answer.status === 200 && answer.value;
+            }, 60_000, 1_000);
+            const wallet = await companion.call('GET', '/status');
+            assert.equal(wallet.value.has_note, false, `the companion still holds the note: ${json(wallet.value)}`);
+            const traffic = companionTraffic(companion, ['operator', 'indexer', 'exit_rpc', 'verifier']);
+            await stop(companion.child);
+            // The OA leases settled: serverd returns to direct provider keys.
+            await startServer();
+            return { note_id: noteId, first_successor_balance: Number(installed.note.current_balance),
+                stale_device: { refusal: companionError(refused), exit_lock: null, traffic: staleTraffic },
+                prepare_attempts: attempts.length, close: closeReceipt.transactionHash, payout_gwei: payout,
+                confirm: confirmed.status ?? confirmed, client_final_state: { has_note: wallet.value.has_note }, traffic };
+        });
+        stopAfter('companion-close');
 
         // Prepared now, abandoned, replayed after its valid_until.
         const replay = { client: await wallet('replay') };
@@ -1622,7 +1848,33 @@ async function main() {
             } else {
                 assert.equal(after[entry.destination] - before[entry.destination], BigInt(entry.payout) * GWEI, `${entry.name}: destination`);
             }
-            return { receipt, deferred: Boolean(deferredEvent) };
+            // The wallet core keeps the state it exited from (it has no exit
+            // records of its own): the finalized escape is the one it proved,
+            // from the state it holds, or (a stale escape) from the snapshot.
+            let driverState = null;
+            if (entry.client === 'driver') {
+                assert.equal(BigInt(finalizedEvent.args.nullifier), BigInt(entry.exitedNullifier), `${entry.name}: the escape the wallet proved`);
+                const status = await entry.wallet('status');
+                assert.equal(BigInt(status.withdrawal_nullifier) === BigInt(entry.exitedNullifier), !entry.staleSnapshot,
+                    `${entry.name}: the wallet holds ${entry.staleSnapshot ? 'a newer state than the stale one it escaped' : 'the state it escaped'}`);
+                assert.equal(status.pending_request, false, `${entry.name}: no request is pending`);
+                if (!entry.staleSnapshot) {
+                    assert.equal(Number(status.state.note.current_balance), entry.stateBalance, `${entry.name}: the escaped balance`);
+                }
+                driverState = { exited_nullifier: felt(entry.exitedNullifier), wallet_nullifier: felt(status.withdrawal_nullifier),
+                    wallet_balance: Number(status.state.note.current_balance), escaped_from: entry.staleSnapshot ?? 'current state' };
+            }
+            return { receipt, deferred: Boolean(deferredEvent), driverState };
+        }
+        // An SDK escape record once its payout is final: closed with the
+        // concession that was paid (conceded_final), no payout alert, and no
+        // note left.
+        function sdkFinalState(entry, after) {
+            assert.equal(after.state.note, null, `${entry.name}: the SDK holds no note after the payout`);
+            assert.equal(String(after.record.concededFinal), String((entry.stateBalance ?? DEPOSIT) - entry.payout), `${entry.name}: concededFinal`);
+            assert.equal(after.record.payoutAlert ?? null, null, `${entry.name}: no payout alert`);
+            return { phase: after.record.phase, conceded_final: after.record.concededFinal, payout_alert: null,
+                payout_credited: after.record.payoutCredited === true };
         }
         await scenario('pause with escapes pending, then finalize while paused (deferred credit and claim; SDK and companion close)', async () => {
             await challengerQuiet();
@@ -1636,7 +1888,7 @@ async function main() {
             await skipChain(Math.max(...deadlines) - await chainNow() + 5, 'challenge period, while paused');
             const results = {};
             for (const entry of pendingEscapes.splice(0)) {
-                const { receipt, deferred } = await finalizePending(entry);
+                const { receipt, deferred, driverState } = await finalizePending(entry);
                 results[entry.name] = { finalize: receipt.transactionHash, payout_gwei: entry.payout, deferred };
                 if (entry.deferred) {
                     const claimed = await vaultSend(account.thirdParty, 'claimEscapePayout', [entry.destination], { operation: 'claim_escape_payout' });
@@ -1654,9 +1906,10 @@ async function main() {
                     assert.equal(closed.conceded_final, String(DEPOSIT - entry.payout));
                     const wallet = await entry.companion.call('GET', '/status');
                     assert.equal(wallet.status, 200);
-                    assert.ok(!wallet.value.note && wallet.value.active !== true, `the companion still holds the note: ${json(wallet.value)}`);
+                    assert.equal(wallet.value.has_note, false, `the companion still holds the note: ${json(wallet.value)}`);
+                    assert.equal(wallet.value.note ?? null, null);
                     results[entry.name].client_final_state = { phase: closed.record?.phase ?? closed.status, payout: closed.payout,
-                        conceded_final: closed.conceded_final, note: wallet.value.note ?? null };
+                        conceded_final: closed.conceded_final, has_note: wallet.value.has_note };
                 }
                 if (entry.client === 'sdk') {
                     const after = await waitFor('the SDK closes the escape record', async () => {
@@ -1664,10 +1917,9 @@ async function main() {
                         const record = state.withdrawals.find(item => Number(item.noteId) === entry.noteId);
                         return record?.phase === 'closed' && { state, record };
                     }, 90_000, 2_000);
-                    assert.equal(after.state.note, null, 'the SDK holds no note after the payout');
-                    results[entry.name].client_final_state = { phase: after.record.phase, conceded_final: after.record.concededFinal ?? null,
-                        payout_alert: after.record.payoutAlert ?? null };
+                    results[entry.name].client_final_state = sdkFinalState(entry, after);
                 }
+                if (entry.client === 'driver') results[entry.name].client_final_state = driverState;
             }
             assert.equal(await vaultRead('paused'), true, 'every finalization ran while paused');
             return { paused: paused.transactionHash, escapes: results };
@@ -1685,7 +1937,9 @@ async function main() {
             gas.record('escape_expired_proof_reverts', replayed);
             // A fresh escape lands although the vault is still paused.
             const escape = await driverEscape(replay.client, replay.noteId, { path: replay.depositPath });
-            pendingEscapes.push({ name: 'driver-escape-after-pause', client: 'driver', noteId: replay.noteId, destination: account.destination, payout: DEPOSIT });
+            pendingEscapes.push({ name: 'driver-escape-after-pause', client: 'driver', wallet: replay.client, noteId: replay.noteId,
+                destination: account.destination, payout: DEPOSIT, exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier,
+                stateBalance: DEPOSIT });
             const unpaused = await vaultSend(owner, 'unpause', [], { operation: 'unpause' });
             assert.equal(unpaused.status, '0x1');
             assert.equal(await revertName(vault.encodeFunctionData('pause', []), owner), 'PauseCooldown');
@@ -1696,8 +1950,16 @@ async function main() {
 
         // ================================================================ adversarial operators (drill build)
         // A signed successor at a non-derived anchor (S4) or above the bound
-        // (S3): the wallet refuses it, the request circuit cannot spend it,
-        // and the owner escapes conceding min(charge, bound) (lost response).
+        // (S3): the wallet refuses it, and the request circuit cannot spend
+        // it. The exit then follows the client rules (design §6.4 E3), which
+        // this wallet core does not implement, so the harness applies them
+        // (the SDK drill after these takes the decision itself):
+        // - S4: the response is treated like a withheld successor (§6.1);
+        //   the owner exits before T conceding 0 (E3, forced early exit), and
+        //   the challenger raises the concession to the settled charge;
+        // - S3: the response passes S1, S2, S4 and S6 but cannot be
+        //   installed (lost ε): the escape concedes min(charge, bound), here
+        //   the bound, at once, and no raise exceeds it.
         async function refusedSuccessor(mode, check) {
             await startServer(mode);
             const client = await wallet(mode);
@@ -1732,23 +1994,80 @@ async function main() {
             const charge = Number(response.charge_applied);
             const bound = Number(after.state.note.bound_at_state);
             if (check === 'S3') assert.equal(charge, bound + 1, 'overcharge: one unit above the bound');
-            const conceded = Math.min(charge, bound);
+            const rule = check === 'S4' ? 'E3.forced' : 'E3.lost_epsilon';
+            const conceded = check === 'S4' ? 0 : Math.min(charge, bound);
             const balanceBefore = Number(after.state.note.current_balance);
             const escape = await driverEscape(client, note.noteId, { conceded, path: note.depositPath });
-            pendingEscapes.push({ name: mode, client: 'driver', noteId: note.noteId, destination: account.destination,
-                payout: balanceBefore - conceded });
-            return { note_id: note.noteId, server_mode: mode, refused_check: check, charge, bound, conceded,
-                wallet_refusal: spend?.wallet_refusal ?? `invalid_successor: ${check}`, circuit_satisfied: spend?.circuit_satisfied ?? null,
-                next_anchor: response.next_anchor, escape: escape.receipt.transactionHash, client_state: 'unchanged; record invalid_successor' };
+            // The concession that is paid: the challenger raises an S4 exit to
+            // the settled charge; the lost-ε concession already covers what
+            // the bound lets it take.
+            let raisedTo = null;
+            if (check === 'S4') {
+                const raised = await waitEvent('EscapeConcessionRaised', note.noteId, Number(BigInt(escape.receipt.blockNumber)));
+                gas.record('raise', raised.receipt, { note_id: note.noteId });
+                assert.equal(raised.event.args.conceded, BigInt(charge), 'raised to the settled charge');
+                raisedTo = charge;
+            }
+            const concededFinal = raisedTo ?? conceded;
+            assert.ok(concededFinal <= bound, 'no concession exceeds the bound');
+            pendingEscapes.push({ name: mode, client: 'driver', wallet: client, noteId: note.noteId, destination: account.destination,
+                payout: balanceBefore - concededFinal, exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier,
+                stateBalance: balanceBefore });
+            return { note_id: note.noteId, server_mode: mode, refused_check: check, charge, bound, rule, conceded_at_init: conceded,
+                raised_to: raisedTo, wallet_refusal: spend?.wallet_refusal ?? `invalid_successor: ${check}`,
+                circuit_satisfied: spend?.circuit_satisfied ?? null, next_anchor: response.next_anchor, escape: escape.receipt.transactionHash,
+                client_state: { balance: Number(after.state.note.current_balance), archived: after.archived.at(-1).disposition } };
         }
-        await scenario('born-spent successor (anchor 1): client refuses (S4), circuit cannot spend it, escape concedes min(charge, bound)',
+        await scenario('born-spent successor (anchor 1): client refuses (S4), circuit cannot spend it; escape before T conceding 0, raised to the charge',
             () => refusedSuccessor('born-spent', 'S4'));
-        await scenario('reused-anchor successor: client refuses (S4), circuit cannot spend it, escape concedes min(charge, bound)',
+        await scenario('reused-anchor successor: client refuses (S4), circuit cannot spend it; escape before T conceding 0, raised to the charge',
             () => refusedSuccessor('reuse-anchor', 'S4'));
-        await scenario('random-anchor successor: client refuses (S4), circuit cannot spend it, escape concedes min(charge, bound)',
+        await scenario('random-anchor successor: client refuses (S4), circuit cannot spend it; escape before T conceding 0, raised to the charge',
             () => refusedSuccessor('random-anchor', 'S4'));
-        await scenario('overcharged successor: client refuses (S3), escape concedes the bound and no raise exceeds it',
+        await scenario('overcharged successor: client refuses (S3), lost ε: escape concedes min(charge, bound) = the bound and no raise exceeds it',
             () => refusedSuccessor('overcharge', 'S3'));
+        // The same refusal through the SDK, which takes the exit decision
+        // itself: the successor fails S4, is archived invalid_successor and
+        // handled like a withheld one (E3). A mutual withdrawal waits for T;
+        // the owner exits early, conceding nothing (E3.forced), to a
+        // destination that cannot take the payout push, and the challenger
+        // raises the concession to the settled charge. The SDK claims the
+        // credited payout itself at finalization.
+        const slowReceiverSdk = '0x00000000000000000000000000000000005104e6';
+        await rpc('anvil_setCode', [slowReceiverSdk, '0x346000553460015534600255346003553460045500']);
+        await scenario('random-anchor successor through the SDK: refused (S4), treated as withheld; early escape conceding 0 (E3.forced), raised to the charge; deferred payout claimed by the SDK', async () => {
+            await startServer('random-anchor');
+            const sdk = await sdkAgent('random-anchor', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const noteId = Number(deposited.note.note_id);
+            const chat = await sdk('chat', { sessionId: 'acceptance-random-anchor', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            // Settling installs nothing: the successor fails S4.
+            const settle = await sdk('settle').then(() => null, error => error.sdk ?? { message: error.message });
+            const held = await sdk('snapshot');
+            const record = held.request_archive.at(-1);
+            assert.equal(record?.disposition, 'invalid_successor', json(held.request_archive));
+            assert.equal(Number(held.note.current_balance), DEPOSIT, 'a refused successor changes no state');
+            const waiting = await sdkRefusal(sdk('withdraw', { mode: 'mutual', destination: slowReceiverSdk }));
+            assert.equal(waiting.code, 'request_settlement_pending', json(waiting));
+            const escaped = await sdk('withdraw', { mode: 'escape', destination: slowReceiverSdk });
+            assert.deepEqual(escaped.result?.decision, { rule: 'E3.forced', conceded: '0' }, json(escaped.result));
+            const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
+            assert.ok(escapeTx, json(escaped.statuses));
+            const receipt = await waitReceipt(escapeTx.hash);
+            assert.equal(receipt.status, '0x1');
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0 });
+            assert.equal(eventOf(receipt, 'EscapeConcessionRecorded').args.conceded, 0n);
+            const raised = await waitEvent('EscapeConcessionRaised', noteId, Number(BigInt(receipt.blockNumber)));
+            gas.record('raise', raised.receipt, { note_id: noteId });
+            assert.equal(raised.event.args.conceded, BigInt(INFERENCE_CHARGE), 'raised to the settled charge');
+            pendingEscapes.push({ name: 'sdk-random-anchor', client: 'sdk', sdk, noteId, destination: slowReceiverSdk,
+                payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT, deferred: true, recordId: escaped.result.recordId });
+            return { note_id: noteId, settle_refusal: settle?.code ?? null, archived: record.disposition, mutual: waiting.code,
+                decision: escaped.result.decision, destination_warning: escaped.result.destinationWarning ?? null,
+                escape: escapeTx.hash, raised_to: INFERENCE_CHARGE, client_state: { balance: Number(held.note.current_balance) } };
+        });
         stopAfter('anchors');
 
         await scenario('lying expired_unaccepted: the SDK discards a request the operator reserved and spent; clearance reveals it; escape raised to the real charge', async () => {
@@ -1801,7 +2120,7 @@ async function main() {
             const status = await get(`${gateUrl}/v2/requests/${stolen.client_request_id}`);
             assert.equal(status.nullifier_status, 'exit_deferred');
             pendingEscapes.push({ name: 'sdk-lie-expired', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
-                payout: DEPOSIT - INFERENCE_CHARGE });
+                payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT });
             return { note_id: noteId, sdk_chat: chat.code, archived: record.disposition, archived_observations: record.observations, mutual: mutual.code,
                 escape_at_ms: mutual.data?.escape_at ?? null, escape: escapeTx.hash, decision: escaped.result?.decision ?? null,
                 raised_to: INFERENCE_CHARGE, server_status: status.nullifier_status };
@@ -1823,6 +2142,9 @@ async function main() {
             assert.equal(waiting.code, 'request_settlement_pending', json(waiting));
             const escapeAt = Number(waiting.data.escape_at);
             assert.ok(escapeAt > Date.now(), 'T is ahead');
+            // The state's bound is the request's: $1 at the mock price.
+            const held = await sdk('snapshot');
+            assert.equal(Number(held.bound_at_state), SDK_REQUEST_BOUND, `the SDK request fixed the state's bound: ${json(held.bound_at_state)}`);
             // The device clock reaches T (W + 900 s after the request) at once.
             await sdk('clock', { offsetSeconds: Math.ceil((escapeAt - Date.now()) / 1000) + 5 });
             const escaped = await sdk('withdraw', { mode: 'mutual', destination: account.sdkDestination });
@@ -1832,9 +2154,9 @@ async function main() {
             assert.equal(receipt.status, '0x1');
             gas.record('escape', receipt, { client: 'sdk', conceded: 'bound' });
             const recorded = eventOf(receipt, 'EscapeConcessionRecorded');
-            const bound = BigInt(escaped.result?.decision?.conceded ?? recorded.args.conceded);
-            assert.equal(recorded.args.conceded, bound);
-            assert.ok(bound >= BigInt(CAP), 'at T the escape concedes the state\'s bound');
+            const bound = BigInt(SDK_REQUEST_BOUND);
+            assert.deepEqual(escaped.result?.decision, { rule: 'E3.T', conceded: String(bound) }, 'at T the SDK decides E3.T');
+            assert.equal(recorded.args.conceded, bound, 'at T the escape concedes exactly the state\'s bound');
             const stateBalance = Number(recorded.args.stateBalance);
             assert.equal(stateBalance, DEPOSIT);
             // The challenger owes nothing more (Ω = the settled charge ≤ c) and
@@ -1853,12 +2175,112 @@ async function main() {
             // settle and sign, then 'exit_deferred' once the exit is seen.
             assert.ok(['finalized', 'exit_deferred'].includes(obligation.settlement?.lease_status), json(obligation.settlement));
             pendingEscapes.push({ name: 'sdk-withhold', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
-                payout: stateBalance - Number(bound), noDefeatFrom: Number(BigInt(receipt.blockNumber)) });
+                payout: stateBalance - Number(bound), stateBalance, noDefeatFrom: Number(BigInt(receipt.blockNumber)) });
             return { note_id: noteId, refusal_before_t: waiting.code, escape_at_ms: escapeAt, device_clock_advanced_s: Math.ceil((escapeAt - Date.now()) / 1000),
                 decision: escaped.result?.decision ?? null, conceded: bound.toString(), escape: escapeTx.hash,
                 challenger: { state: obligation.state, evidence: obligation.evidence, owed: obligation.owed, detail: obligation.detail } };
         });
         stopAfter('withhold');
+
+        // ---------------------------------------------------------------- operator and indexer outages
+        await startServer();
+        await scenario('indexer down, then rebuild from logs: an SDK note without its deposit-time path escapes at the rebuilt root', async () => {
+            const sdk = await sdkAgent('rebuild', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const noteId = Number(deposited.note.note_id);
+            const depositRoot = (await vaultEventsSince('NoteDeposited', noteId, deployBlock))[0].args.newRoot;
+            // A later deposit moves the root; that note escapes too.
+            const filler = { client: await wallet('rebuild-filler') };
+            Object.assign(filler, await driverDeposit(filler.client));
+            const currentRoot = await vaultRead('currentRoot');
+            assert.notEqual(currentRoot, depositRoot);
+            // The rebuild reads the vault's logs up to the finalized block.
+            const fillerBlock = Number(BigInt(filler.receipt.blockNumber));
+            await waitFor('the filler deposit is final', async () =>
+                Number(BigInt((await rpc('eth_getBlockByNumber', ['finalized', false])).number)) >= fillerBlock, 30_000);
+            const dropped = await sdk('drop_deposit_path');
+            assert.equal(dropped.dropped, true, 'the SDK had saved a deposit-time path');
+            assert.equal(dropped.deposit_path_saved, false);
+            await stop(indexer);
+            const escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination });
+            const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
+            assert.ok(escapeTx, json(escaped.statuses));
+            const receipt = await waitReceipt(escapeTx.hash);
+            assert.equal(receipt.status, '0x1');
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0, path: 'rebuild' });
+            assert.equal(escaped.result?.pathSource, 'rebuild', 'with no saved path and no indexer the path is rebuilt from the logs');
+            assert.deepEqual(escaped.result?.decision, { rule: 'E2.escape', conceded: '0' });
+            const pending = await vaultRead('pendingWithdrawals', [noteId]);
+            assert.equal(pending[0], true);
+            assert.equal(pending[1], currentRoot, 'the escape proves at the root rebuilt from the logs, not the deposit root');
+            indexer = launch(path.join(opts.binDir, 'zkapi-indexerd'), indexerArgs, 'indexer-3.log');
+            await synchronizedTree();
+            const fillerEscape = await driverEscape(filler.client, filler.noteId, { path: filler.depositPath });
+            pendingEscapes.push({ name: 'sdk-rebuild', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
+                payout: DEPOSIT, stateBalance: DEPOSIT });
+            pendingEscapes.push({ name: 'rebuild-filler', client: 'driver', wallet: filler.client, noteId: filler.noteId,
+                destination: account.destination, payout: DEPOSIT, stateBalance: DEPOSIT,
+                exitedNullifier: fillerEscape.plan.public_inputs.withdrawal_nullifier });
+            return { note_id: noteId, path_source: escaped.result.pathSource, proof_root: felt(pending[1]), deposit_root: felt(depositRoot),
+                indexer_down_during_escape: true, escape: escapeTx.hash, decision: escaped.result.decision };
+        });
+        stopAfter('rebuild');
+
+        await scenario('hang: serverd --adversary hang holds every call; the SDK escapes within its exit budget, before must_initiate_by', async () => {
+            const sdk = await sdkAgent('hang', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const noteId = Number(deposited.note.note_id);
+            const chat = await sdk('chat', { sessionId: 'acceptance-hang', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            // The operator hangs from now on: every connection stays open with
+            // nothing useful sent (its health route too).
+            await stop(server);
+            server = launch(zkapi, serverArgs(serverPort, dbPath, { adversary: 'hang' }), `server-${++serverStarts}-hang.log`, { env: seedEnv });
+            await waitFor('the hanging serverd listens', () => new Promise(resolve => {
+                const socket = net.connect(serverPort, '127.0.0.1', () => { socket.destroy(); resolve(true); });
+                socket.on('error', () => resolve(false));
+            }), 90_000);
+            const probe = await request(`${serverUrl}/health`, { timeoutMs: 3_000 }).then(answer => `HTTP ${answer.status}`, error => error.message);
+            assert.match(probe, /timed out/, 'serverd hangs');
+            gate.stream = true;
+            let escaped;
+            const began = Date.now();
+            try {
+                escaped = await sdk('withdraw', { mode: 'escape', destination: account.sdkDestination }, 900_000);
+            } finally {
+                gate.stream = false;
+            }
+            const seconds = (Date.now() - began) / 1000;
+            const escapeTx = escaped.sent.find(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector);
+            assert.ok(escapeTx, json(escaped.statuses));
+            const receipt = await waitReceipt(escapeTx.hash);
+            assert.equal(receipt.status, '0x1');
+            gas.record('escape', receipt, { client: 'sdk', conceded: 0 });
+            // The request is unresolved and T is ahead: an early exit
+            // conceding nothing. Each operator call is bounded (20 s) and each
+            // recovery pass (120 s): three passes, the stale-device check and
+            // the lease retirement stay below 7 minutes.
+            assert.deepEqual(escaped.result?.decision, { rule: 'E3.forced', conceded: '0' }, json(escaped.result));
+            assert.ok(seconds < 420, `the escape took ${seconds} s against a hanging operator`);
+            const note = await noteView(noteId);
+            const initiatedAt = Number(BigInt((await rpc('eth_getBlockByNumber', [receipt.blockNumber, false])).timestamp));
+            const mustInitiateBy = note.expiry - 43_200;
+            assert.ok(initiatedAt < mustInitiateBy, 'the escape landed before must_initiate_by');
+            // The operator comes back and settles the request; the challenger
+            // raises the concession to its charge.
+            await startServer();
+            const raised = await waitEvent('EscapeConcessionRaised', noteId, Number(BigInt(receipt.blockNumber)), (TIMING.leaseTtl + 180) * 1000);
+            gas.record('raise', raised.receipt, { note_id: noteId });
+            assert.equal(raised.event.args.conceded, BigInt(INFERENCE_CHARGE));
+            pendingEscapes.push({ name: 'sdk-hang', client: 'sdk', sdk, noteId, destination: account.sdkDestination,
+                payout: DEPOSIT - INFERENCE_CHARGE, stateBalance: DEPOSIT });
+            return { note_id: noteId, seconds, probe_of_hanging_health: probe, decision: escaped.result.decision,
+                escape: escapeTx.hash, initiated_at: initiatedAt, must_initiate_by: mustInitiateBy, raised_to: INFERENCE_CHARGE,
+                statuses: escaped.statuses };
+        });
+        stopAfter('hang');
 
         // ================================================================ a missed defeat
         await startServer();
@@ -1869,8 +2291,10 @@ async function main() {
             // is in the server's evidence: a defeat is due, and nobody sends it.
             const escape = await driverEscape(missed.client, missed.noteId, { snapshot: 'S0', path: missed.depositPath });
             assert.equal(BigInt(escape.recorded.args.nextNullifier), BigInt(missed.requests[1].nullifier), 'evidence at N⁺ exists');
-            pendingEscapes.push({ name: 'missed-defeat', client: 'driver', noteId: missed.noteId, destination: account.destination,
-                payout: DEPOSIT, missed: true, escapeBlock: Number(BigInt(escape.receipt.blockNumber)) });
+            pendingEscapes.push({ name: 'missed-defeat', client: 'driver', wallet: missed.client, noteId: missed.noteId,
+                destination: account.destination, payout: DEPOSIT, missed: true, escapeBlock: Number(BigInt(escape.receipt.blockNumber)),
+                exitedNullifier: escape.plan.public_inputs.withdrawal_nullifier, staleSnapshot: 'S0' });
+            assert.equal(BigInt(escape.plan.public_inputs.withdrawal_nullifier), BigInt(missed.genesis.withdrawal_nullifier));
             return { note_id: missed.noteId, escape: escape.receipt.transactionHash, challenger: 'stopped' };
         });
 
@@ -1880,25 +2304,43 @@ async function main() {
             const results = {};
             for (const entry of pendingEscapes.splice(0)) {
                 const raises = await vaultEventsSince('EscapeConcessionRaised', entry.noteId, deployBlock);
-                const { receipt } = await finalizePending(entry);
+                const { receipt, deferred, driverState } = await finalizePending(entry);
                 const defeats = await vaultEventsSince('EscapeWithdrawalChallenged', entry.noteId, deployBlock);
                 results[entry.name] = { finalize: receipt.transactionHash, payout_gwei: entry.payout, treasury_gwei: DEPOSIT - entry.payout,
-                    raises: raises.map(event => Number(event.args.conceded)), defeats: defeats.length };
-                if (entry.name === 'sdk-withhold' || entry.name === 'missed-defeat') assert.equal(defeats.length, 0, `${entry.name}: never defeated`);
+                    raises: raises.map(event => Number(event.args.conceded)), defeats: defeats.length, deferred };
+                if (['sdk-withhold', 'missed-defeat', 'sdk-hang', 'sdk-rebuild'].includes(entry.name)) {
+                    assert.equal(defeats.length, 0, `${entry.name}: never defeated`);
+                }
                 if (entry.client === 'sdk') {
                     const after = await waitFor('the SDK closes the escape record', async () => {
                         const state = await entry.sdk('sync');
                         const record = state.withdrawals.find(item => Number(item.noteId) === entry.noteId);
                         return record?.phase === 'closed' && { state, record };
                     }, 90_000, 2_000);
-                    assert.equal(after.state.note, null, `${entry.name}: the SDK holds no note after the payout`);
-                    assert.equal(String(after.record.concededFinal ?? DEPOSIT - entry.payout), String(DEPOSIT - entry.payout));
-                    results[entry.name].client_final_state = { phase: after.record.phase, conceded_final: after.record.concededFinal ?? null,
-                        payout_alert: after.record.payoutAlert ?? null };
+                    results[entry.name].client_final_state = sdkFinalState(entry, after);
+                    if (entry.deferred) {
+                        // The SDK claims its own credited payout (E5).
+                        assert.equal(after.record.payoutCredited, true, `${entry.name}: the SDK records the credit`);
+                        const before = await balances(entry.destination);
+                        const claimed = await entry.sdk('claim', { recordId: entry.recordId });
+                        const claimTx = claimed.sent.find(item => item.data === vault.getFunction('claimEscapePayout').selector);
+                        assert.ok(claimTx, `the SDK sent no claim: ${json(claimed.statuses)}`);
+                        const claimReceipt = await waitReceipt(claimTx.hash);
+                        assert.equal(claimReceipt.status, '0x1');
+                        gas.record('claim_escape_payout', claimReceipt, { client: 'sdk' });
+                        assert.ok(eventOf(claimReceipt, 'EscapePayoutClaimed'));
+                        assert.equal(await vaultRead('escapePayoutCredits', [entry.destination]), 0n);
+                        assert.equal((await balances(entry.destination))[entry.destination] - before[entry.destination], BigInt(entry.payout) * GWEI);
+                        const settled = await waitFor('the SDK records the delivered credit', async () => {
+                            const state = await entry.sdk('sync');
+                            const record = state.withdrawals.find(item => Number(item.noteId) === entry.noteId);
+                            return record?.payoutClaimed === true && record;
+                        }, 60_000, 1_000);
+                        results[entry.name].claim = { transaction: claimTx.hash, status: claimed.result?.status ?? null,
+                            payout_claimed: settled.payoutClaimed };
+                    }
                 }
-                if (entry.client === 'driver') {
-                    results[entry.name].client_final_state = 'the wallet holds the exited state; the note is Closed on chain';
-                }
+                if (entry.client === 'driver') results[entry.name].client_final_state = driverState;
             }
             return { escapes: results };
         });
@@ -1920,9 +2362,14 @@ async function main() {
                 const current = await challengerStatus();
                 return current.escapes_finalized_with_successor_evidence_total >= 1 && current;
             }, 60_000);
+            assert.equal(status.last_missed?.note_id, missed.noteId, `the miss recorded is this note's: ${json(status.last_missed)}`);
+            assert.equal(status.last_missed?.kind, 'defeat');
             const logs = await Promise.all([...Array(challengerStarts).keys()].map(index =>
                 fs.readFile(path.join(runDir, `challenger-${index + 1}.log`), 'utf8').catch(() => '')));
-            assert.ok(logs.some(text => text.includes('MISSED escape deadline')), 'the challenger logs the miss');
+            // The log line names the note and the kind of miss (ANSI styling removed).
+            const missLine = new RegExp(`MISSED escape deadline note_id=${missed.noteId} .*missed="defeat"`);
+            assert.ok(logs.some(text => text.replace(/\u001b\[[0-9;]*m/g, '').split('\n').some(line => missLine.test(line))),
+                'the challenger logs the miss of this note');
             // The retired leaf is gone from the tree: the newest state of the
             // note can no longer prove membership at the current root.
             const snapshot = await synchronizedTree();
@@ -1937,6 +2384,81 @@ async function main() {
                 last_missed: status.last_missed ?? null };
         });
         stopAfter('missed');
+
+        // E4.6 then E6 (§10.7 B "late successor, then switch"): the operator
+        // answers the request only after the owner released an escape proof,
+        // which never lands (the owner rejects it in the wallet). The
+        // successor is archived as late_successor and the lock holds while
+        // the proof could still land. Once the proof is dead on the device's
+        // clock and at a finalized block, the lock is released, the late
+        // successor installs, and the owner exits from the newer state by a
+        // mutual close: B_{k+1}, not an escape from S_k.
+        //
+        // The device clock is set so that the proof lives 600 s of chain
+        // time, and then past its valid_until + 900; block time moves by the
+        // same amount, within MAX_CHAIN_LEAD_SECONDS.
+        await scenario('late successor, then switch: the successor arrives after an escape proof is released; E6 installs it once the proof is dead, and the owner closes from the newer state', async () => {
+            const sdk = await sdkAgent('late', { walletAccount: account.sdk });
+            await sdk('init');
+            const deposited = await sdk('deposit', { amount: '0.001' });
+            const noteId = Number(deposited.note.note_id);
+            await sdk('hold_successors', { on: true });
+            const chat = await sdk('chat', { sessionId: 'acceptance-late', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            const settle = await sdk('settle').then(() => null, error => error.sdk ?? { message: error.message });
+            const pendingState = await sdk('snapshot');
+            const requestId = pendingState.journal_request_id ?? pendingState.request_archive.at(-1)?.client_request_id;
+            assert.ok(requestId, json(pendingState.request_archive));
+            // The operator has signed the successor; the SDK has not seen it.
+            const signed = await waitFor('the operator signs the successor', async () => {
+                const found = await get(`${serverUrl}/v2/requests/${requestId}`);
+                return found.request_response && found;
+            }, (TIMING.leaseTtl + 180) * 1000, 1_000);
+            assert.equal(Number(pendingState.note.current_balance), DEPOSIT);
+            // An early escape conceding nothing, whose proof lives 600 s of
+            // chain time; the owner rejects it in the wallet.
+            const lead = await chainNow() - wallNow();
+            await sdk('clock', { offsetSeconds: lead + 600 - 10_800 });
+            await sdk('wallet_reject', { selectors: [vault.getFunction('initiateEscapeWithdrawal').selector] });
+            const rejected = await sdkRefusal(sdk('withdraw', { mode: 'escape', destination: account.sdkDestination }));
+            await sdk('wallet_reject', { selectors: [] });
+            const late = await sdk('snapshot');
+            assert.equal(late.rejected.length, 1, 'the wallet refused the escape: nothing was broadcast');
+            assert.ok(!late.sent.some(item => item.data === vault.getFunction('initiateEscapeWithdrawal').selector));
+            const released = late.exit_lock?.released?.find(entry => Number(entry.kind) === 0);
+            assert.ok(released, `the escape proof was released: ${json(late.exit_lock)}`);
+            const validUntil = Number(released.valid_until);
+            assert.ok(validUntil > await chainNow(), 'the released proof could still land');
+            assert.ok(late.request_archive.some(entry => entry.disposition === 'late_successor' && entry.client_request_id === requestId),
+                `the successor is archived as late_successor: ${json(late.request_archive)}`);
+            assert.equal(Number(late.note.current_balance), DEPOSIT, 'the late successor does not install while the proof can land');
+            // While the proof can land, a cancel keeps the lock (E6).
+            const live = await sdk('cancel');
+            assert.ok(live.exit_lock?.released?.length, 'the lock holds while the proof can land');
+            assert.equal(Number(live.note.current_balance), DEPOSIT);
+            // The proof dies: block time and the device clock pass
+            // valid_until + 900.
+            await skipChain(validUntil + 930 - await chainNow(), 'past the released proof\'s valid_until + 900');
+            await waitFor('a finalized block past the proof\'s life', async () =>
+                Number(BigInt((await rpc('eth_getBlockByNumber', ['finalized', false])).timestamp)) > validUntil + 900, 30_000);
+            await sdk('clock', { offsetSeconds: validUntil + 960 - wallNow() });
+            const dead = await sdk('cancel');
+            assert.equal(dead.exit_lock, null, `E6 released the lock: ${json(dead.statuses)}`);
+            assert.equal(Number(dead.note.current_balance), DEPOSIT - INFERENCE_CHARGE, 'the late successor installed');
+            assert.equal(dead.bound_at_state, '0', 'the successor reset the bound');
+            // The switch: a fresh state, closed cooperatively with the
+            // device clock back on the wall clock.
+            await sdk('clock', { offsetSeconds: 0 });
+            await sdk('hold_successors', { on: false });
+            const destination = '0x000000000000000000000000000000000000c107';
+            const closed = await sdkMutualClose(sdk, noteId, destination, DEPOSIT - INFERENCE_CHARGE, DEPOSIT - INFERENCE_CHARGE);
+            assert.equal((await vaultEventsSince('EscapeWithdrawalInitiated', noteId, deployBlock)).length, 0, 'no escape of this note landed');
+            await sdk.close();
+            return { note_id: noteId, settle_while_held: settle?.code ?? null, held_readings: late.held_readings,
+                successor_signed_charge: Number(signed.request_response.charge_applied), escape_refusal: rejected.code ?? rejected.message,
+                released_valid_until: validUntil, late_successor: 'archived, then installed by E6', ...closed };
+        });
+        stopAfter('late-successor');
 
         await scenario('expiry sweep and pause cooldown end: claimExpired after effectiveExpiry; a pause after PAUSE_COOLDOWN', async () => {
             // Stop the daemons first: block time now runs ahead of the wall clock.
@@ -1999,12 +2521,13 @@ async function main() {
             coverage: {
                 contracts: 'protocol/contracts via demo/contracts/script/Deploy.s.sol, finalized by scripts/expected-codehashes.mjs',
                 proof_system: 'protocol/setup/v2-concession-dev (single-party dev setup, drill vault only)',
-                server: 'zkapi serverd (drill build: --adversary withhold, born-spent, reuse-anchor, random-anchor, overcharge, lie-expired), SQLite archive bound by zkapi db init',
+                server: 'zkapi serverd (drill build: --adversary withhold, born-spent, reuse-anchor, random-anchor, overcharge, lie-expired, hang), SQLite archive bound by zkapi db init',
                 indexer: `zkapi-indexerd at ${INDEXER_CONFIRMATIONS} confirmations, stopped and restarted from its checkpoint`,
                 challenger: 'zkapi-challenged: defeats, raises and retire-on-miss through the signer sidecar',
                 signer: 'docker/aws/signer (EIP-1559, allowlisted calls, retirement budget)',
-                clients: { wallet_core: 'examples/v2_acceptance_wallet (zkapi-browser natively)', sdk: 'sdk/ (zkapiClient + browserWalletRuntime) with sdk/wasm in Node',
-                    companion: 'zkapi-walletd routes the Go clientd calls (the harness signs and sends its transactions)' },
+                clients: { wallet_core: 'examples/v2_acceptance_wallet (zkapi-browser natively; the harness applies the exit rules for it)',
+                    sdk: 'sdk/ (zkapiClient + browserWalletRuntime) with sdk/wasm in Node: its own exit decisions, escapes, mutual closes, finalizations and credit claim',
+                    companion: 'zkapi-walletd routes the Go clientd calls, escape and mutual close (the harness signs and sends its transactions), every connection through its authenticated proxy' },
                 provider: 'loopback mock management and inference HTTP service',
                 oracle: 'loopback mock ETH/USD feed; every other read is the actual chain',
                 external_provider_verified: false, live_network_verified: false, go_clientd_verified: false },

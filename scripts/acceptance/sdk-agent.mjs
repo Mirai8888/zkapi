@@ -10,6 +10,15 @@
 // of the WebAssembly, and an EIP-1193 wallet that signs with an unlocked
 // Anvil account. The device clock is shiftable (`clock`), so an exit decision
 // can be taken at the settlement time T without waiting for it.
+//
+// Drill hooks, each off until the harness turns it on:
+// - `wallet_reject`: the wallet refuses to send calls to the listed
+//   selectors, as a user who rejects the wallet prompt;
+// - `hold_successors`: the operator's signed successor reaches the SDK only
+//   once an exit proof was released (a late successor, E4.6): until then
+//   every recovery answer reads as still reserved;
+// - `drop_deposit_path`: the saved deposit-time path is lost, so an exit
+//   takes its path from the indexer or the vault's logs.
 import path from 'node:path';
 import readline from 'node:readline';
 import { readFile } from 'node:fs/promises';
@@ -44,6 +53,12 @@ globalThis.sessionStorage = globalThis.localStorage;
 delete globalThis.BroadcastChannel;
 const realFetch = globalThis.fetch;
 const fetchLog = [];
+// `hold_successors`: answers that would deliver a successor read as still
+// reserved until this wallet's exit lock holds a released escape or close.
+let holdSuccessors = false;
+let heldReadings = 0;
+const exitProofReleased = () => (runtime?.runtime?.exitLock?.released || []).some(entry => Number(entry.kind) <= 1);
+const SUCCESSOR_ROUTES = /^\/v2\/(?:requests|nullifiers|openrouter\/leases)\/[^/]+$/;
 globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input?.url ?? input));
     if (url.protocol === 'file:') {
@@ -51,7 +66,18 @@ globalThis.fetch = async (input, init = {}) => {
     }
     if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1') throw new TypeError(`the acceptance SDK only reaches loopback (${url.origin})`);
     fetchLog.push({ method: init.method || 'GET', path: url.pathname, origin: url.origin });
-    return realFetch(url, init);
+    const response = await realFetch(url, init);
+    if (!holdSuccessors || !SUCCESSOR_ROUTES.test(url.pathname) || exitProofReleased()) return response;
+    const text = await response.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch { /* Not JSON: passed on unchanged. */ }
+    if (body && typeof body === 'object' && (body.request_response || body.nullifier_status === 'finalized')) {
+        delete body.request_response;
+        if (body.nullifier_status === 'finalized') body.nullifier_status = 'reserved';
+        heldReadings += 1;
+        return new Response(JSON.stringify(body), { status: response.status, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(text, { status: response.status, headers: { 'content-type': response.headers.get('content-type') || 'application/json' } });
 };
 const { execute } = await import(sdk('services/zkapiWasmWorker.js'));
 const workerOperations = [];
@@ -74,6 +100,9 @@ let walletRpcUrl;
 let account;
 let rpcId = 0;
 const sent = [];
+// `wallet_reject`: selectors whose calls the wallet refuses to send.
+const rejectSelectors = new Set();
+const rejected = [];
 async function walletRpc(method, params = []) {
     const response = await realFetch(walletRpcUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }) });
@@ -93,6 +122,11 @@ const provider = {
             case 'eth_sendTransaction': {
                 const tx = { ...params[0] };
                 delete tx.zkapiRecovery;
+                const selector = String(tx.data || '').slice(0, 10).toLowerCase();
+                if (rejectSelectors.has(selector)) {
+                    rejected.push({ to: tx.to, data: selector });
+                    throw Object.assign(new Error('User rejected the request.'), { code: 4001 });
+                }
                 const hash = await walletRpc('eth_sendTransaction', [tx]);
                 sent.push({ hash, to: tx.to, data: tx.data?.slice(0, 10), value: tx.value ?? '0x0' });
                 return hash;
@@ -178,6 +212,26 @@ async function handle(command) {
         case 'snapshot':
             await client.refresh({ quiet: true });
             return state();
+        case 'cancel': {
+            const statuses = [];
+            const result = await client.cancelPreparedWithdrawal(message => statuses.push(message));
+            return { result, statuses, ...state() };
+        }
+        case 'wallet_reject':
+            rejectSelectors.clear();
+            for (const selector of command.selectors || []) rejectSelectors.add(String(selector).toLowerCase());
+            return { rejecting: [...rejectSelectors] };
+        case 'hold_successors':
+            holdSuccessors = command.on !== false;
+            return { holding: holdSuccessors, held_readings: heldReadings };
+        case 'drop_deposit_path': {
+            await client.refresh({ quiet: true });
+            const current = runtime.runtime;
+            const { deposit_path: dropped, ...kept } = current.state;
+            await runtime.commit({ ...current, state: kept });
+            await client.refresh({ quiet: true });
+            return { dropped: Boolean(dropped), ...state() };
+        }
         case 'close':
             setTimeout(() => process.exit(0), 10);
             return { closed: true };
@@ -203,6 +257,10 @@ function state() {
         prepared: plan ? Object.fromEntries(PLAN_FIELDS.filter(key => key in plan).map(key => [key, summarize(plan[key])])) : null,
         exit_lock: durable.exitLock ? summarize({ mode: durable.exitLock.mode, released: durable.exitLock.released?.map(entry =>
             ({ kind: entry.kind, conceded: entry.conceded, valid_until: entry.valid_until ?? entry.validUntil })) }) : null,
+        // The state's bound (C2) as the wallet holds it, and the request
+        // its journal holds.
+        bound_at_state: durable.state ? String(durable.state.bound_at_state ?? 0) : null,
+        journal_request_id: durable.journal?.client_request_id || durable.journal?.prepared_request?.client_request_id || null,
         request_archive: (runtime.requestArchive ?? []).filter(record => record.type === 'request_journal').map(record => ({
             disposition: record.disposition, client_request_id: record.clientRequestId ?? null,
             observations: (record.observations ?? []).map(observation => observation.status) })),
@@ -216,6 +274,9 @@ function state() {
         exit: summarize(exit),
         last_error: snapshot.lastError ? pick(snapshot.lastError) : null,
         sent,
+        rejected,
+        held_readings: heldReadings,
+        deposit_path_saved: Boolean(durable.state?.deposit_path),
         worker_operations: [...new Set(workerOperations)],
         device_clock_offset_seconds: clockOffsetMs / 1000,
     };

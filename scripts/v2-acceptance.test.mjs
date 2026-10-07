@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, TIMING, challengeFees, drillTiming, gasLedger, localJSON, mockOaOrg, mockProvider,
+    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, localJSON, mockOaOrg, mockProvider,
     proxyAuthorized, proxyJsonRpc, trustedDeployment,
 } from './v2-acceptance.mjs';
 
@@ -161,8 +161,10 @@ test('drill timing passes serverd\'s and zkapi-challenged\'s startup checks, and
     assert.equal(drillTiming({ ...TIMING, raiseLead: 2_000 }).ok, false, 'the raise must land within the period');
     assert.equal(drillTiming({ ...TIMING, maxPauseDuration: TIMING.challengePeriod }).ok, false, 'maxPauseDuration >= 2 cp');
     assert.equal(drillTiming({ ...TIMING, settlementDeadline: 900 }).ok, false, 'the deadline leaves 900 s of retries');
-    // One accepted inference ($0.001 at $2,500/ETH) costs 400 gwei.
+    // One accepted inference ($0.001 at $2,500/ETH) costs 400 gwei, and an
+    // SDK request ($1 limit) fixes a bound of 400,000 gwei.
     assert.equal(INFERENCE_CHARGE, 400);
+    assert.equal(SDK_REQUEST_BOUND, 400_000);
 });
 
 test('profiles come only from a finalized Deploy.s.sol manifest', () => {

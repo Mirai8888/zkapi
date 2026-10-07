@@ -367,6 +367,7 @@ The drill vault tests the adversarial cases with short timings. It uses the
 
    ```sh
    git worktree add --detach ../zkapi-drill HEAD && cd ../zkapi-drill
+   npm ci                                             # this worktree's own node_modules
    node scripts/deployment-profile.mjs --finalized "$DRILL_MANIFEST" \
      --deployment-id zkapi-native-eth-sepolia-concession-drill-1 \
      --protocol-server-url https://DRILL_API_HOST --indexer-url https://DRILL_API_HOST \
@@ -1076,18 +1077,26 @@ refuses them everywhere.
   mainnet) per cycle.
 - **Browser host dependence** without a current exit kit; the companion's
   `exit-kit escape` works without the host.
-- **An exit RPC that is down.** With `--exit-rpc-url` set, clientd and the
-  companion stop an escape with an error rather than fall back to the pinned
-  RPC; the owner retries or changes the setting. Without an exit RPC, the
-  pinned RPC is trusted for escape liveness: it decides when a dead exit lock
-  is released and whether an escape landed or was defeated. No client
-  releases a lock before its own clock says the released proof is dead, and
-  clientd reads a reported defeat again on every run instead of recording it
-  for good: a lying pinned RPC can delay an exit, but it cannot release a
-  lock while the escape proof can still land, nor make a defeat permanent.
-  clientd warns on every open escape while no exit RPC is set. The
-  SDK's chat path still releases a dead exit lock on the pinned RPC's reading
-  when no exit RPC is set.
+- **An exit RPC that is down, or none.** With `--exit-rpc-url` set, clientd
+  and the companion stop an escape with an error rather than fall back to the
+  pinned RPC; the owner retries or changes the setting. Without an exit RPC,
+  the pinned RPC, which the operator may run, is trusted for the escape
+  itself: it sends the escape's transactions and decides when a dead exit
+  lock is released and whether the escape landed, was defeated or paid. No
+  client releases a lock before its own clock says the released proof is
+  dead, and clientd reads a reported defeat again on every run instead of
+  recording it for good, so a lying pinned RPC cannot release a lock while
+  the escape proof can still land, nor make a defeat permanent. It can do
+  more than delay an exit, though: by dropping the escape's transactions and
+  faking their receipts and logs, it can make clientd and the companion
+  record the escape as finalized and paid, and archive the note, while the
+  note is still open on chain, where the operator can sweep it with
+  `claimExpired` at expiry. Owners should set an exit RPC before they escape,
+  or check through an independent source (their own node or a block
+  explorer) that the payout reached the destination. clientd warns on every
+  open escape while no exit RPC is set, and repeats that check on an escape
+  it completed without one. The SDK's chat path still releases a dead exit
+  lock on the pinned RPC's reading when no exit RPC is set.
 - **Deployment manifests.** Finalizing needs forge's broadcast log, and owner
   and treasury are checked only when it runs.
 

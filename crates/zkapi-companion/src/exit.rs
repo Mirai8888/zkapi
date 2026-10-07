@@ -255,7 +255,7 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
     let read = |url: Option<&str>| {
         let url = url.map(str::to_string);
         async move {
-            let rpc = Rpc::new(url.as_deref()?).ok()?;
+            let rpc = Rpc::new(url.as_deref()?).ok()?.on_chain(config.chain_id);
             chain::effective_expiry(&rpc, &vault, note_id).await.ok()
         }
     };
@@ -270,6 +270,8 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
 /// would decide what is proved and signed (the root, the start block) or the
 /// escape's state (pending, closed, defeated), and the lock's release (E5,
 /// E6). A failing exit RPC is reported; the owner retries or names another.
+/// Every reading must come from the deployment's chain: an RPC on another
+/// chain fails each call (WP-D's eth_chainId check, as in the SDK).
 pub(crate) fn deciding_rpc(config: &AuthConfig) -> Result<Rpc, AuthError> {
     let url = config
         .exit_rpc_url
@@ -278,7 +280,7 @@ pub(crate) fn deciding_rpc(config: &AuthConfig) -> Result<Rpc, AuthError> {
         .ok_or_else(|| {
             AuthError::InvalidInput("the deployment names no RPC to confirm the exit".into())
         })?;
-    Rpc::new(url)
+    Ok(Rpc::new(url)?.on_chain(config.chain_id))
 }
 
 /// A lock this exit call holds at the end with nothing released under it
@@ -518,7 +520,9 @@ async fn advisory_warnings(
     .into_iter()
     .flatten()
     {
-        let Ok(rpc) = Rpc::new(url) else { continue };
+        let Ok(rpc) = Rpc::new(url).map(|rpc| rpc.on_chain(config.chain_id)) else {
+            continue;
+        };
         for (label, value) in [("nullifier", nullifier), ("successor nullifier", successor)] {
             match chain::challenged(&rpc, &vault, value, "latest").await {
                 Ok(true) => warnings.push(format!(

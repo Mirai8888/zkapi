@@ -122,6 +122,9 @@ pub fn claim_calldata(destination: &[u8; 20]) -> String {
 pub struct Rpc {
     url: String,
     http: reqwest::Client,
+    /// With [`Rpc::on_chain`]: the chain every reading must come from, and
+    /// whether `eth_chainId` confirmed it (asked once, before any other call).
+    chain: Option<(u64, std::sync::Arc<tokio::sync::OnceCell<()>>)>,
 }
 
 fn failure(message: impl Into<String>) -> AuthError {
@@ -152,7 +155,17 @@ impl Rpc {
         Ok(Self {
             url: url.to_string(),
             http,
+            chain: None,
         })
+    }
+
+    /// This RPC, trusted only on `chain_id`: its first call asks
+    /// `eth_chainId`, and an RPC on another chain (or one that cannot say)
+    /// fails every call, so each reader treats it as unavailable. An exit
+    /// RPC the owner pasted for the wrong network never decides an exit.
+    pub fn on_chain(mut self, chain_id: u64) -> Self {
+        self.chain = Some((chain_id, std::sync::Arc::new(tokio::sync::OnceCell::new())));
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -160,6 +173,23 @@ impl Rpc {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, AuthError> {
+        if let Some((chain_id, confirmed)) = &self.chain {
+            confirmed
+                .get_or_try_init(|| async {
+                    let remote = quantity(&self.call_raw("eth_chainId", json!([])).await?)?;
+                    if remote != *chain_id {
+                        return Err(failure(format!(
+                            "the RPC is on chain {remote}, not the vault's chain {chain_id}"
+                        )));
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
+        self.call_raw(method, params).await
+    }
+
+    async fn call_raw(&self, method: &str, params: Value) -> Result<Value, AuthError> {
         let response = self
             .http
             .post(&self.url)

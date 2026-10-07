@@ -57,6 +57,8 @@ struct World {
     pinned_calls: usize,
     /// The exit RPC refuses every call.
     exit_down: bool,
+    /// The exit RPC is on this chain instead of the vault's (chain 1).
+    exit_chain: Option<u64>,
     /// The finalized block trails the latest by this many blocks.
     finalized_lag: u64,
     // Chain.
@@ -101,6 +103,11 @@ async fn pinned_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Res
 async fn exit_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
     if world.lock().unwrap().exit_down {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+    if let Some(chain) = world.lock().unwrap().exit_chain {
+        if body["method"] == "eth_chainId" {
+            return rpc_result(json!(format!("0x{chain:x}")));
+        }
     }
     answer(&world, &body, false)
 }
@@ -1489,6 +1496,43 @@ async fn escapes_follow_the_exit_rpc_when_the_pinned_rpc_is_down_or_lies() {
         assert_eq!(harness.world.lock().unwrap().pinned_calls, 0);
         assert!(harness.wallet().exit_lock().unwrap().is_some());
     }
+}
+
+/// WP-D's chain check, in the companion: an exit RPC the owner configured
+/// for another network (here chain 5, where the same vault address could
+/// hold a Closed note) is never read for the escape's state or its lock
+/// (E6), nor for a root or a rebuild (E4 step 1), and the pinned RPC is not
+/// asked in its place. Pointed back at the vault's chain, it decides again.
+#[tokio::test]
+async fn an_exit_rpc_on_another_chain_decides_nothing() {
+    let harness = Harness::new(true).await.with_exit_rpc();
+    let plan = harness.prepare(Some("0"), None).await.unwrap();
+    harness.initiate(&plan);
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.exit_chain = Some(5);
+        world.pinned_calls = 0;
+    }
+    let status = harness.service.oa_escape_status().await.unwrap();
+    assert_eq!(status["chain"], "unavailable", "{status}");
+    assert!(status.get("chain_rpc").is_none());
+    assert_eq!(harness.world.lock().unwrap().pinned_calls, 0);
+    assert!(harness.wallet().exit_lock().unwrap().is_some());
+    harness.world.lock().unwrap().exit_chain = None;
+    let status = harness.service.oa_escape_status().await.unwrap();
+    assert_eq!(status["phase"], "pending", "{status}");
+    assert_eq!(status["chain_rpc"], "exit");
+
+    let harness = Harness::new(false).await.with_exit_rpc();
+    harness.world.lock().unwrap().exit_chain = Some(5);
+    let refused = harness.prepare(Some("0"), None).await;
+    assert!(
+        matches!(&refused, Err(AuthError::Wallet(message)) if message.contains("chain 5")),
+        "{refused:?}"
+    );
+    harness.world.lock().unwrap().exit_chain = None;
+    let plan = harness.prepare(Some("0"), None).await.unwrap();
+    assert_eq!(plan["status"], "prepared");
 }
 
 /// E4 step 1 with the owner's exit RPC down and no deposit-time path: the

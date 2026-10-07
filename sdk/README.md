@@ -460,6 +460,10 @@ that state:
   the finalized block are read through the exit RPC when one is set, else
   through the pinned RPC. A `Closed` reading releases the lock earlier only
   when it comes from the exit RPC.
+- Every withdrawal first releases a lock whose proofs are all dead. A held
+  `late_successor` then installs, and the decision starts again at the
+  newest state, so an escape that never landed does not force another escape
+  from the old state.
 - Escape and close proofs are valid for 3 hours. Ownership proofs are valid
   for 55 minutes: the server accepts at most an hour, and the margin absorbs a
   client clock up to five minutes fast. The SDK proves again after

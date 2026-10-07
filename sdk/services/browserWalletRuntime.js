@@ -3980,9 +3980,10 @@ class BrowserWalletRuntime extends EventTarget {
             await this.reload();
             const lockBefore = this.runtime.exitLock;
             try {
-                // A verified install moves the note to a new state, and
-                // preparation restarts there (E1, E3.2, E4.3).
-                for (let pass = 0; pass < 3; pass += 1) {
+                // A verified install or a released lock moves the decision
+                // to a new state or a fresh lock, and preparation restarts
+                // there (E1, E3.2, E4.3, E6).
+                for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
                         expectedActiveRoot, reprove, earlyConcession, pathSource, signal, onProgress
                     });
@@ -4047,6 +4048,17 @@ class BrowserWalletRuntime extends EventTarget {
             return existing;
         }
         const now = nowSeconds();
+        // E6 before any decision: a lock whose released escape or close
+        // proofs are all dead is released, and a successor archived as
+        // late_successor meanwhile installs (§7.5). The decision then starts
+        // again at the newest state with a fresh lock, so a dead escape
+        // neither forces another escape nor keeps the stale state.
+        const held = this.runtime.exitLock;
+        const deadAfter = exitLockDeadAfter(held);
+        if (deadAfter != null && now > deadAfter) {
+            const release = await this.releaseExitLockLocked();
+            if (release.released) return WITHDRAWAL_RESTART;
+        }
         const deadline = mustInitiateBy(await this.exitLowExpiry(state));
         const nullifier = await this.worker.call('withdrawalNullifier', { state });
         if (existing && preparedWithdrawalNullifier(existing) != null

@@ -587,6 +587,77 @@ test('E4.6 and E6: a successor after a release is archived, and installs once th
     await h.runtime.issueLease('chat');
 });
 
+test('E6 on the next withdrawal: a dead escape is released first, its late successor installs, and the note closes at the new state', async () => {
+    const clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+    const restore = Date.now;
+    // A forced escape (c = 0) whose receipt arrives just before broadcast.
+    const h = await walletWithLiveRequest();
+    h.server.clearance = clearance;
+    const journal = (await saved()).journal;
+    const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(journal) });
+    assert.deepEqual(await h.runtime.exitBeforeBroadcast(), { checked: true, lateSuccessor: true });
+    // While the escape proof can land, a withdrawal stays that escape.
+    const kept = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(kept.mode, 'escape');
+    assert.deepEqual(kept.proof, escape.proof);
+    // Past T and past valid_until + 900 (locally and at a finalized block),
+    // the escape never landed: the next withdrawal releases the lock,
+    // installs the late successor and closes cooperatively from it.
+    const created = Math.floor(journal.created_at_ms / 1_000);
+    const later = Math.max(created + W + 900 + 3_600, escape.public_inputs.valid_until + 901);
+    Date.now = () => later * 1_000;
+    h.chain.finalizedTimestamp = later;
+    let plan;
+    try {
+        plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    } finally {
+        Date.now = restore;
+    }
+    assert.equal(plan.mode, 'mutual');
+    assert.equal(plan.decision.rule, 'E2');
+    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'), 'from the installed successor');
+    assert.equal(plan.public_inputs.final_balance, 5_000_000 - 25_000, 'B_{k+1}, not B_k − b');
+    assert.equal(plan.public_inputs.conceded, 0);
+    const after = await saved();
+    assert.equal(after.state.current_anchor, '0x9999');
+    assert.equal(after.exitLock.anchor, '0x9999');
+    assert.deepEqual(after.exitLock.released.map(entry => entry.kind), [2, 1]);
+    assert.equal((await records()).find(record => record.clientRequestId === journal.client_request_id).disposition, 'installed');
+    assert.equal(proofsOf(h, 'escape').length, 1, 'no second escape from the stale state');
+
+    // Without a successor, a dead escape no longer forces another escape:
+    // the fresh state closes cooperatively.
+    const alone = await freshWallet();
+    alone.server.clearance = clearance;
+    const first = await alone.runtime.prepareWithdrawal('escape', DESTINATION);
+    Date.now = () => (first.public_inputs.valid_until + 901) * 1_000;
+    alone.chain.finalizedTimestamp = first.public_inputs.valid_until + 901;
+    let close;
+    try {
+        close = await alone.runtime.prepareWithdrawal('mutual', DESTINATION);
+    } finally {
+        Date.now = restore;
+    }
+    assert.equal(close.mode, 'mutual');
+    assert.equal(close.decision.rule, 'E2');
+    assert.equal(close.public_inputs.final_balance, 5_000_000);
+    assert.equal(proofsOf(alone, 'escape').length, 1);
+    // A dead escape whose note the RPC reports still pending stays held.
+    const pending = await freshWallet();
+    const held = await pending.runtime.prepareWithdrawal('escape', DESTINATION);
+    pending.chain.noteStatus = 'pending_withdrawal';
+    Date.now = () => (held.public_inputs.valid_until + 901) * 1_000;
+    pending.chain.finalizedTimestamp = held.public_inputs.valid_until + 901;
+    try {
+        const again = await pending.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(again.mode, 'escape', 'no release while an exit is pending');
+    } finally {
+        Date.now = restore;
+    }
+    assert.equal((await saved()).exitLock.released.filter(entry => entry.kind === 0).length, 2);
+});
+
 test('E6: a lying pinned RPC cannot release a live escape early; the user\'s exit RPC is read instead when set', async () => {
     const statusRpc = ({ status, timestamp, calls, source }) => async ({ method, params }) => {
         calls.push([source, method]);

@@ -2525,6 +2525,10 @@ class ZkapiClient extends EventTarget {
             recordId: record.recordId,
             conceded: BigInt(plan.public_inputs.conceded),
             decision: plan.decision || null,
+            // Where the proof's Merkle path came from (E4.1): the saved
+            // deposit-time path, the indexer or the rebuild from the vault's
+            // logs.
+            pathSource: plan.pathSource || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
     }

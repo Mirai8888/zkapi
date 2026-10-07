@@ -419,9 +419,11 @@ exit waits past `must_initiate_by`. The decision then depends on the state:
      `c = bound_at_state` when called with `concede: 'bound'`.
    - At or after `T`, an escape concedes `bound_at_state`.
 3. **Lost response**: the server finalized a request at the state with a
-   signed response this browser cannot install (`receipt_unrecoverable`,
-   `invalid_successor`). The escape then concedes
-   `min(charge, bound_at_state)` at once.
+   signed response this browser cannot install although it passes S1, S2,
+   S4 and S6 (`receipt_unrecoverable`, or `invalid_successor` for an
+   overcharge, S3). The escape then concedes `min(charge, bound_at_state)` at
+   once. A successor refused for its anchor (S4) is handled like a withheld
+   one (2).
 
 Before proving an escape, the wallet does the following:
 
@@ -433,6 +435,9 @@ Before proving an escape, the wallet does the following:
      event's root checked. Ranges halve on an RPC limit and double again after
      four accepted ranges. The whole rebuild ends within 5 minutes
      (`tree_rebuild_timeout`).
+
+   An escape's `withdraw` result names the source it used: `pathSource` is
+   `deposit`, `indexer` or `rebuild`.
 
    The vault's root and logs are read through the user's exit RPC
    (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it)

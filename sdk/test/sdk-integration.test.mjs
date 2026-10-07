@@ -173,6 +173,15 @@ test('host builds refuse a profile of another setup, a development mainnet and u
         for (const name of ['setup', 'circuit', 'revision', 'vk', 'pk', 'mainnet', 'relabelled']) {
             await assert.rejects(fs.access(out(name)), `${name}: nothing was written`);
         }
+        // A deployed profile may say so, as the finalized manifest, serverd,
+        // clientd and scripts/deployment-profile.mjs do; any other status is
+        // refused.
+        await rewrite({ profiles: { sepolia: sepolia({ deployment_status: 'pending' }) }, manifest: { setupId: 'dev' } });
+        await assert.rejects(module.buildBrowserSdkAssets({ outDir: out('pending'), network: 'sepolia', build }),
+            /unknown deployment_status/);
+        await rewrite({ profiles: { sepolia: sepolia({ deployment_status: 'deployed' }) }, manifest: { setupId: 'dev' } });
+        const deployed = await module.buildBrowserSdkAssets({ outDir: out('deployed'), network: 'sepolia', build });
+        await fs.access(deployed.directory);
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
 });
 

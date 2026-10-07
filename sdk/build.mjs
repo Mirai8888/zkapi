@@ -78,7 +78,8 @@ export async function verifyBrowserSdkAssets() {
 
 /**
  * Refuse a profile this bundle must not be built for: a placeholder
- * (`deployment_status: "not_deployed"`), another circuit or setup, a mainnet
+ * (`deployment_status: "not_deployed"`) or a status other than "deployed",
+ * another circuit or setup, a mainnet
  * profile on a development setup, a vault without the concession exit, or
  * keys other than the shipped ones.
  */
@@ -91,7 +92,9 @@ export function assertDeployableProfile(config, manifest, network, hashes) {
         throw codedError('deployment_not_deployed',
             `The ${network} profile is a placeholder: no ${manifest.circuitId} vault is deployed on ${network}.`);
     }
-    if (trusted.deployment_status != null) {
+    // A deployed profile names no status, or "deployed" as the finalized
+    // manifest, serverd and clientd do.
+    if (trusted.deployment_status != null && trusted.deployment_status !== 'deployed') {
         throw new Error(`The ${network} profile has an unknown deployment_status.`);
     }
     if (trusted.circuit_id !== manifest.circuitId) {

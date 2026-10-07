@@ -16,7 +16,7 @@ const skip = !haveAnvil && process.env.ZKAPI_REQUIRE_ANVIL !== '1' && 'anvil is 
 const key = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const sender = new Wallet(key).address;
 const vault = '0x0000000000000000000000000000000000001234';
-const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0], `0x${'00'.repeat(256)}`, Array(32).fill(0)]);
+const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0], `0x${'00'.repeat(256)}`]);
 const GAS = 200_000n;
 const wei = value => `0x${value.toString(16)}`;
 const fees = (maxFee, tip) => ({ maxFeePerGas: wei(maxFee), maxPriorityFeePerGas: wei(tip) });

@@ -24,9 +24,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zkapi_types::Felt252;
 
-use crate::watcher::SettlementProgress;
+use crate::watcher::{CallKind, SettlementProgress};
 
-pub const STATUS_SCHEMA: &str = "zkapi-challenged-status/v1";
+/// v2: concession escapes (defeats, raises and leaf retirements).
+pub const STATUS_SCHEMA: &str = "zkapi-challenged-status/v2";
 /// Wall time without a new head block before the status warns, then alarms.
 pub const HEAD_AGE_WARNING_SECONDS: u64 = 120;
 pub const HEAD_AGE_CRITICAL_SECONDS: u64 = 600;
@@ -54,36 +55,59 @@ pub enum Severity {
 pub enum ObligationState {
     /// Tracked, but no poll has evaluated it since the daemon started.
     Unevaluated,
-    /// No request transcript at this nullifier (unknown or clearance only).
-    NoEvidence,
-    /// Reserved request: challengeable once the server finalizes it.
+    /// Nothing is due: no verified evidence at the successor nullifier, and
+    /// the concession covers what is owed at the escaped one. The honest
+    /// outcome.
+    NothingDue,
+    /// What is owed at the escaped nullifier is not final: a request that may
+    /// have been delivered has not settled. The raise is decided once it
+    /// settles, or at `deadline - raise_lead_seconds` at the latest.
     AwaitingSettlement,
-    /// Finalized evidence; a challenge is due but not pending.
+    /// A defeat or a raise is due but not pending.
     Ready,
-    /// A challenge transaction is pending on the obligation's nonce.
+    /// A defeat, raise or leaf retirement is pending on the obligation's nonce.
     Submitted,
-    /// The nonce was consumed while the withdrawal is still pending.
+    /// A defeat's nonce was consumed while the escape is still pending.
     MinedUnconfirmed,
-    /// The withdrawal is gone at the latest block, not yet at confirmation
-    /// depth. With evidence it may have been paid out, not challenged.
+    /// The concession covers what is owed (after a raise); the escape is
+    /// watched for successor evidence until its deadline.
+    Raised,
+    /// The escape is gone at the latest block, not yet at confirmation
+    /// depth. With evidence it may have been paid out, not defeated.
     ResolvedUnconfirmed,
-    /// The deadline passed while evidence existed or was expected.
+    /// The deadline passed while a defeat or a raise was due.
     Missed,
-    /// The deadline passed and no evidence existed or was expected.
-    ExpiredWithoutEvidence,
+    /// The deadline passed and nothing was due.
+    ExpiredNothingDue,
+    /// After a missed defeat the escape was paid out: the closed note's leaf
+    /// is being retired (`retireClosedLeaf`, `--retire-on-miss`).
+    RetiringLeaf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
-    Finalized,
-    Reserved,
+    /// A verified request proof at the successor nullifier: a defeat.
+    Successor,
+    /// The request at the escaped nullifier settled; `owed` is its charge.
+    Settled,
+    /// It may have been delivered and has not settled; `owed` is its bound
+    /// from the raise lead on.
+    Unsettled,
+    /// Its key was never issued or never delivered: nothing is owed.
+    NeverDelivered,
+    /// A reservation without a lease row: nothing is owed.
     ReservedWithoutLease,
+    /// The escaped nullifier is reserved only for a clearance.
     Clearance,
+    /// No request at the escaped nullifier.
     Unknown,
+    /// Evidence rows exist that do not verify.
     Corrupt,
     /// The server database could not be read.
     Unavailable,
+    /// The note's leaf, being retired after a missed defeat.
+    Leaf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +270,15 @@ pub struct ChallengeStatus {
     pub indexer: IndexerStatus,
     pub obligations: Vec<ObligationStatus>,
     pub detached_nonces: Vec<DetachedNonceStatus>,
+    /// Missed defeats and missed raises.
     pub missed_total: u64,
+    /// Missed defeats (§5.4): verified evidence at the successor nullifier
+    /// existed before the deadline and the escape was finalized.
+    #[serde(default)]
+    pub escapes_finalized_with_successor_evidence_total: u64,
+    /// Missed raises: more than the concession was owed at finalization.
+    #[serde(default)]
+    pub missed_raises_total: u64,
     pub last_missed: Option<MissedRecord>,
     pub config_warnings: Vec<String>,
 }
@@ -367,7 +399,25 @@ impl Default for IndexerStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObligationStatus {
     pub note_id: u32,
+    /// The escaped nullifier `N`.
     pub nullifier: Felt252,
+    /// `N⁺`: only a request proof at it defeats the escape.
+    #[serde(default)]
+    pub next_nullifier: Option<Felt252>,
+    /// `B`, the escaped state's balance, and `c`, the current concession.
+    #[serde(default)]
+    pub state_balance: Option<u128>,
+    #[serde(default)]
+    pub conceded: Option<u128>,
+    /// `Ω`, once known: final once settled, else the bound from the raise lead.
+    #[serde(default)]
+    pub owed: Option<u128>,
+    /// `deadline - raise_lead_seconds`: the raise is decided by then.
+    #[serde(default)]
+    pub raise_due_at: Option<u64>,
+    /// The vault call on the obligation's nonce.
+    #[serde(default)]
+    pub action: Option<CallKind>,
     pub state: ObligationState,
     pub severity: Severity,
     pub challenge_deadline: Option<u64>,
@@ -414,6 +464,9 @@ pub struct MissedRecord {
     pub challenge_deadline: u64,
     pub reason: String,
     pub recorded_at: u64,
+    /// `defeat` or `raise`; absent in records of an earlier release.
+    #[serde(default)]
+    pub kind: Option<CallKind>,
 }
 
 impl ChallengeStatus {
@@ -434,6 +487,8 @@ impl ChallengeStatus {
             obligations: Vec::new(),
             detached_nonces: Vec::new(),
             missed_total: 0,
+            escapes_finalized_with_successor_evidence_total: 0,
+            missed_raises_total: 0,
             last_missed: None,
             config_warnings: Vec::new(),
         }
@@ -456,28 +511,6 @@ pub fn deadline_severity(seconds_remaining: Option<u64>, t: RemainingThresholds)
         Some(remaining) if remaining <= t.warning_remaining_seconds => Severity::Warning,
         _ => Severity::Ok,
     }
-}
-
-/// A lease whose settlement is not certain to finalize before the critical
-/// threshold (its write-once settlement deadline, or without one its next
-/// scheduled attempt) may not produce evidence in time without operator action.
-pub fn settles_after_critical(o: &ObligationStatus, t: RemainingThresholds) -> bool {
-    o.settlement
-        .as_ref()
-        .and_then(SettlementProgress::evidence_expected_by)
-        .zip(o.challenge_deadline)
-        .is_some_and(|(expected_by, deadline)| {
-            expected_by >= deadline.saturating_sub(t.critical_remaining_seconds)
-        })
-}
-
-/// A reservation that will never produce evidence: no lease row (issuance
-/// never completed) or a lease cancelled for a corrupt binding.
-pub fn evidence_never_expected(o: &ObligationStatus) -> bool {
-    o.evidence == Some(EvidenceKind::ReservedWithoutLease)
-        || o.settlement
-            .as_ref()
-            .is_some_and(|settlement| settlement.lease_status.as_deref() == Some("cancelled"))
 }
 
 /// Severity of one obligation; `o.seconds_remaining` must be current.
@@ -506,14 +539,16 @@ pub fn obligation_severity(
     };
     match o.state {
         ObligationState::Missed => Severity::Critical,
-        // Until confirmation depth tells a challenge from a payout.
+        // Until confirmation depth tells a defeat from a payout.
         ObligationState::ResolvedUnconfirmed if o.evidence.is_some() => deadline.max(blocked),
-        ObligationState::NoEvidence
-        | ObligationState::ExpiredWithoutEvidence
-        | ObligationState::ResolvedUnconfirmed => Severity::Ok,
-        // The nonce is consumed but the withdrawal remains: it reverted.
+        ObligationState::NothingDue
+        | ObligationState::Raised
+        | ObligationState::ExpiredNothingDue
+        | ObligationState::ResolvedUnconfirmed => blocked,
+        // The nonce is consumed but the escape remains: it reverted.
         ObligationState::MinedUnconfirmed | ObligationState::Unevaluated => deadline,
-        ObligationState::AwaitingSettlement if evidence_never_expected(o) => Severity::Warning,
+        // Nothing is sent before the raise lead, whatever the deadline: only
+        // an overdue settlement or a blocked read is reported.
         ObligationState::AwaitingSettlement => {
             let overdue = o
                 .settlement
@@ -522,15 +557,14 @@ pub fn obligation_severity(
                 .is_some_and(|settle_after| {
                     wall_now > settle_after.saturating_add(policy.settlement_overdue_seconds)
                 });
-            let mut severity = deadline.max(blocked);
             if overdue {
-                severity = severity.max(Severity::Warning);
+                blocked.max(Severity::Warning)
+            } else {
+                blocked
             }
-            if settles_after_critical(o, t) {
-                severity = Severity::Critical;
-            }
-            severity
         }
+        // A missed defeat was paid out; its alarm is the missed record.
+        ObligationState::RetiringLeaf => blocked.max(Severity::Warning),
         ObligationState::Ready | ObligationState::Submitted => deadline.max(blocked),
     }
 }
@@ -849,11 +883,17 @@ mod tests {
         ObligationStatus {
             note_id: 0,
             nullifier: Felt252::from_u64(9),
+            next_nullifier: Some(Felt252::from_u64(10)),
+            state_balance: Some(100),
+            conceded: Some(0),
+            owed: None,
+            raise_due_at: None,
+            action: None,
             state,
             severity: Severity::Ok,
             challenge_deadline: Some(NOW + remaining),
             seconds_remaining: Some(remaining),
-            evidence: Some(EvidenceKind::Finalized),
+            evidence: Some(EvidenceKind::Successor),
             blocked_reason: None,
             detail: None,
             blocked_since: None,
@@ -920,10 +960,10 @@ mod tests {
             (MinedUnconfirmed, 5, Severity::Critical),
             (Unevaluated, 5, Severity::Critical),
             (AwaitingSettlement, 100, Severity::Ok),
-            (AwaitingSettlement, 40, Severity::Warning),
-            (AwaitingSettlement, 5, Severity::Critical),
-            (NoEvidence, 0, Severity::Ok),
-            (ExpiredWithoutEvidence, 0, Severity::Ok),
+            (AwaitingSettlement, 5, Severity::Ok),
+            (NothingDue, 0, Severity::Ok),
+            (Raised, 0, Severity::Ok),
+            (ExpiredNothingDue, 0, Severity::Ok),
             // With evidence it may have been paid out: its deadline counts.
             (ResolvedUnconfirmed, 100, Severity::Ok),
             (ResolvedUnconfirmed, 0, Severity::Critical),
@@ -984,48 +1024,36 @@ mod tests {
             o.seconds_remaining = Some(5);
             assert_eq!(severity(&o), Severity::Critical);
         }
-        // Settlement-specific rules.
-        let mut awaiting = obligation(AwaitingSettlement, 1_000);
-        awaiting.evidence = Some(EvidenceKind::Reserved);
+        // Awaiting settlement sends nothing before the raise lead: its
+        // deadline does not escalate it, an overdue settlement warns and an
+        // unreadable lease row is critical.
+        let mut awaiting = obligation(AwaitingSettlement, 5);
+        awaiting.evidence = Some(EvidenceKind::Unsettled);
         awaiting.settlement = Some(SettlementProgress {
             lease_status: Some("active".into()),
             key_issued: true,
+            possibly_delivered: true,
             settle_after: Some(NOW + 100),
             ..Default::default()
         });
         assert_eq!(severity(&awaiting), Severity::Ok);
-        awaiting.settlement.as_mut().unwrap().settle_after = Some(NOW + 995);
-        assert!(settles_after_critical(&awaiting, t));
-        assert_eq!(severity(&awaiting), Severity::Critical);
-        // The write-once settlement deadline, when assigned, takes precedence
-        // over the next scheduled attempt: it bounds when evidence exists.
-        let settlement = awaiting.settlement.as_mut().unwrap();
-        settlement.settle_after = Some(NOW + 100);
-        settlement.settlement_deadline_at = Some(NOW + 995);
-        assert!(settles_after_critical(&awaiting, t));
-        assert_eq!(severity(&awaiting), Severity::Critical);
-        let settlement = awaiting.settlement.as_mut().unwrap();
-        settlement.settle_after = Some(NOW + 995);
-        settlement.settlement_deadline_at = Some(NOW + 100);
-        assert!(!settles_after_critical(&awaiting, t));
-        assert_eq!(severity(&awaiting), Severity::Ok);
-        awaiting.settlement.as_mut().unwrap().settlement_deadline_at = None;
         awaiting.settlement.as_mut().unwrap().settle_after =
             Some(NOW - policy.settlement_overdue_seconds - 1);
         assert_eq!(severity(&awaiting), Severity::Warning, "overdue");
-        let mut orphan = obligation(AwaitingSettlement, 5);
-        orphan.evidence = Some(EvidenceKind::ReservedWithoutLease);
-        assert_eq!(severity(&orphan), Severity::Warning, "never critical");
-        orphan.evidence = Some(EvidenceKind::Reserved);
-        orphan.settlement = Some(SettlementProgress {
-            lease_status: Some("cancelled".into()),
-            ..Default::default()
-        });
-        assert_eq!(severity(&orphan), Severity::Warning);
         let mut unreadable = obligation(AwaitingSettlement, 1_000);
         unreadable.evidence = Some(EvidenceKind::Unavailable);
         unreadable.blocked_reason = Some(BlockedReason::EvidenceDbError);
         assert_eq!(severity(&unreadable), Severity::Critical);
+        // A raised escape is watched quietly; corrupt successor evidence is
+        // critical whatever the state.
+        assert_eq!(severity(&obligation(Raised, 5)), Severity::Ok);
+        let mut corrupt = obligation(NothingDue, 1_000);
+        corrupt.evidence = Some(EvidenceKind::Corrupt);
+        corrupt.blocked_reason = Some(BlockedReason::EvidenceInvalid);
+        corrupt.blocked_since = Some(NOW);
+        assert_eq!(severity(&corrupt), Severity::Critical);
+        // A leaf retirement after a missed defeat warns.
+        assert_eq!(severity(&obligation(RetiringLeaf, 0)), Severity::Warning);
     }
 
     #[test]
@@ -1100,6 +1128,7 @@ mod tests {
             challenge_deadline: NOW - 30,
             reason: "challenge not mined before the deadline".into(),
             recorded_at: NOW - 10,
+            kind: Some(CallKind::Defeat),
         });
         let current = evaluate(&s, &policy, NOW);
         assert_eq!(current.status, Severity::Critical);

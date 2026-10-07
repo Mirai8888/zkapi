@@ -10,7 +10,9 @@ export function createHttpServer(signer) {
       try {
         await signer.checkChain();
         const { sender, vault, ...policy } = signer.policy;
-        response.end(JSON.stringify({ status: 'ok', chain_id: Number(signer.chainId), sender, vault, ...policy }));
+        // Retirement refusals are reported, never a failed health check: a
+        // restart would start a new budget window.
+        response.end(JSON.stringify({ status: 'ok', chain_id: Number(signer.chainId), sender, vault, ...policy, ...signer.retirementStatus() }));
       } catch {
         response.statusCode = 503;
         response.end(JSON.stringify({ status: 'unavailable' }));
@@ -73,6 +75,7 @@ async function main() {
       // The highest maxFeePerGas a MAX_GAS transaction can bid within the tx fee cap.
       tx_fee_cap_wei: decimal(status.tx_fee_cap_wei), max_fee_per_gas_allowed_at_max_gas_wei: decimal(BigInt(status.tx_fee_cap_wei) / BigInt(status.max_gas)),
       max_gas: decimal(status.max_gas), required_balance_wei: decimal(status.required_balance), balance_wei: decimal(status.balance),
+      max_retirements_per_day: status.max_retirements_per_day,
       base_fee_per_gas_wei: decimal(status.base_fee_per_gas), warnings: status.warnings,
     }));
   });

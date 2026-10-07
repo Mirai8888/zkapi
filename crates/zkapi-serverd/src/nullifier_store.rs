@@ -1,7 +1,18 @@
 //! SQLite-backed nullifier and transcript store.
 //!
-//! Stores nullifier reservations and finalized transcripts. Each nullifier
-//! progresses through: Reserved -> Finalized (or ClearanceReserved for withdrawals).
+//! Stores nullifier reservations, the append-only request evidence and the
+//! transcripts of signed successors. A request nullifier progresses through
+//!
+//! ```text
+//! Reserved --settle--> Reserved + settled_charge --sign--> Finalized
+//!                                  |  (consumed on chain)
+//!                                  +--> exit_deferred_since --> Finalized (exit defeated)
+//!                                                          \--> ExitedUnsigned (terminal)
+//! ```
+//!
+//! and a withdrawal nullifier is reserved for good as ClearanceReserved. The
+//! charge of a request is written once, when it settles; its successor is
+//! signed at most once, only while its nullifier is unspent on chain (O7).
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha3::{Digest, Keccak256};
@@ -9,14 +20,71 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use zkapi_core::v2 as core;
 use zkapi_proof::compact::RequestVerifier;
 use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
 use zkapi_types::{
-    canonical_payload_hash, canonical_request_context, Felt252, NullifierStatus, SchnorrSignature,
+    canonical_payload_hash, canonical_request_context, Felt252, RequestPublicInputsV2,
+    SchnorrSignature,
 };
 
 use crate::error::ServerError;
+
+/// The state of a nullifier row (column `nullifiers.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NullifierStatus {
+    /// A request is reserved at this nullifier. Once `settled_charge` is set,
+    /// its charge is final and only its successor's signature is pending.
+    Reserved,
+    /// The successor of the request at this nullifier is signed.
+    Finalized,
+    /// Reserved for good by a mutual-close clearance.
+    ClearanceReserved,
+    /// Terminal: the request settled, but its nullifier stayed consumed on
+    /// chain by an exit that was not defeated within the deferral window, so
+    /// no successor is ever signed for it (O7).
+    ExitedUnsigned,
+}
+
+/// A request's final charge, persisted on its reservation before its
+/// successor is signed (`NullifierStore::settle_openrouter_lease`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledCharge {
+    pub charge: u128,
+    /// "measured", "clamped", "worst_case", "unissued" or "operator_conceded".
+    pub basis: String,
+    pub response_code: u16,
+    /// The settlement payload the successor's response will carry.
+    pub response_payload: String,
+    pub settled_at: u64,
+}
+
+/// What the settlement of a lease found (`settle_openrouter_lease`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// The charge is persisted (or was already, and is kept) and the lease
+    /// row is finalized; the successor still has to be signed.
+    Settled(SettledCharge),
+    /// The lease row no longer satisfied its guard; nothing was written.
+    LeaseChanged,
+}
+
+/// One row of the append-only `request_evidence` table: a request proof the
+/// server accepted (or a verified copy restored by `--rebind`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestEvidence {
+    pub id: i64,
+    pub nullifier: Felt252,
+    pub client_request_id: String,
+    pub solvency_bound: u128,
+    pub public_inputs: RequestPublicInputsV2,
+    /// The 256-byte Groth16 proof.
+    pub proof: Vec<u8>,
+    /// "reserve" or "rebind".
+    pub source: String,
+    pub created_at: u64,
+}
 
 /// A transcript record stored in the database.
 #[derive(Debug, Clone)]
@@ -44,6 +112,39 @@ pub struct TranscriptRecord {
     pub api_request_binding: Option<String>,
     pub created_at: u64,
     pub finalized_at: Option<u64>,
+    /// The final charge, written once when the request settles, before its
+    /// successor is signed. Kept after signing.
+    pub settled_charge: Option<u128>,
+    pub settled_basis: Option<String>,
+    pub settled_at: Option<u64>,
+    /// First time the settled request's nullifier was found consumed on
+    /// chain while its successor was due to be signed (O7).
+    pub exit_deferred_since: Option<u64>,
+}
+
+impl TranscriptRecord {
+    /// A reserved request whose charge is final and whose successor is not
+    /// signed yet (possibly deferred).
+    pub fn settled_unsigned(&self) -> bool {
+        self.status == NullifierStatus::Reserved && self.settled_charge.is_some()
+    }
+}
+
+/// Where a page of `settled_unsigned_requests` ended: the `(settled_at,
+/// nullifier)` of its last row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettledScanKey {
+    settled_at: i64,
+    nullifier: String,
+}
+
+impl SettledScanKey {
+    pub(crate) fn of(record: &TranscriptRecord) -> Self {
+        Self {
+            settled_at: record.settled_at.map(sql_time).unwrap_or(0),
+            nullifier: record.nullifier.to_hex(),
+        }
+    }
 }
 
 /// Whether an OA provisioning attempt can safely be cancelled without usage.
@@ -215,9 +316,40 @@ pub(crate) enum FinalizeGuard {
     Conceded,
 }
 
+impl FinalizeGuard {
+    /// The SQL condition on an `openrouter_leases` row.
+    fn condition(self) -> &'static str {
+        match self {
+            Self::NotCancelled => "status != 'cancelled'",
+            // Never a delivered key: the fence refused delivery from signing on.
+            Self::Unissued => {
+                "charge_basis = 'unissued' AND COALESCE(delivered, 0) = 0
+                 AND ((status = 'provisioning' AND key_hash IS NULL)
+                      OR status IN ('active', 'retiring', 'disabled', 'revoking'))"
+            }
+            Self::Conceded => {
+                "charge_basis = 'operator_conceded'
+                 AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')"
+            }
+        }
+    }
+}
+
+/// What `NullifierStore::defer_signature` recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignatureDeferral {
+    /// Deferred since this first observation of the consumed nullifier.
+    Deferred { since: u64 },
+    /// Terminal: no successor is ever signed.
+    ExitedUnsigned,
+}
+
 /// The deployment a server database serves (table `deployment_binding`, single
-/// row id=1). serverd writes it only after verifying its derived signing keys
-/// against the vault's immutable getters; zkapi-challenged requires it.
+/// row id=1). `zkapi db init` writes it from the deployment manifest
+/// (`source` "manifest"); serverd writes it (`source` "vault") only after
+/// verifying its derived signing keys, the challenge period and the statement
+/// identity against the vault and its adapter. serverd, zkapi-challenged and
+/// zkapi-indexerd refuse a database bound to anything else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentBinding {
     pub chain_id: u64,
@@ -226,9 +358,93 @@ pub struct DeploymentBinding {
     pub state_signing_key: CurvePointWire,
     pub clearance_signing_key: CurvePointWire,
     pub challenge_period_seconds: u64,
-    /// UNIX seconds of the successful vault read.
+    /// UNIX seconds of the successful vault read (or of `zkapi db init`).
     pub verified_at: u64,
     pub verified_block: Option<u64>,
+    /// The statement this database serves (`zkapi_proof::compact::CIRCUIT_ID`).
+    /// None only in a database bound before circuit identifiers were recorded,
+    /// which served circuit `zkapi-v2-note-bound-v1`.
+    pub circuit_id: Option<String>,
+    /// The setup of its verifying keys (`dev`, `rehearsal` or `mpc-1`).
+    pub setup_id: Option<String>,
+    /// keccak256 of the request and withdrawal verifying keys without their
+    /// headers (the adapter's `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`),
+    /// 0x-prefixed lowercase hex.
+    pub request_vk_keccak256: Option<String>,
+    pub withdrawal_vk_keccak256: Option<String>,
+    /// [`BINDING_SOURCE_VAULT`] or [`BINDING_SOURCE_MANIFEST`].
+    pub source: String,
+}
+
+/// A binding serverd verified against the vault.
+pub const BINDING_SOURCE_VAULT: &str = "vault";
+/// A binding `zkapi db init` recorded from the deployment manifest; serverd
+/// verifies it against the vault before its first start.
+pub const BINDING_SOURCE_MANIFEST: &str = "manifest";
+
+/// The statement identity a database binding records, for comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementIdentity {
+    pub circuit_id: String,
+    pub setup_id: String,
+    pub request_vk_keccak256: String,
+    pub withdrawal_vk_keccak256: String,
+}
+
+impl StatementIdentity {
+    /// The identity of the verifying keys in `proof_setup_dir`, as loaded by
+    /// this build (which refuses keys of a setup it does not accept).
+    pub fn load(proof_setup_dir: &str) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use zkapi_proof::compact::{hex32, WithdrawalVerifier, CIRCUIT_ID};
+        let request = RequestVerifier::load(proof_setup_dir)
+            .with_context(|| format!("load the request verifying key from {proof_setup_dir}"))?;
+        let withdrawal = WithdrawalVerifier::load(proof_setup_dir)
+            .with_context(|| format!("load the withdrawal verifying key from {proof_setup_dir}"))?;
+        anyhow::ensure!(
+            request.setup_id() == withdrawal.setup_id(),
+            "the request key is of setup {:?} but the withdrawal key of setup {:?}",
+            request.setup_id(),
+            withdrawal.setup_id()
+        );
+        Ok(Self {
+            circuit_id: CIRCUIT_ID.to_string(),
+            setup_id: request.setup_id().to_string(),
+            request_vk_keccak256: hex32(&request.verifying_key_keccak256()),
+            withdrawal_vk_keccak256: hex32(&withdrawal.verifying_key_keccak256()),
+        })
+    }
+
+    /// Why `binding` records another statement, if it does.
+    pub fn mismatch(&self, binding: &DeploymentBinding) -> Option<String> {
+        let recorded = |value: &Option<String>| {
+            value
+                .clone()
+                .unwrap_or_else(|| "none (bound before circuit identifiers were recorded: circuit zkapi-v2-note-bound-v1)".into())
+        };
+        for (name, local, stored) in [
+            ("circuit_id", &self.circuit_id, &binding.circuit_id),
+            ("setup_id", &self.setup_id, &binding.setup_id),
+            (
+                "request_vk_keccak256",
+                &self.request_vk_keccak256,
+                &binding.request_vk_keccak256,
+            ),
+            (
+                "withdrawal_vk_keccak256",
+                &self.withdrawal_vk_keccak256,
+                &binding.withdrawal_vk_keccak256,
+            ),
+        ] {
+            if stored.as_deref() != Some(local.as_str()) {
+                return Some(format!(
+                    "{name} is {} in the database but {local} here",
+                    recorded(stored)
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// SQLite-backed nullifier store.
@@ -467,7 +683,12 @@ impl NullifierStore {
                 clearance_key_y TEXT NOT NULL,
                 challenge_period_seconds INTEGER NOT NULL,
                 verified_at INTEGER NOT NULL,
-                verified_block INTEGER
+                verified_block INTEGER,
+                circuit_id TEXT,
+                setup_id TEXT,
+                request_vk_keccak256 TEXT,
+                withdrawal_vk_keccak256 TEXT,
+                source TEXT NOT NULL DEFAULT 'vault'
             );
             CREATE TABLE IF NOT EXISTS settlement_reviews (
                 review_id INTEGER PRIMARY KEY,
@@ -509,6 +730,22 @@ impl NullifierStore {
             ),
             ("nullifiers", "api_request_binding", "TEXT"),
             ("nullifiers", "clearance_auth", "TEXT"),
+            // The settle/sign split (O7): the final charge, written once
+            // before the successor is signed, and the deferral of a signature
+            // while the nullifier is consumed on chain.
+            ("nullifiers", "settled_charge", "INTEGER"),
+            ("nullifiers", "settled_basis", "TEXT"),
+            ("nullifiers", "settled_at", "INTEGER"),
+            ("nullifiers", "exit_deferred_since", "INTEGER"),
+            ("deployment_binding", "circuit_id", "TEXT"),
+            ("deployment_binding", "setup_id", "TEXT"),
+            ("deployment_binding", "request_vk_keccak256", "TEXT"),
+            ("deployment_binding", "withdrawal_vk_keccak256", "TEXT"),
+            (
+                "deployment_binding",
+                "source",
+                "TEXT NOT NULL DEFAULT 'vault'",
+            ),
             (
                 "openrouter_leases",
                 "key_source",
@@ -535,8 +772,13 @@ impl NullifierStore {
         }
         migrate_oa_provisioning_outcome(&conn)?;
         migrate_settlement_review_log(&conn)?;
+        conn.execute_batch(REQUEST_EVIDENCE_SCHEMA).map_err(|e| {
+            ServerError::Database(format!("failed to create request_evidence: {e}"))
+        })?;
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS openrouter_leases_status
+            "CREATE INDEX IF NOT EXISTS nullifiers_settled_unsigned
+                ON nullifiers(status, settled_charge);
+             CREATE INDEX IF NOT EXISTS openrouter_leases_status
                 ON openrouter_leases(status, settle_after);
              CREATE INDEX IF NOT EXISTS openrouter_leases_deadline
                 ON openrouter_leases(settlement_deadline_at);
@@ -571,31 +813,74 @@ impl NullifierStore {
         .map_err(|e| ServerError::Database(format!("failed to open db read-only: {e}")))?;
         conn.execute_batch("PRAGMA query_only = ON")
             .map_err(|e| ServerError::Database(format!("failed to make db query-only: {e}")))?;
-        for (table, required) in [
-            ("nullifiers", TRANSCRIPT_RECORD_COLUMNS),
-            ("openrouter_leases", OPENROUTER_LEASE_RECORD_COLUMNS),
-        ] {
-            let present = conn
-                .prepare("SELECT name FROM pragma_table_info(?1)")
-                .and_then(|mut statement| {
-                    statement
-                        .query_map([table], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .map_err(|e| ServerError::Database(format!("schema check failed: {e}")))?;
-            if required
-                .iter()
-                .any(|column| !present.iter().any(|name| name == column))
-            {
-                return Err(ServerError::Database(
-                    "server database schema is older than this reader; upgrade and start the API server first"
-                        .to_string(),
-                ));
-            }
-        }
+        check_reader_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// The deployment binding recorded in the database file at `path`, read
+    /// before the database is opened for writes, whatever release wrote it:
+    /// unlike [`Self::open_read_only`], an older schema is no reason to skip
+    /// the binding. A column an older release did not record reads as absent
+    /// (None, and `source` "vault"), so a binding recorded before circuit
+    /// identifiers names no circuit (zkapi-v2-note-bound-v1) and matches no
+    /// statement of this release. None only when no binding row exists.
+    /// Nothing is written: the file is opened query-only, read-write only so
+    /// that SQLite can roll back a hot journal as any opener does.
+    pub fn read_recorded_deployment_binding<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Option<DeploymentBinding>, ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("deployment binding read failed: {error}"))
+        };
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(failed)?;
+        conn.execute_batch("PRAGMA query_only = ON")
+            .map_err(failed)?;
+        let present = conn
+            .prepare("SELECT name FROM pragma_table_info('deployment_binding')")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(failed)?;
+        if present.is_empty() {
+            // No binding table: a database older than the binding.
+            return Ok(None);
+        }
+        let column = |name: &str, absent: &str| {
+            if present.iter().any(|column| column == name) {
+                name.to_string()
+            } else {
+                format!("{absent} AS {name}")
+            }
+        };
+        // The columns every binding table has are read as they are: one
+        // missing fails the read.
+        conn.query_row(
+            &format!(
+                "SELECT chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
+                    clearance_key_y, challenge_period_seconds, verified_at, {}, {}, {}, {}, {}, {}
+                 FROM deployment_binding WHERE id = 1",
+                column("verified_block", "NULL"),
+                column("circuit_id", "NULL"),
+                column("setup_id", "NULL"),
+                column("request_vk_keccak256", "NULL"),
+                column("withdrawal_vk_keccak256", "NULL"),
+                column("source", "'vault'"),
+            ),
+            [],
+            row_to_deployment_binding,
+        )
+        .optional()
+        .map_err(failed)
     }
 
     /// Record the vault-verified deployment this database serves.
@@ -607,15 +892,20 @@ impl NullifierStore {
         conn.execute(
             "INSERT INTO deployment_binding (
                 id, chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
-                clearance_key_y, challenge_period_seconds, verified_at, verified_block
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                clearance_key_y, challenge_period_seconds, verified_at, verified_block,
+                circuit_id, setup_id, request_vk_keccak256, withdrawal_vk_keccak256, source
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 chain_id = excluded.chain_id, contract_address = excluded.contract_address,
                 state_key_x = excluded.state_key_x, state_key_y = excluded.state_key_y,
                 clearance_key_x = excluded.clearance_key_x,
                 clearance_key_y = excluded.clearance_key_y,
                 challenge_period_seconds = excluded.challenge_period_seconds,
-                verified_at = excluded.verified_at, verified_block = excluded.verified_block",
+                verified_at = excluded.verified_at, verified_block = excluded.verified_block,
+                circuit_id = excluded.circuit_id, setup_id = excluded.setup_id,
+                request_vk_keccak256 = excluded.request_vk_keccak256,
+                withdrawal_vk_keccak256 = excluded.withdrawal_vk_keccak256,
+                source = excluded.source",
             // u64 values above i64::MAX fail to bind instead of wrapping.
             params![
                 binding.chain_id,
@@ -627,6 +917,11 @@ impl NullifierStore {
                 binding.challenge_period_seconds,
                 binding.verified_at,
                 binding.verified_block,
+                binding.circuit_id,
+                binding.setup_id,
+                binding.request_vk_keccak256,
+                binding.withdrawal_vk_keccak256,
+                binding.source,
             ],
         )
         .map_err(|error| {
@@ -656,7 +951,8 @@ impl NullifierStore {
         }
         conn.query_row(
             "SELECT chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
-                clearance_key_y, challenge_period_seconds, verified_at, verified_block
+                clearance_key_y, challenge_period_seconds, verified_at, verified_block,
+                circuit_id, setup_id, request_vk_keccak256, withdrawal_vk_keccak256, source
              FROM deployment_binding WHERE id = 1",
             [],
             row_to_deployment_binding,
@@ -709,25 +1005,61 @@ impl NullifierStore {
             .unwrap()
     }
 
+    /// Reserve a verified lease request's nullifier and record its proof as
+    /// evidence (`request_evidence`, source "reserve") in one transaction:
+    /// either both rows exist or neither does (O2). A request whose proof is
+    /// not a 256-byte Groth16 proof reserves nothing.
     pub fn reserve_openrouter_lease(&self, request: &ApiRequestV2) -> Result<(), ServerError> {
-        self.reserve_bound_v2(request, "openrouter_lease")
+        self.reserve_openrouter_lease_with(request, None)
     }
 
-    fn reserve_bound_v2(
+    /// `reserve_openrouter_lease`, also inserting the lease's issuance row
+    /// (`lease`) in the same transaction, so that no reservation is ever left
+    /// without the lease row that settles it.
+    pub fn reserve_openrouter_lease_with(
         &self,
         request: &ApiRequestV2,
-        reservation_kind: &str,
+        lease: Option<&NewOpenRouterLease<'_>>,
     ) -> Result<(), ServerError> {
+        if let Some(lease) = lease {
+            if lease.request.client_request_id != request.client_request_id
+                || lease.request.public_inputs.request_nullifier
+                    != request.public_inputs.request_nullifier
+            {
+                return Err(ServerError::Internal(
+                    "the lease row is not the reserved request's".into(),
+                ));
+            }
+        }
         let binding = api_request_binding(request)?;
-        self.reserve_with_kind(
+        request_proof_bytes(request)?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| ServerError::Database(format!("reservation failed: {e}")))?;
+        let now = current_timestamp();
+        insert_reservation(
+            &transaction,
             &request.public_inputs.request_nullifier,
             &request.client_request_id,
             &request.payload_hash,
-            reservation_kind,
+            "openrouter_lease",
             Some(&binding),
-        )
+            now,
+        )?;
+        insert_evidence(&transaction, request, "reserve", now)?;
+        if let Some(lease) = lease {
+            insert_lease_row(&transaction, lease)?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| ServerError::Database(format!("reservation commit failed: {e}")))
     }
 
+    #[cfg(test)]
     fn reserve_with_kind(
         &self,
         nullifier: &Felt252,
@@ -740,38 +1072,407 @@ impl NullifierStore {
             .conn
             .lock()
             .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
-        let now = current_timestamp();
-        let null_hex = nullifier.to_hex();
-
-        conn.execute(
-            "INSERT INTO nullifiers (
-                nullifier, status, reservation_kind, client_request_id, payload_hash,
-                api_request_binding, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                null_hex,
-                status_to_str(NullifierStatus::Reserved),
-                reservation_kind,
-                client_request_id,
-                payload_hash.to_hex(),
-                api_request_binding,
-                now as i64,
-            ],
+        insert_reservation(
+            &conn,
+            nullifier,
+            client_request_id,
+            payload_hash,
+            reservation_kind,
+            api_request_binding,
+            current_timestamp(),
         )
-        .map_err(|e| {
-            if let rusqlite::Error::SqliteFailure(ref err, _) = e {
-                if err.code == rusqlite::ErrorCode::ConstraintViolation {
-                    return ServerError::Replay;
-                }
-            }
-            ServerError::Database(format!("insert failed: {}", e))
-        })?;
+    }
 
+    /// The evidence rows at `nullifier`, oldest first.
+    pub fn request_evidence(
+        &self,
+        nullifier: &Felt252,
+    ) -> Result<Vec<RequestEvidence>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let mut statement = conn
+            .prepare("SELECT * FROM request_evidence WHERE nullifier = ?1 ORDER BY id ASC")
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        let rows = statement
+            .query_map(params![nullifier.to_hex()], row_to_evidence)
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))
+    }
+
+    /// Drill builds (`--adversary overcharge`): rewrite a settled, unsigned
+    /// request's charge, which no honest path ever does.
+    #[cfg(feature = "adversary")]
+    pub(crate) fn overcharge_for_adversary(
+        &self,
+        nullifier: &Felt252,
+        charge: u128,
+    ) -> Result<(), ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.execute(
+            "UPDATE nullifiers SET settled_charge = ?1
+             WHERE nullifier = ?2 AND status = 'Reserved' AND settled_charge IS NOT NULL",
+            params![sql_charge(charge)?, nullifier.to_hex()],
+        )
+        .map_err(|e| ServerError::Database(format!("overcharge failed: {e}")))?;
         Ok(())
     }
 
-    /// Finalize a previously reserved nullifier with the full transcript.
-    pub fn finalize(
+    /// The evidence rows at `nullifier`, oldest first, each decoded on its
+    /// own: a row that does not decode is reported with its id and why,
+    /// without hiding the others (the challenger may defeat with any row
+    /// that verifies). A failed read is an error.
+    pub fn request_evidence_rows(
+        &self,
+        nullifier: &Felt252,
+    ) -> Result<Vec<Result<RequestEvidence, String>>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let mut statement = conn
+            .prepare("SELECT * FROM request_evidence WHERE nullifier = ?1 ORDER BY id ASC")
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        let mut rows = statement
+            .query(params![nullifier.to_hex()])
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+        let mut decoded = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?
+        {
+            let id: i64 = row
+                .get("id")
+                .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))?;
+            decoded
+                .push(row_to_evidence(row).map_err(|error| {
+                    format!("request_evidence row {id} does not decode: {error}")
+                }));
+        }
+        Ok(decoded)
+    }
+
+    /// The earliest evidence row the reservation of `nullifier` wrote (source
+    /// "reserve"), as `GET /v2/nullifiers/{N}/evidence` serves it.
+    pub fn earliest_reserve_evidence(
+        &self,
+        nullifier: &Felt252,
+    ) -> Result<Option<RequestEvidence>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.query_row(
+            "SELECT * FROM request_evidence WHERE nullifier = ?1 AND source = 'reserve'
+             ORDER BY id ASC LIMIT 1",
+            params![nullifier.to_hex()],
+            row_to_evidence,
+        )
+        .optional()
+        .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))
+    }
+
+    /// Settle a lease: persist its final charge on its reservation, which
+    /// stays Reserved until its successor is signed (`finalize_signed`), and
+    /// finalize the lease row under `finalization.guard`, with its review and
+    /// key cleanup, in one transaction. The charge is written once: a
+    /// reservation settled earlier keeps its charge, basis and payload, and
+    /// the lease row records those. Nothing is written when the lease row no
+    /// longer satisfies its guard (`LeaseChanged`), and the reservation must
+    /// be Reserved.
+    pub(crate) fn settle_openrouter_lease(
+        &self,
+        client_request_id: &str,
+        nullifier: &Felt252,
+        settlement: &SettledCharge,
+        finalization: &LeaseFinalization<'_>,
+    ) -> Result<SettleOutcome, ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("lease settlement failed: {error}"))
+        };
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let record = transaction
+            .query_row(
+                "SELECT * FROM nullifiers WHERE nullifier = ?1",
+                params![nullifier.to_hex()],
+                row_to_record,
+            )
+            .optional()
+            .map_err(failed)?
+            .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
+        if record.status != NullifierStatus::Reserved {
+            return Err(ServerError::Internal(format!(
+                "the request's reservation is {:?}, not Reserved; nothing is settled",
+                record.status
+            )));
+        }
+        let settled = match (record.settled_charge, record.settled_basis.clone()) {
+            (Some(charge), Some(basis)) => SettledCharge {
+                charge,
+                basis,
+                response_code: record.response_code.unwrap_or(200),
+                response_payload: record.response_payload.clone().unwrap_or_default(),
+                settled_at: record.settled_at.unwrap_or(settlement.settled_at),
+            },
+            _ => {
+                let rows = transaction
+                    .execute(
+                        "UPDATE nullifiers SET settled_charge = ?1, settled_basis = ?2,
+                            settled_at = ?3, response_code = ?4, response_payload = ?5
+                         WHERE nullifier = ?6 AND status = 'Reserved' AND settled_charge IS NULL",
+                        params![
+                            sql_charge(settlement.charge)?,
+                            settlement.basis,
+                            sql_time(settlement.settled_at),
+                            settlement.response_code,
+                            settlement.response_payload,
+                            nullifier.to_hex(),
+                        ],
+                    )
+                    .map_err(failed)?;
+                if rows != 1 {
+                    return Err(ServerError::Internal(
+                        "the reservation changed while settling".into(),
+                    ));
+                }
+                settlement.clone()
+            }
+        };
+        let now = current_timestamp() as i64;
+        let condition = finalization.guard.condition();
+        let rows = transaction
+            .execute(
+                &format!(
+                    "UPDATE openrouter_leases SET
+                        status = 'finalized', usage_usd = ?1, charge_applied = ?2,
+                        charge_basis = ?3, last_error = NULL, updated_at = ?4
+                     WHERE client_request_id = ?5 AND request_nullifier = ?6
+                       AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')
+                       AND {condition}"
+                ),
+                params![
+                    finalization.usage_usd,
+                    sql_charge(settled.charge)?,
+                    settled.basis,
+                    now,
+                    client_request_id,
+                    nullifier.to_hex(),
+                ],
+            )
+            .map_err(failed)?;
+        if rows != 1 {
+            return Ok(SettleOutcome::LeaseChanged);
+        }
+        if let Some(review) = finalization.review {
+            insert_review(&transaction, review, now)?;
+        }
+        if let Some(cleanup) = finalization.key_cleanup {
+            insert_key_cleanup(&transaction, client_request_id, &cleanup, now)?;
+        }
+        transaction.commit().map_err(failed)?;
+        Ok(SettleOutcome::Settled(settled))
+    }
+
+    /// Record the signed successor of a settled request: Reserved (with
+    /// `settled_charge` equal to the transcript's charge) becomes Finalized,
+    /// at most once. A lease deferred by O7 (`exit_deferred`) returns to
+    /// `finalized` in the same transaction.
+    pub(crate) fn finalize_signed(&self, transcript: &TranscriptRecord) -> Result<(), ServerError> {
+        let failed =
+            |error: rusqlite::Error| ServerError::Database(format!("finalize failed: {error}"));
+        let charge = transcript
+            .charge_applied
+            .ok_or_else(|| ServerError::Internal("signed transcript has no charge".into()))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let sig_json = transcript
+            .next_state_sig
+            .as_ref()
+            .map(|sig| serde_json::to_string(sig).unwrap_or_default());
+        let rows = transaction
+            .execute(
+                "UPDATE nullifiers SET
+                    status = 'Finalized', charge_applied = ?1, response_code = ?2,
+                    response_payload = ?3, response_hash = ?4, next_commitment_x = ?5,
+                    next_commitment_y = ?6, next_anchor = ?7, blind_delta_srv = ?8,
+                    next_state_sig_json = ?9, proof_blob = ?10, request_inputs_json = ?11,
+                    finalized_at = ?12
+                 WHERE nullifier = ?13 AND status = 'Reserved' AND settled_charge = ?1",
+                params![
+                    sql_charge(charge)?,
+                    transcript.response_code.map(i64::from),
+                    transcript.response_payload.as_deref(),
+                    transcript.response_hash.map(|h| h.to_hex()),
+                    transcript.next_commitment_x.map(|c| c.to_hex()),
+                    transcript.next_commitment_y.map(|c| c.to_hex()),
+                    transcript.next_anchor.map(|a| a.to_hex()),
+                    transcript.blind_delta_srv.map(|b| b.to_hex()),
+                    sig_json,
+                    transcript.proof_blob.as_deref(),
+                    transcript.request_inputs_json.as_deref(),
+                    sql_time(transcript.finalized_at.unwrap_or_else(current_timestamp)),
+                    transcript.nullifier.to_hex(),
+                ],
+            )
+            .map_err(failed)?;
+        if rows == 0 {
+            return Err(ServerError::Internal(
+                "nullifier is not a settled reservation at this charge, or its successor is \
+                 already signed"
+                    .to_string(),
+            ));
+        }
+        if let Some(id) = transcript.client_request_id.as_deref() {
+            transaction
+                .execute(
+                    "UPDATE openrouter_leases SET status = 'finalized', updated_at = ?1
+                     WHERE client_request_id = ?2 AND request_nullifier = ?3
+                       AND status = 'exit_deferred'",
+                    params![
+                        current_timestamp() as i64,
+                        id,
+                        transcript.nullifier.to_hex()
+                    ],
+                )
+                .map_err(failed)?;
+        }
+        transaction.commit().map_err(failed)
+    }
+
+    /// O7: the settled request's nullifier is consumed on chain, so its
+    /// successor is not signed. Records the first observation
+    /// (`exit_deferred_since`) and marks its lease `exit_deferred`. Once
+    /// `window` seconds have passed since that first observation, the
+    /// reservation becomes ExitedUnsigned (terminal) and its lease
+    /// `exited_unsigned`. `window` None never ends the deferral.
+    pub(crate) fn defer_signature(
+        &self,
+        nullifier: &Felt252,
+        now: u64,
+        window: Option<u64>,
+    ) -> Result<SignatureDeferral, ServerError> {
+        let failed =
+            |error: rusqlite::Error| ServerError::Database(format!("deferral failed: {error}"));
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let record = transaction
+            .query_row(
+                "SELECT * FROM nullifiers WHERE nullifier = ?1",
+                params![nullifier.to_hex()],
+                row_to_record,
+            )
+            .optional()
+            .map_err(failed)?
+            .ok_or_else(|| ServerError::Internal("the request has no reservation".into()))?;
+        match record.status {
+            NullifierStatus::ExitedUnsigned => return Ok(SignatureDeferral::ExitedUnsigned),
+            NullifierStatus::Reserved if record.settled_charge.is_some() => {}
+            status => {
+                return Err(ServerError::Internal(format!(
+                    "only a settled, unsigned request can be deferred (it is {status:?})"
+                )))
+            }
+        }
+        let since = record.exit_deferred_since.unwrap_or(now);
+        let exited = window.is_some_and(|window| now >= since.saturating_add(window));
+        let (status, lease_status) = if exited {
+            ("ExitedUnsigned", "exited_unsigned")
+        } else {
+            ("Reserved", "exit_deferred")
+        };
+        transaction
+            .execute(
+                "UPDATE nullifiers SET exit_deferred_since = ?1, status = ?2
+                 WHERE nullifier = ?3 AND status = 'Reserved' AND settled_charge IS NOT NULL",
+                params![sql_time(since), status, nullifier.to_hex()],
+            )
+            .map_err(failed)?;
+        if let Some(id) = record.client_request_id.as_deref() {
+            transaction
+                .execute(
+                    "UPDATE openrouter_leases SET status = ?1, updated_at = ?2
+                     WHERE client_request_id = ?3 AND request_nullifier = ?4
+                       AND status IN ('finalized', 'exit_deferred')",
+                    params![lease_status, sql_time(now), id, nullifier.to_hex()],
+                )
+                .map_err(failed)?;
+        }
+        transaction.commit().map_err(failed)?;
+        Ok(if exited {
+            SignatureDeferral::ExitedUnsigned
+        } else {
+            SignatureDeferral::Deferred { since }
+        })
+    }
+
+    /// One page of the settled requests whose successors are not signed yet:
+    /// those never found consumed (`deferred == false`), or those O7 deferred
+    /// (`deferred == true`). Pages run in `(settled_at, nullifier)` order,
+    /// strictly after `after` (a previous page's last `SettledScanKey`), so a
+    /// caller walking the pages visits every row however many sit before it.
+    pub(crate) fn settled_unsigned_requests(
+        &self,
+        deferred: bool,
+        after: Option<&SettledScanKey>,
+        limit: usize,
+    ) -> Result<Vec<TranscriptRecord>, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let class = if deferred {
+            "exit_deferred_since IS NOT NULL"
+        } else {
+            "exit_deferred_since IS NULL"
+        };
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT * FROM nullifiers
+                 WHERE status = 'Reserved' AND settled_charge IS NOT NULL AND {class}
+                   AND (?1 IS NULL OR (COALESCE(settled_at, 0), nullifier) > (?1, ?2))
+                 ORDER BY COALESCE(settled_at, 0) ASC, nullifier ASC LIMIT ?3"
+            ))
+            .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.map(|key| key.settled_at),
+                    after.map(|key| key.nullifier.as_str()),
+                    limit as i64
+                ],
+                row_to_record,
+            )
+            .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))
+    }
+
+    /// Write a transcript over a Reserved row without the settle/sign
+    /// protocol: test fixtures only. Production signs through
+    /// `settle_openrouter_lease` and `finalize_signed`.
+    #[cfg(test)]
+    pub(crate) fn finalize(
         &self,
         nullifier: &Felt252,
         transcript: &TranscriptRecord,
@@ -1040,39 +1741,11 @@ impl NullifierStore {
         &self,
         lease: &NewOpenRouterLease<'_>,
     ) -> Result<(), ServerError> {
-        let request = lease.request;
-        let request_json = serde_json::to_string(request).map_err(|error| {
-            ServerError::Database(format!("lease serialization failed: {error}"))
-        })?;
         let conn = self
             .conn
             .lock()
             .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
-        conn.execute(
-            "INSERT INTO openrouter_leases (
-                client_request_id, request_nullifier, api_request_json, key_source, status,
-                issued_at, expires_at, settle_after, spending_limit_usd, updated_at, oa_client_request_id,
-                oa_provisioning_outcome, ttl_seconds, settlement_deadline_at, delivered
-             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                request.client_request_id,
-                request.public_inputs.request_nullifier.to_hex(),
-                request_json,
-                lease.key_source,
-                lease.issued_at as i64,
-                lease.expires_at as i64,
-                lease.settle_after as i64,
-                lease.spending_limit_usd,
-                current_timestamp() as i64,
-                lease.oa_client_request_id,
-                if lease.key_source == "oa_org" { "not_started" } else { "may_have_issued" },
-                lease.ttl_seconds.map(sql_time),
-                lease.settlement_deadline_at.map(sql_time),
-                lease.delivered,
-            ],
-        )
-        .map_err(|error| ServerError::Database(format!("lease insert failed: {error}")))?;
-        Ok(())
+        insert_lease_row(&conn, lease)
     }
 
     /// Durably fence upstream I/O before sending an OA issuance request. Only
@@ -1330,7 +2003,7 @@ impl NullifierStore {
             .prepare(
                 "SELECT client_request_id, expires_at FROM openrouter_leases
                  WHERE settlement_deadline_at IS NULL
-                   AND status NOT IN ('finalized', 'cancelled')",
+                   AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')",
             )
             .map_err(|error| ServerError::Database(format!("deadline scan failed: {error}")))?;
         let rows = statement
@@ -1622,19 +2295,7 @@ impl NullifierStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ServerError::Database(format!("lease finalize failed: {error}")))?;
         let now = current_timestamp() as i64;
-        let condition = match finalization.guard {
-            FinalizeGuard::NotCancelled => "status != 'cancelled'",
-            // Never a delivered key: the fence refused delivery from signing on.
-            FinalizeGuard::Unissued => {
-                "charge_basis = 'unissued' AND COALESCE(delivered, 0) = 0
-                 AND ((status = 'provisioning' AND key_hash IS NULL)
-                      OR status IN ('active', 'retiring', 'disabled', 'revoking'))"
-            }
-            FinalizeGuard::Conceded => {
-                "charge_basis = 'operator_conceded'
-                 AND status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')"
-            }
-        };
+        let condition = finalization.guard.condition();
         let rows = transaction
             .execute(
                 &format!(
@@ -1964,9 +2625,19 @@ impl NullifierStore {
             }
         }
         let id = lease.client_request_id.clone();
-        let signed = record.is_some_and(|record| record.status == NullifierStatus::Finalized);
+        let signed = record
+            .as_ref()
+            .is_some_and(|record| record.status == NullifierStatus::Finalized);
         if signed && options.zero_charge {
             return Err(ReopenRefusal::AlreadySigned);
+        }
+        // Settled (charge written once) but not signed yet: the lease settles
+        // at that charge again, and it cannot be conceded.
+        let settled = record
+            .as_ref()
+            .is_some_and(TranscriptRecord::settled_unsigned);
+        if settled && options.zero_charge {
+            return Err(ReopenRefusal::AlreadySettled);
         }
         // Reviews left under a former id of this row, repaired by hand, join
         // it, so that they are acknowledged with it.
@@ -2061,6 +2732,8 @@ impl NullifierStore {
             // and lets a later run concede its charge (--zero-charge).
             let settles = if signed {
                 "signed_transcript"
+            } else if settled {
+                "settled_charge"
             } else if lease.charge_basis.as_deref() == Some("operator_conceded") {
                 "operator_conceded"
             } else if lease.charge_basis.is_some()
@@ -2155,6 +2828,8 @@ impl NullifierStore {
             lease.key_source == "openrouter" && status == "active" && !key_cleanup_withdrawn;
         let settles = if signed {
             "signed_transcript"
+        } else if settled {
+            "settled_charge"
         } else if options.zero_charge {
             "operator_conceded"
         } else if never_delivered {
@@ -2362,7 +3037,7 @@ impl NullifierStore {
         let mut statement = conn
             .prepare(
                 "SELECT * FROM openrouter_leases
-                 WHERE status NOT IN ('finalized', 'cancelled')
+                 WHERE status IN ('provisioning', 'active', 'retiring', 'disabled', 'revoking')
                  ORDER BY settlement_deadline_at IS NULL, settlement_deadline_at, expires_at
                  LIMIT ?1",
             )
@@ -2436,19 +3111,25 @@ impl NullifierStore {
                 .map_err(|error| ServerError::Database(format!("settlement count failed: {error}")))
         };
         let pending = count(
-            "SELECT COUNT(*) FROM openrouter_leases WHERE status NOT IN ('finalized', 'cancelled')",
+            "SELECT COUNT(*) FROM openrouter_leases
+             WHERE status NOT IN ('finalized', 'cancelled', 'exit_deferred', 'exited_unsigned')",
         )?;
         let retrying = count(
             "SELECT COUNT(*) FROM openrouter_leases
-             WHERE status NOT IN ('finalized', 'cancelled')
+             WHERE status NOT IN ('finalized', 'cancelled', 'exit_deferred', 'exited_unsigned')
                AND (settlement_attempts > 0 OR last_error IS NOT NULL)",
         )?;
+        let exit_deferred =
+            count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'exit_deferred'")?;
+        let exited_unsigned =
+            count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'exited_unsigned'")?;
         let provisioning =
             count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'provisioning'")?;
         let cancelled = count("SELECT COUNT(*) FROM openrouter_leases WHERE status = 'cancelled'")?;
         let unknown_status = count(
             "SELECT COUNT(*) FROM openrouter_leases WHERE status NOT IN
-                ('provisioning', 'active', 'retiring', 'disabled', 'revoking', 'finalized', 'cancelled')",
+                ('provisioning', 'active', 'retiring', 'disabled', 'revoking', 'finalized',
+                 'cancelled', 'exit_deferred', 'exited_unsigned')",
         )?;
         let open_reviews =
             count("SELECT COUNT(*) FROM settlement_reviews WHERE acknowledged_at IS NULL")?;
@@ -2456,13 +3137,15 @@ impl NullifierStore {
         let next_deadline: Option<i64> = conn
             .query_row(
                 "SELECT MIN(settlement_deadline_at) FROM openrouter_leases
-                 WHERE status NOT IN ('finalized', 'cancelled')",
+                 WHERE status NOT IN ('finalized', 'cancelled', 'exit_deferred', 'exited_unsigned')",
                 [],
                 |row| row.get(0),
             )
             .map_err(|error| ServerError::Database(format!("settlement count failed: {error}")))?;
         Ok(crate::dashboard::SettlementCounts {
             pending,
+            exit_deferred,
+            exited_unsigned,
             retrying,
             provisioning,
             cancelled,
@@ -2578,6 +3261,17 @@ pub enum ReopenRefusal {
          and its charge cannot be conceded"
     )]
     AlreadySigned,
+    #[error(
+        "the request's charge is already settled (nullifiers.settled_charge): its successor is \
+         signed at that charge once its nullifier is unspent on chain, and the charge cannot be \
+         conceded or its reservation rewritten"
+    )]
+    AlreadySettled,
+    #[error(
+        "the reservation's charge is already settled (nullifiers.settled_charge), so --rebind \
+         cannot rewrite it; restore the nullifiers row from a backup, then run this command again"
+    )]
+    RebindSettled,
     #[error(transparent)]
     Store(#[from] ServerError),
 }
@@ -2596,7 +3290,9 @@ pub struct ReopenedLease {
     /// `captured_usage` (the usage captured when its direct key was
     /// disabled), `measured_until_deadline`, `deadline_fallback` (no usage
     /// can be measured: the solvency bound, at its deadline),
-    /// `operator_conceded` or `signed_transcript`.
+    /// `operator_conceded`, `settled_charge` (its charge was settled before:
+    /// it is kept, and its successor is signed once its nullifier is unspent)
+    /// or `signed_transcript`.
     pub settles: &'static str,
     /// A key deletion queued by the cancellation was withdrawn, so the key
     /// can still be measured. Otherwise a direct key was deleted.
@@ -2856,6 +3552,9 @@ fn rebind_reservation(
     let nullifier = lease.request_nullifier.to_hex();
     let reserved = status_to_str(NullifierStatus::Reserved);
     match record {
+        // A settled reservation's charge is final: its request is the one
+        // that settled, and nothing is rewritten.
+        Some(record) if record.settled_charge.is_some() => Err(ReopenRefusal::RebindSettled),
         Some(record) if record.status == NullifierStatus::Reserved => {
             let rows = conn
                 .execute(
@@ -2876,6 +3575,8 @@ fn rebind_reservation(
                     ServerError::Internal("reservation changed while rebinding".into()).into(),
                 );
             }
+            // The verified request becomes evidence too (append-only).
+            insert_evidence(conn, request, "rebind", now)?;
             Ok("rewritten")
         }
         Some(_) => Err(ReopenRefusal::RebindSigned),
@@ -2906,6 +3607,7 @@ fn rebind_reservation(
                 ],
             )
             .map_err(failed)?;
+            insert_evidence(conn, request, "rebind", now)?;
             Ok("recreated")
         }
     }
@@ -3018,6 +3720,79 @@ fn truncate_detail(detail: &str) -> String {
 /// UNIX seconds as a SQLite integer; far-future values saturate.
 fn sql_time(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
+}
+
+/// A charge in gwei as a SQLite integer. Charges never exceed a request's
+/// solvency bound, which admission keeps below 2^53.
+fn sql_charge(value: u128) -> Result<i64, ServerError> {
+    i64::try_from(value).map_err(|_| ServerError::Internal("charge exceeds i64".into()))
+}
+
+/// Insert a new lease row (`NullifierStore::create_openrouter_lease_bound`).
+fn insert_lease_row(conn: &Connection, lease: &NewOpenRouterLease<'_>) -> Result<(), ServerError> {
+    let request = lease.request;
+    let request_json = serde_json::to_string(request)
+        .map_err(|error| ServerError::Database(format!("lease serialization failed: {error}")))?;
+    conn.execute(
+            "INSERT INTO openrouter_leases (
+                client_request_id, request_nullifier, api_request_json, key_source, status,
+                issued_at, expires_at, settle_after, spending_limit_usd, updated_at, oa_client_request_id,
+                oa_provisioning_outcome, ttl_seconds, settlement_deadline_at, delivered
+             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                request.client_request_id,
+                request.public_inputs.request_nullifier.to_hex(),
+                request_json,
+                lease.key_source,
+                lease.issued_at as i64,
+                lease.expires_at as i64,
+                lease.settle_after as i64,
+                lease.spending_limit_usd,
+                current_timestamp() as i64,
+                lease.oa_client_request_id,
+                if lease.key_source == "oa_org" { "not_started" } else { "may_have_issued" },
+                lease.ttl_seconds.map(sql_time),
+                lease.settlement_deadline_at.map(sql_time),
+                lease.delivered,
+            ],
+        )
+        .map_err(|error| ServerError::Database(format!("lease insert failed: {error}")))?;
+    Ok(())
+}
+
+fn insert_reservation(
+    conn: &Connection,
+    nullifier: &Felt252,
+    client_request_id: &str,
+    payload_hash: &Felt252,
+    reservation_kind: &str,
+    api_request_binding: Option<&str>,
+    now: u64,
+) -> Result<(), ServerError> {
+    conn.execute(
+        "INSERT INTO nullifiers (
+            nullifier, status, reservation_kind, client_request_id, payload_hash,
+            api_request_binding, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            nullifier.to_hex(),
+            status_to_str(NullifierStatus::Reserved),
+            reservation_kind,
+            client_request_id,
+            payload_hash.to_hex(),
+            api_request_binding,
+            sql_time(now),
+        ],
+    )
+    .map_err(|e| {
+        if let rusqlite::Error::SqliteFailure(ref err, _) = e {
+            if err.code == rusqlite::ErrorCode::ConstraintViolation {
+                return ServerError::Replay;
+            }
+        }
+        ServerError::Database(format!("insert failed: {}", e))
+    })?;
+    Ok(())
 }
 
 /// Add a column a decoder reads by name unless it already exists. Failure is
@@ -3204,6 +3979,7 @@ fn status_to_str(status: NullifierStatus) -> &'static str {
         NullifierStatus::Reserved => "Reserved",
         NullifierStatus::Finalized => "Finalized",
         NullifierStatus::ClearanceReserved => "ClearanceReserved",
+        NullifierStatus::ExitedUnsigned => "ExitedUnsigned",
     }
 }
 
@@ -3213,6 +3989,7 @@ fn str_to_status(s: &str) -> NullifierStatus {
         "Reserved" => NullifierStatus::Reserved,
         "Finalized" => NullifierStatus::Finalized,
         "ClearanceReserved" => NullifierStatus::ClearanceReserved,
+        "ExitedUnsigned" => NullifierStatus::ExitedUnsigned,
         _ => NullifierStatus::Reserved, // fallback
     }
 }
@@ -3220,6 +3997,106 @@ fn str_to_status(s: &str) -> NullifierStatus {
 /// Parse an optional hex string into a Felt252.
 fn parse_opt_felt(s: Option<String>) -> Option<Felt252> {
     s.and_then(|h| Felt252::from_hex(&h).ok())
+}
+
+/// The append-only evidence table: every request proof the server accepted,
+/// written in the transaction that reserves its nullifier (`source`
+/// "reserve"), or appended when `zkapi settlement reopen --rebind` re-creates a
+/// reservation from a verified request ("rebind"). Kept until the deployment
+/// is retired; the triggers refuse every update and delete.
+pub(crate) const REQUEST_EVIDENCE_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS request_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nullifier TEXT NOT NULL, client_request_id TEXT NOT NULL,
+        solvency_bound TEXT NOT NULL,
+        request_inputs_json TEXT NOT NULL,
+        proof_blob BLOB NOT NULL CHECK (length(proof_blob) = 256),
+        source TEXT NOT NULL CHECK (source IN ('reserve','rebind')),
+        created_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS request_evidence_nullifier ON request_evidence(nullifier);
+    CREATE TRIGGER IF NOT EXISTS request_evidence_no_update BEFORE UPDATE ON request_evidence
+        BEGIN SELECT RAISE(ABORT,'append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS request_evidence_no_delete BEFORE DELETE ON request_evidence
+        BEGIN SELECT RAISE(ABORT,'append-only'); END;";
+
+/// Every `request_evidence` column `row_to_evidence` reads.
+pub(crate) const REQUEST_EVIDENCE_COLUMNS: &[&str] = &[
+    "id",
+    "nullifier",
+    "client_request_id",
+    "solvency_bound",
+    "request_inputs_json",
+    "proof_blob",
+    "source",
+    "created_at",
+];
+
+/// The triggers that keep `request_evidence` append-only.
+pub(crate) const REQUEST_EVIDENCE_TRIGGERS: &[&str] =
+    &["request_evidence_no_update", "request_evidence_no_delete"];
+
+/// Every `deployment_binding` column `read_deployment_binding` reads.
+pub(crate) const DEPLOYMENT_BINDING_COLUMNS: &[&str] = &[
+    "id",
+    "chain_id",
+    "contract_address",
+    "state_key_x",
+    "state_key_y",
+    "clearance_key_x",
+    "clearance_key_y",
+    "challenge_period_seconds",
+    "verified_at",
+    "verified_block",
+    "circuit_id",
+    "setup_id",
+    "request_vk_keccak256",
+    "withdrawal_vk_keccak256",
+    "source",
+];
+
+/// The refusal of a reader (zkapi-challenged) opening a database without the
+/// schema it reads.
+pub const READER_SCHEMA_REFUSAL: &str =
+    "server database schema is older than this reader: run `zkapi db init` first \
+     (or start the upgraded API server once)";
+
+/// A reader requires every table and column its decoders read, and the
+/// triggers that keep the evidence it relies on append-only.
+fn check_reader_schema(conn: &Connection) -> Result<(), ServerError> {
+    for (table, required) in [
+        ("nullifiers", TRANSCRIPT_RECORD_COLUMNS),
+        ("openrouter_leases", OPENROUTER_LEASE_RECORD_COLUMNS),
+        ("request_evidence", REQUEST_EVIDENCE_COLUMNS),
+        ("deployment_binding", DEPLOYMENT_BINDING_COLUMNS),
+    ] {
+        let present = conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([table], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| ServerError::Database(format!("schema check failed: {e}")))?;
+        if required
+            .iter()
+            .any(|column| !present.iter().any(|name| name == column))
+        {
+            return Err(ServerError::Database(READER_SCHEMA_REFUSAL.to_string()));
+        }
+    }
+    for trigger in REQUEST_EVIDENCE_TRIGGERS {
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1)",
+                [trigger],
+                |row| row.get(0),
+            )
+            .map_err(|e| ServerError::Database(format!("schema check failed: {e}")))?;
+        if !present {
+            return Err(ServerError::Database(READER_SCHEMA_REFUSAL.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Every `nullifiers` column `row_to_record` reads; `open_read_only` refuses a
@@ -3246,6 +4123,10 @@ pub(crate) const TRANSCRIPT_RECORD_COLUMNS: &[&str] = &[
     "api_request_binding",
     "created_at",
     "finalized_at",
+    "settled_charge",
+    "settled_basis",
+    "settled_at",
+    "exit_deferred_since",
 ];
 
 /// Convert a database row into a TranscriptRecord.
@@ -3271,6 +4152,10 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
     let api_request_binding: Option<String> = row.get("api_request_binding")?;
     let created_at: i64 = row.get("created_at")?;
     let finalized_at: Option<i64> = row.get("finalized_at")?;
+    let settled_charge: Option<i64> = row.get("settled_charge")?;
+    let settled_basis: Option<String> = row.get("settled_basis")?;
+    let settled_at: Option<i64> = row.get("settled_at")?;
+    let exit_deferred_since: Option<i64> = row.get("exit_deferred_since")?;
 
     let next_state_sig =
         next_state_sig_json.and_then(|json| serde_json::from_str::<SchnorrSignature>(&json).ok());
@@ -3297,7 +4182,76 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
         api_request_binding,
         created_at: created_at as u64,
         finalized_at: finalized_at.map(|t| t as u64),
+        settled_charge: settled_charge.map(|c| c.max(0) as u128),
+        settled_basis,
+        settled_at: settled_at.map(|t| t.max(0) as u64),
+        exit_deferred_since: exit_deferred_since.map(|t| t.max(0) as u64),
     })
+}
+
+fn row_to_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEvidence> {
+    let undecodable = |index: usize, error: String| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, error.into())
+    };
+    let nullifier: String = row.get("nullifier")?;
+    let bound: String = row.get("solvency_bound")?;
+    let inputs: String = row.get("request_inputs_json")?;
+    Ok(RequestEvidence {
+        id: row.get("id")?,
+        nullifier: Felt252::from_hex(&nullifier).map_err(|e| undecodable(1, e.to_string()))?,
+        client_request_id: row.get("client_request_id")?,
+        solvency_bound: bound
+            .parse()
+            .map_err(|e: std::num::ParseIntError| undecodable(3, e.to_string()))?,
+        public_inputs: serde_json::from_str(&inputs).map_err(|e| undecodable(4, e.to_string()))?,
+        proof: row.get("proof_blob")?,
+        source: row.get("source")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+    })
+}
+
+/// Append one evidence row inside the caller's transaction. The proof must
+/// be the 256-byte Groth16 proof the server verified.
+fn insert_evidence(
+    conn: &Connection,
+    request: &ApiRequestV2,
+    source: &str,
+    now: u64,
+) -> Result<(), ServerError> {
+    let proof = request_proof_bytes(request)?;
+    let inputs = serde_json::to_string(&request.public_inputs).map_err(|error| {
+        ServerError::Internal(format!("failed to encode request evidence: {error}"))
+    })?;
+    conn.execute(
+        "INSERT INTO request_evidence (
+            nullifier, client_request_id, solvency_bound, request_inputs_json, proof_blob,
+            source, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            request.public_inputs.request_nullifier.to_hex(),
+            request.client_request_id,
+            request.public_inputs.solvency_bound.to_string(),
+            inputs,
+            proof,
+            source,
+            sql_time(now),
+        ],
+    )
+    .map_err(|error| ServerError::Database(format!("request evidence insert failed: {error}")))?;
+    Ok(())
+}
+
+/// The 256-byte Groth16 proof of a request (eight 32-byte coordinates).
+pub(crate) fn request_proof_bytes(request: &ApiRequestV2) -> Result<Vec<u8>, ServerError> {
+    let proof = base64::engine::general_purpose::STANDARD
+        .decode(&request.proof.proof)
+        .map_err(|error| ServerError::InvalidProof(format!("proof is not base64: {error}")))?;
+    if proof.len() != 256 {
+        return Err(ServerError::InvalidProof(
+            "a Groth16 proof has exactly 256 bytes".into(),
+        ));
+    }
+    Ok(proof)
 }
 
 /// Every `openrouter_leases` column `row_to_openrouter_lease` reads; keep in
@@ -3399,6 +4353,11 @@ fn row_to_deployment_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deploy
         challenge_period_seconds: row.get(6)?,
         verified_at: row.get(7)?,
         verified_block: row.get(8)?,
+        circuit_id: row.get(9)?,
+        setup_id: row.get(10)?,
+        request_vk_keccak256: row.get(11)?,
+        withdrawal_vk_keccak256: row.get(12)?,
+        source: row.get(13)?,
     })
 }
 
@@ -3411,7 +4370,7 @@ fn current_timestamp() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn lease_request(client_request_id: &str, nullifier: u64) -> ApiRequestV2 {
@@ -3438,7 +4397,7 @@ mod tests {
             },
             proof: Groth16ProofWire {
                 backend: ProofBackendWire::Groth16Bn254,
-                proof: "public-proof".to_string(),
+                proof: crate::test_support::fake_proof(7),
             },
         }
     }
@@ -3723,6 +4682,10 @@ mod tests {
             api_request_binding: None,
             created_at: 0,
             finalized_at: None,
+            settled_charge: None,
+            settled_basis: None,
+            settled_at: None,
+            exit_deferred_since: None,
         };
 
         store.finalize(&nullifier, &transcript).unwrap();
@@ -3797,7 +4760,7 @@ mod tests {
             },
             proof: Groth16ProofWire {
                 backend: ProofBackendWire::Groth16Bn254,
-                proof: "public-proof".to_string(),
+                proof: crate::test_support::fake_proof(7),
             },
         };
         store.reserve_openrouter_lease(&request).unwrap();
@@ -3848,6 +4811,11 @@ mod tests {
             challenge_period_seconds: 86_400,
             verified_at: 1_700_000_000,
             verified_block: None,
+            circuit_id: Some(zkapi_proof::compact::CIRCUIT_ID.into()),
+            setup_id: Some("dev".into()),
+            request_vk_keccak256: Some(format!("0x{}", "11".repeat(32))),
+            withdrawal_vk_keccak256: Some(format!("0x{}", "22".repeat(32))),
+            source: BINDING_SOURCE_VAULT.into(),
         }
     }
 
@@ -3874,6 +4842,10 @@ mod tests {
             api_request_binding: None,
             created_at: 0,
             finalized_at: None,
+            settled_charge: None,
+            settled_basis: None,
+            settled_at: None,
+            exit_deferred_since: None,
         }
     }
 
@@ -3998,6 +4970,122 @@ mod tests {
         assert!(NullifierStore::open_read_only(&legacy).is_ok());
     }
 
+    /// A reader refuses a database missing any column it reads, in any of
+    /// the four tables, even with every table and trigger present.
+    #[test]
+    fn read_only_store_requires_every_column_of_every_table_it_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        for (table, columns) in [
+            ("nullifiers", TRANSCRIPT_RECORD_COLUMNS),
+            ("openrouter_leases", OPENROUTER_LEASE_RECORD_COLUMNS),
+            ("request_evidence", REQUEST_EVIDENCE_COLUMNS),
+            ("deployment_binding", DEPLOYMENT_BINDING_COLUMNS),
+        ] {
+            let mut dropped = 0;
+            for column in columns {
+                let path = directory.path().join(format!("{table}-{column}.db"));
+                drop(NullifierStore::new(&path).unwrap());
+                assert!(NullifierStore::open_read_only(&path).is_ok());
+                // Key and indexed columns cannot be dropped; the others can.
+                if Connection::open(&path)
+                    .unwrap()
+                    .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                    .is_err()
+                {
+                    continue;
+                }
+                dropped += 1;
+                let error = NullifierStore::open_read_only(&path)
+                    .err()
+                    .map(|error| error.to_string());
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("run `zkapi db init` first")),
+                    "{table}.{column}: {error:?}"
+                );
+            }
+            assert!(dropped > 0, "no column of {table} could be dropped");
+        }
+    }
+
+    #[test]
+    fn the_recorded_binding_is_read_from_a_database_of_any_release_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let read = || NullifierStore::read_recorded_deployment_binding(&path);
+        // A database older than the binding table, then the pre-change
+        // schema with no binding row: unbound.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE nullifiers (nullifier TEXT PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(read().unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SCHEMA_4F21B66)
+            .unwrap();
+        assert_eq!(read().unwrap(), None);
+        // Its binding: no statement recorded, verified against the vault.
+        let legacy = deployment_binding();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                    state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                    verified_at, verified_block)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 9)",
+                params![
+                    legacy.chain_id,
+                    legacy.contract_address,
+                    legacy.state_signing_key.x.to_hex(),
+                    legacy.state_signing_key.y.to_hex(),
+                    legacy.clearance_signing_key.x.to_hex(),
+                    legacy.clearance_signing_key.y.to_hex(),
+                    legacy.challenge_period_seconds,
+                    legacy.verified_at
+                ],
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            read().unwrap(),
+            Some(DeploymentBinding {
+                verified_block: Some(9),
+                circuit_id: None,
+                setup_id: None,
+                request_vk_keccak256: None,
+                withdrawal_vk_keccak256: None,
+                source: BINDING_SOURCE_VAULT.into(),
+                ..legacy
+            })
+        );
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "nothing is written"
+        );
+        assert!(NullifierStore::open_read_only(&path).is_err());
+        // Migrated, it reads as `read_deployment_binding` reads it.
+        let store = NullifierStore::new(&path).unwrap();
+        store
+            .write_deployment_binding(&deployment_binding())
+            .unwrap();
+        drop(store);
+        assert_eq!(read().unwrap(), Some(deployment_binding()));
+        // A binding table without a column every release recorded is an
+        // error, never "unbound".
+        let damaged = directory.path().join("damaged.db");
+        Connection::open(&damaged)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE deployment_binding (id INTEGER PRIMARY KEY, chain_id INTEGER);
+                 INSERT INTO deployment_binding VALUES (1, 1);",
+            )
+            .unwrap();
+        assert!(NullifierStore::read_recorded_deployment_binding(&damaged).is_err());
+    }
+
     #[test]
     fn deployment_binding_round_trips_and_is_absent_from_older_databases() {
         let store = NullifierStore::in_memory().unwrap();
@@ -4045,10 +5133,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server.db");
         NullifierStore::new(&path).unwrap();
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch("DROP TABLE deployment_binding;")
-            .unwrap();
         assert_eq!(
             NullifierStore::open_read_only(&path)
                 .unwrap()
@@ -4056,6 +5140,14 @@ mod tests {
                 .unwrap(),
             None
         );
+        // A reader requires the binding table (with its statement columns):
+        // `zkapi db init` creates it.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE deployment_binding;")
+            .unwrap();
+        let error = NullifierStore::open_read_only(&path).err().unwrap();
+        assert!(error.to_string().contains("zkapi db init"), "{error}");
     }
 
     #[test]
@@ -4067,9 +5159,16 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(&format!(
-                "CREATE TABLE nullifiers ({}); CREATE TABLE openrouter_leases ({});",
+                "CREATE TABLE nullifiers ({}); CREATE TABLE openrouter_leases ({});
+                 CREATE TABLE request_evidence ({}); CREATE TABLE deployment_binding ({});
+                 CREATE TRIGGER request_evidence_no_update BEFORE UPDATE ON request_evidence
+                    BEGIN SELECT RAISE(ABORT,'append-only'); END;
+                 CREATE TRIGGER request_evidence_no_delete BEFORE DELETE ON request_evidence
+                    BEGIN SELECT RAISE(ABORT,'append-only'); END;",
                 TRANSCRIPT_RECORD_COLUMNS.join(", "),
-                OPENROUTER_LEASE_RECORD_COLUMNS.join(", ")
+                OPENROUTER_LEASE_RECORD_COLUMNS.join(", "),
+                REQUEST_EVIDENCE_COLUMNS.join(", "),
+                DEPLOYMENT_BINDING_COLUMNS.join(", ")
             ))
             .unwrap();
             conn.execute(
@@ -4090,6 +5189,25 @@ mod tests {
                 ],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO request_evidence (id, nullifier, client_request_id, solvency_bound,
+                    request_inputs_json, proof_blob, source, created_at)
+                 VALUES (1, ?1, 'minimal', '1000', ?2, ?3, 'reserve', 4)",
+                params![
+                    request.public_inputs.request_nullifier.to_hex(),
+                    serde_json::to_string(&request.public_inputs).unwrap(),
+                    vec![7u8; 256]
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                    state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                    verified_at, source)
+                 VALUES (1, 1, '0xaa', '0x1', '0x2', '0x3', '0x4', 86400, 7, 'manifest')",
+                [],
+            )
+            .unwrap();
         }
         let reader = NullifierStore::open_read_only(&path).unwrap();
         assert_eq!(
@@ -4107,6 +5225,125 @@ mod tests {
                 .unwrap()
                 .status,
             "active"
+        );
+        let evidence = reader
+            .earliest_reserve_evidence(&Felt252::from_u64(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.solvency_bound, 1_000);
+        assert_eq!(evidence.proof, vec![7u8; 256]);
+        assert_eq!(
+            reader.read_deployment_binding().unwrap().unwrap().source,
+            BINDING_SOURCE_MANIFEST
+        );
+    }
+
+    /// O2: a reservation and its evidence are written in one transaction.
+    /// An evidence insert that fails (here injected with a trigger) leaves no
+    /// reservation, a reservation that fails (a replay) leaves no evidence,
+    /// and a proof that is not 256 bytes reserves nothing.
+    #[test]
+    fn evidence_is_written_atomically_with_the_reservation() {
+        let store = NullifierStore::in_memory().unwrap();
+        let request = lease_request("atomic", 31);
+        store.execute_for_test(
+            "CREATE TRIGGER inject_evidence_failure BEFORE INSERT ON request_evidence
+             BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END",
+            [],
+        );
+        let error = store.reserve_openrouter_lease(&request).unwrap_err();
+        assert!(
+            error.to_string().contains("injected evidence failure"),
+            "{error}"
+        );
+        assert!(store
+            .try_lookup_by_nullifier(&Felt252::from_u64(31))
+            .unwrap()
+            .is_none());
+        store.execute_for_test("DROP TRIGGER inject_evidence_failure", []);
+        store.reserve_openrouter_lease(&request).unwrap();
+        let evidence = store.request_evidence(&Felt252::from_u64(31)).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source, "reserve");
+        assert_eq!(evidence[0].client_request_id, "atomic");
+        assert_eq!(evidence[0].solvency_bound, 1_000);
+        assert_eq!(evidence[0].public_inputs, request.public_inputs);
+        assert_eq!(evidence[0].proof, vec![7u8; 256]);
+        // A replay of the nullifier reserves nothing and adds no evidence.
+        let mut replay = lease_request("replay", 31);
+        replay.proof.proof = crate::test_support::fake_proof(8);
+        assert!(matches!(
+            store.reserve_openrouter_lease(&replay),
+            Err(ServerError::Replay)
+        ));
+        assert_eq!(
+            store
+                .request_evidence(&Felt252::from_u64(31))
+                .unwrap()
+                .len(),
+            1
+        );
+        // A proof of the wrong size reserves nothing.
+        let mut short = lease_request("short", 32);
+        short.proof.proof = "AA==".into();
+        assert!(matches!(
+            store.reserve_openrouter_lease(&short),
+            Err(ServerError::InvalidProof(_))
+        ));
+        assert!(store.lookup_by_nullifier(&Felt252::from_u64(32)).is_none());
+        assert!(store
+            .request_evidence(&Felt252::from_u64(32))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The evidence table is append-only: updates and deletes abort, also on
+    /// a raw connection, and the triggers are recreated on every open.
+    #[test]
+    fn request_evidence_is_append_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let store = NullifierStore::new(&path).unwrap();
+        store
+            .reserve_openrouter_lease(&lease_request("kept", 41))
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        for sql in [
+            "UPDATE request_evidence SET solvency_bound = '1'",
+            "UPDATE request_evidence SET proof_blob = zeroblob(256)",
+            "DELETE FROM request_evidence",
+        ] {
+            let error = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "{sql}: {error}");
+        }
+        // Rows of another size or source never enter.
+        for sql in [
+            "INSERT INTO request_evidence (nullifier, client_request_id, solvency_bound,
+                request_inputs_json, proof_blob, source, created_at)
+             VALUES ('0x1', 'x', '1', '{}', zeroblob(255), 'reserve', 1)",
+            "INSERT INTO request_evidence (nullifier, client_request_id, solvency_bound,
+                request_inputs_json, proof_blob, source, created_at)
+             VALUES ('0x1', 'x', '1', '{}', zeroblob(256), 'forged', 1)",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{sql}");
+        }
+        // Dropping a trigger does not survive the next open.
+        conn.execute_batch("DROP TRIGGER request_evidence_no_delete;")
+            .unwrap();
+        drop(conn);
+        let error = NullifierStore::open_read_only(&path).err().unwrap();
+        assert!(error.to_string().contains("zkapi db init"), "{error}");
+        NullifierStore::new(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert!(conn.execute("DELETE FROM request_evidence", []).is_err());
+        assert_eq!(
+            NullifierStore::open_read_only(&path)
+                .unwrap()
+                .request_evidence(&Felt252::from_u64(41))
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -4715,6 +5952,150 @@ mod tests {
         CREATE INDEX settlement_reviews_open ON settlement_reviews(acknowledged_at, created_at);
         CREATE INDEX settlement_reviews_lease ON settlement_reviews(client_request_id);";
 
+    /// The schema `NullifierStore::new` created before the concession exit
+    /// (circuit zkapi-v2-note-bound-v1, release ac9be63).
+    pub(crate) const SCHEMA_4F21B66: &str = "CREATE TABLE nullifiers (
+            nullifier TEXT PRIMARY KEY, status TEXT NOT NULL,
+            reservation_kind TEXT NOT NULL DEFAULT 'proxy', client_request_id TEXT,
+            payload_hash TEXT, charge_applied INTEGER, response_code INTEGER,
+            response_payload TEXT, response_hash TEXT, next_commitment_x TEXT,
+            next_commitment_y TEXT, next_anchor TEXT, blind_delta_srv TEXT,
+            next_state_sig_epoch INTEGER, next_state_sig_root TEXT, next_state_sig_json TEXT,
+            policy_reason_code INTEGER, policy_evidence_hash TEXT, proof_blob BLOB,
+            request_inputs_json TEXT, api_request_binding TEXT, clearance_auth TEXT,
+            created_at INTEGER NOT NULL, finalized_at INTEGER
+        );
+        CREATE TABLE openrouter_leases (
+            client_request_id TEXT PRIMARY KEY, request_nullifier TEXT NOT NULL UNIQUE,
+            api_request_json TEXT NOT NULL, oa_client_request_id TEXT, key_hash TEXT UNIQUE,
+            key_source TEXT NOT NULL DEFAULT 'openrouter',
+            oa_provisioning_outcome TEXT NOT NULL DEFAULT 'may_have_issued',
+            status TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+            settle_after INTEGER NOT NULL, spending_limit_usd REAL NOT NULL, usage_usd REAL,
+            charge_applied INTEGER, last_error TEXT, updated_at INTEGER NOT NULL,
+            ttl_seconds INTEGER, settlement_deadline_at INTEGER,
+            settlement_attempts INTEGER NOT NULL DEFAULT 0, first_error_at INTEGER,
+            charge_basis TEXT, delivered INTEGER, next_attempt_at INTEGER,
+            key_source_identity TEXT
+        );
+        CREATE TABLE deployment_binding (
+            id INTEGER PRIMARY KEY CHECK (id = 1), chain_id INTEGER NOT NULL,
+            contract_address TEXT NOT NULL, state_key_x TEXT NOT NULL, state_key_y TEXT NOT NULL,
+            clearance_key_x TEXT NOT NULL, clearance_key_y TEXT NOT NULL,
+            challenge_period_seconds INTEGER NOT NULL, verified_at INTEGER NOT NULL,
+            verified_block INTEGER
+        );
+        CREATE TABLE settlement_reviews (
+            review_id INTEGER PRIMARY KEY, client_request_id TEXT NOT NULL,
+            request_nullifier TEXT NOT NULL, key_source TEXT NOT NULL, reason TEXT NOT NULL,
+            charge_basis TEXT, detail TEXT NOT NULL, reported_usage_micro_usd TEXT,
+            charge_applied INTEGER, solvency_bound TEXT NOT NULL, created_at INTEGER NOT NULL,
+            acknowledged_at INTEGER
+        );
+        CREATE TABLE provider_key_cleanup (
+            client_request_id TEXT PRIMARY KEY, key_source TEXT NOT NULL, key_hash TEXT,
+            key_name TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL, last_error TEXT, created_at INTEGER NOT NULL
+        );
+        CREATE INDEX openrouter_leases_status ON openrouter_leases(status, settle_after);
+        CREATE INDEX openrouter_leases_deadline ON openrouter_leases(settlement_deadline_at);
+        CREATE INDEX settlement_reviews_open ON settlement_reviews(acknowledged_at, created_at);
+        CREATE INDEX settlement_reviews_lease ON settlement_reviews(client_request_id);";
+
+    /// §11: a database of the pre-change server migrates in place: the
+    /// settle/sign columns, the append-only evidence table and its triggers,
+    /// and the binding's statement columns appear; its rows stay readable;
+    /// its binding reads as bound before circuit identifiers were recorded,
+    /// which every daemon of this release refuses; and a reader opens it only
+    /// after the migration.
+    #[test]
+    fn the_pre_change_database_migrates_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let request = lease_request("legacy-pending", 1);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_4F21B66).unwrap();
+            conn.execute(
+                "INSERT INTO nullifiers (nullifier, status, reservation_kind, client_request_id,
+                    payload_hash, created_at)
+                 VALUES (?1, 'Reserved', 'openrouter_lease', 'legacy-pending', ?2, 5)",
+                params![
+                    request.public_inputs.request_nullifier.to_hex(),
+                    request.payload_hash.to_hex()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO openrouter_leases (client_request_id, request_nullifier,
+                    api_request_json, key_source, key_hash, status, issued_at, expires_at,
+                    settle_after, spending_limit_usd, updated_at)
+                 VALUES ('legacy-pending', ?1, ?2, 'oa_org', 'hash', 'active', 10, 20, 21, 6.0, 10)",
+                params![
+                    request.public_inputs.request_nullifier.to_hex(),
+                    serde_json::to_string(&request).unwrap()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                    state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                    verified_at)
+                 VALUES (1, 1, '0x00000000000000000000000000000000000000aa', '0x1', '0x2', '0x3',
+                    '0x4', 86400, 7)",
+                [],
+            )
+            .unwrap();
+        }
+        let error = NullifierStore::open_read_only(&path).err().unwrap();
+        assert!(error.to_string().contains("zkapi db init"), "{error}");
+        let store = NullifierStore::new(&path).unwrap();
+        let record = store
+            .try_lookup_by_nullifier(&request.public_inputs.request_nullifier)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, NullifierStatus::Reserved);
+        assert_eq!(record.settled_charge, None);
+        assert_eq!(record.exit_deferred_since, None);
+        assert_eq!(
+            store
+                .lookup_openrouter_lease("legacy-pending")
+                .unwrap()
+                .status,
+            "active"
+        );
+        let binding = store.read_deployment_binding().unwrap().unwrap();
+        assert_eq!(binding.circuit_id, None);
+        assert_eq!(binding.source, BINDING_SOURCE_VAULT);
+        let identity = StatementIdentity {
+            circuit_id: zkapi_proof::compact::CIRCUIT_ID.into(),
+            setup_id: "dev".into(),
+            request_vk_keccak256: "0x1".into(),
+            withdrawal_vk_keccak256: "0x2".into(),
+        };
+        assert!(identity
+            .mismatch(&binding)
+            .unwrap()
+            .contains("zkapi-v2-note-bound-v1"));
+        // The evidence table works, append-only, after the migration.
+        let new = lease_request("new", 2);
+        store.reserve_openrouter_lease(&new).unwrap();
+        assert_eq!(
+            store.request_evidence(&Felt252::from_u64(2)).unwrap().len(),
+            1
+        );
+        assert!(store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM request_evidence", [])
+            .is_err());
+        drop(store);
+        // Idempotent; a reader now opens it.
+        NullifierStore::new(&path).unwrap();
+        NullifierStore::open_read_only(&path).unwrap();
+    }
+
     #[test]
     fn databases_from_earlier_releases_gain_the_pending_deferral() {
         for (release, schema) in [("045b444", SCHEMA_045B444), ("f7c99837", SCHEMA_F7C99837)] {
@@ -4736,15 +6117,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            // A reader of the shipped schema still opens the database before
-            // the API server has migrated it: no decoder reads the column.
-            if release == "f7c99837" {
-                let reader = NullifierStore::open_read_only(&path).unwrap();
-                assert!(reader
-                    .try_lookup_openrouter_lease("pending")
-                    .unwrap()
-                    .is_some());
-            }
+            // A reader refuses the database until it is migrated (by
+            // `zkapi db init` or the API server): it lacks the evidence table.
+            let error = NullifierStore::open_read_only(&path).err().unwrap();
+            assert!(error.to_string().contains("zkapi db init"), "{error}");
             let store = NullifierStore::new(&path).unwrap();
             store.assign_settlement_deadline("pending", 1_000).unwrap();
             assert_eq!(store.due_openrouter_leases(21).len(), 1, "{release}");

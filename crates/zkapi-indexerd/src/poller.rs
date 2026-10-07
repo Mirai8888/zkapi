@@ -37,11 +37,18 @@ use crate::events::VaultEvent;
 use crate::service::{unix_ms, IndexerService, SyncStatus, TreeView};
 use crate::tree_mirror::{EscapeClose, MissedReEscape, TreeMirror, TreeMirrorSnapshot};
 
-const CHECKPOINT_VERSION: u32 = 2;
+/// Version 3: the append-only tree of vault revision 3, with note statuses,
+/// known roots and the published-nullifier table. Earlier checkpoints mirror
+/// a tree whose exits removed leaves; they are archived and replayed.
+const CHECKPOINT_VERSION: u32 = 3;
+/// The statement of the vaults this indexer mirrors. A checkpoint records it.
+pub const CIRCUIT_ID: &str = "zkapi-v2-concession-v1";
 /// `currentRoot()`
 const CURRENT_ROOT: &str = "0xfdab463d";
 /// `nextNoteId()`
 const NEXT_NOTE_ID: &str = "0x7a2043a3";
+/// `CONCESSION_ESCAPE_VERSION()`, 1 on a revision-3 vault and absent before.
+const CONCESSION_ESCAPE_VERSION: &str = "0x5e00b426";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest parent-hash walk used to confirm that a reorganized checkpoint
 /// block is an ancestor of the head. Beyond it two sightings suffice.
@@ -145,6 +152,10 @@ impl Header {
 struct Committed {
     mirror: Arc<TreeMirror>,
     anchor: Option<BlockRef>,
+    /// Block of the latest committed lifecycle event (any event but a
+    /// deposit or a leaf retirement). Lifecycle events change no root, so a
+    /// reorg below the checkpoint near one is rebuilt, never re-anchored.
+    last_lifecycle_block: Option<u64>,
 }
 
 impl Committed {
@@ -152,6 +163,7 @@ impl Committed {
         Self {
             mirror: Arc::new(TreeMirror::new()),
             anchor: None,
+            last_lifecycle_block: None,
         }
     }
 }
@@ -168,6 +180,7 @@ struct Provisional {
     /// Missed re-escapes in the held chunks, reported only when a later
     /// chunk verifies and commits them.
     missed_re_escapes: Vec<MissedReEscapeAt>,
+    last_lifecycle_block: Option<u64>,
 }
 
 pub struct JsonRpcLogPoller {
@@ -184,6 +197,9 @@ pub struct JsonRpcLogPoller {
     chain_id: Option<u64>,
     chain_verified: bool,
     chain_mismatch_reported: bool,
+    /// The vault reported `CONCESSION_ESCAPE_VERSION() == 1` in this process.
+    vault_verified: bool,
+    vault_mismatch_reported: bool,
     published: Option<BlockRef>,
     /// The committed state is a restored checkpoint not yet verified in this
     /// process.
@@ -231,6 +247,8 @@ impl JsonRpcLogPoller {
             chain_id: config.chain_id,
             chain_verified: false,
             chain_mismatch_reported: false,
+            vault_verified: false,
+            vault_mismatch_reported: false,
             published: None,
             startup_check_pending: false,
             anchor_checked_at: None,
@@ -302,6 +320,7 @@ impl JsonRpcLogPoller {
         self.committed = Committed {
             mirror: Arc::new(checkpoint.mirror),
             anchor: Some(anchor),
+            last_lifecycle_block: checkpoint.last_lifecycle_block,
         };
         self.chain_id = Some(checkpoint.chain_id);
         self.startup_check_pending = true;
@@ -364,6 +383,11 @@ impl JsonRpcLogPoller {
 
         // S2. Chain id, after start or rebuild and while it disagrees.
         if !self.chain_verified && !self.verify_chain_id(service).await? {
+            return Ok(PollOutcome::Idle);
+        }
+        // S2b. The vault's revision, once per process: this mirror's rules
+        // (an append-only tree, concession events) are revision 3's.
+        if !self.vault_verified && !self.verify_vault_revision(service, &head_ref).await? {
             return Ok(PollOutcome::Idle);
         }
 
@@ -433,6 +457,53 @@ impl JsonRpcLogPoller {
         self.chain_verified = true;
         service.set_chain_id(rpc_chain_id);
         Ok(true)
+    }
+
+    /// Fail closed on a vault that is not revision 3 (`CONCESSION_ESCAPE_VERSION()`
+    /// is not 1, or the getter does not exist): its exits remove leaves, which
+    /// this mirror never does, so every view would be wrong.
+    async fn verify_vault_revision(
+        &mut self,
+        service: &IndexerService,
+        head: &BlockRef,
+    ) -> anyhow::Result<bool> {
+        let version = match self.call_word(CONCESSION_ESCAPE_VERSION, head).await {
+            Ok(Some(word)) => Some(word),
+            Ok(None) => bail!(
+                "vault has no code at head block {} {}; waiting",
+                head.number,
+                head.hash
+            ),
+            Err(err) if is_revert(&err) => None,
+            Err(err) => return Err(err.context("cannot read CONCESSION_ESCAPE_VERSION()")),
+        };
+        let one = {
+            let mut word = [0u8; 32];
+            word[31] = 1;
+            word
+        };
+        if version == Some(one) {
+            self.vault_verified = true;
+            self.vault_mismatch_reported = false;
+            return Ok(true);
+        }
+        let reason = match version {
+            Some(word) => format!(
+                "vault CONCESSION_ESCAPE_VERSION() is 0x{}, not 1: not a revision-3 vault ({CIRCUIT_ID})",
+                hex::encode(word)
+            ),
+            None => format!(
+                "vault has no CONCESSION_ESCAPE_VERSION(): a vault before revision 3, which this indexer ({CIRCUIT_ID}) cannot mirror"
+            ),
+        };
+        if !self.vault_mismatch_reported {
+            self.vault_mismatch_reported = true;
+            tracing::error!(reason = %reason, "indexer refuses the vault; tree endpoints return 503");
+        }
+        service.set_phase(SyncStatus::Diverged, Some(reason.clone()));
+        service.record_failure(reason);
+        self.published = None;
+        Ok(false)
     }
 
     async fn check_anchor(
@@ -540,6 +611,23 @@ impl JsonRpcLogPoller {
             .verify_state(&mirror, &canonical.block_ref(), false)
             .await
         {
+            Verdict::Match
+                if self.committed.last_lifecycle_block.is_some_and(|block| {
+                    block.saturating_add(MAX_ANCESTRY_WALK) >= anchor.number
+                }) =>
+            {
+                // The tree is unchanged, but exits, defeats and raises change
+                // no root: the reorg may have removed one the mirror holds.
+                self.anchor_candidate = None;
+                Ok(Some(self.request_rebuild(
+                    service,
+                    format!(
+                        "reorg below checkpoint at block {} near a committed exit or defeat (block {}); its replacement cannot be verified by the root",
+                        anchor.number,
+                        self.committed.last_lifecycle_block.unwrap_or_default()
+                    ),
+                )))
+            }
             Verdict::Match => {
                 self.anchor_candidate = None;
                 self.anchor_unavailable = 0;
@@ -635,8 +723,12 @@ impl JsonRpcLogPoller {
             .provisional
             .as_ref()
             .map_or_else(|| self.committed.mirror.clone(), |held| held.mirror.clone());
-        let (staged, chunk_missed) = match apply_logs(&base, &logs) {
-            Ok(applied) => (applied.mirror, applied.missed_re_escapes),
+        let (staged, chunk_missed, chunk_lifecycle) = match apply_logs(&base, &logs) {
+            Ok(applied) => (
+                applied.mirror,
+                applied.missed_re_escapes,
+                applied.last_lifecycle_block,
+            ),
             Err(detail) => {
                 self.on_mismatch(service, detail).await;
                 return Ok(Some(PollOutcome::Idle));
@@ -645,9 +737,14 @@ impl JsonRpcLogPoller {
         let to_ref = to_header.block_ref();
         match self.verify_state(&staged, &to_ref, false).await {
             Verdict::Match => {
-                let mut missed = self.take_provisional_missed();
+                let (mut missed, held_lifecycle) = self.take_provisional();
                 missed.extend(chunk_missed);
-                self.commit(service, staged, to_ref);
+                let lifecycle = self
+                    .committed
+                    .last_lifecycle_block
+                    .max(held_lifecycle)
+                    .max(chunk_lifecycle);
+                self.commit(service, staged, to_ref, lifecycle);
                 // Read by number under this head and verified as canonical.
                 self.anchor_checked_at = Some(head.clone());
                 self.report_missed_re_escapes(service, &missed);
@@ -666,11 +763,12 @@ impl JsonRpcLogPoller {
                     error = %format!("{err:#}"),
                     "historical vault state unavailable; holding catch-up chunk in memory"
                 );
-                let mut missed = self.take_provisional_missed();
+                let (mut missed, held_lifecycle) = self.take_provisional();
                 missed.extend(chunk_missed);
                 self.provisional = Some(Provisional {
                     mirror: staged,
                     missed_re_escapes: missed,
+                    last_lifecycle_block: held_lifecycle.max(chunk_lifecycle),
                 });
                 self.next_block = to + 1;
             }
@@ -682,7 +780,13 @@ impl JsonRpcLogPoller {
         Ok((self.next_block <= target).then_some(PollOutcome::MoreWork))
     }
 
-    fn commit(&mut self, service: &IndexerService, mirror: Arc<TreeMirror>, at: BlockRef) {
+    fn commit(
+        &mut self,
+        service: &IndexerService,
+        mirror: Arc<TreeMirror>,
+        at: BlockRef,
+        last_lifecycle_block: Option<u64>,
+    ) {
         service.set_confirmed(
             at.number,
             at.hash.clone(),
@@ -697,16 +801,17 @@ impl JsonRpcLogPoller {
         self.committed = Committed {
             mirror,
             anchor: Some(at),
+            last_lifecycle_block,
         };
         self.persist_committed();
     }
 
-    /// Missed re-escapes of the held catch-up chunks, if any; the held
-    /// chunks themselves are dropped.
-    fn take_provisional_missed(&mut self) -> Vec<MissedReEscapeAt> {
+    /// Missed re-escapes and the latest lifecycle block of the held catch-up
+    /// chunks, if any; the held chunks themselves are dropped.
+    fn take_provisional(&mut self) -> (Vec<MissedReEscapeAt>, Option<u64>) {
         self.provisional
             .take()
-            .map(|held| held.missed_re_escapes)
+            .map(|held| (held.missed_re_escapes, held.last_lifecycle_block))
             .unwrap_or_default()
     }
 
@@ -728,6 +833,10 @@ impl JsonRpcLogPoller {
                 EscapeClose::Challenged => tracing::warn!(
                     detail = %at,
                     "escape challenged that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list showed a stale nullifier and deadline until now"
+                ),
+                EscapeClose::Raised => tracing::warn!(
+                    detail = %at,
+                    "escape raised that the indexer never saw initiated: the rpc logs missed a challenge and re-escape of the note, or a reorg below the checkpoint replaced its escape; the pending list now shows the raised escape without its successor nullifier"
                 ),
                 // The vault finalized (paid or credited) an escape the pending
                 // list never showed.
@@ -1153,6 +1262,7 @@ impl JsonRpcLogPoller {
         let mirror = &self.committed.mirror;
         let checkpoint = IndexerCheckpoint {
             version: CHECKPOINT_VERSION,
+            circuit_id: CIRCUIT_ID.to_string(),
             chain_id,
             contract_address: self.contract_address.clone(),
             from_block: self.cfg.from_block,
@@ -1160,6 +1270,7 @@ impl JsonRpcLogPoller {
             last_processed_block_hash: anchor.hash.clone(),
             root: mirror.root(),
             next_note_id: mirror.next_note_id(),
+            last_lifecycle_block: self.committed.last_lifecycle_block,
             mirror: mirror.snapshot(),
         };
         if let Err(err) = write_checkpoint(path, &checkpoint) {
@@ -1222,6 +1333,16 @@ fn rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
         .find_map(|cause| cause.downcast_ref::<RpcError>())
 }
 
+/// A JSON-RPC error of a reverted `eth_call` (geth code 3 with revert data,
+/// or -32000 "execution reverted").
+fn is_revert(err: &anyhow::Error) -> bool {
+    matches!(
+        rpc_error(err),
+        Some(RpcError::Rpc { code, message, .. })
+            if *code == 3 || message.to_ascii_lowercase().contains("revert")
+    )
+}
+
 fn rpc_error_code(err: &anyhow::Error) -> Option<i64> {
     match rpc_error(err)? {
         RpcError::Rpc { code, .. } => Some(*code),
@@ -1252,6 +1373,8 @@ fn retry_delay(err: &anyhow::Error) -> Option<Duration> {
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexerCheckpoint {
     version: u32,
+    /// The statement of the vault mirrored (`CIRCUIT_ID`).
+    circuit_id: String,
     chain_id: u64,
     contract_address: String,
     from_block: u64,
@@ -1259,6 +1382,8 @@ struct IndexerCheckpoint {
     last_processed_block_hash: String,
     root: Felt252,
     next_note_id: u32,
+    #[serde(default)]
+    last_lifecycle_block: Option<u64>,
     mirror: TreeMirrorSnapshot,
 }
 
@@ -1271,6 +1396,7 @@ struct LoadedCheckpoint {
     chain_id: u64,
     anchor: BlockRef,
     mirror: TreeMirror,
+    last_lifecycle_block: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1413,7 +1539,9 @@ struct Applied {
     mirror: Arc<TreeMirror>,
     /// Block of the last vault event.
     last_event_block: Option<u64>,
-    /// Events that closed an escape the mirror never saw initiated.
+    /// Block of the last lifecycle event (not a deposit or retirement).
+    last_lifecycle_block: Option<u64>,
+    /// Events that ended or raised an escape the mirror never saw initiated.
     missed_re_escapes: Vec<MissedReEscapeAt>,
 }
 
@@ -1421,6 +1549,7 @@ struct Applied {
 fn apply_logs(base: &Arc<TreeMirror>, logs: &[ChainLog]) -> Result<Applied, String> {
     let mut staged: Option<TreeMirror> = None;
     let mut last_event_block = None;
+    let mut last_lifecycle_block = None;
     let mut missed_re_escapes = Vec::new();
     for log in logs {
         let event = decode_log(&log.log)
@@ -1440,10 +1569,17 @@ fn apply_logs(base: &Arc<TreeMirror>, logs: &[ChainLog]) -> Result<Applied, Stri
             });
         }
         last_event_block = Some(log.block);
+        if !matches!(
+            event,
+            VaultEvent::NoteDeposited { .. } | VaultEvent::ClosedLeafRetired { .. }
+        ) {
+            last_lifecycle_block = Some(log.block);
+        }
     }
     Ok(Applied {
         mirror: staged.map(Arc::new).unwrap_or_else(|| base.clone()),
         last_event_block,
+        last_lifecycle_block,
         missed_re_escapes,
     })
 }
@@ -1562,6 +1698,16 @@ fn load_checkpoint(
             );
             return Ok(None);
         }
+        2 => {
+            // Revision-2 mirrors removed leaves on exits and lack note
+            // statuses, known roots and published nullifiers.
+            let archived = archive(path, "v2")?;
+            tracing::warn!(
+                archived = %archived.display(),
+                "v2 indexer checkpoint mirrors a tree whose exits removed leaves; archived and replaying from --from-block"
+            );
+            return Ok(None);
+        }
         CHECKPOINT_VERSION => {}
         version if version > CHECKPOINT_VERSION => bail!(
             "indexer checkpoint version {version} is newer than this binary supports; refusing to replace it"
@@ -1571,9 +1717,15 @@ fn load_checkpoint(
 
     let checkpoint: IndexerCheckpoint = match serde_json::from_slice(&raw) {
         Ok(checkpoint) => checkpoint,
-        Err(err) => return corrupt(format!("invalid v2 checkpoint: {err}")),
+        Err(err) => return corrupt(format!("invalid v3 checkpoint: {err}")),
     };
     let bound_address = normalize_address(&checkpoint.contract_address).ok();
+    if checkpoint.circuit_id != CIRCUIT_ID {
+        bail!(
+            "indexer checkpoint mirrors a vault of circuit {:?}, not {CIRCUIT_ID}; restart with --resync to discard it",
+            checkpoint.circuit_id
+        );
+    }
     if bound_address.as_deref() != Some(contract_address)
         || chain_id.is_some_and(|chain_id| chain_id != checkpoint.chain_id)
     {
@@ -1603,6 +1755,7 @@ fn load_checkpoint(
             hash,
         },
         mirror,
+        last_lifecycle_block: checkpoint.last_lifecycle_block,
     }))
 }
 
@@ -1635,31 +1788,70 @@ fn hex_quantity(value: u64) -> String {
     format!("0x{value:x}")
 }
 
+/// Event signatures of vault revision 3 (topic0 is their keccak256).
+pub(crate) const NOTE_DEPOSITED: &str = "NoteDeposited(uint32,bytes32,uint128,uint64,uint256)";
+pub(crate) const MUTUAL_CLOSE: &str = "MutualClose(uint32,uint256,uint128,address)";
+pub(crate) const ESCAPE_INITIATED: &str =
+    "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)";
+pub(crate) const CONCESSION_RECORDED: &str =
+    "EscapeConcessionRecorded(uint32,uint256,uint128,uint128)";
+pub(crate) const CONCESSION_RAISED: &str = "EscapeConcessionRaised(uint32,uint256,uint128,uint128)";
+pub(crate) const ESCAPE_CHALLENGED: &str = "EscapeWithdrawalChallenged(uint32,uint256,uint256)";
+pub(crate) const ESCAPE_FINALIZED: &str =
+    "EscapeWithdrawalFinalized(uint32,uint256,uint128,address)";
+pub(crate) const EXPIRED_CLAIMED: &str = "ExpiredClaimed(uint32,uint128,uint256)";
+pub(crate) const CLOSED_LEAF_RETIRED: &str = "ClosedLeafRetired(uint32,uint256)";
+
 struct EventTopics {
     note_deposited: String,
     mutual_close: String,
     escape_initiated: String,
+    concession_recorded: String,
+    concession_raised: String,
     escape_challenged: String,
     escape_finalized: String,
     expired_claimed: String,
+    closed_leaf_retired: String,
 }
 
 fn event_topics() -> &'static EventTopics {
     static TOPICS: OnceLock<EventTopics> = OnceLock::new();
     TOPICS.get_or_init(|| EventTopics {
-        note_deposited: event_topic("NoteDeposited(uint32,bytes32,uint128,uint64,uint256)"),
-        mutual_close: event_topic("MutualClose(uint32,uint256,uint128,address)"),
-        escape_initiated: event_topic(
-            "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)",
-        ),
-        escape_challenged: event_topic("EscapeWithdrawalChallenged(uint32,uint256,uint256)"),
-        escape_finalized: event_topic("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)"),
-        expired_claimed: event_topic("ExpiredClaimed(uint32,uint128,uint256)"),
+        note_deposited: event_topic(NOTE_DEPOSITED),
+        mutual_close: event_topic(MUTUAL_CLOSE),
+        escape_initiated: event_topic(ESCAPE_INITIATED),
+        concession_recorded: event_topic(CONCESSION_RECORDED),
+        concession_raised: event_topic(CONCESSION_RAISED),
+        escape_challenged: event_topic(ESCAPE_CHALLENGED),
+        escape_finalized: event_topic(ESCAPE_FINALIZED),
+        expired_claimed: event_topic(EXPIRED_CLAIMED),
+        closed_leaf_retired: event_topic(CLOSED_LEAF_RETIRED),
     })
 }
 
-/// Decode one of the six tree events. Any other topic (treasury, pause,
-/// ownership and future events) is ignored without parsing its data.
+/// The data words and the indexed note id of a vault event log, which must
+/// carry exactly `topics` topics and `words` data words.
+fn event_words(
+    log: &RpcLog,
+    name: &str,
+    topics: usize,
+    words: usize,
+) -> anyhow::Result<(u32, Vec<[u8; 32]>)> {
+    let data = split_words(&log.data)?;
+    if log.topics.len() != topics || data.len() != words {
+        bail!(
+            "malformed {name} log: {} topics and {} data words, expected {topics} and {words}",
+            log.topics.len(),
+            data.len()
+        );
+    }
+    Ok((topic_to_u32(&log.topics[1])?, data))
+}
+
+/// Decode one of the nine tree and lifecycle events, strictly: exact topic
+/// and word counts, canonical uint widths and field elements. Any other
+/// topic (treasury, pause, ownership, payout credits and future events) is
+/// ignored without parsing its data.
 fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
     let Some(topic0) = log.topics.first() else {
         return Ok(None);
@@ -1667,77 +1859,81 @@ fn decode_log(log: &RpcLog) -> anyhow::Result<Option<VaultEvent>> {
     let topics = event_topics();
     let is = |topic: &String| topic0.eq_ignore_ascii_case(topic);
 
-    if is(&topics.note_deposited) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 3 || words.len() != 3 {
-            return Err(anyhow!("malformed NoteDeposited log"));
-        }
-        return Ok(Some(VaultEvent::NoteDeposited {
-            note_id: topic_to_u32(&log.topics[1])?,
+    let event = if is(&topics.note_deposited) {
+        let (note_id, words) = event_words(log, "NoteDeposited", 3, 3)?;
+        VaultEvent::NoteDeposited {
+            note_id,
             commitment: topic_to_felt(&log.topics[2])?,
-            amount: word_to_u128(&words[0]),
-            expiry_ts: word_to_u64(&words[1]),
-            new_root: word_to_felt(&words[2]),
-        }));
-    }
-    if is(&topics.mutual_close) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 2 || words.len() != 3 {
-            return Err(anyhow!("malformed MutualClose log"));
+            amount: word_to_u128(&words[0])?,
+            expiry_ts: word_to_u64(&words[1])?,
+            new_root: word_to_felt(&words[2])?,
         }
-        return Ok(Some(VaultEvent::MutualClose {
-            note_id: topic_to_u32(&log.topics[1])?,
-            nullifier: word_to_felt(&words[0]),
-            final_balance: word_to_u128(&words[1]),
-        }));
-    }
-    if is(&topics.escape_initiated) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 2 || words.len() != 5 {
-            return Err(anyhow!("malformed EscapeWithdrawalInitiated log"));
+    } else if is(&topics.mutual_close) {
+        let (note_id, words) = event_words(log, "MutualClose", 2, 3)?;
+        word_to_address(&words[2])?;
+        VaultEvent::MutualClose {
+            note_id,
+            nullifier: word_to_felt(&words[0])?,
+            final_balance: word_to_u128(&words[1])?,
         }
-        return Ok(Some(VaultEvent::EscapeWithdrawalInitiated {
-            note_id: topic_to_u32(&log.topics[1])?,
-            nullifier: word_to_felt(&words[0]),
-            final_balance: word_to_u128(&words[1]),
-            challenge_deadline: word_to_u64(&words[3]),
-            new_root: word_to_felt(&words[4]),
-        }));
-    }
-    if is(&topics.escape_challenged) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 2 || words.len() != 2 {
-            return Err(anyhow!("malformed EscapeWithdrawalChallenged log"));
+    } else if is(&topics.escape_initiated) {
+        let (note_id, words) = event_words(log, "EscapeWithdrawalInitiated", 2, 5)?;
+        word_to_address(&words[2])?;
+        VaultEvent::EscapeWithdrawalInitiated {
+            note_id,
+            nullifier: word_to_felt(&words[0])?,
+            final_balance: word_to_u128(&words[1])?,
+            challenge_deadline: word_to_u64(&words[3])?,
+            current_root: word_to_felt(&words[4])?,
         }
-        return Ok(Some(VaultEvent::EscapeWithdrawalChallenged {
-            note_id: topic_to_u32(&log.topics[1])?,
-            nullifier: word_to_felt(&words[0]),
-            restored_root: word_to_felt(&words[1]),
-        }));
-    }
-    if is(&topics.escape_finalized) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 2 || words.len() != 3 {
-            return Err(anyhow!("malformed EscapeWithdrawalFinalized log"));
+    } else if is(&topics.concession_recorded) {
+        let (note_id, words) = event_words(log, "EscapeConcessionRecorded", 2, 3)?;
+        VaultEvent::EscapeConcessionRecorded {
+            note_id,
+            next_nullifier: word_to_felt(&words[0])?,
+            state_balance: word_to_u128(&words[1])?,
+            conceded: word_to_u128(&words[2])?,
         }
-        return Ok(Some(VaultEvent::EscapeWithdrawalFinalized {
-            note_id: topic_to_u32(&log.topics[1])?,
-            nullifier: word_to_felt(&words[0]),
-            final_balance: word_to_u128(&words[1]),
-        }));
-    }
-    if is(&topics.expired_claimed) {
-        let words = split_words(&log.data)?;
-        if log.topics.len() < 2 || words.len() != 2 {
-            return Err(anyhow!("malformed ExpiredClaimed log"));
+    } else if is(&topics.concession_raised) {
+        let (note_id, words) = event_words(log, "EscapeConcessionRaised", 2, 3)?;
+        VaultEvent::EscapeConcessionRaised {
+            note_id,
+            nullifier: word_to_felt(&words[0])?,
+            conceded: word_to_u128(&words[1])?,
+            final_balance: word_to_u128(&words[2])?,
         }
-        return Ok(Some(VaultEvent::ExpiredClaimed {
-            note_id: topic_to_u32(&log.topics[1])?,
-            deposit_amount: word_to_u128(&words[0]),
-            new_root: word_to_felt(&words[1]),
-        }));
-    }
-    Ok(None)
+    } else if is(&topics.escape_challenged) {
+        let (note_id, words) = event_words(log, "EscapeWithdrawalChallenged", 2, 2)?;
+        VaultEvent::EscapeWithdrawalChallenged {
+            note_id,
+            nullifier: word_to_felt(&words[0])?,
+            current_root: word_to_felt(&words[1])?,
+        }
+    } else if is(&topics.escape_finalized) {
+        let (note_id, words) = event_words(log, "EscapeWithdrawalFinalized", 2, 3)?;
+        word_to_address(&words[2])?;
+        VaultEvent::EscapeWithdrawalFinalized {
+            note_id,
+            nullifier: word_to_felt(&words[0])?,
+            final_balance: word_to_u128(&words[1])?,
+        }
+    } else if is(&topics.expired_claimed) {
+        let (note_id, words) = event_words(log, "ExpiredClaimed", 2, 2)?;
+        VaultEvent::ExpiredClaimed {
+            note_id,
+            deposit_amount: word_to_u128(&words[0])?,
+            current_root: word_to_felt(&words[1])?,
+        }
+    } else if is(&topics.closed_leaf_retired) {
+        let (note_id, words) = event_words(log, "ClosedLeafRetired", 2, 1)?;
+        VaultEvent::ClosedLeafRetired {
+            note_id,
+            new_root: word_to_felt(&words[0])?,
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(event))
 }
 
 pub(crate) fn event_topic(signature: &str) -> String {
@@ -1789,20 +1985,30 @@ fn topic_to_felt(topic: &str) -> anyhow::Result<Felt252> {
     Felt252::from_hex(topic).map_err(|err| anyhow!("invalid topic felt {topic}: {err}"))
 }
 
-fn word_to_u64(word: &[u8; 32]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&word[24..]);
-    u64::from_be_bytes(buf)
+/// An ABI word holding a uint of `bytes` bytes: its high bytes are zero.
+fn narrow<const N: usize>(word: &[u8; 32], kind: &str) -> anyhow::Result<[u8; N]> {
+    if word[..32 - N].iter().any(|byte| *byte != 0) {
+        bail!("log word 0x{} is not a canonical {kind}", hex::encode(word));
+    }
+    Ok(word[32 - N..].try_into().expect("N bytes"))
 }
 
-fn word_to_u128(word: &[u8; 32]) -> u128 {
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&word[16..]);
-    u128::from_be_bytes(buf)
+fn word_to_u64(word: &[u8; 32]) -> anyhow::Result<u64> {
+    Ok(u64::from_be_bytes(narrow::<8>(word, "uint64")?))
 }
 
-fn word_to_felt(word: &[u8; 32]) -> Felt252 {
-    Felt252(*word)
+fn word_to_u128(word: &[u8; 32]) -> anyhow::Result<u128> {
+    Ok(u128::from_be_bytes(narrow::<16>(word, "uint128")?))
+}
+
+fn word_to_address(word: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
+    narrow::<20>(word, "address")
+}
+
+/// A uint256 the vault emits as a BN254 field element (a nullifier or root).
+fn word_to_felt(word: &[u8; 32]) -> anyhow::Result<Felt252> {
+    Felt252::try_from_bytes_be(*word)
+        .map_err(|err| anyhow!("log word is not a field element: {err}"))
 }
 
 #[cfg(test)]
@@ -1967,7 +2173,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    pub(super) fn write_v2_checkpoint(
+    pub(super) fn write_v3_checkpoint(
         path: &Path,
         contract_address: &str,
         chain_id: u64,
@@ -1978,6 +2184,7 @@ mod tests {
             path,
             &IndexerCheckpoint {
                 version: CHECKPOINT_VERSION,
+                circuit_id: CIRCUIT_ID.to_string(),
                 chain_id,
                 contract_address: contract_address.to_string(),
                 from_block: 0,
@@ -1985,6 +2192,7 @@ mod tests {
                 last_processed_block_hash: anchor.hash.clone(),
                 root: mirror.root(),
                 next_note_id: mirror.next_note_id(),
+                last_lifecycle_block: None,
                 mirror: mirror.snapshot(),
             },
         )
@@ -2013,7 +2221,7 @@ mod tests {
             number: 17,
             hash: format!("0x{}", "17".repeat(32)),
         };
-        write_v2_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
+        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &mirror);
 
         let restored = service();
         let poller = JsonRpcLogPoller::new(
@@ -2139,5 +2347,188 @@ mod tests {
         let error = service.health().last_error.unwrap();
         assert!(!error.contains("secret-api-key"), "{error}");
         assert!(!error.contains("127.0.0.1:1"), "{error}");
+    }
+
+    fn log_of(topics: Vec<String>, words: &[String]) -> RpcLog {
+        RpcLog {
+            block_number: "0x1".to_string(),
+            block_hash: format!("0x{}", "ab".repeat(32)),
+            log_index: "0x0".to_string(),
+            address: None,
+            removed: None,
+            topics,
+            data: format!("0x{}", words.concat()),
+        }
+    }
+
+    #[test]
+    fn revision_three_event_topics_are_pinned() {
+        // topic0 values pinned in the concession-exit spec (section 4.1).
+        assert_eq!(
+            event_topic(CONCESSION_RECORDED),
+            "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d"
+        );
+        assert_eq!(
+            event_topic(CONCESSION_RAISED),
+            "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c"
+        );
+        assert_eq!(
+            event_topic(CLOSED_LEAF_RETIRED),
+            "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3"
+        );
+        assert!(event_topic(ESCAPE_INITIATED).starts_with("0xb0d1eb71"));
+        assert!(event_topic(ESCAPE_CHALLENGED).starts_with("0x5cc5343b"));
+    }
+
+    #[test]
+    fn concession_events_decode_strictly() {
+        let note = format!("0x{:064x}", 4);
+        let recorded = log_of(
+            vec![event_topic(CONCESSION_RECORDED), note.clone()],
+            &[
+                encode_word(Felt252::from_u64(0x901)),
+                encode_u128(15),
+                encode_u128(5),
+            ],
+        );
+        assert_eq!(
+            decode_log(&recorded).unwrap(),
+            Some(VaultEvent::EscapeConcessionRecorded {
+                note_id: 4,
+                next_nullifier: Felt252::from_u64(0x901),
+                state_balance: 15,
+                conceded: 5,
+            })
+        );
+        let raised = log_of(
+            vec![event_topic(CONCESSION_RAISED), note.clone()],
+            &[
+                encode_word(Felt252::from_u64(0x900)),
+                encode_u128(9),
+                encode_u128(6),
+            ],
+        );
+        assert_eq!(
+            decode_log(&raised).unwrap(),
+            Some(VaultEvent::EscapeConcessionRaised {
+                note_id: 4,
+                nullifier: Felt252::from_u64(0x900),
+                conceded: 9,
+                final_balance: 6,
+            })
+        );
+        let retired = log_of(
+            vec![event_topic(CLOSED_LEAF_RETIRED), note.clone()],
+            &[encode_word(Felt252::from_u64(77))],
+        );
+        assert_eq!(
+            decode_log(&retired).unwrap(),
+            Some(VaultEvent::ClosedLeafRetired {
+                note_id: 4,
+                new_root: Felt252::from_u64(77),
+            })
+        );
+
+        // A word too many or too few, an extra topic, a uint128 with high
+        // bytes, and a nullifier outside the field are refused.
+        let mut extra_word = recorded.clone();
+        extra_word.data.push_str(&encode_u128(0));
+        let mut missing_word = retired.clone();
+        missing_word.data = "0x".to_string();
+        let mut extra_topic = raised.clone();
+        extra_topic.topics.push(note.clone());
+        let wide = log_of(
+            vec![event_topic(CONCESSION_RAISED), note.clone()],
+            &[
+                encode_word(Felt252::from_u64(0x900)),
+                format!("{}{}", "01", "0".repeat(62)),
+                encode_u128(6),
+            ],
+        );
+        let outside_field = log_of(
+            vec![event_topic(CONCESSION_RECORDED), note],
+            &["f".repeat(64), encode_u128(15), encode_u128(5)],
+        );
+        for log in [extra_word, missing_word, extra_topic, wide, outside_field] {
+            assert!(decode_log(&log).is_err(), "{log:?}");
+        }
+    }
+
+    #[test]
+    fn v2_checkpoint_of_a_leaf_removing_tree_is_archived_and_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+        fs::write(
+            &path,
+            r#"{"version":2,"chain_id":31337,"contract_address":"0xaa","mirror":{}}"#,
+        )
+        .unwrap();
+        assert!(load_checkpoint(&path, VAULT, None).unwrap().is_none());
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".v2-"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn checkpoint_of_another_circuit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+        let anchor = BlockRef {
+            number: 3,
+            hash: format!("0x{}", "03".repeat(32)),
+        };
+        write_v3_checkpoint(&path, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["circuit_id"] = "zkapi-v2-note-bound-v1".into();
+        fs::write(&path, raw.to_string()).unwrap();
+        let error = load_checkpoint(&path, VAULT, None).err().unwrap();
+        assert!(format!("{error:#}").contains("zkapi-v2-note-bound-v1"));
+        assert!(path.exists(), "a refused checkpoint is left in place");
+    }
+
+    #[tokio::test]
+    async fn a_vault_before_revision_three_is_never_served() {
+        for version in [None, Some(0), Some(2)] {
+            let chain = MockChain::start().await;
+            chain.mine(vec![crate::test_chain::Tx::Deposit { commitment: 0xa }]);
+            chain.set_escape_version(version);
+            let service = service();
+            let mut poller = JsonRpcLogPoller::new(
+                PollerConfig {
+                    rpc_url: chain.url(),
+                    contract_address: VAULT.to_string(),
+                    cursor_path: None,
+                    confirmations: 0,
+                    chain_id: Some(CHAIN_ID),
+                    catch_up_interval: Duration::ZERO,
+                    ..PollerConfig::default()
+                },
+                &service,
+            )
+            .unwrap();
+            for _ in 0..3 {
+                assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
+                assert_eq!(service.status(), SyncStatus::Diverged, "{version:?}");
+                assert!(service.view().is_err());
+            }
+            assert!(service.health().reason.unwrap().contains("revision"));
+            assert!(chain.calls("eth_getLogs").is_empty());
+
+            // Once the vault reports version 1 (a misread corrected), it is
+            // mirrored.
+            chain.set_escape_version(Some(1));
+            assert_eq!(poller.poll_once(&service).await.unwrap(), PollOutcome::Idle);
+            assert!(service.is_ready());
+        }
     }
 }

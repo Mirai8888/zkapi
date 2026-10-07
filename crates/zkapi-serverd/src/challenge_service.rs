@@ -1,12 +1,41 @@
-//! Durable event-to-submission loop for v2 escape challenges.
+//! Durable event-to-submission loop of the concession-exit challenger (§5.4).
+//!
+//! For each pending escape `(n, N, N⁺, B, c, deadline)`, read every poll from
+//! `pendingWithdrawals(n)` and `pendingConcessions(n)` at one block:
+//!
+//! 1. **Defeat.** Verified evidence at `N⁺` in the server's `request_evidence`,
+//!    whatever its lease status: `challengeEscapeWithdrawal(n, inputs, proof)`
+//!    with the oldest such row. No indexer path and no live root are needed.
+//! 2. **Raise.** Otherwise, once `Ω(N)` is final (a settled charge), or at
+//!    `deadline - raise_lead_seconds` at the latest: if `min(Ω, bound, B)`
+//!    exceeds `c` by at least `raise_min_units`, `raiseEscapeConcession(n,
+//!    inputs, proof, Ω)` with the row at `N` with the largest solvency bound.
+//! 3. Otherwise nothing: the honest outcome. After a raise, evidence at `N⁺`
+//!    is still watched until the deadline.
+//!
+//! Rows at `N⁺` that do not verify defeat nothing: they never hold back the
+//! raise, but keep the obligation critical (`evidence_invalid`) and count as
+//! a possible missed defeat if the escape is paid out.
+//!
+//! One signer and one nonce lane. A same-nonce replacement may change only
+//! fees, with one exception: a defeat may replace an unmined raise; a raise
+//! never replaces a defeat. The call and its digest are persisted before
+//! every send, so the transition survives a restart. A raise that lands
+//! first leaves the defeat to the next nonce.
+//!
+//! A missed defeat (verified successor evidence before the deadline, and the
+//! escape finalized) or missed raise (more owed than conceded at
+//! finalization) is recorded; after a missed defeat, `retire_on_miss` retires
+//! the closed note's leaf (`retireClosedLeaf`, with the indexer's path at the
+//! live root).
 //!
 //! The configured RPC must expose an operator-controlled transaction signer.
 //! Keys are never loaded by this service; the sender must be dedicated to it.
-//! Only Finalized server transcripts are challenge evidence. Challenges are
-//! EIP-1559 transactions whose fees the daemon proposes and escalates, within
-//! its caps and a per-transaction fee ceiling, by same-nonce replacement as
-//! deadlines approach. Every obligation's state, deadline and blocking reason
-//! is published on the operator status endpoint (see `challenge_status`).
+//! Transactions are EIP-1559, with fees the daemon proposes and escalates,
+//! within its caps and a per-transaction fee ceiling, by same-nonce
+//! replacement as deadlines approach. Every obligation's state, deadline and
+//! blocking reason is published on the operator status endpoint (see
+//! `challenge_status`).
 
 use crate::{
     challenge_status::{
@@ -15,12 +44,15 @@ use crate::{
         ObligationState, ObligationStatus, PollStatus, RemainingThresholds, SenderStatus, Severity,
         StatusHandle,
     },
+    deployment::{probe_deployment, ContractReader, DeploymentManifest, ProbeError},
     error::ServerError,
-    nullifier_store::{DeploymentBinding, NullifierStore},
-    watcher::{ChallengeWatcher, EvidenceStatus, SettlementProgress},
+    nullifier_store::{DeploymentBinding, NullifierStore, StatementIdentity},
+    watcher::{
+        CallKind, ChallengeWatcher, EvidenceBinding, EvidenceProof, NothingOwed, Owed, OwedBasis,
+        SettlementProgress, VaultCall,
+    },
 };
 use anyhow::{anyhow, bail, ensure, Context};
-use base64::Engine;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
@@ -31,13 +63,12 @@ use std::{
     time::Duration,
 };
 use zkapi_proof::compact::RequestVerifier;
-use zkapi_types::{
-    wire::{Groth16ProofWire, ProofBackendWire},
-    Felt252, MERKLE_DEPTH,
-};
+use zkapi_types::{Felt252, MERKLE_DEPTH};
 
 const ESCAPE_EVENT: &str =
     "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)";
+const CONCESSION_RECORDED_EVENT: &str = "EscapeConcessionRecorded(uint32,uint256,uint128,uint128)";
+const CONCESSION_RAISED_EVENT: &str = "EscapeConcessionRaised(uint32,uint256,uint128,uint128)";
 const CHALLENGED_EVENT: &str = "EscapeWithdrawalChallenged(uint32,uint256,uint256)";
 const FINALIZED_EVENT: &str = "EscapeWithdrawalFinalized(uint32,uint256,uint128,address)";
 /// `notes(noteId).status` of a note whose escape was finalized.
@@ -58,9 +89,15 @@ const MAX_SUPERSEDED_HASHES: usize = 32;
 /// The signer may make several sequential upstream calls for one send.
 const SEND_TIMEOUT: Duration = Duration::from_secs(95);
 const INDEXER_TIMEOUT: Duration = Duration::from_secs(10);
-/// Challenge gas assumed for balance alarms before any estimate (a measured
-/// real-Groth16 challenge is about 6.3M gas, plus the daemon's 20% margin).
-const DEFAULT_CHALLENGE_GAS: u128 = 7_600_000;
+/// Gas limit of a defeat unless its estimate (plus 20%) is higher (§5.4).
+pub const DEFAULT_DEFEAT_GAS_LIMIT: u64 = 600_000;
+/// Gas limit of a raise unless its estimate (plus 20%) is higher (§5.4).
+pub const DEFAULT_RAISE_GAS_LIMIT: u64 = 450_000;
+/// The raise is decided this long before the escape's deadline at the
+/// latest (mainnet and Sepolia production; the drill uses 1,800).
+pub const DEFAULT_RAISE_LEAD_SECONDS: u64 = 21_600;
+/// Gas assumed for balance alarms before any estimate: one defeat.
+const DEFAULT_CHALLENGE_GAS: u128 = DEFAULT_DEFEAT_GAS_LIMIT as u128;
 /// Critical obligations and an indexer divergence are re-logged this often.
 const RELOG_SECONDS: u64 = 300;
 /// Indexer-listed escapes missing from the checkpoint checked per poll.
@@ -175,6 +212,24 @@ pub struct ChallengeServiceConfig {
     pub proof_setup_dir: PathBuf,
     pub fee: FeePolicy,
     pub alarms: AlarmPolicy,
+    /// The raise is decided at `deadline - raise_lead_seconds` at the latest.
+    pub raise_lead_seconds: u64,
+    /// The smallest raise worth a transaction, in gwei units.
+    pub raise_min_units: u128,
+    /// Retire a closed note's leaf after a missed defeat.
+    pub retire_on_miss: bool,
+    pub defeat_gas_limit: u64,
+    pub raise_gas_limit: u64,
+}
+
+/// What the startup timing checks need beyond the vault (§5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChallengeTiming {
+    /// The server's `ttl + grace + settlement deadline`: the deployment
+    /// manifest's `settlement_window_seconds`.
+    pub settlement_window_seconds: u64,
+    /// The server's settlement poll interval.
+    pub settlement_poll_seconds: u64,
 }
 
 /// Attempts on one reserved nonce. Every field is written before a send, so a
@@ -214,6 +269,27 @@ struct NonceAttempts {
     /// be a valid replacement of the persisted fees.
     #[serde(default)]
     unknown_attempt: bool,
+    /// The vault call the attempts on this nonce make. None in records of an
+    /// earlier release, whose attempts were challenges (defeats).
+    #[serde(default)]
+    action: Option<CallKind>,
+    /// The `request_evidence` row a defeat or raise was built from.
+    #[serde(default)]
+    evidence_row: Option<i64>,
+    /// The amount of a raise.
+    #[serde(default)]
+    raise_amount: Option<u128>,
+    /// A defeat replaced an unmined raise on this nonce: the one change of
+    /// call a same-nonce replacement may make.
+    #[serde(default)]
+    replaced_raise: bool,
+}
+
+impl NonceAttempts {
+    /// The call on the nonce; an earlier release only sent defeats.
+    fn kind(&self) -> CallKind {
+        self.action.unwrap_or(CallKind::Defeat)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -246,6 +322,21 @@ struct PendingChallenge {
     /// escape ended.
     #[serde(default)]
     ended_before_deadline: bool,
+    /// `N⁺`, `B` and `c` of the escape: from `pendingConcessions` at the last
+    /// read, or from its events before any read.
+    #[serde(default)]
+    next_nullifier: Option<Felt252>,
+    #[serde(default)]
+    state_balance: Option<u128>,
+    #[serde(default)]
+    conceded: Option<u128>,
+    /// What was missed when the deadline passed: a defeat or a raise.
+    #[serde(default)]
+    missed_kind: Option<CallKind>,
+    /// After a missed defeat the escape was paid out: the obligation now
+    /// retires the closed note's leaf.
+    #[serde(default)]
+    retire_leaf: bool,
     #[serde(flatten)]
     attempt: NonceAttempts,
 }
@@ -264,6 +355,14 @@ struct Checkpoint {
     detached_nonces: BTreeMap<u64, DetachedNonce>,
     #[serde(default)]
     missed_total: u64,
+    /// Missed defeats: `escapes_finalized_with_successor_evidence_total`.
+    #[serde(default)]
+    missed_defeats_total: u64,
+    #[serde(default)]
+    missed_raises_total: u64,
+    /// Leaves retired after missed defeats.
+    #[serde(default)]
+    retired_leaves_total: u64,
     #[serde(default)]
     last_missed: Option<MissedRecord>,
     /// Nullifiers of the escapes counted in `missed_total`: an escape tracked
@@ -377,6 +476,9 @@ struct Evaluation {
     blocked: Option<BlockedReason>,
     detail: Option<String>,
     settlement: Option<SettlementProgress>,
+    /// Ω, once known.
+    owed: Option<u128>,
+    raise_due_at: Option<u64>,
     evaluated_at: u64,
 }
 
@@ -388,6 +490,8 @@ impl Evaluation {
             blocked: None,
             detail: None,
             settlement: None,
+            owed: None,
+            raise_due_at: None,
             evaluated_at: 0,
         }
     }
@@ -404,17 +508,71 @@ impl Evaluation {
     }
 }
 
-struct WithdrawalState {
+/// A note's escape as the vault holds it at one block: `pendingWithdrawals`
+/// and `pendingConcessions` read at the same block (§5.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EscapeState {
     exists: bool,
+    /// `N`, the escaped nullifier.
     nullifier: Felt252,
+    /// The current payout, `B - c`.
+    final_balance: u128,
     deadline: u64,
+    /// `N⁺`: only a request proof at it defeats the escape.
+    next_nullifier: Felt252,
+    /// `B`.
+    state_balance: u128,
+    /// `c`.
+    conceded: u128,
 }
 
-/// Evidence that makes the loss of an escape a missed deadline.
+/// What made the loss of an escape a missed deadline.
+#[derive(Clone, Debug)]
 struct MissEvidence {
-    kind: EvidenceKind,
+    /// What was due: a defeat or a raise.
+    kind: CallKind,
+    evidence: EvidenceKind,
     settlement: Option<SettlementProgress>,
-    reason: &'static str,
+    reason: String,
+}
+
+/// What a pending escape calls for (§5.4 decision order).
+#[derive(Clone, Debug)]
+struct Decision {
+    /// The evidence kind the status shows.
+    evidence: EvidenceKind,
+    settlement: Option<SettlementProgress>,
+    /// Ω, once known: final once settled, else the bound from the raise lead.
+    owed: Option<u128>,
+    raise_due_at: u64,
+    due: Due,
+    /// Rows at `N⁺` exist and none of them verifies. They defeat nothing, so
+    /// `due` is decided from Ω as if they were absent, but they are alarmed
+    /// on (evidence_invalid) and, at the deadline, counted as a possible
+    /// missed defeat.
+    successor_invalid: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum Due {
+    /// Verified evidence at `N⁺`; `before_deadline` when a verified row was
+    /// written before the deadline (a missed defeat otherwise).
+    Defeat {
+        evidence: EvidenceProof,
+        before_deadline: bool,
+    },
+    /// Raise to `amount = Ω` with the row of the largest bound at `N`.
+    Raise {
+        evidence: EvidenceProof,
+        amount: u128,
+    },
+    /// Ω is not final before the raise lead.
+    AwaitingSettlement,
+    /// Nothing is due; the detail says why.
+    Nothing { covered: bool, detail: String },
+    /// Evidence rows that do not verify: the defeat or raise `kind` may be
+    /// due but cannot be built.
+    Invalid { kind: CallKind, detail: String },
 }
 
 /// How an escape that left `pendingWithdrawals` ended.
@@ -581,6 +739,8 @@ pub struct ChallengeService {
     client: reqwest::Client,
     watcher: ChallengeWatcher,
     verifier: RequestVerifier,
+    /// The statement of the loaded verifying keys.
+    identity: StatementIdentity,
     checkpoint: Checkpoint,
     status: StatusHandle,
     started_at: u64,
@@ -647,6 +807,10 @@ impl ChallengeService {
         );
         config.fee.validate()?;
         config.alarms.validate().map_err(anyhow::Error::msg)?;
+        ensure!(
+            config.defeat_gas_limit > 0 && config.raise_gas_limit > 0,
+            "defeat and raise gas limits must be positive"
+        );
         let checkpoint: Checkpoint = if config.checkpoint.exists() {
             serde_json::from_slice(&std::fs::read(&config.checkpoint)?)?
         } else {
@@ -660,6 +824,9 @@ impl ChallengeService {
                 pending: BTreeMap::new(),
                 detached_nonces: BTreeMap::new(),
                 missed_total: 0,
+                missed_defeats_total: 0,
+                missed_raises_total: 0,
+                retired_leaves_total: 0,
                 last_missed: None,
                 missed_nullifiers: Vec::new(),
                 legacy_miss_bound: None,
@@ -723,8 +890,10 @@ impl ChallengeService {
             sender.clone(),
             started_at,
         )));
+        let proof_setup_dir = config.proof_setup_dir.display().to_string();
         let mut service = Self {
             verifier: RequestVerifier::load(&config.proof_setup_dir)?,
+            identity: StatementIdentity::load(&proof_setup_dir)?,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()?,
@@ -821,6 +990,13 @@ impl ChallengeService {
                 self.vault_address()
             )));
         }
+        // The evidence was verified, and the vault verifies challenges, with
+        // the keys of one statement and setup: this daemon's.
+        if let Some(mismatch) = self.identity.mismatch(&binding) {
+            return Err(DeploymentCheckError::Mismatch(format!(
+                "server database serves another statement than this daemon's verifying keys: {mismatch}"
+            )));
+        }
         let chain = self
             .rpc("eth_chainId", json!([]))
             .await
@@ -842,6 +1018,80 @@ impl ChallengeService {
             ));
         }
         self.vault_state_key = Some(key);
+        Ok(binding)
+    }
+
+    /// The startup checks (§5.4, §5.5): the database binding (as
+    /// `verify_deployment_binding`) must be the deployment manifest's; the
+    /// vault and adapter must pass the startup probes (revision 3, the
+    /// adapter's circuit and verifying-key hashes equal to the loaded keys,
+    /// and the three runtime codehashes the manifest pins); and the vault's
+    /// challenge period must be the manifest's and pass the G5 and raise
+    /// timing checks with `timing` and `raise_lead_seconds`.
+    pub async fn verify_deployment(
+        &mut self,
+        manifest: &DeploymentManifest,
+        timing: ChallengeTiming,
+    ) -> Result<DeploymentBinding, DeploymentCheckError> {
+        let result = self.check_deployment(manifest, timing).await;
+        self.startup_warning = match &result {
+            Ok(_) => None,
+            Err(error) => Some(format!("deployment not verified: {error}")),
+        };
+        self.publish();
+        result
+    }
+
+    async fn check_deployment(
+        &mut self,
+        manifest: &DeploymentManifest,
+        timing: ChallengeTiming,
+    ) -> Result<DeploymentBinding, DeploymentCheckError> {
+        let vault = self.vault_address();
+        if manifest.chain_id != self.config.chain_id || manifest.contract_address != vault {
+            return Err(DeploymentCheckError::Mismatch(format!(
+                "the deployment manifest is for vault {} on chain {}, not vault {vault} on chain {}",
+                manifest.contract_address, manifest.chain_id, self.config.chain_id
+            )));
+        }
+        let binding = self.check_deployment_binding().await?;
+        if let Some(mismatch) = manifest.binding_mismatch(&binding) {
+            return Err(DeploymentCheckError::Mismatch(mismatch));
+        }
+        let reader = RpcReader {
+            client: self.client.clone(),
+            url: self.config.rpc_url.clone(),
+        };
+        probe_deployment(&reader, manifest, &self.identity)
+            .await
+            .map_err(|error| match error {
+                ProbeError::Mismatch(message) => DeploymentCheckError::Mismatch(message),
+                ProbeError::Unavailable(message) => {
+                    DeploymentCheckError::Unavailable(anyhow!(message))
+                }
+            })?;
+        let period = self
+            .call(selector("challengePeriod()"))
+            .await
+            .and_then(|words| {
+                ensure!(words.len() == 1, "malformed challengePeriod response");
+                felt_u64(&words[0])
+            })
+            .map_err(DeploymentCheckError::Unavailable)?;
+        if period != manifest.challenge_period || period != binding.challenge_period_seconds {
+            return Err(DeploymentCheckError::Mismatch(format!(
+                "vault challengePeriod() is {period} s, but the deployment manifest pins {} s and the database binding records {} s",
+                manifest.challenge_period, binding.challenge_period_seconds
+            )));
+        }
+        crate::config::validate_challenger_timing(
+            timing.settlement_window_seconds,
+            timing.settlement_poll_seconds,
+            self.config.raise_lead_seconds,
+            period,
+        )
+        .map_err(|error| DeploymentCheckError::Mismatch(format!("{error:#}")))?;
+        self.challenge_period = Some(period);
         Ok(binding)
     }
 
@@ -1045,9 +1295,14 @@ impl ChallengeService {
             .rpc("eth_getBlockByNumber", json!([format!("0x{to:x}"), false]))
             .await?;
         let before_hash = before["hash"].as_str().context("scan block lacks hash")?;
+        let topic =
+            |signature: &str| format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())));
         let logs = self.rpc("eth_getLogs", json!([{
             "address": self.vault_address(), "fromBlock": format!("0x{:x}", self.checkpoint.next_block),
-            "toBlock": format!("0x{to:x}"), "topics": [format!("0x{}", hex::encode(Keccak256::digest(ESCAPE_EVENT.as_bytes())))]
+            "toBlock": format!("0x{to:x}"), "topics": [[
+                topic(ESCAPE_EVENT), topic(CONCESSION_RECORDED_EVENT),
+                topic(CONCESSION_RAISED_EVENT), topic(CHALLENGED_EVENT),
+            ]]
         }])).await?;
         let after = self
             .rpc("eth_getBlockByNumber", json!([format!("0x{to:x}"), false]))
@@ -1057,22 +1312,70 @@ impl ChallengeService {
             before_hash == after_hash,
             "chain reorganized while reading escape events; retrying range"
         );
-        for log in logs.as_array().context("RPC logs must be an array")? {
-            if log.get("removed").and_then(Value::as_bool) == Some(true) {
-                continue;
+        let mut logs = logs
+            .as_array()
+            .context("RPC logs must be an array")?
+            .iter()
+            .filter(|log| log.get("removed").and_then(Value::as_bool) != Some(true))
+            .map(|log| {
+                let position = |field: &str| log.get(field).and_then(|value| quantity(value).ok());
+                (position("blockNumber"), position("logIndex"), log)
+            })
+            .collect::<Vec<_>>();
+        // The concession record follows its initiation in the same
+        // transaction: apply the logs in chain order.
+        logs.sort_by_key(|(block, index, _)| (*block, *index));
+        for (block, _, log) in logs {
+            match decode_scan_event(log)? {
+                ScanEvent::Initiated {
+                    note,
+                    nullifier,
+                    deadline,
+                } => {
+                    self.track_escape(note, nullifier, Some(deadline), block);
+                }
+                ScanEvent::Recorded {
+                    note,
+                    next_nullifier,
+                    state_balance,
+                    conceded,
+                } => {
+                    if let Some(entry) = self
+                        .checkpoint
+                        .pending
+                        .get_mut(&note)
+                        .filter(|entry| entry.next_nullifier.is_none())
+                    {
+                        entry.next_nullifier = Some(next_nullifier);
+                        entry.state_balance = Some(state_balance);
+                        entry.conceded = Some(conceded);
+                    }
+                }
+                ScanEvent::Raised {
+                    note,
+                    nullifier,
+                    conceded,
+                } => {
+                    if let Some(entry) = self
+                        .checkpoint
+                        .pending
+                        .get_mut(&note)
+                        .filter(|entry| entry.nullifier == nullifier)
+                    {
+                        entry.conceded = Some(entry.conceded.unwrap_or(0).max(conceded));
+                    }
+                }
+                ScanEvent::Challenged { note, nullifier } => {
+                    if self
+                        .checkpoint
+                        .pending
+                        .get(&note)
+                        .is_some_and(|entry| entry.nullifier == nullifier)
+                    {
+                        tracing::info!(note_id = note, nullifier = %nullifier, "escape defeated; any pending raise for it is dropped");
+                    }
+                }
             }
-            let topics = log["topics"]
-                .as_array()
-                .context("escape event lacks topics")?;
-            ensure!(topics.len() == 2, "malformed escape event topics");
-            let note = quantity(&topics[1])?;
-            ensure!(note <= u32::MAX as u64, "escape note ID exceeds uint32");
-            let words = words(&log["data"])?;
-            ensure!(words.len() == 5, "malformed escape event data");
-            let block = log
-                .get("blockNumber")
-                .and_then(|block| quantity(block).ok());
-            self.track_escape(note as u32, words[0], felt_u64(&words[3]).ok(), block);
         }
         self.checkpoint.last_block_hash = Some(after_hash.to_owned());
         self.checkpoint.next_block = to.saturating_add(1);
@@ -1270,7 +1573,7 @@ impl ChallengeService {
                 break;
             }
             checked += 1;
-            let state = match self.withdrawal_state(escape.note_id, None).await {
+            let state = match self.escape_state(escape.note_id, head).await {
                 Ok(state) => state,
                 Err(error) => {
                     tracing::warn!(note_id = escape.note_id, error = %error, "could not confirm an indexer-listed escape");
@@ -1328,6 +1631,7 @@ impl ChallengeService {
             self.indexer.escapes_added_from_indexer += 1;
             changed |=
                 self.track_escape(escape.note_id, state.nullifier, Some(state.deadline), None);
+            self.set_concession(escape.note_id, &state);
         }
         let mut since = self
             .indexer
@@ -1379,7 +1683,7 @@ impl ChallengeService {
         &mut self,
         note: u32,
         tracked: Felt252,
-        state: &WithdrawalState,
+        state: &EscapeState,
     ) -> anyhow::Result<()> {
         tracing::warn!(
             note_id = note,
@@ -1388,7 +1692,23 @@ impl ChallengeService {
             "the vault holds a different escape than the one tracked for this note; tracking the vault's"
         );
         self.track_escape(note, state.nullifier, Some(state.deadline), None);
+        self.set_concession(note, state);
         self.persist()
+    }
+
+    /// Record the vault's concession of the tracked escape (the caller
+    /// persists).
+    fn set_concession(&mut self, note: u32, state: &EscapeState) {
+        if let Some(entry) = self
+            .checkpoint
+            .pending
+            .get_mut(&note)
+            .filter(|entry| state.exists && entry.nullifier == state.nullifier)
+        {
+            entry.next_nullifier = Some(state.next_nullifier);
+            entry.state_balance = Some(state.state_balance);
+            entry.conceded = Some(state.conceded);
+        }
     }
 
     fn observation_due(&mut self) -> bool {
@@ -1645,7 +1965,10 @@ impl ChallengeService {
         head: &HeadInfo,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
-        let state = self.current_withdrawal(note, &pending, head).await?;
+        if pending.retire_leaf {
+            return self.reconcile_retirement(note, nonce_state, head).await;
+        }
+        let state = self.escape_state(note, head.number).await?;
         if state.exists && state.nullifier != pending.nullifier {
             // Re-checked every poll, so a tip reorg back to the tracked escape
             // restores it with its reservation.
@@ -1654,7 +1977,7 @@ impl ChallengeService {
         if !state.exists {
             return self.retire_if_confirmed(note, &pending, head).await;
         }
-        self.note_pending(note, state.deadline)?;
+        self.note_pending(note, &state)?;
         self.note_seen(
             note,
             head.number
@@ -1662,67 +1985,457 @@ impl ChallengeService {
                 .saturating_sub(SEEN_MARGIN_BLOCKS),
             LOG_RANGE_BLOCKS,
         )?;
-        let evidence = self.watcher.evidence_status(&pending.nullifier);
+        let decision = match self.decide(&state, head.timestamp) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.record(note, decision_unreadable(&error));
+                return Err(error);
+            }
+        };
         if head.timestamp >= state.deadline {
             // Keep the obligation until confirmed vault completion, including
             // the possibility of a reorg back before the deadline.
             return self
-                .record_expiry(note, &evidence, state.deadline, Some(nonce_state))
+                .record_expiry(note, &decision, &state, Some(nonce_state))
                 .await;
         }
-        match evidence {
-            Ok(EvidenceStatus::Ready(_)) => match nonce_state {
-                NonceState::Mined => {
-                    self.mined_unconfirmed(note).await;
-                    Ok(())
-                }
-                NonceState::Pending => self.maybe_replace(note, head, true).await,
-                NonceState::Held => self.maybe_replace(note, head, false).await,
-                NonceState::Free => self.submit(note, None, head, FeePlan::First).await,
-                NonceState::Reserved => {
-                    let plan = self
-                        .persisted_fees(note)
-                        .map_or(FeePlan::First, FeePlan::Resend);
-                    self.submit(note, pending.nonce, head, plan).await
-                }
+        let successor_invalid = decision.successor_invalid.clone();
+        let acted = self.act(note, nonce_state, head, &pending, decision).await;
+        let Some(detail) = successor_invalid else {
+            return acted;
+        };
+        // Whatever was sent, the rows that do not verify stay alarmed on.
+        self.flag_invalid_evidence(note, &detail);
+        acted.and(Err(anyhow!(detail)))
+    }
+
+    /// Mark the obligation's recorded status blocked on evidence that does
+    /// not verify, unless a condition as critical already blocks it.
+    fn flag_invalid_evidence(&mut self, note: u32, detail: &str) {
+        let Some(evaluation) = self.evaluations.get_mut(&note) else {
+            return;
+        };
+        if evaluation
+            .blocked
+            .is_some_and(BlockedReason::is_immediately_critical)
+        {
+            return;
+        }
+        let detail = match (evaluation.blocked, &evaluation.detail) {
+            (Some(_), Some(previous)) => format!("{detail}; {previous}"),
+            _ => detail.to_owned(),
+        };
+        if evaluation.blocked.is_none() {
+            let entry = self.blocked_since.entry(note).or_insert((unix_now(), 0));
+            entry.1 = entry.1.saturating_add(1);
+        }
+        evaluation.blocked = Some(BlockedReason::EvidenceInvalid);
+        evaluation.detail = Some(bounded(&detail));
+    }
+
+    /// The deployment every evidence row must name.
+    fn evidence_binding(&self) -> anyhow::Result<EvidenceBinding> {
+        let state_key = self
+            .vault_state_key
+            .context("vault state signing key not yet read")?;
+        Ok(EvidenceBinding {
+            chain_id: self.config.chain_id,
+            contract_address: self.config.contract_address,
+            state_key,
+        })
+    }
+
+    /// §5.4's decision order for a pending escape at chain time `now`: a
+    /// defeat with any verified evidence at `N⁺`; otherwise a raise to `Ω`
+    /// once `Ω` is final, or at `deadline - raise_lead_seconds` at the
+    /// latest, when `min(Ω, bound, B)` exceeds the concession by at least
+    /// `raise_min_units`; otherwise nothing. Rows at `N⁺` that do not verify
+    /// defeat nothing: they are reported (`successor_invalid`) and the raise
+    /// is decided as without them. An unreadable database is an error, never
+    /// "nothing due".
+    fn decide(&self, state: &EscapeState, now: u64) -> anyhow::Result<Decision> {
+        let binding = self.evidence_binding()?;
+        let unreadable = |error: ServerError| anyhow!("evidence database read failed: {error}");
+        let raise_due_at = state
+            .deadline
+            .saturating_sub(self.config.raise_lead_seconds);
+        let successor = self
+            .watcher
+            .verified_evidence(&state.next_nullifier, &self.verifier, &binding)
+            .map_err(unreadable)?;
+        if let Some(evidence) = successor.earliest() {
+            return Ok(Decision {
+                evidence: EvidenceKind::Successor,
+                settlement: None,
+                owed: None,
+                raise_due_at,
+                due: Due::Defeat {
+                    evidence: evidence.clone(),
+                    before_deadline: successor.existed_before(state.deadline),
+                },
+                successor_invalid: None,
+            });
+        }
+        let successor_invalid = (!successor.rejected.is_empty()).then(|| {
+            format!(
+                "evidence at the successor nullifier does not verify: {}",
+                successor.rejected.join("; ")
+            )
+        });
+        let decision = |evidence, settlement, owed, due: Due| Decision {
+            // Shown as corrupt unless a raise is sent from verified rows.
+            evidence: if successor_invalid.is_some() && !matches!(due, Due::Raise { .. }) {
+                EvidenceKind::Corrupt
+            } else {
+                evidence
             },
-            other => match self.evaluate_evidence(note, other) {
-                Some(error) => Err(error),
-                None => Ok(()),
+            settlement,
+            owed,
+            raise_due_at,
+            due,
+            successor_invalid: successor_invalid.clone(),
+        };
+        let Owed { basis, settlement } = self.watcher.owed(&state.nullifier).map_err(unreadable)?;
+        let at_escaped = self
+            .watcher
+            .verified_evidence(&state.nullifier, &self.verifier, &binding)
+            .map_err(unreadable)?;
+        let raise_evidence = at_escaped.max_bound();
+        let (kind, owed) = match basis {
+            OwedBasis::Settled { charge } => (EvidenceKind::Settled, Some(charge)),
+            OwedBasis::Unsettled => (
+                EvidenceKind::Unsettled,
+                (now >= raise_due_at)
+                    .then(|| raise_evidence.map(|evidence| evidence.inputs.solvency_bound))
+                    .flatten(),
+            ),
+            OwedBasis::Nothing(why) => (nothing_kind(why), Some(0)),
+        };
+        let Some(owed) = owed else {
+            if raise_evidence.is_none() && !at_escaped.rejected.is_empty() {
+                return Ok(decision(
+                    EvidenceKind::Corrupt,
+                    settlement,
+                    None,
+                    Due::Invalid {
+                        kind: CallKind::Raise,
+                        detail: format!(
+                            "evidence at the escaped nullifier does not verify: {}",
+                            at_escaped.rejected.join("; ")
+                        ),
+                    },
+                ));
+            }
+            return Ok(decision(kind, settlement, None, Due::AwaitingSettlement));
+        };
+        // What the vault would concede: min(amount, proof bound, B).
+        let target = raise_evidence.map_or(0, |evidence| {
+            owed.min(evidence.inputs.solvency_bound)
+                .min(state.state_balance)
+        });
+        let due = match raise_evidence {
+            Some(evidence)
+                if target > state.conceded
+                    && target - state.conceded >= self.config.raise_min_units =>
+            {
+                Due::Raise {
+                    evidence: evidence.clone(),
+                    amount: owed,
+                }
+            }
+            None if owed > state.conceded && !at_escaped.rejected.is_empty() => Due::Invalid {
+                kind: CallKind::Raise,
+                detail: format!(
+                    "evidence at the escaped nullifier does not verify: {}",
+                    at_escaped.rejected.join("; ")
+                ),
             },
+            _ if owed == 0 => Due::Nothing {
+                covered: false,
+                detail: match basis {
+                    OwedBasis::Nothing(why) => why.reason().to_string(),
+                    _ => "the request at the escaped nullifier was charged nothing".into(),
+                },
+            },
+            _ if target > state.conceded => Due::Nothing {
+                covered: false,
+                detail: format!(
+                    "a raise of {} units is below --raise-min-units {}",
+                    target - state.conceded,
+                    self.config.raise_min_units
+                ),
+            },
+            _ => Due::Nothing {
+                covered: true,
+                detail: format!(
+                    "the concession {} covers the {owed} units owed",
+                    state.conceded
+                ),
+            },
+        };
+        Ok(decision(
+            if matches!(due, Due::Invalid { .. }) {
+                EvidenceKind::Corrupt
+            } else {
+                kind
+            },
+            settlement,
+            Some(owed),
+            due,
+        ))
+    }
+
+    /// Send, replace or keep the call `decision` makes due, on the note's
+    /// nonce lane. A defeat replaces an unmined raise at its nonce; a raise
+    /// never replaces a defeat; any other replacement changes only fees.
+    async fn act(
+        &mut self,
+        note: u32,
+        nonce_state: NonceState,
+        head: &HeadInfo,
+        pending: &PendingChallenge,
+        decision: Decision,
+    ) -> anyhow::Result<()> {
+        let attempt = pending.attempt.kind();
+        if nonce_state == NonceState::Mined {
+            if attempt == CallKind::Raise || self.replaced_raise_mined(note, pending).await {
+                // The raise landed, or reverted harmlessly. Its nonce stays
+                // tracked until confirmed; a defeat goes on the next nonce.
+                self.detach_nonce(note);
+                let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+                entry.nonce = None;
+                entry.transaction_hash = None;
+                entry.attempt = NonceAttempts::default();
+                self.observed_fees.remove(&note);
+                self.persist()?;
+                tracing::info!(
+                    note_id = note,
+                    "a raise was mined; any defeat goes on the next nonce"
+                );
+                let refreshed = self.checkpoint.pending[&note].clone();
+                return Box::pin(self.act(note, NonceState::Free, head, &refreshed, decision))
+                    .await;
+            }
+            self.mined_unconfirmed(note, decision.evidence).await;
+            return Ok(());
+        }
+        let evidence_kind = decision.evidence;
+        let (call, row) = match &decision.due {
+            Due::Defeat { evidence, .. } => (
+                VaultCall::Defeat {
+                    note_id: note,
+                    inputs: evidence.inputs.clone(),
+                    proof: evidence.proof.clone(),
+                },
+                evidence.row_id,
+            ),
+            Due::Raise { evidence, amount } => (
+                VaultCall::Raise {
+                    note_id: note,
+                    inputs: evidence.inputs.clone(),
+                    proof: evidence.proof.clone(),
+                    amount: *amount,
+                },
+                evidence.row_id,
+            ),
+            _ => {
+                return self
+                    .hold_without_call(note, nonce_state, head, pending, decision)
+                    .await
+            }
+        };
+        let context = SendContext {
+            evidence: evidence_kind,
+            evidence_row: Some(row),
+            root: None,
+            owed: decision.owed,
+            raise_due_at: Some(decision.raise_due_at),
+        };
+        match (nonce_state, call.kind(), attempt) {
+            // The one transition: a defeat replaces the unmined raise.
+            (NonceState::Pending | NonceState::Held, CallKind::Defeat, CallKind::Raise) => {
+                let nonce = pending.nonce.context("pending raise lacks a nonce")?;
+                let old = self.persisted_fees(note).or_else(|| {
+                    (nonce_state == NonceState::Pending)
+                        .then(|| self.observed_fees.get(&note).copied())
+                        .flatten()
+                });
+                let plan = old.map_or(FeePlan::First, FeePlan::Bump);
+                tracing::warn!(note_id = note, nonce, "successor evidence appeared while a raise is pending; the defeat replaces it on the same nonce");
+                self.submit(note, call, Some(nonce), head, plan, context)
+                    .await
+            }
+            // A raise never replaces a defeat: keep the pending defeat.
+            (NonceState::Pending | NonceState::Held, CallKind::Raise, CallKind::Defeat) => {
+                self.record(
+                    note,
+                    Evaluation::new(ObligationState::Submitted, Some(evidence_kind)).detail(
+                        "a defeat is pending on this note's nonce; a raise never replaces it",
+                    ),
+                );
+                Ok(())
+            }
+            (NonceState::Pending | NonceState::Held, CallKind::Raise, CallKind::Raise) => {
+                // Replacements keep the call: re-send the raise first sent.
+                match self.pending_raise_call(note, pending, &decision)? {
+                    Some(call) => {
+                        self.maybe_replace(
+                            note,
+                            head,
+                            nonce_state == NonceState::Pending,
+                            call,
+                            context,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.record(
+                            note,
+                            Evaluation::new(ObligationState::Submitted, Some(evidence_kind))
+                                .detail("the pending raise was built from evidence no longer at hand; it is kept as sent"),
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            (NonceState::Pending, _, _) => {
+                self.maybe_replace(note, head, true, call, context).await
+            }
+            (NonceState::Held, _, _) => self.maybe_replace(note, head, false, call, context).await,
+            (NonceState::Free, _, _) => {
+                self.submit(note, call, None, head, FeePlan::First, context)
+                    .await
+            }
+            (NonceState::Reserved, _, _) => {
+                let plan = self
+                    .persisted_fees(note)
+                    .map_or(FeePlan::First, FeePlan::Resend);
+                self.submit(note, call, pending.nonce, head, plan, context)
+                    .await
+            }
+            (NonceState::Mined, _, _) => unreachable!("handled above"),
         }
     }
 
-    /// The tracked escape's withdrawal at the latest block. When that shows
-    /// it pending at a head past its deadline, which makes it a missed
-    /// deadline, the withdrawal is read again at the head block itself: a
-    /// backend of a load-balanced RPC behind the head can answer a
-    /// latest-block read with an escape that a challenge mined just before
-    /// the deadline ended. A backend without the head block fails that read
-    /// instead of answering stale, and the poll is retried.
-    async fn current_withdrawal(
+    /// The raise first sent on the note's nonce, rebuilt from its evidence
+    /// row and amount (None when that row no longer verifies).
+    fn pending_raise_call(
         &self,
         note: u32,
         pending: &PendingChallenge,
-        head: &HeadInfo,
-    ) -> anyhow::Result<WithdrawalState> {
-        let state = self.withdrawal_state(note, None).await?;
-        if state.exists && state.nullifier == pending.nullifier && head.timestamp >= state.deadline
+        decision: &Decision,
+    ) -> anyhow::Result<Option<VaultCall>> {
+        let (Some(row), Some(amount)) =
+            (pending.attempt.evidence_row, pending.attempt.raise_amount)
+        else {
+            return Ok(None);
+        };
+        if let Due::Raise {
+            evidence,
+            amount: due,
+        } = &decision.due
         {
-            return self.withdrawal_state(note, Some(head.number)).await;
+            if evidence.row_id == row && *due == amount {
+                return Ok(Some(VaultCall::Raise {
+                    note_id: note,
+                    inputs: evidence.inputs.clone(),
+                    proof: evidence.proof.clone(),
+                    amount,
+                }));
+            }
         }
-        Ok(state)
+        let binding = self.evidence_binding()?;
+        let set = self
+            .watcher
+            .verified_evidence(&pending.nullifier, &self.verifier, &binding)
+            .map_err(|error| anyhow!("evidence database read failed: {error}"))?;
+        Ok(set
+            .verified
+            .into_iter()
+            .find(|evidence| evidence.row_id == row)
+            .map(|evidence| VaultCall::Raise {
+                note_id: note,
+                inputs: evidence.inputs,
+                proof: evidence.proof,
+                amount,
+            }))
     }
 
-    /// Do not discard an obligation due to an unconfirmed challenge or
+    /// Whether the nonce of a defeat that replaced a raise was consumed by
+    /// the raise: the defeat has no receipt although its nonce is mined.
+    async fn replaced_raise_mined(&self, note: u32, pending: &PendingChallenge) -> bool {
+        if !pending.attempt.replaced_raise || pending.attempt.kind() != CallKind::Defeat {
+            return false;
+        }
+        let Some(hash) = pending.transaction_hash.as_ref() else {
+            return false;
+        };
+        matches!(
+            self.rpc("eth_getTransactionReceipt", json!([hash])).await,
+            Ok(receipt) if receipt.is_null()
+        ) && self
+            .checkpoint
+            .pending
+            .get(&note)
+            .is_some_and(|entry| entry.nonce.is_some())
+    }
+
+    /// Nothing is to be sent (awaiting settlement, nothing due, or invalid
+    /// evidence). A raise already on the note's nonce is left to mine (a
+    /// moot raise reverts harmlessly); one no attempt holds is released.
+    async fn hold_without_call(
+        &mut self,
+        note: u32,
+        nonce_state: NonceState,
+        _head: &HeadInfo,
+        pending: &PendingChallenge,
+        decision: Decision,
+    ) -> anyhow::Result<()> {
+        let mut evaluation = evaluation_of(&decision);
+        if let Some(nonce) = pending.nonce {
+            match nonce_state {
+                NonceState::Reserved if pending.attempt.kind() == CallKind::Raise => {
+                    // No attempt holds the nonce: the raise is no longer due.
+                    let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+                    entry.nonce = None;
+                    entry.transaction_hash = None;
+                    entry.attempt = NonceAttempts::default();
+                    self.observed_fees.remove(&note);
+                    self.persist()?;
+                    tracing::warn!(note_id = note, nonce, "released the nonce of a raise that is no longer due and that no attempt holds");
+                }
+                NonceState::Pending | NonceState::Held => {
+                    evaluation = Evaluation {
+                        state: ObligationState::Submitted,
+                        ..evaluation
+                    }
+                    .detail(format!(
+                        "a {} no longer due is pending on nonce {nonce}; if it mines it reverts harmlessly",
+                        pending.attempt.kind().as_str()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let error = match &decision.due {
+            Due::Invalid { detail, .. } => Some(anyhow!("{detail}")),
+            _ => None,
+        };
+        self.record(note, evaluation);
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Do not discard an obligation due to an unconfirmed defeat or
     /// finalization that a tip reorg could remove without changing the
     /// event-scan checkpoint block. An escape gone at confirmation depth
-    /// while evidence existed or was expected may have been paid out rather
-    /// than challenged: whatever polls saw before (the escaper can finalize
-    /// in the first block at the deadline, or while the daemon is down), that
-    /// is recorded as a missed deadline before the obligation retires. While
-    /// the evidence database cannot say whether evidence existed, the
-    /// obligation is kept and the error returned, so a later poll decides.
+    /// while a defeat or raise was due may have been paid out rather than
+    /// defeated: whatever polls saw before (the escaper can finalize in the
+    /// first block at the deadline, or while the daemon is down), that is
+    /// recorded as a missed deadline before the obligation retires, and
+    /// after a missed defeat with `retire_on_miss` the obligation turns to
+    /// retiring the closed note's leaf. While the evidence database cannot
+    /// say whether evidence existed, the obligation is kept and the error
+    /// returned, so a later poll decides.
     async fn retire_if_confirmed(
         &mut self,
         note: u32,
@@ -1772,6 +2485,26 @@ impl ChallengeService {
         // A nonce no attempt was broadcast on is released rather than kept.
         self.release_if_never_broadcast(note).await;
         self.detach_nonce(note);
+        let missed_defeat = self.checkpoint.pending[&note].missed_kind == Some(CallKind::Defeat);
+        if missed_defeat
+            && self.config.retire_on_miss
+            && self.note_closed_at(note, confirmed).await?
+        {
+            let entry = self.checkpoint.pending.get_mut(&note).unwrap();
+            entry.retire_leaf = true;
+            entry.nonce = None;
+            entry.transaction_hash = None;
+            entry.attempt = NonceAttempts::default();
+            self.forget_observations(note);
+            self.persist()?;
+            tracing::error!(note_id = note, nullifier = %pending.nullifier, "escape paid out after a missed defeat; retiring the closed note's leaf (--retire-on-miss)");
+            self.record(
+                note,
+                Evaluation::new(ObligationState::RetiringLeaf, Some(EvidenceKind::Leaf))
+                    .detail("retiring the closed note's leaf after a missed defeat"),
+            );
+            return Ok(());
+        }
         self.checkpoint.pending.remove(&note);
         self.forget_observations(note);
         self.persist()?;
@@ -1783,8 +2516,19 @@ impl ChallengeService {
         Ok(())
     }
 
+    /// Whether `notes(note).status` is Closed at the `confirmed` block.
+    async fn note_closed_at(&self, note: u32, confirmed: u64) -> anyhow::Result<bool> {
+        let mut query = selector("notes(uint32)");
+        query.extend_from_slice(Felt252::from_u64(note as u64).as_bytes());
+        let state = self
+            .call_at(query, json!(format!("0x{confirmed:x}")))
+            .await?;
+        ensure!(state.len() == 4, "malformed note response");
+        Ok(felt_u64(&state[3])? == NOTE_STATUS_CLOSED)
+    }
+
     /// The confirmed block (the latest less the confirmations) when the
-    /// tracked withdrawal, gone at the latest block, is gone there too; None
+    /// tracked escape, gone at the latest block, is gone there too; None
     /// while it is pending there or no block is that deep.
     async fn gone_at_confirmed(
         &mut self,
@@ -1795,7 +2539,7 @@ impl ChallengeService {
         let Some(confirmed) = latest.checked_sub(self.config.confirmations) else {
             return Ok(None);
         };
-        let state = self.withdrawal_state(note, Some(confirmed)).await?;
+        let state = self.escape_state(note, confirmed).await?;
         if state.exists && state.nullifier == pending.nullifier {
             self.note_seen(note, confirmed, 1)?;
             return Ok(None);
@@ -1839,39 +2583,47 @@ impl ChallengeService {
                 tracing::warn!(note_id = note, nullifier = %pending.nullifier, "the escape was paid out after its challenge deadline; taken for a miss the earlier release counted in missed_total without its nullifier, so not counted again");
             }
             Some(EscapeOutcome::PaidOut { inferred }) => {
-                let reason = if inferred {
-                    format!(
-                        "{}; the note is closed and no challenge of the escape is logged",
+                let mut evidence = evidence.clone();
+                if inferred {
+                    evidence.reason = format!(
+                        "{}; the note is closed and no defeat of the escape is logged",
                         evidence.reason
-                    )
-                } else {
-                    evidence.reason.to_string()
-                };
+                    );
+                }
                 self.record_missed(
                     note,
                     pending.challenge_deadline.unwrap_or_default(),
-                    &reason,
+                    &evidence,
                 )?;
             }
         }
         Ok(outcome)
     }
 
-    /// The evidence of an obligation whose withdrawal is gone, when losing
-    /// the escape would be a missed deadline (the reasons of `record_expiry`).
-    /// An unreadable evidence database is an error: unlike at the deadline,
-    /// nothing is lost by waiting for it, as the escape has already ended.
+    /// What made losing an escape whose withdrawal is gone a missed deadline
+    /// (as `record_expiry` decides it): verified evidence at `N⁺` written
+    /// before the deadline (a missed defeat), or more owed at `N` than the
+    /// last concession read (a missed raise). An unreadable evidence database
+    /// is an error: unlike at the deadline, nothing is lost by waiting, as
+    /// the escape has already ended.
     fn payout_evidence(&self, pending: &PendingChallenge) -> anyhow::Result<Option<MissEvidence>> {
-        let status = self
-            .watcher
-            .evidence_status(&pending.nullifier)
-            .map_err(|error| anyhow!("evidence database read failed: {error}"))?;
-        let (kind, settlement, reason) = miss_reason(&Ok(status));
-        Ok(reason.map(|reason| MissEvidence {
-            kind,
-            settlement,
-            reason,
-        }))
+        let (Some(deadline), Some(state_balance)) =
+            (pending.challenge_deadline, pending.state_balance)
+        else {
+            return Ok(None);
+        };
+        let state = EscapeState {
+            exists: true,
+            nullifier: pending.nullifier,
+            final_balance: state_balance.saturating_sub(pending.conceded.unwrap_or(0)),
+            deadline,
+            next_nullifier: pending.next_nullifier.unwrap_or(Felt252::ZERO),
+            state_balance,
+            conceded: pending.conceded.unwrap_or(0),
+        };
+        // After the deadline Ω is final or the request's bound.
+        let decision = self.decide(&state, deadline)?;
+        Ok(miss_of(&decision))
     }
 
     /// Whether the withdrawal, gone at the latest block, ended before its
@@ -1891,7 +2643,7 @@ impl ChallengeService {
             return Ok(false);
         }
         let nullifier = pending.nullifier;
-        let state = self.withdrawal_state(note, Some(head.number)).await?;
+        let state = self.escape_state(note, head.number).await?;
         if state.exists && state.nullifier == nullifier {
             // Gone only in a block after the head, which may be at the deadline.
             return Ok(false);
@@ -2047,12 +2799,12 @@ impl ChallengeService {
         Ok(())
     }
 
-    /// How an escape with evidence, gone past its deadline behind a blocked
+    /// How an escape with a miss, gone past its deadline behind a blocked
     /// queue, ended, once that is known at confirmation depth: a payout is
     /// recorded as a missed deadline when found, not once the queue moves.
-    /// An escape a challenge ended (or whose initiation was reorganized out)
-    /// is marked as ended before its deadline, so it is shown resolved and
-    /// not read again. Returns whether it ended without a payout.
+    /// An escape a defeat ended (or whose initiation was reorganized out) is
+    /// marked as ended before its deadline, so it is shown resolved and not
+    /// read again. Returns whether it ended without a payout.
     async fn observe_payout(
         &mut self,
         note: u32,
@@ -2106,7 +2858,17 @@ impl ChallengeService {
         blocked: Option<(BlockedReason, String)>,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
-        let state = self.current_withdrawal(note, &pending, head).await?;
+        if pending.retire_leaf {
+            let mut evaluation =
+                Evaluation::new(ObligationState::RetiringLeaf, Some(EvidenceKind::Leaf))
+                    .detail("retiring the closed note's leaf after a missed defeat");
+            if let Some((reason, detail)) = blocked {
+                evaluation = evaluation.blocked(reason, detail);
+            }
+            self.record(note, evaluation);
+            return Ok(());
+        }
+        let state = self.escape_state(note, head.number).await?;
         if state.exists && state.nullifier != pending.nullifier {
             return self.follow_vault_escape(note, pending.nullifier, &state);
         }
@@ -2128,154 +2890,54 @@ impl ChallengeService {
             self.record(note, evaluation);
             return Ok(());
         }
-        self.note_pending(note, state.deadline)?;
-        let evidence = self.watcher.evidence_status(&pending.nullifier);
+        self.note_pending(note, &state)?;
+        let decision = match self.decide(&state, head.timestamp) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.record(note, decision_unreadable(&error));
+                return Ok(());
+            }
+        };
         if head.timestamp >= state.deadline {
-            return self
-                .record_expiry(note, &evidence, state.deadline, None)
-                .await;
+            return self.record_expiry(note, &decision, &state, None).await;
         }
-        match evidence {
-            Ok(EvidenceStatus::Ready(_)) => {
-                let state = if pending.transaction_hash.is_some() {
-                    ObligationState::Submitted
-                } else {
-                    ObligationState::Ready
-                };
-                let mut evaluation = Evaluation::new(state, Some(EvidenceKind::Finalized));
-                if let Some((reason, detail)) = blocked {
-                    evaluation = evaluation.blocked(reason, detail);
-                }
-                self.record(note, evaluation);
-            }
-            other => {
-                self.evaluate_evidence(note, other);
+        let mut evaluation = evaluation_of(&decision);
+        if matches!(decision.due, Due::Defeat { .. } | Due::Raise { .. }) {
+            evaluation.state = if pending.transaction_hash.is_some() {
+                ObligationState::Submitted
+            } else {
+                ObligationState::Ready
+            };
+            if let Some((reason, detail)) = blocked {
+                evaluation = evaluation.blocked(reason, detail);
             }
         }
+        self.record(note, evaluation);
         Ok(())
     }
 
-    /// Record a non-Ready evidence state. Returns the error a reconcile must
-    /// propagate (corrupt evidence or an unreadable database).
-    fn evaluate_evidence(
-        &mut self,
-        note: u32,
-        evidence: Result<EvidenceStatus, ServerError>,
-    ) -> Option<anyhow::Error> {
-        match evidence {
-            Err(error) => {
-                let error = anyhow!("evidence database read failed: {error}");
-                self.record(
-                    note,
-                    Evaluation::new(ObligationState::Ready, Some(EvidenceKind::Unavailable))
-                        .blocked(BlockedReason::EvidenceDbError, error.to_string()),
-                );
-                Some(error)
-            }
-            Ok(EvidenceStatus::Corrupt(reason)) => {
-                let error = anyhow!("corrupt finalized evidence: {reason}");
-                self.record(
-                    note,
-                    Evaluation::new(ObligationState::Ready, Some(EvidenceKind::Corrupt))
-                        .blocked(BlockedReason::EvidenceInvalid, error.to_string()),
-                );
-                Some(error)
-            }
-            Ok(EvidenceStatus::AwaitingSettlement(progress)) => {
-                let thresholds = self.thresholds();
-                let deadline = self.checkpoint.pending[&note].challenge_deadline;
-                let mut evaluation = if let Some(error) = &progress.lease_read_error {
-                    Evaluation::new(
-                        ObligationState::AwaitingSettlement,
-                        Some(EvidenceKind::Unavailable),
-                    )
-                    .blocked(
-                        BlockedReason::EvidenceDbError,
-                        format!("lease row unreadable; settlement cannot progress: {error}"),
-                    )
-                } else if progress.lease_status.is_none() {
-                    Evaluation::new(
-                        ObligationState::AwaitingSettlement,
-                        Some(EvidenceKind::ReservedWithoutLease),
-                    )
-                    .detail("reservation has no lease row; issuance never completed")
-                } else if progress.lease_status.as_deref() == Some("cancelled") {
-                    Evaluation::new(
-                        ObligationState::AwaitingSettlement,
-                        Some(EvidenceKind::Reserved),
-                    )
-                    .detail("lease cancelled for a corrupt binding; no evidence will be produced")
-                } else {
-                    // The write-once settlement deadline bounds when evidence
-                    // exists; rows without one fall back to the next attempt.
-                    let late = progress.evidence_expected_by().zip(deadline).is_some_and(
-                        |(expected_by, deadline)| {
-                            expected_by
-                                >= deadline.saturating_sub(thresholds.critical_remaining_seconds)
-                        },
-                    );
-                    let overdue = progress.settle_after.is_some_and(|settle_after| {
-                        unix_now()
-                            > settle_after
-                                .saturating_add(self.config.alarms.settlement_overdue_seconds)
-                    });
-                    Evaluation::new(
-                        ObligationState::AwaitingSettlement,
-                        Some(EvidenceKind::Reserved),
-                    )
-                    .detail(if late {
-                        "settlement scheduled after the challenge critical threshold"
-                    } else if overdue {
-                        "settlement overdue; is the API server settling?"
-                    } else {
-                        "awaiting finalized settlement"
-                    })
-                };
-                evaluation.settlement = Some(progress);
-                self.record(note, evaluation);
-                None
-            }
-            Ok(EvidenceStatus::ClearanceOnly) => {
-                self.record(
-                    note,
-                    Evaluation::new(ObligationState::NoEvidence, Some(EvidenceKind::Clearance))
-                        .detail("nullifier is reserved only for a withdrawal clearance"),
-                );
-                None
-            }
-            Ok(EvidenceStatus::Unknown) => {
-                self.record(
-                    note,
-                    Evaluation::new(ObligationState::NoEvidence, Some(EvidenceKind::Unknown))
-                        .detail("no server request at this nullifier"),
-                );
-                None
-            }
-            Ok(EvidenceStatus::Ready(_)) => None,
-        }
-    }
-
-    /// The deadline passed: a missed challenge when evidence existed or was
-    /// expected, otherwise an expiry without evidence. An unmined reserved
-    /// nonce of an expired obligation still blocks new allocations, unless no
-    /// attempt on it was broadcast.
+    /// The deadline passed: a missed defeat or raise when one was due,
+    /// otherwise an expiry with nothing due. An unmined reserved nonce of an
+    /// expired obligation still blocks new allocations, unless no attempt on
+    /// it was broadcast.
     async fn record_expiry(
         &mut self,
         note: u32,
-        evidence: &Result<EvidenceStatus, ServerError>,
-        deadline: u64,
+        decision: &Decision,
+        state: &EscapeState,
         nonce_state: Option<NonceState>,
     ) -> anyhow::Result<()> {
-        let (kind, settlement, missed_reason) = miss_reason(evidence);
-        let mut evaluation = match missed_reason {
-            Some(reason) => {
-                self.record_missed(note, deadline, reason)?;
-                Evaluation::new(ObligationState::Missed, Some(kind)).detail(reason)
+        let mut evaluation = match miss_of(decision) {
+            Some(miss) => {
+                self.record_missed(note, state.deadline, &miss)?;
+                Evaluation::new(ObligationState::Missed, Some(miss.evidence)).detail(miss.reason)
             }
-            None => Evaluation::new(ObligationState::ExpiredWithoutEvidence, Some(kind))
-                .detail("deadline passed without challenge evidence"),
+            None => Evaluation::new(ObligationState::ExpiredNothingDue, Some(decision.evidence))
+                .detail("deadline passed with nothing due"),
         };
-        evaluation.settlement = settlement;
+        evaluation.settlement = decision.settlement.clone();
+        evaluation.owed = decision.owed;
+        evaluation.raise_due_at = Some(decision.raise_due_at);
         if matches!(nonce_state, Some(NonceState::Reserved | NonceState::Held)) {
             if self.release_if_never_broadcast(note).await {
                 self.persist()?;
@@ -2295,12 +2957,18 @@ impl ChallengeService {
         Ok(())
     }
 
-    fn record_missed(&mut self, note: u32, deadline: u64, reason: &str) -> anyhow::Result<()> {
+    fn record_missed(
+        &mut self,
+        note: u32,
+        deadline: u64,
+        miss: &MissEvidence,
+    ) -> anyhow::Result<()> {
         let entry = self.checkpoint.pending.get_mut(&note).unwrap();
         if entry.deadline_reported {
             return Ok(());
         }
         entry.deadline_reported = true;
+        entry.missed_kind = Some(miss.kind);
         let nullifier = entry.nullifier;
         if self.checkpoint.missed_nullifiers.contains(&nullifier) {
             // Counted before the escape was tracked again.
@@ -2308,35 +2976,58 @@ impl ChallengeService {
         }
         self.checkpoint.missed_nullifiers.push(nullifier);
         self.checkpoint.missed_total = self.checkpoint.missed_total.saturating_add(1);
+        match miss.kind {
+            CallKind::Raise => {
+                self.checkpoint.missed_raises_total =
+                    self.checkpoint.missed_raises_total.saturating_add(1)
+            }
+            _ => {
+                self.checkpoint.missed_defeats_total =
+                    self.checkpoint.missed_defeats_total.saturating_add(1)
+            }
+        }
         self.checkpoint.last_missed = Some(MissedRecord {
             note_id: note,
             nullifier,
             challenge_deadline: deadline,
-            reason: reason.into(),
+            reason: miss.reason.clone(),
             recorded_at: unix_now(),
+            kind: Some(miss.kind),
         });
-        tracing::error!(note_id = note, nullifier = %nullifier, reason, "MISSED escape challenge deadline");
+        tracing::error!(note_id = note, nullifier = %nullifier, missed = miss.kind.as_str(), reason = %miss.reason, "MISSED escape deadline");
         self.persist()
     }
 
-    /// The tracked escape is pending at the latest block with `deadline`.
-    fn note_pending(&mut self, note: u32, deadline: u64) -> anyhow::Result<()> {
+    /// The tracked escape is pending at the poll's head with `state`.
+    fn note_pending(&mut self, note: u32, state: &EscapeState) -> anyhow::Result<()> {
         let entry = self.checkpoint.pending.get_mut(&note).unwrap();
-        if entry.challenge_deadline != Some(deadline) || entry.ended_before_deadline {
-            entry.challenge_deadline = Some(deadline);
+        let concession = (
+            Some(state.next_nullifier),
+            Some(state.state_balance),
+            Some(state.conceded),
+        );
+        if entry.challenge_deadline != Some(state.deadline)
+            || entry.ended_before_deadline
+            || (entry.next_nullifier, entry.state_balance, entry.conceded) != concession
+        {
+            entry.challenge_deadline = Some(state.deadline);
             // A reorganization undid the end seen before the deadline.
             entry.ended_before_deadline = false;
+            (entry.next_nullifier, entry.state_balance, entry.conceded) = concession;
             self.persist()?;
         }
         Ok(())
     }
 
-    /// The nonce was consumed while the withdrawal is still pending, so the
-    /// mined challenge reverted (for example after a front-running deposit).
-    /// It keeps its deadline-derived severity until resubmission.
-    async fn mined_unconfirmed(&mut self, note: u32) {
+    /// The nonce was consumed while the escape is still pending, so the mined
+    /// defeat (or leaf retirement) reverted. It keeps its deadline-derived
+    /// severity until resubmission.
+    async fn mined_unconfirmed(&mut self, note: u32, evidence: EvidenceKind) {
         let pending = self.checkpoint.pending[&note].clone();
-        let mut detail = "nonce consumed while the withdrawal is still pending; resubmitting after confirmations".to_string();
+        let action = pending.attempt.kind().as_str();
+        let mut detail = format!(
+            "nonce consumed while the escape is still pending; resubmitting the {action} after confirmations"
+        );
         for hash in pending
             .transaction_hash
             .iter()
@@ -2344,19 +3035,131 @@ impl ChallengeService {
         {
             if let Ok(receipt) = self.rpc("eth_getTransactionReceipt", json!([hash])).await {
                 if receipt.get("status").and_then(Value::as_str) == Some("0x0") {
-                    detail = format!("challenge {hash} reverted; resubmitting after confirmations");
+                    detail = format!("{action} {hash} reverted; resubmitting after confirmations");
                     break;
                 }
             }
         }
         self.record(
             note,
-            Evaluation::new(
-                ObligationState::MinedUnconfirmed,
-                Some(EvidenceKind::Finalized),
-            )
-            .detail(detail),
+            Evaluation::new(ObligationState::MinedUnconfirmed, Some(evidence)).detail(detail),
         );
+    }
+
+    /// After a missed defeat was paid out: retire the closed note's leaf
+    /// with the indexer's path at the live root, then retire the obligation
+    /// once the leaf is zero there.
+    async fn reconcile_retirement(
+        &mut self,
+        note: u32,
+        nonce_state: NonceState,
+        head: &HeadInfo,
+    ) -> anyhow::Result<()> {
+        let base = |state: ObligationState| Evaluation::new(state, Some(EvidenceKind::Leaf));
+        macro_rules! blocked {
+            ($reason:expr, $error:expr) => {{
+                let error: anyhow::Error = $error;
+                self.record(
+                    note,
+                    base(ObligationState::RetiringLeaf).blocked($reason, error.to_string()),
+                );
+                return Err(error);
+            }};
+        }
+        let response = match self
+            .indexer_get::<PathResponse>(&format!("/v1/tree/notes/{note}/path"))
+            .await
+        {
+            Ok(response) => response,
+            Err(IndexerFailure::Decode(error)) => blocked!(
+                BlockedReason::IndexerInvalidResponse,
+                anyhow!("indexer returned a malformed path: {error}")
+            ),
+            Err(error) => blocked!(
+                BlockedReason::IndexerUnavailable,
+                anyhow!("indexer path request failed: {error}")
+            ),
+        };
+        if response.note_id != note {
+            blocked!(
+                BlockedReason::IndexerInvalidResponse,
+                anyhow!("indexer returned the path of another note")
+            );
+        }
+        let Ok(siblings) = <[Felt252; MERKLE_DEPTH]>::try_from(response.siblings) else {
+            blocked!(
+                BlockedReason::IndexerInvalidResponse,
+                anyhow!("indexer path must have 32 siblings")
+            );
+        };
+        let root = match self.live_root().await {
+            Ok(root) => root,
+            Err(error) => blocked!(BlockedReason::RpcError, error),
+        };
+        if zkapi_core::v2::merkle_root(note, &response.leaf, &siblings) != root {
+            let state = self
+                .classify_root_mismatch(
+                    response.root.unwrap_or(Felt252::ZERO),
+                    response.block_hash.as_deref(),
+                    response.block_number,
+                    head,
+                )
+                .await;
+            let reason = if state == IndexerState::Diverged {
+                BlockedReason::IndexerDiverged
+            } else {
+                BlockedReason::IndexerPathBehind
+            };
+            blocked!(
+                reason,
+                anyhow!("indexer path of note {note} does not hash to the vault's current root")
+            );
+        }
+        if response.leaf.is_zero() {
+            // The leaf is retired at the live root.
+            self.release_if_never_broadcast(note).await;
+            self.detach_nonce(note);
+            self.checkpoint.pending.remove(&note);
+            self.checkpoint.retired_leaves_total =
+                self.checkpoint.retired_leaves_total.saturating_add(1);
+            self.forget_observations(note);
+            self.persist()?;
+            tracing::warn!(
+                note_id = note,
+                "closed note's leaf retired after a missed defeat"
+            );
+            return Ok(());
+        }
+        let call = VaultCall::Retire {
+            note_id: note,
+            siblings: Box::new(siblings),
+        };
+        let context = SendContext {
+            evidence: EvidenceKind::Leaf,
+            evidence_row: None,
+            root: Some(root),
+            owed: None,
+            raise_due_at: None,
+        };
+        match nonce_state {
+            NonceState::Mined => {
+                self.mined_unconfirmed(note, EvidenceKind::Leaf).await;
+                Ok(())
+            }
+            NonceState::Pending => self.maybe_replace(note, head, true, call, context).await,
+            NonceState::Held => self.maybe_replace(note, head, false, call, context).await,
+            NonceState::Free => {
+                self.submit(note, call, None, head, FeePlan::First, context)
+                    .await
+            }
+            NonceState::Reserved => {
+                let nonce = self.checkpoint.pending[&note].nonce;
+                let plan = self
+                    .persisted_fees(note)
+                    .map_or(FeePlan::First, FeePlan::Resend);
+                self.submit(note, call, nonce, head, plan, context).await
+            }
+        }
     }
 
     /// Replace the queue-head attempt on its nonce when it has waited
@@ -2369,17 +3172,19 @@ impl ChallengeService {
         note: u32,
         head: &HeadInfo,
         visible: bool,
+        call: VaultCall,
+        context: SendContext,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
         let nonce = pending.nonce.context("pending challenge lacks a nonce")?;
         let (submitted, waiting) = if visible {
             (
-                Evaluation::new(ObligationState::Submitted, Some(EvidenceKind::Finalized)),
-                format!("pending on nonce {nonce}"),
+                context.evaluation(ObligationState::Submitted),
+                format!("{} pending on nonce {nonce}", call.kind().as_str()),
             )
         } else {
             (
-                Evaluation::new(ObligationState::Ready, Some(EvidenceKind::Finalized)),
+                context.evaluation(ObligationState::Ready),
                 format!("nonce {nonce} may be held by an attempt without a known hash"),
             )
         };
@@ -2405,7 +3210,9 @@ impl ChallengeService {
         let Some(old) = old else {
             if !visible {
                 // A reservation from an older daemon: its fees are unknown.
-                return self.submit(note, Some(nonce), head, FeePlan::First).await;
+                return self
+                    .submit(note, call, Some(nonce), head, FeePlan::First, context)
+                    .await;
             }
             self.record(
                 note,
@@ -2488,18 +3295,24 @@ impl ChallengeService {
                 return Ok(());
             }
         }
-        self.submit(note, Some(nonce), head, FeePlan::Bump(old))
+        self.submit(note, call, Some(nonce), head, FeePlan::Bump(old), context)
             .await
     }
 
-    /// Build, simulate and send a challenge on a new or reused nonce. The
-    /// nonce, fees and evidence digest are persisted before the send.
+    /// Build, simulate and send `call` on a new or reused nonce. The nonce,
+    /// call, fees and digest are persisted before the send. Every attempt on
+    /// a nonce makes the same call (the same digest), with one exception: a
+    /// defeat replaces a raise. A raise or a retirement never replaces a
+    /// defeat; a raise no attempt holds the nonce of may be replaced by any
+    /// call.
     async fn submit(
         &mut self,
         note: u32,
+        call: VaultCall,
         reuse: Option<u64>,
         head: &HeadInfo,
         plan: FeePlan,
+        context: SendContext,
     ) -> anyhow::Result<()> {
         let pending = self.checkpoint.pending[&note].clone();
         let base_state = if matches!(plan, FeePlan::Bump(_)) && pending.transaction_hash.is_some() {
@@ -2512,163 +3325,48 @@ impl ChallengeService {
                 let error: anyhow::Error = $error;
                 self.record(
                     note,
-                    Evaluation::new(base_state, Some(EvidenceKind::Finalized))
+                    context
+                        .evaluation(base_state)
                         .blocked($reason, error.to_string()),
                 );
                 return Err(error);
             }};
         }
-        let path_url = format!("/v1/tree/notes/{note}/zero-path");
-        let response = match self.indexer_get::<PathResponse>(&path_url).await {
-            Ok(response) => response,
-            Err(IndexerFailure::Decode(error)) => blocked!(
-                BlockedReason::IndexerInvalidResponse,
-                anyhow!("indexer returned a malformed zero path: {error}")
-            ),
-            Err(error) => blocked!(
-                BlockedReason::IndexerUnavailable,
-                anyhow!("indexer zero-path request failed: {error}")
-            ),
-        };
-        if response.note_id != note || response.leaf != Felt252::ZERO {
-            blocked!(
-                BlockedReason::IndexerInvalidResponse,
-                anyhow!("indexer returned the wrong zero slot")
-            );
-        }
-        let Ok(siblings) = <[Felt252; MERKLE_DEPTH]>::try_from(response.siblings) else {
-            blocked!(
-                BlockedReason::IndexerInvalidResponse,
-                anyhow!("indexer path must have 32 siblings")
-            );
-        };
-        let path_root = zkapi_core::v2::merkle_root(note, &Felt252::ZERO, &siblings);
-        let root = match self.live_root().await {
-            Ok(root) => root,
-            Err(error) => blocked!(BlockedReason::RpcError, error),
-        };
-        // Siblings that hash to the live root are the path to challenge with,
-        // whatever root the indexer reports.
-        if path_root != root {
-            if let Some(reported) = response.root.filter(|reported| *reported != path_root) {
-                // Not a zero path in the indexer's own view. A consistent view
-                // from before the escape (lagging, or behind this RPC) holds
-                // the note's leaf, under a root the vault had at its block.
-                let consistent = match response.block_hash.as_deref() {
-                    Some(hash) => match self.root_at_block_hash(hash).await {
-                        Ok(vault) => vault == reported,
-                        // This RPC does not know the block: inconclusive.
-                        Err(_) => true,
-                    },
-                    None => false,
-                };
-                if !consistent {
-                    blocked!(
-                        BlockedReason::IndexerInvalidResponse,
-                        anyhow!("indexer zero path does not hash to its reported root, which the vault did not have at the reported block")
-                    );
-                }
-                blocked!(
-                    BlockedReason::IndexerPathBehind,
-                    anyhow!("indexer view predates the escape: the note's leaf is not zero at its block")
-                );
-            }
-            let state = self
-                .classify_root_mismatch(
-                    path_root,
-                    response.block_hash.as_deref(),
-                    response.block_number,
-                    head,
-                )
-                .await;
-            if state == IndexerState::Diverged {
-                self.set_indexer_state(
-                    IndexerState::Diverged,
-                    Some("indexer zero path differs from the vault root".into()),
-                );
-            }
-            let reason = if self.indexer.state == IndexerState::Diverged {
-                BlockedReason::IndexerDiverged
-            } else {
-                BlockedReason::IndexerPathBehind
-            };
-            blocked!(
-                reason,
-                anyhow!("indexer path is behind the current vault root")
-            );
-        }
-        let action = match self
-            .watcher
-            .build_challenge_action(note, &pending.nullifier, siblings)
-        {
-            Ok(action) => action,
-            Err(error) if error.starts_with("evidence database read failed") => {
-                blocked!(BlockedReason::EvidenceDbError, anyhow!(error))
-            }
-            Err(error) => blocked!(BlockedReason::EvidenceInvalid, anyhow!(error)),
-        };
-        if action.request_inputs.chain_id != self.config.chain_id
-            || action.request_inputs.contract_address != self.config.contract_address
-        {
-            blocked!(
-                BlockedReason::EvidenceInvalid,
-                anyhow!("archived proof belongs to another deployment")
-            );
-        }
-        match self.vault_state_key {
-            None => blocked!(
-                BlockedReason::RpcError,
-                anyhow!("vault state signing key not yet read")
-            ),
-            Some(key)
-                if key
-                    != (
-                        action.request_inputs.state_signing_key_x,
-                        action.request_inputs.state_signing_key_y,
-                    ) =>
-            {
-                blocked!(
-                    BlockedReason::EvidenceInvalid,
-                    anyhow!("archived proof state key differs from vault immutable key (server signing-key misconfiguration)")
-                )
-            }
-            Some(_) => {}
-        }
-        let proof = Groth16ProofWire {
-            backend: ProofBackendWire::Groth16Bn254,
-            proof: base64::engine::general_purpose::STANDARD.encode(&action.proof_artifact),
-        };
-        match self.verifier.verify(&action.request_inputs, &proof) {
-            Ok(true) => {}
-            Ok(false) => blocked!(
-                BlockedReason::EvidenceInvalid,
-                anyhow!("archived challenge proof failed verification")
-            ),
-            Err(error) => blocked!(BlockedReason::EvidenceInvalid, error),
-        }
-        let digest = action.evidence_digest();
-        if pending
+        let digest = call.digest();
+        let recorded = pending
             .attempt
             .evidence_digest
             .as_ref()
-            .is_some_and(|recorded| *recorded != digest)
-        {
-            blocked!(
+            .filter(|_| reuse.is_some());
+        // An attempt may hold the nonce (a bump) or none does (a re-send).
+        let held = matches!(plan, FeePlan::Bump(_));
+        let transition = match recorded {
+            None => false,
+            Some(recorded) if *recorded == digest => false,
+            Some(_) if pending.attempt.kind() == CallKind::Raise && call.kind() == CallKind::Defeat => {
+                true
+            }
+            Some(_) if pending.attempt.kind() == CallKind::Raise && !held => true,
+            Some(_) => blocked!(
                 BlockedReason::EvidenceInvalid,
-                anyhow!("a replacement would change the challenged note, request inputs or proof on its nonce")
-            );
-        }
-        let calldata = match action.calldata() {
+                anyhow!(
+                    "a replacement would change the {} on its nonce to {} (only a defeat may replace a raise)",
+                    pending.attempt.kind().as_str(),
+                    call.kind().as_str()
+                )
+            ),
+        };
+        let calldata = match call.calldata() {
             Ok(calldata) => calldata,
             Err(error) => blocked!(BlockedReason::EvidenceInvalid, anyhow!(error)),
         };
         let data = format!("0x{}", hex::encode(calldata));
         let mut transaction =
             json!({ "from": self.config.sender, "to": self.vault_address(), "data": data });
-        // Simulate against the live contract to check keys, proof, deadline and
-        // path together, including races with unrelated tree updates.
+        // Simulate against the live contract to check keys, proof, deadline
+        // and concession together.
         if let Err(error) = self.rpc("eth_call", json!([transaction, "latest"])).await {
-            return self.simulation_failed(note, base_state, error);
+            return self.simulation_failed(note, base_state, error, &context);
         }
         let estimated_gas = match self
             .rpc("eth_estimateGas", json!([transaction]))
@@ -2676,11 +3374,18 @@ impl ChallengeService {
             .and_then(|value| quantity(&value))
         {
             Ok(gas) => gas,
-            Err(error) => return self.simulation_failed(note, base_state, error),
+            Err(error) => return self.simulation_failed(note, base_state, error, &context),
         };
-        let gas = estimated_gas
+        let estimated = estimated_gas
             .checked_add(estimated_gas / 5)
             .context("challenge gas estimate overflow")?;
+        // §5.4 default gas limits; a higher estimate wins, as a limit below
+        // it would run out of gas.
+        let gas = match call.kind() {
+            CallKind::Defeat => estimated.max(self.config.defeat_gas_limit),
+            CallKind::Raise => estimated.max(self.config.raise_gas_limit),
+            CallKind::Retire => estimated,
+        };
         self.last_gas = Some(gas as u128);
         let nonce = match reuse {
             Some(nonce) => nonce,
@@ -2731,7 +3436,7 @@ impl ChallengeService {
                 };
                 self.record(
                     note,
-                    Evaluation::new(base_state, Some(EvidenceKind::Finalized)).blocked(
+                    context.evaluation(base_state).blocked(
                         reason,
                         format!("{waiting}; the remaining fee headroom is reserved for the critical threshold"),
                     ),
@@ -2768,11 +3473,7 @@ impl ChallengeService {
                 if reuse.is_some() && self.release_if_never_broadcast(note).await {
                     self.persist()?;
                 }
-                self.record(
-                    note,
-                    Evaluation::new(base_state, Some(EvidenceKind::Finalized))
-                        .blocked(reason, detail),
-                );
+                self.record(note, context.evaluation(base_state).blocked(reason, detail));
                 return Ok(());
             }
         };
@@ -2811,8 +3512,15 @@ impl ChallengeService {
             entry.attempt.attempts = entry.attempt.attempts.saturating_add(1);
             entry.attempt.submitted_block = Some(head.number);
             entry.attempt.evidence_digest = Some(digest);
-            entry.attempt.submitted_root = Some(root);
+            entry.attempt.submitted_root = context.root;
             entry.attempt.unknown_attempt = true;
+            entry.attempt.replaced_raise |= transition && call.kind() == CallKind::Defeat;
+            entry.attempt.action = Some(call.kind());
+            entry.attempt.evidence_row = context.evidence_row;
+            entry.attempt.raise_amount = match &call {
+                VaultCall::Raise { amount, .. } => Some(*amount),
+                _ => None,
+            };
             rollback
         };
         self.persist()?;
@@ -2841,15 +3549,18 @@ impl ChallengeService {
                 tracing::info!(
                     note_id = note,
                     nonce,
+                    call = call.kind().as_str(),
                     transaction_hash = %hash,
                     max_fee_per_gas = fees.max_fee,
                     max_priority_fee_per_gas = fees.tip,
-                    "submitted escape challenge"
+                    "submitted escape {}",
+                    call.kind().as_str()
                 );
                 self.record(
                     note,
-                    Evaluation::new(ObligationState::Submitted, Some(EvidenceKind::Finalized))
-                        .detail(format!("pending on nonce {nonce}")),
+                    context
+                        .evaluation(ObligationState::Submitted)
+                        .detail(format!("{} pending on nonce {nonce}", call.kind().as_str())),
                 );
                 Ok(())
             }
@@ -2861,6 +3572,7 @@ impl ChallengeService {
                     base_state,
                     rollback,
                     error,
+                    &context,
                 )
                 .await
             }
@@ -2868,6 +3580,7 @@ impl ChallengeService {
     }
 
     /// `sent` is the gas limit and maxFeePerGas of the failed send.
+    #[allow(clippy::too_many_arguments)]
     async fn send_failed(
         &mut self,
         note: u32,
@@ -2876,6 +3589,7 @@ impl ChallengeService {
         base_state: ObligationState,
         rollback: (Option<u64>, Option<String>, NonceAttempts),
         error: anyhow::Error,
+        context: &SendContext,
     ) -> anyhow::Result<()> {
         let (gas, max_fee) = sent;
         let reason = match classify_send_error(&error) {
@@ -2910,7 +3624,8 @@ impl ChallengeService {
         self.persist()?;
         self.record(
             note,
-            Evaluation::new(base_state, Some(EvidenceKind::Finalized))
+            context
+                .evaluation(base_state)
                 .blocked(reason, error.to_string()),
         );
         Err(error)
@@ -3026,6 +3741,7 @@ impl ChallengeService {
         note: u32,
         base_state: ObligationState,
         error: anyhow::Error,
+        context: &SendContext,
     ) -> anyhow::Result<()> {
         let revert = vault_revert(&error);
         let reason = match revert {
@@ -3034,18 +3750,31 @@ impl ChallengeService {
                 // ever retires an obligation, so re-check next poll.
                 self.record(
                     note,
-                    Evaluation::new(
-                        ObligationState::ResolvedUnconfirmed,
-                        Some(EvidenceKind::Finalized),
-                    )
-                    .detail(format!(
-                        "simulation reverted {}; re-checking the withdrawal next poll",
-                        revert.unwrap_or_default()
-                    )),
+                    context
+                        .evaluation(ObligationState::ResolvedUnconfirmed)
+                        .detail(format!(
+                            "simulation reverted {}; re-checking the escape next poll",
+                            revert.unwrap_or_default()
+                        )),
+                );
+                return Ok(());
+            }
+            Some("NotARaise()") => {
+                // The concession already covers the raise (another raise
+                // landed): re-read next poll.
+                self.record(
+                    note,
+                    context.evaluation(ObligationState::Raised).detail(
+                        "simulation reverted NotARaise(): the concession already covers this raise",
+                    ),
                 );
                 return Ok(());
             }
             Some("StaleRoot()") => BlockedReason::IndexerPathBehind,
+            // The evidence does not match the vault's escape or verifier.
+            Some("NotSuccessorEvidence()" | "NotStateEvidence()" | "InvalidProof()") => {
+                BlockedReason::EvidenceInvalid
+            }
             Some(_) => BlockedReason::SimulationReverted,
             None if error.downcast_ref::<RpcError>().is_some() => BlockedReason::SimulationReverted,
             None => BlockedReason::RpcError,
@@ -3054,10 +3783,7 @@ impl ChallengeService {
             Some(name) => format!("simulation reverted {name}: {error}"),
             None => error.to_string(),
         };
-        self.record(
-            note,
-            Evaluation::new(base_state, Some(EvidenceKind::Finalized)).blocked(reason, detail),
-        );
+        self.record(note, context.evaluation(base_state).blocked(reason, detail));
         Err(error)
     }
 
@@ -3243,7 +3969,7 @@ impl ChallengeService {
 
     /// Escalation urgency for a send: the most urgent deadline among this
     /// obligation and every obligation queued behind it (holding a later
-    /// nonce, or waiting for one) whose evidence exists or is expected.
+    /// nonce, or waiting for one) that has a defeat or raise due or pending.
     fn queue_severity(&self, note: u32, head: &HeadInfo) -> Severity {
         let thresholds = self.thresholds();
         let own_nonce = self
@@ -3264,16 +3990,24 @@ impl ChallengeService {
             })
             .filter(|(other, entry)| {
                 **other == note
-                    || match self.watcher.evidence_status(&entry.nullifier) {
-                        Ok(EvidenceStatus::Ready(_)) => true,
-                        Ok(EvidenceStatus::AwaitingSettlement(progress)) => {
-                            progress.lease_status.is_some()
-                        }
-                        _ => false,
-                    }
+                    || entry.nonce.is_some()
+                    || self
+                        .evaluations
+                        .get(other)
+                        .or_else(|| self.previous_evaluations.get(other))
+                        .is_none_or(|evaluation| {
+                            matches!(
+                                evaluation.state,
+                                ObligationState::Ready
+                                    | ObligationState::Submitted
+                                    | ObligationState::MinedUnconfirmed
+                                    | ObligationState::Unevaluated
+                            )
+                        })
             })
+            .filter(|(_, entry)| !entry.retire_leaf)
             .filter_map(|(_, entry)| entry.challenge_deadline)
-            // An expired obligation can no longer be challenged.
+            // An expired obligation can no longer be acted on.
             .filter(|deadline| *deadline > head.timestamp)
             .map(|deadline| {
                 challenge_status::deadline_severity(Some(deadline - head.timestamp), thresholds)
@@ -3380,6 +4114,12 @@ impl ChallengeService {
             let obligation = ObligationStatus {
                 note_id: *note,
                 nullifier: pending.nullifier,
+                next_nullifier: pending.next_nullifier,
+                state_balance: pending.state_balance,
+                conceded: pending.conceded,
+                owed: evaluation.and_then(|e| e.owed),
+                raise_due_at: evaluation.and_then(|e| e.raise_due_at),
+                action: pending.nonce.map(|_| pending.attempt.kind()),
                 state,
                 severity: Severity::Ok,
                 challenge_deadline: pending.challenge_deadline,
@@ -3400,16 +4140,15 @@ impl ChallengeService {
                 first_seen_at: pending.first_seen_at,
                 evaluated_at: evaluation.map(|e| e.evaluated_at),
             };
-            let may_need_gas = match state {
+            let may_need_gas = matches!(
+                state,
                 ObligationState::Unevaluated
-                | ObligationState::Ready
-                | ObligationState::Submitted
-                | ObligationState::MinedUnconfirmed => true,
-                ObligationState::AwaitingSettlement => {
-                    !challenge_status::evidence_never_expected(&obligation)
-                }
-                _ => false,
-            };
+                    | ObligationState::Ready
+                    | ObligationState::Submitted
+                    | ObligationState::MinedUnconfirmed
+                    | ObligationState::AwaitingSettlement
+                    | ObligationState::RetiringLeaf
+            );
             if may_need_gas {
                 outstanding += 1;
             }
@@ -3448,8 +4187,8 @@ impl ChallengeService {
                 "the signer's node refused a transaction fee of {refused} wei (upstream_tx_fee_cap): its RPC fee cap is below the ceiling, so bids stay within {bound} wei until restart; set ZKAPI_CHALLENGE_TX_FEE_CAP_WEI in the env files of the signer and this daemon to the node's --rpc.txfeecap and recreate both containers (docker compose up -d; a restart keeps the old environment), or raise the node's cap and restart this daemon"
             ));
         }
-        // A real challenge needs about 7.6M gas: a fee cap above the ceiling
-        // per gas is never reached.
+        // A defeat needs about 0.6M gas: a fee cap above the ceiling per gas
+        // is never reached.
         let challenge_gas = gas.max(DEFAULT_CHALLENGE_GAS);
         if fee.max_fee_per_gas.saturating_mul(challenge_gas) > self.tx_fee_cap() {
             config_warnings.push(format!(
@@ -3496,6 +4235,9 @@ impl ChallengeService {
         status.obligations = obligations;
         status.detached_nonces = self.detached_status.clone();
         status.missed_total = self.checkpoint.missed_total;
+        status.escapes_finalized_with_successor_evidence_total =
+            self.checkpoint.missed_defeats_total;
+        status.missed_raises_total = self.checkpoint.missed_raises_total;
         status.last_missed = self.checkpoint.last_missed.clone();
         status.config_warnings = config_warnings;
         status
@@ -3546,30 +4288,57 @@ impl ChallengeService {
         )
     }
 
-    async fn withdrawal_state(
-        &self,
-        note: u32,
-        block: Option<u64>,
-    ) -> anyhow::Result<WithdrawalState> {
-        let mut query = selector("pendingWithdrawals(uint32)");
-        query.extend_from_slice(Felt252::from_u64(note as u64).as_bytes());
-        let state = match block {
-            None => self.call(query).await?,
-            Some(block) => self.call_at(query, json!(format!("0x{block:x}"))).await?,
+    /// The note's escape at `block`: `pendingWithdrawals(note)` (6 words)
+    /// and `pendingConcessions(note)` (3 words), both read at that block
+    /// number, strictly decoded and checked against each other
+    /// (`finalBalance + conceded == stateBalance`, and a successor nullifier
+    /// exactly when an escape exists). A backend without the block fails the
+    /// read, which the poll retries, rather than answering stale.
+    async fn escape_state(&self, note: u32, block: u64) -> anyhow::Result<EscapeState> {
+        let tag = json!(format!("0x{block:x}"));
+        let argument = Felt252::from_u64(note as u64);
+        let mut withdrawal = selector("pendingWithdrawals(uint32)");
+        withdrawal.extend_from_slice(argument.as_bytes());
+        let mut concession = selector("pendingConcessions(uint32)");
+        concession.extend_from_slice(argument.as_bytes());
+        let pending = self.call_at(withdrawal, tag.clone()).await?;
+        ensure!(pending.len() == 6, "malformed pending withdrawal response");
+        let concession = self.call_at(concession, tag).await?;
+        ensure!(
+            concession.len() == 3,
+            "malformed pending concession response"
+        );
+        let exists = match felt_u64(&pending[0])? {
+            0 => false,
+            1 => true,
+            _ => bail!("malformed pending withdrawal flag"),
         };
         ensure!(
-            state.len() == 6,
-            if block.is_none() {
-                "malformed pending withdrawal response"
-            } else {
-                "malformed confirmed withdrawal response"
-            }
+            pending[4].as_bytes()[..12].iter().all(|byte| *byte == 0),
+            "malformed pending withdrawal destination"
         );
-        Ok(WithdrawalState {
-            exists: state[0] != Felt252::ZERO,
-            nullifier: state[2],
-            deadline: felt_u64(&state[5])?,
-        })
+        let state = EscapeState {
+            exists,
+            nullifier: pending[2],
+            final_balance: felt_u128(&pending[3])?,
+            deadline: felt_u64(&pending[5])?,
+            next_nullifier: concession[0],
+            state_balance: felt_u128(&concession[1])?,
+            conceded: felt_u128(&concession[2])?,
+        };
+        if exists {
+            ensure!(
+                !state.next_nullifier.is_zero()
+                    && state.final_balance.checked_add(state.conceded) == Some(state.state_balance),
+                "vault concession of note {note} is inconsistent with its pending escape"
+            );
+        } else {
+            ensure!(
+                state.next_nullifier.is_zero() && state.state_balance == 0 && state.conceded == 0,
+                "vault holds a concession for note {note} without a pending escape"
+            );
+        }
+        Ok(state)
     }
 
     async fn live_root(&mut self) -> anyhow::Result<Felt252> {
@@ -3700,84 +4469,162 @@ impl ChallengeService {
     }
 }
 
-/// The evidence kind and settlement an expired or lost escape is reported
-/// with, and why it is a missed deadline: evidence existed or was expected.
-fn miss_reason(
-    evidence: &Result<EvidenceStatus, ServerError>,
-) -> (
-    EvidenceKind,
-    Option<SettlementProgress>,
-    Option<&'static str>,
-) {
-    match evidence {
-        Err(_) => (
-            EvidenceKind::Unavailable,
-            None,
-            Some("evidence database unreadable at the deadline"),
-        ),
-        Ok(EvidenceStatus::Ready(_)) => (
-            EvidenceKind::Finalized,
-            None,
-            Some("challenge not mined before the deadline"),
-        ),
-        Ok(EvidenceStatus::Corrupt(_)) => (
-            EvidenceKind::Corrupt,
-            None,
-            Some("finalized evidence corrupt at the deadline"),
-        ),
-        Ok(EvidenceStatus::AwaitingSettlement(progress)) => {
-            let never = progress.lease_read_error.is_none()
-                && (progress.lease_status.is_none()
-                    || progress.lease_status.as_deref() == Some("cancelled"));
-            (
-                if progress.lease_read_error.is_some() {
-                    EvidenceKind::Unavailable
-                } else if progress.lease_status.is_none() {
-                    EvidenceKind::ReservedWithoutLease
-                } else {
-                    EvidenceKind::Reserved
-                },
-                Some(progress.clone()),
-                (!never).then_some("request still settling at the deadline"),
-            )
-        }
-        Ok(EvidenceStatus::ClearanceOnly) => (EvidenceKind::Clearance, None, None),
-        Ok(EvidenceStatus::Unknown) => (EvidenceKind::Unknown, None, None),
+/// What a send reports on the status besides its outcome.
+#[derive(Clone, Debug)]
+struct SendContext {
+    evidence: EvidenceKind,
+    /// The `request_evidence` row of a defeat or raise.
+    evidence_row: Option<i64>,
+    /// The root a retirement's siblings hash to.
+    root: Option<Felt252>,
+    owed: Option<u128>,
+    raise_due_at: Option<u64>,
+}
+
+impl SendContext {
+    fn evaluation(&self, state: ObligationState) -> Evaluation {
+        let mut evaluation = Evaluation::new(state, Some(self.evidence));
+        evaluation.owed = self.owed;
+        evaluation.raise_due_at = self.raise_due_at;
+        evaluation
     }
 }
 
-/// An obligation whose withdrawal is gone at the latest block. With evidence
-/// it may have been paid out, so it keeps its deadline severity until the
+/// The status of a pending escape before any send.
+fn evaluation_of(decision: &Decision) -> Evaluation {
+    let mut evaluation = match &decision.due {
+        Due::Defeat { .. } => Evaluation::new(ObligationState::Ready, Some(decision.evidence))
+            .detail("verified evidence at the successor nullifier: a defeat is due"),
+        Due::Raise { amount, .. } => {
+            Evaluation::new(ObligationState::Ready, Some(decision.evidence))
+                .detail(format!("a raise to {amount} units is due"))
+        }
+        Due::AwaitingSettlement => Evaluation::new(
+            ObligationState::AwaitingSettlement,
+            Some(decision.evidence),
+        )
+        .detail("the request at the escaped nullifier may have been delivered and has not settled; the raise is decided once it settles, or at the raise lead"),
+        Due::Nothing { covered: true, detail } => {
+            Evaluation::new(ObligationState::Raised, Some(decision.evidence)).detail(detail.clone())
+        }
+        Due::Nothing { covered: false, detail } => {
+            Evaluation::new(ObligationState::NothingDue, Some(decision.evidence))
+                .detail(detail.clone())
+        }
+        Due::Invalid { detail, .. } => Evaluation::new(ObligationState::Ready, Some(decision.evidence))
+            .blocked(BlockedReason::EvidenceInvalid, detail.clone()),
+    };
+    if let Some(invalid) = &decision.successor_invalid {
+        let detail = match (&decision.due, &evaluation.detail) {
+            (Due::Invalid { .. }, Some(detail)) => format!("{invalid}; {detail}"),
+            _ => invalid.clone(),
+        };
+        evaluation = evaluation.blocked(BlockedReason::EvidenceInvalid, detail);
+    }
+    evaluation.settlement = decision.settlement.clone();
+    evaluation.owed = decision.owed;
+    evaluation.raise_due_at = Some(decision.raise_due_at);
+    evaluation
+}
+
+/// A pending escape whose evidence database cannot be read.
+fn decision_unreadable(error: &anyhow::Error) -> Evaluation {
+    Evaluation::new(ObligationState::Ready, Some(EvidenceKind::Unavailable))
+        .blocked(BlockedReason::EvidenceDbError, error.to_string())
+}
+
+fn nothing_kind(why: NothingOwed) -> EvidenceKind {
+    match why {
+        NothingOwed::NoRequest | NothingOwed::NotALease => EvidenceKind::Unknown,
+        NothingOwed::Clearance => EvidenceKind::Clearance,
+        NothingOwed::NoLeaseRow => EvidenceKind::ReservedWithoutLease,
+        NothingOwed::NeverDelivered => EvidenceKind::NeverDelivered,
+    }
+}
+
+/// The miss a decision makes of an escape whose deadline passed: a defeat
+/// due with evidence written before the deadline, a raise due, or evidence
+/// that does not verify where one of them may have been due.
+fn miss_of(decision: &Decision) -> Option<MissEvidence> {
+    let miss = |kind, evidence, reason: String| MissEvidence {
+        kind,
+        evidence,
+        settlement: decision.settlement.clone(),
+        reason,
+    };
+    if let Some(detail) = &decision.successor_invalid {
+        // Rows at N⁺ that may have been a defeat: a possible missed defeat,
+        // whatever was due at N.
+        return Some(miss(
+            CallKind::Defeat,
+            EvidenceKind::Corrupt,
+            format!("evidence invalid at the deadline: {detail}"),
+        ));
+    }
+    match &decision.due {
+        Due::Defeat {
+            before_deadline: true,
+            ..
+        } => Some(miss(
+            CallKind::Defeat,
+            EvidenceKind::Successor,
+            "defeat not mined before the deadline: verified evidence at the successor nullifier existed".into(),
+        )),
+        Due::Raise { amount, .. } => Some(miss(
+            CallKind::Raise,
+            decision.evidence,
+            format!("raise not mined before the deadline: {amount} units owed exceeded the concession"),
+        )),
+        Due::Invalid { kind, detail } => Some(miss(
+            *kind,
+            EvidenceKind::Corrupt,
+            format!("evidence invalid at the deadline: {detail}"),
+        )),
+        Due::Defeat {
+            before_deadline: false,
+            ..
+        }
+        | Due::AwaitingSettlement
+        | Due::Nothing { .. } => None,
+    }
+}
+
+/// An obligation whose escape is gone at the latest block. With a miss it
+/// may have been paid out, so it keeps its deadline severity until the
 /// outcome is known at confirmation depth, unless it ended before the
 /// deadline (`ended_early`), when it cannot have been. Once its miss is
 /// counted (`missed`) it is shown missed until it retires.
 fn disappeared(evidence: Option<&MissEvidence>, ended_early: bool, missed: bool) -> Evaluation {
     match evidence {
         _ if ended_early => Evaluation::new(ObligationState::ResolvedUnconfirmed, None).detail(
-            "withdrawal ended before its challenge deadline, so it was not paid out; retirement waits for confirmations",
+            "escape ended before its challenge deadline, so it was not paid out; retirement waits for confirmations",
         ),
         Some(evidence) if missed => {
-            let mut evaluation = Evaluation::new(ObligationState::Missed, Some(evidence.kind))
-                .detail("missed challenge deadline recorded; the withdrawal is no longer pending, and the obligation retires at confirmation depth");
+            let mut evaluation = Evaluation::new(ObligationState::Missed, Some(evidence.evidence))
+                .detail("missed deadline recorded; the escape is no longer pending, and the obligation retires at confirmation depth");
             evaluation.settlement = evidence.settlement.clone();
             evaluation
         }
         Some(evidence) => {
-            let mut evaluation =
-                Evaluation::new(ObligationState::ResolvedUnconfirmed, Some(evidence.kind)).detail(
-                    "withdrawal no longer pending at the latest block; at confirmation depth it is retired, or recorded missed if it was paid out",
-                );
+            let mut evaluation = Evaluation::new(
+                ObligationState::ResolvedUnconfirmed,
+                Some(evidence.evidence),
+            )
+            .detail(
+                "escape no longer pending at the latest block; at confirmation depth it is retired, or recorded missed if it was paid out",
+            );
             evaluation.settlement = evidence.settlement.clone();
             evaluation
         }
         None => Evaluation::new(ObligationState::ResolvedUnconfirmed, None).detail(
-            "withdrawal no longer pending at the latest block; retirement waits for confirmations",
+            "escape no longer pending at the latest block; retirement waits for confirmations",
         ),
     }
 }
 
-/// An obligation whose withdrawal is gone while the evidence database cannot
-/// say whether evidence existed, so whether a payout was a missed deadline.
+/// An obligation whose escape is gone while the evidence database cannot
+/// say whether a defeat or raise was due, so whether a payout was a missed
+/// deadline.
 fn evidence_unreadable(error: &anyhow::Error) -> Evaluation {
     Evaluation::new(
         ObligationState::ResolvedUnconfirmed,
@@ -3787,6 +4634,67 @@ fn evidence_unreadable(error: &anyhow::Error) -> Evaluation {
         BlockedReason::EvidenceDbError,
         format!("{error}; whether a payout of the escape was a missed deadline is decided once it reads"),
     )
+}
+
+/// The challenger's RPC as a `ContractReader` for the startup probes.
+struct RpcReader {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl RpcReader {
+    async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+        let response: Value = self
+            .client
+            .post(&self.url)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| format!("{method}: {}", error.without_url()))?
+            .json()
+            .await
+            .map_err(|error| format!("{method}: {}", error.without_url()))?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("{method}: {error}"));
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("{method}: missing RPC result"))
+    }
+}
+
+impl ContractReader for RpcReader {
+    async fn contract_word(&self, address: &str, selector: &str) -> Result<[u8; 32], String> {
+        let result = self
+            .rpc(
+                "eth_call",
+                json!([{ "to": address, "data": selector }, "latest"]),
+            )
+            .await?;
+        let word = result
+            .as_str()
+            .and_then(|raw| raw.strip_prefix("0x"))
+            .filter(|raw| raw.len() == 64)
+            .ok_or("getter returned no 32-byte word (is the contract deployed at this address on this chain?)")?;
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(word, &mut bytes).map_err(|_| "malformed ABI word".to_string())?;
+        Ok(bytes)
+    }
+
+    async fn code_hash(&self, address: &str) -> Result<[u8; 32], String> {
+        let code = self.rpc("eth_getCode", json!([address, "latest"])).await?;
+        let body = code
+            .as_str()
+            .and_then(|raw| raw.strip_prefix("0x"))
+            .ok_or("invalid eth_getCode response")?;
+        if body.is_empty() {
+            return Err("no contract code at this address on this chain".into());
+        }
+        let bytes = hex::decode(body).map_err(|_| "invalid eth_getCode response".to_string())?;
+        Ok(Keccak256::digest(&bytes).into())
+    }
 }
 
 /// Plan the fees of one send at its exact gas limit. `tx_fee_limit` is the
@@ -4070,10 +4978,8 @@ fn classify_send_error(error: &anyhow::Error) -> SendFailure {
     }
 }
 
-/// The vault custom error a challenge simulation reverted with, when the RPC
-/// passes the revert data through. `challengeEscapeWithdrawal` checks neither
-/// the root window (`UnknownRoot()`) nor challenged nullifiers
-/// (`ChallengedNullifier()`), so only withdrawals raise those.
+/// The vault custom error a defeat, raise or retirement simulation reverted
+/// with, when the RPC passes the revert data through.
 fn vault_revert(error: &anyhow::Error) -> Option<&'static str> {
     let rpc = error.downcast_ref::<RpcError>()?;
     let candidates = [
@@ -4089,6 +4995,11 @@ fn vault_revert(error: &anyhow::Error) -> Option<&'static str> {
         "ChallengeExpired()",
         "NotPendingWithdrawal()",
         "ReplayedNullifier()",
+        "NotARaise()",
+        "NotSuccessorEvidence()",
+        "NotStateEvidence()",
+        "InvalidProof()",
+        "NoteNotClosed()",
     ]
     .into_iter()
     .find(|signature| {
@@ -4153,6 +5064,96 @@ struct PendingEscape {
     challenge_deadline: Option<u64>,
 }
 
+/// An escape event of the scan, strictly decoded.
+#[derive(Debug, PartialEq, Eq)]
+enum ScanEvent {
+    Initiated {
+        note: u32,
+        nullifier: Felt252,
+        deadline: u64,
+    },
+    Recorded {
+        note: u32,
+        next_nullifier: Felt252,
+        state_balance: u128,
+        conceded: u128,
+    },
+    Raised {
+        note: u32,
+        nullifier: Felt252,
+        conceded: u128,
+    },
+    Challenged {
+        note: u32,
+        nullifier: Felt252,
+    },
+}
+
+/// Decode an `EscapeWithdrawalInitiated` (5 words), `EscapeConcessionRecorded`
+/// (3), `EscapeConcessionRaised` (3) or `EscapeWithdrawalChallenged` (2) log,
+/// with exactly two topics and canonical uint widths; anything else is an
+/// error that fails the scan of the range.
+fn decode_scan_event(log: &Value) -> anyhow::Result<ScanEvent> {
+    let topics = log["topics"]
+        .as_array()
+        .context("escape event lacks topics")?;
+    ensure!(topics.len() == 2, "malformed escape event topics");
+    let topic0 = topics[0].as_str().context("malformed escape event topic")?;
+    let note = quantity(&topics[1])?;
+    ensure!(note <= u32::MAX as u64, "escape note ID exceeds uint32");
+    let note = note as u32;
+    let words = words(&log["data"])?;
+    let is = |signature: &str| {
+        topic0.eq_ignore_ascii_case(&format!(
+            "0x{}",
+            hex::encode(Keccak256::digest(signature.as_bytes()))
+        ))
+    };
+    let count = |expected: usize, name: &str| {
+        ensure!(words.len() == expected, "malformed {name} event data");
+        Ok(())
+    };
+    if is(ESCAPE_EVENT) {
+        count(5, "EscapeWithdrawalInitiated")?;
+        felt_u128(&words[1])?;
+        ensure!(
+            words[2].as_bytes()[..12].iter().all(|byte| *byte == 0),
+            "malformed escape destination"
+        );
+        return Ok(ScanEvent::Initiated {
+            note,
+            nullifier: words[0],
+            deadline: felt_u64(&words[3])?,
+        });
+    }
+    if is(CONCESSION_RECORDED_EVENT) {
+        count(3, "EscapeConcessionRecorded")?;
+        return Ok(ScanEvent::Recorded {
+            note,
+            next_nullifier: words[0],
+            state_balance: felt_u128(&words[1])?,
+            conceded: felt_u128(&words[2])?,
+        });
+    }
+    if is(CONCESSION_RAISED_EVENT) {
+        count(3, "EscapeConcessionRaised")?;
+        felt_u128(&words[2])?;
+        return Ok(ScanEvent::Raised {
+            note,
+            nullifier: words[0],
+            conceded: felt_u128(&words[1])?,
+        });
+    }
+    if is(CHALLENGED_EVENT) {
+        count(2, "EscapeWithdrawalChallenged")?;
+        return Ok(ScanEvent::Challenged {
+            note,
+            nullifier: words[0],
+        });
+    }
+    bail!("unexpected event topic {topic0} in the escape scan")
+}
+
 fn selector(signature: &str) -> Vec<u8> {
     Keccak256::digest(signature.as_bytes())[..4].to_vec()
 }
@@ -4176,6 +5177,9 @@ fn parse_digits_u128(digits: &str) -> Option<u128> {
         return Some(0);
     }
     u128::from_str_radix(digits.trim_start_matches('0'), 16).ok()
+}
+fn felt_u128(value: &Felt252) -> anyhow::Result<u128> {
+    value.to_u128().context("value exceeds uint128")
 }
 fn felt_u64(value: &Felt252) -> anyhow::Result<u64> {
     ensure!(
@@ -4208,6 +5212,7 @@ mod tests {
     use crate::watcher::tests::{
         finalized_transcript, finalized_v2_request, two_finalized_v2_requests,
     };
+    use crate::watcher::{DEFEAT_SELECTOR, RAISE_SELECTOR, RETIRE_SELECTOR};
     use axum::{
         extract::{Path, State},
         http::StatusCode,
@@ -4219,9 +5224,38 @@ mod tests {
     use zkapi_types::wire::{ApiRequestV2, CurvePointWire};
 
     const ONE_ETHER: u128 = 1_000_000_000_000_000_000;
+    /// The default escape's nullifier `N`: no request was made at it.
+    const ESCAPED: Felt252 = Felt252([0x0e; 32]);
+    /// The nullifier of a re-escape of note 0 from another state.
+    const RE_ESCAPED: Felt252 = Felt252([0x0c; 32]);
 
     struct MockChain {
+        /// `N`, the escaped nullifier of the default escape.
         nullifier: Felt252,
+        /// `N⁺` of the default escape: by default the fixture request's
+        /// nullifier, whose evidence defeats the escape.
+        next_nullifier: Felt252,
+        /// `c` of the default escape; `B` is its final balance 100 plus `c`.
+        conceded: u128,
+        /// Concessions `(N⁺, c)` of escapes in `withdrawals`; by default the
+        /// default escape's.
+        concessions: BTreeMap<u32, (Felt252, u128)>,
+        /// Receipts by transaction hash (null for any other hash).
+        receipts: BTreeMap<String, Value>,
+        /// Simulation error of raises only.
+        raise_simulation_error: Option<Value>,
+        /// The indexer's path of a note's slot: (leaf, siblings).
+        leaf_paths: BTreeMap<u32, (Felt252, [Felt252; MERKLE_DEPTH])>,
+        /// Words of no-argument getters (the startup probes), by calldata.
+        probe_words: BTreeMap<String, Felt252>,
+        /// Runtime code by lowercase address.
+        code: BTreeMap<String, String>,
+        /// ("withdrawal" | "concession", block parameter) of escape reads.
+        escape_reads: Vec<(&'static str, Value)>,
+        /// pendingConcessions of the default escape answers these words.
+        concession_words: Option<Vec<Felt252>>,
+        /// The scan's concession record lacks its last word.
+        malformed_concession_event: bool,
         active: bool,
         confirmed_active: bool,
         mined_nonce: u64,
@@ -4296,13 +5330,24 @@ mod tests {
     }
 
     impl MockChain {
-        fn new(nullifier: Felt252, state_key: (Felt252, Felt252)) -> Self {
+        fn new(nullifier: Felt252, next_nullifier: Felt252, state_key: (Felt252, Felt252)) -> Self {
             let siblings = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
                 .try_into()
                 .unwrap();
             let now = unix_now();
             Self {
                 nullifier,
+                next_nullifier,
+                conceded: 0,
+                concessions: BTreeMap::new(),
+                receipts: BTreeMap::new(),
+                raise_simulation_error: None,
+                leaf_paths: BTreeMap::new(),
+                probe_words: BTreeMap::new(),
+                code: BTreeMap::new(),
+                escape_reads: Vec::new(),
+                concession_words: None,
+                malformed_concession_event: false,
                 active: true,
                 confirmed_active: true,
                 mined_nonce: 3,
@@ -4433,7 +5478,7 @@ mod tests {
             "eth_getLogs" => {
                 let filter = &request["params"][0];
                 let from = quantity(&filter["fromBlock"]).unwrap();
-                if filter["topics"][0].is_array() {
+                if filter["topics"].as_array().unwrap().len() == 2 {
                     let to = quantity(&filter["toBlock"]).unwrap();
                     let note = filter["topics"][1]
                         .as_str()
@@ -4466,10 +5511,27 @@ mod tests {
                 if state.drop_logs {
                     json!([])
                 } else {
+                    let topic = |signature: &str| {
+                        format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
+                    };
+                    // The initiation and its concession record, in one
+                    // transaction; served in reverse to check the ordering.
+                    let mut recorded = vec![
+                        state.next_nullifier,
+                        Felt252::from_u128(100 + state.conceded),
+                        Felt252::from_u128(state.conceded),
+                    ];
+                    if state.malformed_concession_event {
+                        recorded.pop();
+                    }
                     json!([{
-                        "topics": [format!("0x{}", hex::encode(Keccak256::digest(ESCAPE_EVENT.as_bytes()))), format!("0x{:064x}", state.event_note)],
+                        "topics": [topic(CONCESSION_RECORDED_EVENT), format!("0x{:064x}", state.event_note)],
+                        "data": encoded(&recorded),
+                        "blockNumber": hex_quantity(from as u128), "logIndex": "0x1"
+                    }, {
+                        "topics": [topic(ESCAPE_EVENT), format!("0x{:064x}", state.event_note)],
                         "data": encoded(&[state.nullifier, Felt252::from_u64(100), Felt252::from_u64(5), Felt252::from_u64(state.deadline), state.root]),
-                        "blockNumber": hex_quantity(from as u128)
+                        "blockNumber": hex_quantity(from as u128), "logIndex": "0x0"
                     }])
                 }
             }
@@ -4486,18 +5548,61 @@ mod tests {
                 {
                     return rpc_error(-32000, "temporary note-state failure");
                 }
-                if data.starts_with(&call_data("pendingWithdrawals(uint32)")) {
+                let concession_read = data.starts_with(&call_data("pendingConcessions(uint32)"));
+                if let Some(word) = state.probe_words.get(data) {
+                    encoded(&[*word])
+                } else if data.starts_with(&call_data("pendingWithdrawals(uint32)"))
+                    || concession_read
+                {
                     let note = u32::from_str_radix(&data[data.len() - 8..], 16).unwrap();
-                    *state.withdrawal_reads.entry(note).or_default() += 1;
+                    let kind = if concession_read {
+                        "concession"
+                    } else {
+                        "withdrawal"
+                    };
+                    state.escape_reads.push((kind, block.clone()));
+                    if let Some(words) = state
+                        .concession_words
+                        .clone()
+                        .filter(|_| concession_read && note == 0)
+                    {
+                        return Json(
+                            json!({ "jsonrpc": "2.0", "id": 1, "result": encoded(&words) }),
+                        )
+                        .into_response();
+                    }
+                    if !concession_read {
+                        *state.withdrawal_reads.entry(note).or_default() += 1;
+                    }
+                    let concession = |active: bool| {
+                        let (next, conceded) = state
+                            .concessions
+                            .get(&note)
+                            .copied()
+                            .unwrap_or((state.next_nullifier, state.conceded));
+                        if active {
+                            encoded(&[
+                                next,
+                                Felt252::from_u128(100 + conceded),
+                                Felt252::from_u128(conceded),
+                            ])
+                        } else {
+                            encoded(&[Felt252::ZERO; 3])
+                        }
+                    };
                     if let Some((active, nullifier, deadline)) = state.withdrawals.get(&note) {
-                        encoded(&[
-                            Felt252::from_u64(*active as u64),
-                            Felt252::from_u64(8),
-                            *nullifier,
-                            Felt252::from_u64(100),
-                            Felt252::from_u64(5),
-                            Felt252::from_u64(*deadline),
-                        ])
+                        if concession_read {
+                            concession(*active)
+                        } else {
+                            encoded(&[
+                                Felt252::from_u64(*active as u64),
+                                Felt252::from_u64(8),
+                                *nullifier,
+                                Felt252::from_u64(100),
+                                Felt252::from_u64(5),
+                                Felt252::from_u64(*deadline),
+                            ])
+                        }
                     } else {
                         // A read at the head block sees the latest state.
                         let latest = *block == "latest";
@@ -4516,6 +5621,12 @@ mod tests {
                         } else {
                             state.confirmed_active
                         };
+                        if concession_read {
+                            return Json(
+                                json!({ "jsonrpc": "2.0", "id": 1, "result": concession(active) }),
+                            )
+                            .into_response();
+                        }
                         encoded(&[
                             Felt252::from_u64(active as u64),
                             Felt252::from_u64(8),
@@ -4569,8 +5680,17 @@ mod tests {
                     encoded(&[state.state_key.0])
                 } else if data == call_data("stateSigningKeyY()") {
                     encoded(&[state.state_key.1])
-                } else if data.starts_with(&call_data(crate::watcher::CHALLENGE_SIGNATURE)) {
-                    if let Some(error) = &state.simulation_error {
+                } else if [DEFEAT_SELECTOR, RAISE_SELECTOR, RETIRE_SELECTOR]
+                    .iter()
+                    .any(|selector| data.starts_with(&format!("0x{}", hex::encode(selector))))
+                {
+                    let raise = data.starts_with(&format!("0x{}", hex::encode(RAISE_SELECTOR)));
+                    if let Some(error) = state
+                        .raise_simulation_error
+                        .as_ref()
+                        .filter(|_| raise)
+                        .or(state.simulation_error.as_ref())
+                    {
                         return Json(json!({ "jsonrpc": "2.0", "id": 1, "error": error }))
                             .into_response();
                     }
@@ -4580,6 +5700,11 @@ mod tests {
                 }
             }
             "eth_estimateGas" => hex_quantity(state.estimate as u128),
+            "eth_getCode" => json!(state
+                .code
+                .get(&request["params"][0].as_str().unwrap().to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| "0x".into())),
             "eth_getTransactionCount" => hex_quantity(if request["params"][1] == "pending" {
                 state.pending_nonce.unwrap_or(state.mined_nonce)
             } else if request["params"][1] == "latest" {
@@ -4676,7 +5801,11 @@ mod tests {
                     transaction
                 }
             }
-            "eth_getTransactionReceipt" => Value::Null,
+            "eth_getTransactionReceipt" => state
+                .receipts
+                .get(request["params"][0].as_str().unwrap())
+                .cloned()
+                .unwrap_or(Value::Null),
             "zkapi_signerStatus" => match &state.signer_status {
                 Some(status) => status.clone(),
                 None => return rpc_error(-32601, "RPC method is not allowed"),
@@ -4709,6 +5838,26 @@ mod tests {
             }
         }
         Json(body).into_response()
+    }
+
+    /// `/v1/tree/notes/{note}/path`: a configured leaf path of the note.
+    async fn leaf_path(
+        State(state): State<Arc<Mutex<MockChain>>>,
+        Path(note): Path<u32>,
+    ) -> Response {
+        let mut state = state.lock().unwrap();
+        if state.path_unavailable > 0 {
+            state.path_unavailable -= 1;
+            return unavailable();
+        }
+        match state.leaf_paths.get(&note) {
+            Some((leaf, siblings)) => Json(json!({
+                "note_id": note, "leaf": leaf, "siblings": siblings.to_vec(),
+                "root": zkapi_core::v2::merkle_root(note, leaf, siblings),
+            }))
+            .into_response(),
+            None => unavailable(),
+        }
     }
 
     async fn tree_root(State(state): State<Arc<Mutex<MockChain>>>) -> Response {
@@ -4762,20 +5911,39 @@ mod tests {
     }
 
     impl Fixture {
+        /// The default escape, defeated by the fixture request's evidence,
+        /// written long before any deadline a test sets.
         async fn new() -> Self {
-            let (store, request) = finalized_v2_request().await;
+            let (_, request) = finalized_v2_request().await;
+            let store = Arc::new(NullifierStore::in_memory().unwrap());
+            crate::watcher::tests::append_raw_evidence(
+                &store,
+                &request.public_inputs.request_nullifier,
+                &serde_json::to_string(&request.public_inputs).unwrap(),
+                &request.public_inputs.solvency_bound.to_string(),
+                &base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &request.proof.proof,
+                )
+                .unwrap(),
+                1,
+            );
             Self::with_store(store, &request).await
         }
 
         async fn with_store(store: Arc<NullifierStore>, request: &ApiRequestV2) -> Self {
             let public = &request.public_inputs;
+            // The default escape is from the state before the request: its
+            // successor nullifier is the request's, whose evidence defeats it.
             let chain = Arc::new(Mutex::new(MockChain::new(
+                ESCAPED,
                 public.request_nullifier,
                 (public.state_signing_key_x, public.state_signing_key_y),
             )));
             let app = Router::new()
                 .route("/", post(rpc))
                 .route("/v1/tree/notes/{note}/zero-path", get(path))
+                .route("/v1/tree/notes/{note}/path", get(leaf_path))
                 .route("/v1/tree/root", get(tree_root))
                 .route("/v1/escapes/pending", get(pending_escapes))
                 .route("/health", get(indexer_health))
@@ -4794,7 +5962,7 @@ mod tests {
                 confirmations: 2,
                 checkpoint: directory.path().join("checkpoint.json"),
                 proof_setup_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../protocol/setup/v2"),
+                    .join("../../protocol/setup/v2-concession-dev"),
                 // A transaction fee ceiling the mock's 12M gas limit never
                 // reaches at these caps; the ceiling tests use real figures.
                 fee: FeePolicy {
@@ -4809,6 +5977,14 @@ mod tests {
                     observe_interval_seconds: 0,
                     ..Default::default()
                 },
+                // The raise of the 100 s escape is decided 60 s before it.
+                raise_lead_seconds: 60,
+                raise_min_units: 0,
+                // The retire-on-miss tests opt in; the miss-accounting tests
+                // see the obligation retire after a payout.
+                retire_on_miss: false,
+                defeat_gas_limit: DEFAULT_DEFEAT_GAS_LIMIT,
+                raise_gas_limit: DEFAULT_RAISE_GAS_LIMIT,
             };
             Self {
                 store,
@@ -4879,6 +6055,21 @@ mod tests {
         }
     }
 
+    /// The defeat calldata of `request`'s evidence for `note`.
+    fn defeat_of(request: &ApiRequestV2, note: u32) -> Vec<u8> {
+        VaultCall::Defeat {
+            note_id: note,
+            inputs: request.public_inputs.clone(),
+            proof: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &request.proof.proof,
+            )
+            .unwrap(),
+        }
+        .calldata()
+        .unwrap()
+    }
+
     fn obligation(status: &ChallengeStatus, note: u32) -> ObligationStatus {
         status
             .obligations
@@ -4892,17 +6083,38 @@ mod tests {
         parse_hex_u128(transaction[field].as_str().unwrap()).unwrap()
     }
 
-    /// (noteId word, 12-word request tuple, siblings, proof) of challenge calldata.
-    fn decode_call(transaction: &Value) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// (noteId word, 12-word request tuple, proof) of defeat calldata.
+    fn decode_call(transaction: &Value) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let data = hex::decode(&transaction["data"].as_str().unwrap()[2..]).unwrap();
-        assert_eq!(data[..4], selector(crate::watcher::CHALLENGE_SIGNATURE));
+        assert_eq!(data[..4], DEFEAT_SELECTOR);
+        assert_eq!(data.len(), crate::watcher::DEFEAT_CALLDATA_LEN);
         let word = |index: usize| 4 + index * 32;
         (
             data[word(0)..word(1)].to_vec(),
             data[word(1)..word(13)].to_vec(),
-            data[word(14)..word(46)].to_vec(),
-            data[word(47)..].to_vec(),
+            data[word(15)..].to_vec(),
         )
+    }
+
+    /// The call a send makes and its note.
+    fn sent_call(transaction: &Value) -> (CallKind, u32) {
+        let data = hex::decode(&transaction["data"].as_str().unwrap()[2..]).unwrap();
+        let note = u32::from_be_bytes(data[32..36].try_into().unwrap());
+        let kind = match data[..4].try_into().unwrap() {
+            DEFEAT_SELECTOR => CallKind::Defeat,
+            RAISE_SELECTOR => CallKind::Raise,
+            RETIRE_SELECTOR => CallKind::Retire,
+            other => panic!("unexpected selector {other:?}"),
+        };
+        (kind, note)
+    }
+
+    /// The amount of raise calldata.
+    fn raise_amount(transaction: &Value) -> u128 {
+        let data = hex::decode(&transaction["data"].as_str().unwrap()[2..]).unwrap();
+        assert_eq!(data[..4], RAISE_SELECTOR);
+        assert_eq!(data.len(), crate::watcher::RAISE_CALLDATA_LEN);
+        u128::from_be_bytes(data[4 + 14 * 32 + 16..4 + 15 * 32].try_into().unwrap())
     }
 
     fn alternate_tree() -> ([Felt252; MERKLE_DEPTH], Felt252) {
@@ -5164,14 +6376,7 @@ mod tests {
             chain.reorg_during_scan = true;
             chain.fail_first_send = true;
         }
-        let siblings = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
-            .try_into()
-            .unwrap();
-        let expected = ChallengeWatcher::new(fixture.store.clone())
-            .build_challenge_action(0, &request.public_inputs.request_nullifier, siblings)
-            .unwrap()
-            .calldata()
-            .unwrap();
+        let expected = defeat_of(&request, 0);
         let mut service = fixture.service();
         assert!(service
             .poll_once()
@@ -5300,7 +6505,7 @@ mod tests {
         restarted.checkpoint.pending.insert(
             0,
             PendingChallenge {
-                nullifier: request.public_inputs.request_nullifier,
+                nullifier: ESCAPED,
                 ..Default::default()
             },
         );
@@ -5332,233 +6537,297 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn issued_lease_escape_waits_for_finalized_settlement_then_challenges() {
-        let (_, request) = finalized_v2_request().await;
-        let nullifier = request.public_inputs.request_nullifier;
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        store.reserve_openrouter_lease(&request).unwrap();
+    /// A nullifier with no request evidence.
+    const NO_EVIDENCE: Felt252 = Felt252([0x0d; 32]);
+
+    /// A fixture whose escape is at `request`'s own nullifier `N`: the
+    /// request decides Ω, and the escape's successor `N⁺` has no evidence.
+    async fn escape_at_request(store: Arc<NullifierStore>, request: &ApiRequestV2) -> Fixture {
+        let fixture = Fixture::with_store(store, request).await;
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.nullifier = request.public_inputs.request_nullifier;
+            chain.next_nullifier = NO_EVIDENCE;
+        }
+        fixture
+    }
+
+    /// A reserved request whose key was issued and may have been delivered,
+    /// not settled.
+    fn issued_lease(store: &NullifierStore, request: &ApiRequestV2) {
+        store.reserve_openrouter_lease(request).unwrap();
         let now = unix_now();
         store
-            .create_openrouter_lease(&request, "oa_org", now, now + 20, now + 30, 1.0)
+            .create_openrouter_lease(request, "oa_org", now, now + 20, now + 30, 1.0)
             .unwrap();
         store
             .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
             .unwrap();
-        let fixture = Fixture::with_store(store.clone(), &request).await;
-        let mut service = fixture.service();
-        service.poll_once().await.unwrap();
-        assert!(
-            fixture.sends().is_empty(),
-            "an issued lease is not evidence"
-        );
-        assert_eq!(service.checkpoint.pending[&0].nonce, None);
-        let status = service.status();
-        let awaiting = obligation(&status, 0);
-        assert_eq!(awaiting.state, ObligationState::AwaitingSettlement);
-        assert_eq!(awaiting.evidence, Some(EvidenceKind::Reserved));
-        let settlement = awaiting.settlement.unwrap();
-        assert_eq!(settlement.lease_status.as_deref(), Some("active"));
-        assert!(settlement.key_issued);
-        assert!(
-            (99..=100).contains(&awaiting.seconds_remaining.unwrap()),
-            "{:?}",
-            awaiting.seconds_remaining
-        );
-        assert_eq!(awaiting.severity, Severity::Ok);
-        // Bounded settlement writes the Finalized transcript.
-        store
-            .finalize(&nullifier, &finalized_transcript(&request, 1))
-            .unwrap();
-        let siblings = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
-            .try_into()
-            .unwrap();
-        let expected = ChallengeWatcher::new(store)
-            .build_challenge_action(0, &nullifier, siblings)
-            .unwrap()
-            .calldata()
-            .unwrap();
-        service.poll_once().await.unwrap();
-        let sends = fixture.sends();
-        assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0]["nonce"], "0x3");
-        assert_eq!(sends[0]["data"], format!("0x{}", hex::encode(expected)));
-        assert_eq!(
-            obligation(&service.status(), 0).state,
-            ObligationState::Submitted
+    }
+
+    fn settle(store: &NullifierStore, request: &ApiRequestV2, charge: u128) {
+        store.execute_for_test(
+            "UPDATE nullifiers SET settled_charge = ?1, settled_basis = 'measured',
+                settled_at = 1 WHERE nullifier = ?2",
+            rusqlite::params![
+                charge as i64,
+                request.public_inputs.request_nullifier.to_hex()
+            ],
         );
     }
 
     #[tokio::test]
-    async fn awaiting_settlement_past_deadline_is_missed_and_critical() {
+    async fn an_unsettled_request_waits_for_its_charge_then_is_raised_to_it() {
         let (_, request) = finalized_v2_request().await;
         let store = Arc::new(NullifierStore::in_memory().unwrap());
-        store.reserve_openrouter_lease(&request).unwrap();
-        let now = unix_now();
-        store
-            .create_openrouter_lease(&request, "openrouter", now, now + 20, now + 30, 1.0)
-            .unwrap();
-        store
-            .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
-            .unwrap();
-        let fixture = Fixture::with_store(store, &request).await;
+        issued_lease(&store, &request);
+        let fixture = escape_at_request(store.clone(), &request).await;
+        let deadline = fixture.chain.lock().unwrap().deadline;
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
-        assert_eq!(service.status().status, Severity::Ok);
+        assert!(
+            fixture.sends().is_empty(),
+            "Ω is not final before settlement or the raise lead"
+        );
+        let awaiting = obligation(&service.status(), 0);
+        assert_eq!(awaiting.state, ObligationState::AwaitingSettlement);
+        assert_eq!(awaiting.evidence, Some(EvidenceKind::Unsettled));
+        assert_eq!(awaiting.owed, None);
+        assert_eq!(awaiting.raise_due_at, Some(deadline - 60));
+        assert_eq!(awaiting.next_nullifier, Some(NO_EVIDENCE));
+        assert_eq!(
+            (awaiting.state_balance, awaiting.conceded),
+            (Some(100), Some(0))
+        );
+        assert!(awaiting.settlement.unwrap().possibly_delivered);
+        assert_eq!(awaiting.severity, Severity::Ok);
+
+        // Settled: Ω is final at once, long before the raise lead.
+        settle(&store, &request, 1);
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sent_call(&sends[0]), (CallKind::Raise, 0));
+        assert_eq!(raise_amount(&sends[0]), 1);
+        let expected = VaultCall::Raise {
+            note_id: 0,
+            inputs: request.public_inputs.clone(),
+            proof: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &request.proof.proof,
+            )
+            .unwrap(),
+            amount: 1,
+        };
+        assert_eq!(
+            sends[0]["data"],
+            format!("0x{}", hex::encode(expected.calldata().unwrap()))
+        );
+        assert_eq!(
+            service.checkpoint.pending[&0].attempt.evidence_digest,
+            Some(expected.digest())
+        );
+        let raised = obligation(&service.status(), 0);
+        assert_eq!(raised.state, ObligationState::Submitted);
+        assert_eq!(raised.action, Some(CallKind::Raise));
+        assert_eq!(raised.owed, Some(1));
+
+        // The vault takes the raise: the concession covers what is owed.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.conceded = 1;
+            chain.mined_nonce = 4;
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 1);
+        let covered = obligation(&service.status(), 0);
+        assert_eq!(covered.state, ObligationState::Raised);
+        assert_eq!(covered.conceded, Some(1));
+        assert_eq!(covered.severity, Severity::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_unsettled_request_is_raised_to_its_bound_at_the_raise_lead() {
+        let (_, request) = finalized_v2_request().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        issued_lease(&store, &request);
+        let fixture = escape_at_request(store, &request).await;
+        let deadline = fixture.chain.lock().unwrap().deadline;
+        let mut service = fixture.service();
+        // One second before the lead: still waiting.
+        fixture.chain.lock().unwrap().head_timestamp = deadline - 61;
+        service.poll_once().await.unwrap();
+        assert!(fixture.sends().is_empty());
+        // At deadline - raise_lead_seconds Ω is the request's bound.
+        fixture.chain.lock().unwrap().head_timestamp = deadline - 60;
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sent_call(&sends[0]), (CallKind::Raise, 0));
+        assert_eq!(
+            raise_amount(&sends[0]),
+            request.public_inputs.solvency_bound
+        );
+        assert_eq!(obligation(&service.status(), 0).owed, Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_raise_uses_the_largest_bound_and_honours_the_minimum() {
+        let (_, request) = finalized_v2_request().await;
+        // A second proof at the same state with a larger bound, filed by a
+        // --rebind; Ω (unsettled, at the lead) is that bound.
+        let larger = crate::watcher::tests::request_at_genesis(42, "same-state-larger", 2);
+        assert_eq!(
+            larger.public_inputs.request_nullifier,
+            request.public_inputs.request_nullifier
+        );
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        issued_lease(&store, &request);
+        crate::watcher::tests::append_raw_evidence(
+            &store,
+            &larger.public_inputs.request_nullifier,
+            &serde_json::to_string(&larger.public_inputs).unwrap(),
+            "2",
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &larger.proof.proof,
+            )
+            .unwrap(),
+            unix_now(),
+        );
+        for (min_units, conceded, expected) in [
+            (0, 0, Some(2)),
+            // The vault would concede 2: a raise of 2 is below a minimum of 3.
+            (3, 0, None),
+            // Already conceding 2: nothing to raise.
+            (0, 2, None),
+        ] {
+            let fixture = escape_at_request(store.clone(), &request).await;
+            let deadline = {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.conceded = conceded;
+                chain.head_timestamp = chain.deadline - 60;
+                chain.deadline
+            };
+            let mut service = fixture.service_with(|config| config.raise_min_units = min_units);
+            service.poll_once().await.unwrap();
+            let sends = fixture.sends();
+            let status = obligation(&service.status(), 0);
+            assert_eq!(status.raise_due_at, Some(deadline - 60));
+            match expected {
+                Some(amount) => {
+                    assert_eq!(sends.len(), 1);
+                    assert_eq!(raise_amount(&sends[0]), amount);
+                    let data = hex::decode(&sends[0]["data"].as_str().unwrap()[2..]).unwrap();
+                    // The tuple's solvencyBound word is the larger proof's.
+                    assert_eq!(
+                        &data[4 + 8 * 32..4 + 9 * 32],
+                        Felt252::from_u128(2).as_bytes()
+                    );
+                }
+                None => {
+                    assert!(sends.is_empty(), "{min_units} {conceded}");
+                    let state = if conceded > 0 {
+                        ObligationState::Raised
+                    } else {
+                        ObligationState::NothingDue
+                    };
+                    assert_eq!(status.state, state, "{:?}", status.detail);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_is_owed_for_a_key_never_delivered_and_its_expiry_is_no_miss() {
+        let (_, request) = finalized_v2_request().await;
+        // A reservation without a lease row, a key never issued, and one
+        // issued but never returned: each owes nothing.
+        for (case, kind) in [
+            ("no lease row", EvidenceKind::ReservedWithoutLease),
+            ("never issued", EvidenceKind::NeverDelivered),
+            ("never delivered", EvidenceKind::NeverDelivered),
+        ] {
+            let store = Arc::new(NullifierStore::in_memory().unwrap());
+            store.reserve_openrouter_lease(&request).unwrap();
+            if case != "no lease row" {
+                store
+                    .create_openrouter_lease(&request, "oa_org", 1, 2, 3, 1.0)
+                    .unwrap();
+            }
+            if case == "never delivered" {
+                store
+                    .activate_openrouter_lease(&request.client_request_id, "key-hash")
+                    .unwrap();
+                store.execute_for_test("UPDATE openrouter_leases SET delivered = 0", []);
+            }
+            let fixture = escape_at_request(store, &request).await;
+            let mut service = fixture.service();
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_timestamp = chain.deadline - 60;
+            }
+            service.poll_once().await.unwrap();
+            let nothing = obligation(&service.status(), 0);
+            assert_eq!(nothing.state, ObligationState::NothingDue, "{case}");
+            assert_eq!(nothing.evidence, Some(kind), "{case}");
+            assert_eq!(nothing.owed, Some(0), "{case}");
+            assert_eq!(nothing.severity, Severity::Ok, "{case}");
+            {
+                let mut chain = fixture.chain.lock().unwrap();
+                chain.head_timestamp = chain.deadline;
+            }
+            service.poll_once().await.unwrap();
+            let status = service.status();
+            let expired = obligation(&status, 0);
+            assert_eq!(expired.state, ObligationState::ExpiredNothingDue, "{case}");
+            assert_eq!(expired.severity, Severity::Ok);
+            assert_eq!(status.missed_total, 0);
+            assert!(!service.checkpoint.pending[&0].deadline_reported);
+            assert!(fixture.sends().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_raise_still_due_at_the_deadline_is_a_missed_raise() {
+        let (_, request) = finalized_v2_request().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        issued_lease(&store, &request);
+        settle(&store, &request, 1);
+        let fixture = escape_at_request(store, &request).await;
+        // Every raise simulation reverts, so none is sent.
+        fixture.chain.lock().unwrap().raise_simulation_error =
+            Some(json!({ "code": -32000, "message": "execution reverted" }));
+        let mut service = fixture.service();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
         {
             let mut chain = fixture.chain.lock().unwrap();
             chain.head_timestamp = chain.deadline;
             chain.head_number += 1;
         }
         service.poll_once().await.unwrap();
-        assert!(service.checkpoint.pending[&0].deadline_reported);
+        assert_eq!(
+            service.checkpoint.pending[&0].missed_kind,
+            Some(CallKind::Raise)
+        );
         let status = service.status();
         assert_eq!(status.missed_total, 1);
-        assert_eq!(status.last_missed.as_ref().unwrap().note_id, 0);
+        assert_eq!(status.missed_raises_total, 1);
+        assert_eq!(status.escapes_finalized_with_successor_evidence_total, 0);
+        let last = status.last_missed.as_ref().unwrap();
+        assert_eq!(last.kind, Some(CallKind::Raise));
         let missed = obligation(&status, 0);
         assert_eq!(missed.state, ObligationState::Missed);
         assert_eq!(missed.severity, Severity::Critical);
-        assert_eq!(status.status, Severity::Critical);
-        service.poll_once().await.unwrap();
-        assert_eq!(service.status().missed_total, 1);
-        assert!(fixture.sends().is_empty());
-        // A missed obligation ages out once the vault shows the withdrawal
-        // resolved at confirmation depth; the miss, counted once, stays a
-        // critical alarm for a while.
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.active = false;
-            chain.confirmed_active = false;
-        }
+        // Paid out at confirmation depth: a missed raise retires the
+        // obligation (only a missed defeat retires the leaf).
+        fixture.chain.lock().unwrap().pay_out(5);
         service.poll_once().await.unwrap();
         assert!(service.checkpoint.pending.is_empty());
         let status = service.status();
-        assert_eq!(
-            status.alarms,
-            ["critical: missed challenge deadline of note 0 (request still settling at the deadline)"]
-        );
         assert_eq!(status.missed_total, 1);
-    }
-
-    #[tokio::test]
-    async fn reservation_without_lease_expires_without_missed_alarm() {
-        let (_, request) = finalized_v2_request().await;
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        store.reserve_openrouter_lease(&request).unwrap();
-        let fixture = Fixture::with_store(store, &request).await;
-        let mut service = fixture.service();
-        service.poll_once().await.unwrap();
-        let orphan = obligation(&service.status(), 0);
-        assert_eq!(orphan.state, ObligationState::AwaitingSettlement);
-        assert_eq!(orphan.evidence, Some(EvidenceKind::ReservedWithoutLease));
-        assert_eq!(orphan.severity, Severity::Warning);
-        assert!(orphan.detail.unwrap().contains("no lease row"));
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.head_timestamp = chain.deadline;
-        }
-        service.poll_once().await.unwrap();
-        let status = service.status();
-        let expired = obligation(&status, 0);
-        assert_eq!(expired.state, ObligationState::ExpiredWithoutEvidence);
-        assert_eq!(expired.severity, Severity::Ok);
-        assert_eq!(status.missed_total, 0);
-        assert!(!service.checkpoint.pending[&0].deadline_reported);
-        assert!(fixture.sends().is_empty());
-    }
-
-    #[tokio::test]
-    async fn settlement_scheduled_after_critical_threshold_is_critical_immediately() {
-        let (_, request) = finalized_v2_request().await;
-        let store = Arc::new(NullifierStore::in_memory().unwrap());
-        store.reserve_openrouter_lease(&request).unwrap();
-        let fixture = Fixture::with_store(store.clone(), &request).await;
-        let deadline = fixture.chain.lock().unwrap().deadline;
-        // Settlement is not due until after deadline - critical_remaining.
-        store
-            .create_openrouter_lease(
-                &request,
-                "oa_org",
-                deadline - 50,
-                deadline - 5,
-                deadline - 5,
-                1.0,
-            )
-            .unwrap();
-        store
-            .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
-            .unwrap();
-        let mut service = fixture.service();
-        service.poll_once().await.unwrap();
-        let late = obligation(&service.status(), 0);
-        assert_eq!(late.state, ObligationState::AwaitingSettlement);
-        assert!(
-            late.seconds_remaining.unwrap() > 10,
-            "not yet in the critical window"
-        );
-        assert_eq!(late.severity, Severity::Critical);
-        assert!(late
-            .detail
-            .unwrap()
-            .contains("settlement scheduled after the challenge critical threshold"));
-    }
-
-    #[tokio::test]
-    async fn settlement_deadline_takes_precedence_over_the_next_attempt() {
-        // The write-once deadline bounds when the server finalizes the lease
-        // (at worst case if needed); the next attempt may fail and move.
-        for (settle_after_offset, deadline_offset, critical) in [(50, 5, true), (5, 50, false)] {
-            let (_, request) = finalized_v2_request().await;
-            let store = Arc::new(NullifierStore::in_memory().unwrap());
-            store.reserve_openrouter_lease(&request).unwrap();
-            let fixture = Fixture::with_store(store.clone(), &request).await;
-            let deadline = fixture.chain.lock().unwrap().deadline;
-            store
-                .create_openrouter_lease_bound(&crate::nullifier_store::NewOpenRouterLease {
-                    request: &request,
-                    key_source: "openrouter",
-                    issued_at: deadline - 100,
-                    expires_at: deadline - settle_after_offset,
-                    settle_after: deadline - settle_after_offset,
-                    spending_limit_usd: 1.0,
-                    oa_client_request_id: None,
-                    ttl_seconds: Some(60),
-                    settlement_deadline_at: Some(deadline - deadline_offset),
-                    delivered: Some(true),
-                })
-                .unwrap();
-            store
-                .activate_openrouter_lease(&request.client_request_id, "issued-key-hash")
-                .unwrap();
-            let mut service = fixture.service();
-            service.poll_once().await.unwrap();
-            let status = obligation(&service.status(), 0);
-            assert_eq!(status.state, ObligationState::AwaitingSettlement);
-            let settlement = status.settlement.as_ref().unwrap();
-            assert_eq!(
-                settlement.settle_after,
-                Some(deadline - settle_after_offset)
-            );
-            assert_eq!(
-                settlement.settlement_deadline_at,
-                Some(deadline - deadline_offset)
-            );
-            assert!(
-                status.seconds_remaining.unwrap() > 10,
-                "not yet in the critical window"
-            );
-            let detail = status.detail.unwrap();
-            if critical {
-                assert_eq!(status.severity, Severity::Critical);
-                assert!(
-                    detail.contains("settlement scheduled after the challenge critical threshold"),
-                    "{detail}"
-                );
-            } else {
-                assert_eq!(status.severity, Severity::Ok);
-                assert_eq!(detail, "awaiting finalized settlement");
-            }
-        }
+        assert!(status.alarms[0].contains("raise not mined before the deadline"));
     }
 
     #[tokio::test]
@@ -5891,44 +7160,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_root_replacement_refreshes_only_siblings() {
-        let fixture = Fixture::new().await;
-        let mut service = fixture.service();
-        service.poll_once().await.unwrap();
-        let (siblings, root) = alternate_tree();
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.siblings = siblings;
-            chain.root = root;
-        }
-        service.poll_once().await.unwrap();
-        let sends = fixture.sends();
-        assert_eq!(
-            sends.len(),
-            2,
-            "a pending call against an old root would revert"
-        );
-        assert_eq!(sends[0]["nonce"], sends[1]["nonce"]);
-        let (note0, inputs0, siblings0, proof0) = decode_call(&sends[0]);
-        let (note1, inputs1, siblings1, proof1) = decode_call(&sends[1]);
-        assert_eq!(note0, note1);
-        assert_eq!(inputs0, inputs1);
-        assert_eq!(proof0, proof1);
-        assert_ne!(siblings0, siblings1);
-        assert_eq!(&siblings1[..32], siblings[0].as_bytes());
-        for field in ["maxFeePerGas", "maxPriorityFeePerGas"] {
-            assert!(
-                fee(&sends[1], field) >= min_bump(fee(&sends[0], field)),
-                "{field}"
-            );
-        }
-        assert_eq!(
-            service.checkpoint.pending[&0].attempt.submitted_root,
-            Some(root)
-        );
-    }
-
-    #[tokio::test]
     async fn replacement_waits_while_an_earlier_nonce_is_pending() {
         let fixture = Fixture::new().await;
         let mut service = fixture.service();
@@ -5986,12 +7217,12 @@ mod tests {
             obligation(&service.status(), 0).state,
             ObligationState::ResolvedUnconfirmed
         );
-        fixture.chain.lock().unwrap().simulation_error = Some(revert("StaleRoot()"));
+        // Evidence the vault does not take for this escape is invalid.
+        fixture.chain.lock().unwrap().simulation_error = Some(revert("NotSuccessorEvidence()"));
         assert!(service.poll_once().await.is_err());
-        assert_eq!(
-            obligation(&service.status(), 0).blocked_reason,
-            Some(BlockedReason::IndexerPathBehind)
-        );
+        let invalid = obligation(&service.status(), 0);
+        assert_eq!(invalid.blocked_reason, Some(BlockedReason::EvidenceInvalid));
+        assert_eq!(invalid.severity, Severity::Critical);
         fixture.chain.lock().unwrap().simulation_error = Some(revert("ChallengeExpired()"));
         assert!(service.poll_once().await.is_err());
         let expired = obligation(&service.status(), 0);
@@ -6054,163 +7285,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexer_root_mismatch_escalates_to_divergence_alarm() {
+    async fn an_indexer_divergence_alarms_but_never_blocks_a_defeat() {
         // Heuristic mode: an indexer without block metadata.
         let fixture = Fixture::new().await;
-        let (siblings, other_root) = alternate_tree();
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.siblings = siblings;
-            chain.indexer_root = Some(json!({ "root": other_root }));
-        }
+        let (_, other_root) = alternate_tree();
+        fixture.chain.lock().unwrap().indexer_root = Some(json!({ "root": other_root }));
         let mut service = fixture.service_with(|config| {
             config.alarms.indexer_divergence_seconds = 0;
             config.alarms.indexer_divergence_polls = 3;
         });
-        assert!(service.poll_once().await.is_err());
-        let status = service.status();
-        assert_eq!(status.indexer.state, IndexerState::Lagging);
-        assert_eq!(
-            obligation(&status, 0).blocked_reason,
-            Some(BlockedReason::IndexerPathBehind)
-        );
-        assert!(service.poll_once().await.is_err());
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().indexer.state, IndexerState::Lagging);
+        // A defeat needs no indexer path and no live root (§5.4).
+        assert_eq!(fixture.sends().len(), 1);
+        assert_eq!(sent_call(&fixture.sends()[0]), (CallKind::Defeat, 0));
+        service.poll_once().await.unwrap();
+        assert_eq!(service.status().indexer.state, IndexerState::Lagging);
+        service.poll_once().await.unwrap();
         let status = service.status();
         assert_eq!(status.indexer.state, IndexerState::Diverged);
-        assert_eq!(
-            obligation(&status, 0).blocked_reason,
-            Some(BlockedReason::IndexerDiverged)
-        );
+        assert_eq!(obligation(&status, 0).blocked_reason, None);
         assert_eq!(status.status, Severity::Critical);
         assert!(status
             .alarms
             .iter()
             .any(|alarm| alarm.contains("indexer mirror diverged")));
-        assert!(fixture.sends().is_empty());
 
         // Exact mode: the vault root at the indexer's own block differs.
         let fixture = Fixture::new().await;
         {
             let mut chain = fixture.chain.lock().unwrap();
             let live = chain.root;
-            chain.siblings = siblings;
-            let meta = json!({ "root": other_root, "block_number": 5, "block_hash": "0xindexer" });
-            chain.indexer_root = Some(meta.clone());
-            chain.path_meta = Some(meta);
+            chain.indexer_root =
+                Some(json!({ "root": other_root, "block_number": 5, "block_hash": "0xindexer" }));
             chain.roots_by_hash.insert("0xindexer".into(), live);
         }
         let mut service = fixture.service();
-        assert!(service.poll_once().await.is_err());
+        service.poll_once().await.unwrap();
         let status = service.status();
         assert_eq!(status.indexer.state, IndexerState::Diverged);
-        assert_eq!(
-            obligation(&status, 0).blocked_reason,
-            Some(BlockedReason::IndexerDiverged)
-        );
-        assert_eq!(status.status, Severity::Critical);
+        assert_eq!(fixture.sends().len(), 1);
 
-        // A consistent but lagging root is not an alarm, nor is a block hash
-        // this RPC does not know.
-        for known in [true, false] {
-            let fixture = Fixture::new().await;
-            {
-                let mut chain = fixture.chain.lock().unwrap();
-                chain.siblings = siblings;
-                let meta = json!({ "root": other_root, "block_number": 4, "block_hash": "0xold" });
-                chain.indexer_root = Some(meta.clone());
-                chain.path_meta = Some(meta);
-                if known {
-                    chain.roots_by_hash.insert("0xold".into(), other_root);
-                }
-            }
-            let mut service = fixture.service();
-            for _ in 0..3 {
-                assert!(service.poll_once().await.is_err());
-            }
-            let status = service.status();
-            assert_eq!(status.indexer.state, IndexerState::Lagging);
-            assert_eq!(status.indexer.lag_blocks, Some(1));
-            assert_eq!(
-                obligation(&status, 0).blocked_reason,
-                Some(BlockedReason::IndexerPathBehind)
-            );
-            assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
-        }
-    }
-
-    #[tokio::test]
-    async fn indexer_view_predating_the_escape_is_lag_not_an_invalid_response() {
-        // The indexer's verified view predates the escape: the note's leaf is
-        // not zero there, so its zero path does not hash to the view's root,
-        // which the vault did have at the view's block.
-        let lagging = |siblings: &[Felt252; MERKLE_DEPTH]| {
-            let root = zkapi_core::v2::merkle_root(0, &Felt252::from_u64(0x1234), siblings);
-            (
-                root,
-                json!({ "root": root, "block_number": 4, "block_hash": "0xold" }),
-            )
-        };
-        // Only the note's leaf changed since: the siblings are those of the
-        // live root, and the challenge is sent at once.
+        // A consistent but lagging root is not an alarm.
         let fixture = Fixture::new().await;
         {
             let mut chain = fixture.chain.lock().unwrap();
-            let (root, meta) = lagging(&chain.siblings);
-            chain.indexer_root = Some(meta.clone());
-            chain.path_meta = Some(meta);
-            chain.roots_by_hash.insert("0xold".into(), root);
+            chain.indexer_root =
+                Some(json!({ "root": other_root, "block_number": 4, "block_hash": "0xold" }));
+            chain.roots_by_hash.insert("0xold".into(), other_root);
         }
         let mut service = fixture.service();
         service.poll_once().await.unwrap();
-        assert_eq!(fixture.sends().len(), 1);
         let status = service.status();
         assert_eq!(status.indexer.state, IndexerState::Lagging);
-        assert_eq!(obligation(&status, 0).state, ObligationState::Submitted);
+        assert_eq!(status.indexer.lag_blocks, Some(1));
         assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
-
-        // Another leaf changed too: the path is behind, which escalates with
-        // time, not invalid.
-        let (siblings, _) = alternate_tree();
-        let fixture = Fixture::new().await;
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.siblings = siblings;
-            let (root, meta) = lagging(&siblings);
-            chain.indexer_root = Some(meta.clone());
-            chain.path_meta = Some(meta);
-            chain.roots_by_hash.insert("0xold".into(), root);
-        }
-        let mut service = fixture.service();
-        assert!(service.poll_once().await.is_err());
-        let status = service.status();
-        let behind = obligation(&status, 0);
-        assert_eq!(
-            behind.blocked_reason,
-            Some(BlockedReason::IndexerPathBehind)
-        );
-        assert_eq!(behind.severity, Severity::Ok);
-        assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
-        assert!(fixture.sends().is_empty());
-
-        // A reported root the vault never had at that block is invalid.
-        let fixture = Fixture::new().await;
-        {
-            let mut chain = fixture.chain.lock().unwrap();
-            chain.siblings = siblings;
-            let (_, meta) = lagging(&siblings);
-            chain.path_meta = Some(meta);
-            let live = chain.root;
-            chain.roots_by_hash.insert("0xold".into(), live);
-        }
-        let mut service = fixture.service();
-        assert!(service.poll_once().await.is_err());
-        let invalid = obligation(&service.status(), 0);
-        assert_eq!(
-            invalid.blocked_reason,
-            Some(BlockedReason::IndexerInvalidResponse)
-        );
-        assert_eq!(invalid.severity, Severity::Critical);
-        assert!(fixture.sends().is_empty());
+        assert_eq!(fixture.sends().len(), 1);
     }
 
     #[tokio::test]
@@ -6252,36 +7382,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexer_unavailable_for_several_polls_still_challenges_after_recovery() {
+    async fn an_unavailable_indexer_never_delays_a_defeat() {
         let fixture = Fixture::new().await;
-        fixture.chain.lock().unwrap().path_unavailable = 3;
-        let mut service = fixture.service_with(|config| config.alarms.blocked_warning_seconds = 0);
-        for _ in 0..3 {
-            let error = service.poll_once().await.unwrap_err().to_string();
-            assert!(
-                error.contains("indexer zero-path request failed: HTTP 503"),
-                "{error}"
-            );
-            let unavailable = obligation(&service.status(), 0);
-            assert_eq!(
-                unavailable.blocked_reason,
-                Some(BlockedReason::IndexerUnavailable)
-            );
-            assert_eq!(unavailable.severity, Severity::Warning);
-            assert!(fixture.sends().is_empty());
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.path_unavailable = u32::MAX;
+            chain.indexer_health = "rebuilding";
+            chain.escapes = None;
         }
+        let mut service = fixture.service_with(|config| config.alarms.blocked_warning_seconds = 0);
         service.poll_once().await.unwrap();
         assert_eq!(fixture.sends().len(), 1);
-        let recovered = obligation(&service.status(), 0);
-        assert_eq!(recovered.state, ObligationState::Submitted);
-        assert_eq!(recovered.blocked_reason, None);
-        assert_eq!(recovered.blocked_since, None);
-
-        // An unavailable indexer is visible on the status too.
-        let fixture = Fixture::new().await;
-        fixture.chain.lock().unwrap().indexer_health = "rebuilding";
-        let mut service = fixture.service_with(|config| config.alarms.blocked_warning_seconds = 0);
-        service.poll_once().await.unwrap();
+        let submitted = obligation(&service.status(), 0);
+        assert_eq!(submitted.state, ObligationState::Submitted);
+        assert_eq!(submitted.blocked_reason, None);
+        // The unavailable indexer is visible on the status.
         let status = service.status();
         assert_eq!(status.indexer.state, IndexerState::Unavailable);
         assert!(status.indexer.detail.unwrap().contains("rebuilding"));
@@ -6308,6 +7423,7 @@ mod tests {
             chain
                 .withdrawals
                 .insert(7, (true, Felt252::from_u64(78), deadline + 5));
+            chain.concessions.insert(7, (NO_EVIDENCE, 0));
             deadline
         };
         let mut service = fixture.service();
@@ -6339,7 +7455,7 @@ mod tests {
             obligation(&status, 7).challenge_deadline,
             Some(deadline + 5)
         );
-        assert_eq!(obligation(&status, 7).state, ObligationState::NoEvidence);
+        assert_eq!(obligation(&status, 7).state, ObligationState::NothingDue);
         assert!(status
             .indexer
             .pending_escapes_disagreement
@@ -6376,10 +7492,12 @@ mod tests {
         }
         service.poll_once().await.unwrap();
         assert!(service.checkpoint.pending.is_empty());
-        // The owner escapes again at another anchor: a new obligation.
+        // The owner escapes again from another state, whose successor the
+        // second request spent: a new obligation.
         {
             let mut chain = fixture.chain.lock().unwrap();
-            chain.nullifier = second.public_inputs.request_nullifier;
+            chain.nullifier = RE_ESCAPED;
+            chain.next_nullifier = second.public_inputs.request_nullifier;
             chain.active = true;
             chain.confirmed_active = true;
             chain.head_number += 1;
@@ -6392,9 +7510,10 @@ mod tests {
             nullifier_word(&sends[1]),
             second.public_inputs.request_nullifier.as_bytes()
         );
+        assert_eq!(service.checkpoint.pending[&0].nullifier, RE_ESCAPED);
         assert_eq!(
-            service.checkpoint.pending[&0].nullifier,
-            second.public_inputs.request_nullifier
+            service.checkpoint.pending[&0].next_nullifier,
+            Some(second.public_inputs.request_nullifier)
         );
     }
 
@@ -6415,7 +7534,7 @@ mod tests {
         let fixture = Fixture::with_store(reader, &request).await;
         rusqlite::Connection::open(&path)
             .unwrap()
-            .execute_batch("DROP TABLE nullifiers;")
+            .execute_batch("DROP TRIGGER request_evidence_no_delete; DROP TABLE request_evidence;")
             .unwrap();
         let mut service = fixture.service();
         let error = service.poll_once().await.unwrap_err().to_string();
@@ -6433,13 +7552,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archived_state_key_mismatch_is_evidence_invalid() {
+    async fn evidence_of_another_state_key_is_invalid_and_critical() {
         let fixture = Fixture::new().await;
         fixture.chain.lock().unwrap().state_key.0 = Felt252::from_u64(5);
         let mut service = fixture.service();
         let error = service.poll_once().await.unwrap_err().to_string();
         assert!(
-            error.contains("differs from vault immutable key"),
+            error.contains("names a state key other than the vault's"),
             "{error}"
         );
         assert!(fixture.sends().is_empty());
@@ -6973,11 +8092,12 @@ mod tests {
     async fn escape_paid_out_in_the_first_deadline_block_is_recorded_missed() {
         for legacy in [false, true] {
             let fixture = Fixture::new().await;
-            // The indexer serves no zero path, so the challenge stays blocked
+            // Every defeat simulation reverts, so the defeat stays blocked
             // into the critical threshold.
             let (nullifier, deadline) = {
                 let mut chain = fixture.chain.lock().unwrap();
-                chain.path_unavailable = u32::MAX;
+                chain.simulation_error =
+                    Some(json!({ "code": -32000, "message": "execution reverted" }));
                 chain.legacy_vault = legacy;
                 chain.head_timestamp = chain.deadline - 5;
                 (chain.nullifier, chain.deadline)
@@ -7016,7 +8136,7 @@ mod tests {
             // Told by challengedNullifiers, or on a legacy vault by the log.
             assert_eq!(
                 service.status().last_missed.unwrap().reason,
-                "challenge not mined before the deadline"
+                "defeat not mined before the deadline: verified evidence at the successor nullifier existed"
             );
             service.poll_once().await.unwrap();
             assert_eq!(service.status().missed_total, 1);
@@ -7093,7 +8213,7 @@ mod tests {
                     .last_missed
                     .unwrap()
                     .reason
-                    .contains("no challenge of the escape is logged"),
+                    .contains("no defeat of the escape is logged"),
                 !logged
             );
             assert!(fixture.sends().is_empty());
@@ -7105,7 +8225,8 @@ mod tests {
         let fixture = Fixture::new().await;
         let (nullifier, deadline) = {
             let mut chain = fixture.chain.lock().unwrap();
-            chain.path_unavailable = u32::MAX;
+            chain.simulation_error =
+                Some(json!({ "code": -32000, "message": "execution reverted" }));
             chain.head_timestamp = chain.deadline;
             (chain.nullifier, chain.deadline)
         };
@@ -7134,7 +8255,7 @@ mod tests {
                 "from_block": 0, "next_block": 0, "last_block_hash": null,
                 "pending": {}, "detached_nonces": {}, "missed_total": 1,
                 "last_missed": { "note_id": 0, "nullifier": nullifier, "challenge_deadline": deadline,
-                    "reason": "challenge not mined before the deadline", "recorded_at": unix_now() }
+                    "reason": "defeat not mined before the deadline: verified evidence at the successor nullifier existed", "recorded_at": unix_now() }
             }))
             .unwrap(),
         )
@@ -7179,7 +8300,7 @@ mod tests {
                 service.poll_once().await.unwrap();
                 assert_eq!(
                     obligation(&service.status(), 0).state,
-                    ObligationState::ExpiredWithoutEvidence
+                    ObligationState::ExpiredNothingDue
                 );
             }
             {
@@ -7190,7 +8311,7 @@ mod tests {
             }
             // The evidence database cannot be read when the payout is found.
             database
-                .execute_batch("ALTER TABLE nullifiers RENAME TO hidden;")
+                .execute_batch("ALTER TABLE request_evidence RENAME TO hidden;")
                 .unwrap();
             for _ in 0..2 {
                 let error = service.poll_once().await.unwrap_err().to_string();
@@ -7210,17 +8331,20 @@ mod tests {
                 );
             }
             database
-                .execute_batch("ALTER TABLE hidden RENAME TO nullifiers;")
+                .execute_batch("ALTER TABLE hidden RENAME TO request_evidence;")
                 .unwrap();
             service.poll_once().await.unwrap();
             assert!(service.checkpoint.pending.is_empty());
             let status = service.status();
             if evidenced {
                 assert_missed_once(&status, nullifier, deadline);
+                let last = status.last_missed.unwrap();
                 assert_eq!(
-                    status.last_missed.unwrap().reason,
-                    "challenge not mined before the deadline"
+                    last.reason,
+                    "defeat not mined before the deadline: verified evidence at the successor nullifier existed"
                 );
+                assert_eq!(last.kind, Some(CallKind::Defeat));
+                assert_eq!(status.escapes_finalized_with_successor_evidence_total, 1);
             } else {
                 assert_eq!(status.missed_total, 0);
                 assert!(status.last_missed.is_none());
@@ -7260,7 +8384,7 @@ mod tests {
                 "pending": pending, "detached_nonces": {}, "missed_total": 2,
                 "last_missed": { "note_id": 7, "nullifier": Felt252::from_u64(77),
                     "challenge_deadline": last_deadline,
-                    "reason": "challenge not mined before the deadline",
+                    "reason": "defeat not mined before the deadline: verified evidence at the successor nullifier existed",
                     "recorded_at": recorded_at }
             }))
             .unwrap(),
@@ -7379,7 +8503,8 @@ mod tests {
         // is at most the first head's timestamp.
         for recorded_at in [day_ago, now - 60] {
             let fixture = Fixture::new().await;
-            fixture.chain.lock().unwrap().path_unavailable = u32::MAX;
+            fixture.chain.lock().unwrap().simulation_error =
+                Some(json!({ "code": -32000, "message": "execution reverted" }));
             write_legacy_checkpoint(&fixture, None, json!({}), recorded_at);
             let mut service = fixture.service();
             assert!(service.poll_once().await.is_err());
@@ -7568,7 +8693,7 @@ mod tests {
         assert_missed_once(&status, nullifier, deadline);
         assert_eq!(
             status.last_missed.unwrap().reason,
-            "challenge not mined before the deadline"
+            "defeat not mined before the deadline: verified evidence at the successor nullifier existed"
         );
         // An escape read pending above the confirmed block (an RPC whose block
         // number lags) is searched only once that block is confirmed.
@@ -7595,7 +8720,7 @@ mod tests {
         assert!(service.checkpoint.pending.is_empty());
         assert_eq!(
             service.status().last_missed.unwrap().reason,
-            "challenge not mined before the deadline"
+            "defeat not mined before the deadline: verified evidence at the successor nullifier existed"
         );
     }
 
@@ -7668,6 +8793,8 @@ mod tests {
             let mut chain = fixture.chain.lock().unwrap();
             let deadline = chain.deadline + 10_000;
             chain.withdrawals.insert(9, (true, blocker, deadline));
+            // Nothing is due for note 9: its reserved nonce stays unsent.
+            chain.concessions.insert(9, (NO_EVIDENCE, 0));
         }
         service.checkpoint.pending.insert(
             9,
@@ -7728,7 +8855,7 @@ mod tests {
                 assert_missed_once(&status, nullifier, deadline);
                 assert_eq!(
                     status.last_missed.as_ref().unwrap().reason,
-                    "challenge not mined before the deadline",
+                    "defeat not mined before the deadline: verified evidence at the successor nullifier existed",
                     "legacy {legacy}"
                 );
                 let missed = obligation(&status, 0);
@@ -7880,7 +9007,30 @@ mod tests {
             challenge_period_seconds: 86_400,
             verified_at: 1,
             verified_block: None,
+            circuit_id: Some(zkapi_proof::compact::CIRCUIT_ID.into()),
+            setup_id: Some("dev".into()),
+            request_vk_keccak256: Some(service.identity.request_vk_keccak256.clone()),
+            withdrawal_vk_keccak256: Some(service.identity.withdrawal_vk_keccak256.clone()),
+            source: crate::nullifier_store::BINDING_SOURCE_VAULT.into(),
         };
+        // A database bound to another statement (here, one bound before
+        // circuit identifiers were recorded) is refused.
+        store
+            .write_deployment_binding(&DeploymentBinding {
+                circuit_id: None,
+                ..binding.clone()
+            })
+            .unwrap();
+        assert!(mismatch(service.verify_deployment_binding().await).contains("another statement"));
+        store
+            .write_deployment_binding(&DeploymentBinding {
+                request_vk_keccak256: Some(format!("0x{}", "11".repeat(32))),
+                ..binding.clone()
+            })
+            .unwrap();
+        assert!(
+            mismatch(service.verify_deployment_binding().await).contains("request_vk_keccak256")
+        );
         store.write_deployment_binding(&binding).unwrap();
         assert_eq!(service.verify_deployment_binding().await.unwrap(), binding);
         assert!(service.status().config_warnings.is_empty());
@@ -8481,7 +9631,6 @@ mod tests {
     async fn back_run_re_escape_is_challenged_when_the_listing_is_stale() {
         let (store, first, second) = two_finalized_v2_requests().await;
         let fixture = Fixture::with_store(store, &first).await;
-        let a = first.public_inputs.request_nullifier;
         let b = second.public_inputs.request_nullifier;
         let mut service = fixture.service_with(|config| config.alarms.blocked_warning_seconds = 0);
         service.poll_once().await.unwrap();
@@ -8491,13 +9640,14 @@ mod tests {
             // The challenge of A mined, and in the same block the owner
             // escaped again with B, another finalized request.
             chain.mined_nonce = 4;
-            chain.nullifier = b;
+            chain.nullifier = RE_ESCAPED;
+            chain.next_nullifier = b;
             chain.head_number += 3;
             // The scan misses B, and the indexer, whose log source dropped
             // the root-neutral pair, still lists A.
             chain.drop_logs = true;
             chain.escapes = Some(vec![json!({
-                "note_id": 0, "withdrawal_nullifier": a, "challenge_deadline": chain.deadline
+                "note_id": 0, "withdrawal_nullifier": ESCAPED, "challenge_deadline": chain.deadline
             })]);
         }
         for _ in 0..3 {
@@ -8507,7 +9657,7 @@ mod tests {
         assert_eq!(sends.len(), 2, "B is challenged");
         assert_eq!(sends[1]["nonce"], "0x4");
         assert_eq!(decode_call(&sends[1]).1[8 * 32..9 * 32], b.as_bytes()[..]);
-        assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+        assert_eq!(service.checkpoint.pending[&0].nullifier, RE_ESCAPED);
         let status = service.status();
         assert!(status
             .indexer
@@ -8732,7 +9882,8 @@ mod tests {
                 // escaped again with B, whose log the scan drops.
                 let mut chain = fixture.chain.lock().unwrap();
                 chain.mined_nonce = 4;
-                chain.nullifier = b;
+                chain.nullifier = RE_ESCAPED;
+                chain.next_nullifier = b;
                 chain.head_number += 3;
                 chain.drop_logs = true;
                 chain.escapes = listing.clone();
@@ -8745,7 +9896,7 @@ mod tests {
             assert_eq!(sends.len(), 2, "B is challenged: {listing:?}");
             assert_eq!(sends[1]["nonce"], "0x4");
             assert_eq!(decode_call(&sends[1]).1[8 * 32..9 * 32], b.as_bytes()[..]);
-            assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+            assert_eq!(service.checkpoint.pending[&0].nullifier, RE_ESCAPED);
             assert_eq!(service.status().missed_total, 0);
         }
     }
@@ -8763,7 +9914,8 @@ mod tests {
             // A's challenge mined and the owner escaped again with B; neither
             // the scan nor the indexer reports B.
             chain.mined_nonce = 4;
-            chain.nullifier = b;
+            chain.nullifier = RE_ESCAPED;
+            chain.next_nullifier = b;
             chain.deadline += 500;
             chain.head_number += 3;
             chain.drop_logs = true;
@@ -8774,6 +9926,7 @@ mod tests {
             chain
                 .withdrawals
                 .insert(9, (true, Felt252::from_u64(12345), deadline + 50));
+            chain.concessions.insert(9, (NO_EVIDENCE, 0));
             deadline
         };
         service.checkpoint.pending.insert(
@@ -8789,7 +9942,7 @@ mod tests {
             let _ = service.poll_once().await;
             fixture.chain.lock().unwrap().head_number += 1;
         }
-        assert_eq!(service.checkpoint.pending[&0].nullifier, b);
+        assert_eq!(service.checkpoint.pending[&0].nullifier, RE_ESCAPED);
         let o = obligation(&service.status(), 0);
         assert_eq!(o.challenge_deadline, Some(deadline_b));
         assert_eq!(o.state, ObligationState::Ready);
@@ -9154,6 +10307,7 @@ mod tests {
             chain
                 .withdrawals
                 .insert(7, (true, Felt252::from_u64(78), deadline + 5));
+            chain.concessions.insert(7, (NO_EVIDENCE, 0));
         }
         service.poll_once().await.unwrap();
         assert_eq!(service.checkpoint.pending[&500].nullifier, nullifier);
@@ -9493,5 +10647,813 @@ mod tests {
         service.poll_once().await.unwrap();
         assert!(service.dead_escapes.is_empty());
         assert!(!service.checkpoint.pending.contains_key(&7));
+    }
+
+    /// The proof bytes of a fixture request.
+    fn proof_bytes(request: &ApiRequestV2) -> Vec<u8> {
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &request.proof.proof,
+        )
+        .unwrap()
+    }
+
+    /// File `request`'s proof as evidence (a later reservation at its
+    /// nullifier), written `created_at`.
+    fn file_evidence(store: &NullifierStore, request: &ApiRequestV2, created_at: u64) {
+        crate::watcher::tests::append_raw_evidence(
+            store,
+            &request.public_inputs.request_nullifier,
+            &serde_json::to_string(&request.public_inputs).unwrap(),
+            &request.public_inputs.solvency_bound.to_string(),
+            &proof_bytes(request),
+            created_at,
+        );
+    }
+
+    fn kinds(sends: &[Value]) -> Vec<CallKind> {
+        sends.iter().map(|send| sent_call(send).0).collect()
+    }
+
+    #[tokio::test]
+    async fn successor_evidence_defeats_whatever_its_lease_status() {
+        let (_, request) = finalized_v2_request().await;
+        let nullifier = request.public_inputs.request_nullifier;
+        // A reservation without a lease row, a key never issued, an issued
+        // key, a cancelled lease, a settled charge awaiting its signature
+        // (deferred, the exit consuming it), and a Finalized transcript.
+        for case in [
+            "no lease row",
+            "provisioning",
+            "active",
+            "cancelled",
+            "deferred",
+            "finalized",
+        ] {
+            let store = Arc::new(NullifierStore::in_memory().unwrap());
+            store.reserve_openrouter_lease(&request).unwrap();
+            if case != "no lease row" {
+                store
+                    .create_openrouter_lease(&request, "oa_org", 1, 2, 3, 1.0)
+                    .unwrap();
+            }
+            match case {
+                "active" | "cancelled" => {
+                    store
+                        .activate_openrouter_lease(&request.client_request_id, "key-hash")
+                        .unwrap();
+                    if case == "cancelled" {
+                        store.execute_for_test(
+                            "UPDATE openrouter_leases SET status = 'cancelled'",
+                            [],
+                        );
+                    }
+                }
+                "deferred" => {
+                    settle(&store, &request, 1);
+                    store.execute_for_test(
+                        "UPDATE nullifiers SET exit_deferred_since = 5 WHERE nullifier = ?1",
+                        [nullifier.to_hex()],
+                    );
+                }
+                "finalized" => store
+                    .finalize(&nullifier, &finalized_transcript(&request, 0))
+                    .unwrap(),
+                _ => {}
+            }
+            let fixture = Fixture::with_store(store, &request).await;
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            let sends = fixture.sends();
+            assert_eq!(kinds(&sends), [CallKind::Defeat], "{case}");
+            assert_eq!(
+                sends[0]["data"],
+                format!("0x{}", hex::encode(defeat_of(&request, 0))),
+                "{case}"
+            );
+            // The default defeat gas limit, unless the estimate is higher.
+            assert_eq!(sends[0]["gas"], format!("0x{:x}", 12_000_000), "{case}");
+            let status = obligation(&service.status(), 0);
+            assert_eq!(status.evidence, Some(EvidenceKind::Successor), "{case}");
+            assert_eq!(status.action, Some(CallKind::Defeat), "{case}");
+        }
+        // With a cheap estimate the defeat goes at the 600,000 default.
+        let fixture = Fixture::new().await;
+        fixture.chain.lock().unwrap().estimate = 350_000;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            fixture.sends()[0]["gas"],
+            format!("0x{:x}", DEFAULT_DEFEAT_GAS_LIMIT)
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_only_at_the_escaped_nullifier_never_yields_a_defeat() {
+        // Every row at N: Finalized, settled, unsettled; none at N⁺. A
+        // request at the escaped state only ever raises.
+        let (_, request) = finalized_v2_request().await;
+        for settled in [false, true] {
+            let store = Arc::new(NullifierStore::in_memory().unwrap());
+            issued_lease(&store, &request);
+            if settled {
+                settle(&store, &request, 1);
+            }
+            let fixture = escape_at_request(store, &request).await;
+            let mut service = fixture.service();
+            for _ in 0..3 {
+                service.poll_once().await.unwrap();
+                fixture.chain.lock().unwrap().head_timestamp += 20;
+            }
+            let sends = fixture.sends();
+            assert!(
+                kinds(&sends).iter().all(|kind| *kind != CallKind::Defeat),
+                "settled {settled}: {:?}",
+                kinds(&sends)
+            );
+            assert!(!sends.is_empty(), "a raise is due by the raise lead");
+        }
+    }
+
+    /// An escape at `first`'s nullifier, charged 1 (a raise is due at once),
+    /// whose successor is `second`'s nullifier: evidence at it appears only
+    /// when the test files it.
+    async fn raise_then_successor() -> (Fixture, Arc<NullifierStore>, ApiRequestV2, ApiRequestV2) {
+        let (_, first, second) = two_finalized_v2_requests().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        issued_lease(&store, &first);
+        settle(&store, &first, 1);
+        let fixture = escape_at_request(store.clone(), &first).await;
+        fixture.chain.lock().unwrap().next_nullifier = second.public_inputs.request_nullifier;
+        (fixture, store, first, second)
+    }
+
+    #[tokio::test]
+    async fn a_defeat_replaces_a_pending_raise_at_its_nonce_and_is_mined_before_the_deadline() {
+        let (fixture, store, _first, second) = raise_then_successor().await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise]);
+        assert_eq!(sends[0]["nonce"], "0x3");
+        let raise_hash = service.checkpoint.pending[&0]
+            .transaction_hash
+            .clone()
+            .unwrap();
+        // The owner spent the successor state: evidence at N⁺ appears while
+        // the raise is unmined.
+        file_evidence(&store, &second, unix_now());
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise, CallKind::Defeat]);
+        assert_eq!(sends[1]["nonce"], "0x3", "the defeat replaces the raise");
+        for field in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            assert!(
+                fee(&sends[1], field) >= min_bump(fee(&sends[0], field)),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            sends[1]["data"],
+            format!("0x{}", hex::encode(defeat_of(&second, 0)))
+        );
+        let attempt = &service.checkpoint.pending[&0].attempt;
+        assert_eq!(attempt.action, Some(CallKind::Defeat));
+        assert!(attempt.replaced_raise);
+        assert!(attempt.superseded_hashes.contains(&raise_hash));
+        assert_eq!(attempt.raise_amount, None);
+        // A pending defeat is never replaced by a raise, and is only bumped.
+        service.poll_once().await.unwrap();
+        assert_eq!(fixture.sends().len(), 2);
+        assert_eq!(
+            obligation(&service.status(), 0).action,
+            Some(CallKind::Defeat)
+        );
+        // The defeat mines before the deadline and ends the escape.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            assert!(chain.head_timestamp < chain.deadline);
+            chain.mined_nonce = 4;
+            chain.active = false;
+            chain.confirmed_active = false;
+            let nullifier = chain.nullifier;
+            chain.challenged.insert(nullifier);
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        let status = service.status();
+        assert_eq!(status.missed_total, 0);
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Raise, CallKind::Defeat]);
+    }
+
+    /// §5.4: a raise goes at the 450,000 default gas limit, unless its
+    /// estimate plus 20% is higher.
+    #[tokio::test]
+    async fn a_raise_goes_at_the_default_gas_limit_unless_the_estimate_is_higher() {
+        for (estimate, gas) in [(300_000, 450_000), (500_000, 600_000)] {
+            let (fixture, ..) = raise_then_successor().await;
+            fixture.chain.lock().unwrap().estimate = estimate;
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            let sends = fixture.sends();
+            assert_eq!(kinds(&sends), [CallKind::Raise], "estimate {estimate}");
+            assert_eq!(sends[0]["gas"], format!("0x{gas:x}"), "estimate {estimate}");
+        }
+        assert_eq!(format!("0x{DEFAULT_RAISE_GAS_LIMIT:x}"), "0x6ddd0");
+    }
+
+    /// Review regression: evidence at `N⁺` that does not verify defeats
+    /// nothing, so it must not hold back the raise owed at `N`. The raise
+    /// goes out, and the invalid row still raises the critical
+    /// evidence_invalid alarm and fails the poll.
+    #[tokio::test]
+    async fn invalid_successor_evidence_alarms_but_never_blocks_the_raise() {
+        let (fixture, store, _first, second) = raise_then_successor().await;
+        let mut tampered = proof_bytes(&second);
+        tampered[40] ^= 1;
+        crate::watcher::tests::append_raw_evidence(
+            &store,
+            &second.public_inputs.request_nullifier,
+            &serde_json::to_string(&second.public_inputs).unwrap(),
+            &second.public_inputs.solvency_bound.to_string(),
+            &tampered,
+            unix_now(),
+        );
+        let mut service = fixture.service();
+        let error = service.poll_once().await.unwrap_err().to_string();
+        assert!(
+            error.contains("evidence at the successor nullifier does not verify"),
+            "{error}"
+        );
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise]);
+        let status = service.status();
+        let raised = obligation(&status, 0);
+        assert_eq!(raised.action, Some(CallKind::Raise));
+        assert_eq!(raised.state, ObligationState::Submitted);
+        assert_eq!(raised.blocked_reason, Some(BlockedReason::EvidenceInvalid));
+        assert_eq!(raised.severity, Severity::Critical);
+        assert_eq!(status.status, Severity::Critical);
+        // A verified row at N⁺ still takes precedence: the defeat replaces
+        // the raise on its nonce.
+        file_evidence(&store, &second, unix_now());
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise, CallKind::Defeat]);
+        assert_eq!(sends[1]["nonce"], sends[0]["nonce"]);
+        assert_eq!(obligation(&service.status(), 0).blocked_reason, None);
+    }
+
+    /// Review regression: with nothing owed at `N`, an unverifiable row at
+    /// `N⁺` is still reported, and a payout at the deadline is still
+    /// counted as a possible missed defeat.
+    #[tokio::test]
+    async fn invalid_successor_evidence_with_nothing_owed_is_critical_and_missed_at_the_deadline() {
+        let (_, first, second) = two_finalized_v2_requests().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let fixture = escape_at_request(store.clone(), &first).await;
+        fixture.chain.lock().unwrap().next_nullifier = second.public_inputs.request_nullifier;
+        let mut tampered = proof_bytes(&second);
+        tampered[40] ^= 1;
+        crate::watcher::tests::append_raw_evidence(
+            &store,
+            &second.public_inputs.request_nullifier,
+            &serde_json::to_string(&second.public_inputs).unwrap(),
+            &second.public_inputs.solvency_bound.to_string(),
+            &tampered,
+            1,
+        );
+        let mut service = fixture.service();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
+        let invalid = obligation(&service.status(), 0);
+        assert_eq!(invalid.blocked_reason, Some(BlockedReason::EvidenceInvalid));
+        assert_eq!(invalid.evidence, Some(EvidenceKind::Corrupt));
+        assert_eq!(invalid.severity, Severity::Critical);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+        }
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        let missed = obligation(&status, 0);
+        assert_eq!(missed.state, ObligationState::Missed);
+        assert_eq!(missed.evidence, Some(EvidenceKind::Corrupt));
+        assert_eq!(status.missed_total, 1);
+        assert_eq!(status.last_missed.unwrap().kind, Some(CallKind::Defeat));
+    }
+
+    #[tokio::test]
+    async fn a_restart_in_the_middle_of_the_replacement_resends_the_defeat_never_the_raise() {
+        let (fixture, store, _first, second) = raise_then_successor().await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Raise]);
+        file_evidence(&store, &second, unix_now());
+        // The defeat's send has an unknown outcome, and the daemon stops.
+        fixture
+            .chain
+            .lock()
+            .unwrap()
+            .send_errors
+            .push_back(json!({ "code": -32000, "message": "connection reset" }));
+        assert!(service.poll_once().await.is_err());
+        let persisted = service.checkpoint.pending[&0].attempt.clone();
+        assert_eq!(persisted.action, Some(CallKind::Defeat));
+        assert!(persisted.replaced_raise);
+        assert!(persisted.unknown_attempt);
+        let defeat_fees = (
+            parse_hex_u128(persisted.max_fee_per_gas.as_deref().unwrap()).unwrap(),
+            parse_hex_u128(persisted.max_priority_fee_per_gas.as_deref().unwrap()).unwrap(),
+        );
+        drop(service);
+        let mut restarted = fixture.service();
+        restarted.poll_once().await.unwrap();
+        // Either attempt may hold the nonce: nothing is sent before the bump
+        // interval, and then only the defeat, outbidding its own persisted
+        // bid on the same nonce.
+        assert_eq!(fixture.sends().len(), 2);
+        fixture.chain.lock().unwrap().head_number += 3;
+        restarted.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(
+            kinds(&sends),
+            [CallKind::Raise, CallKind::Defeat, CallKind::Defeat]
+        );
+        assert_eq!(sends[2]["nonce"], "0x3");
+        assert_eq!(sends[2]["data"], sends[1]["data"]);
+        assert!(fee(&sends[2], "maxFeePerGas") >= min_bump(defeat_fees.0));
+        assert!(fee(&sends[2], "maxPriorityFeePerGas") >= min_bump(defeat_fees.1));
+        let attempt = &restarted.checkpoint.pending[&0].attempt;
+        assert_eq!(attempt.action, Some(CallKind::Defeat));
+        assert!(attempt.replaced_raise);
+    }
+
+    #[tokio::test]
+    async fn a_raise_mined_first_leaves_the_defeat_to_the_next_nonce() {
+        let (fixture, store, _first, second) = raise_then_successor().await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Raise]);
+        // The raise lands (unconfirmed) and successor evidence appears.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.confirmed_nonce = Some(3);
+            chain.conceded = 1;
+        }
+        file_evidence(&store, &second, unix_now());
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise, CallKind::Defeat]);
+        assert_eq!(
+            sends[1]["nonce"], "0x4",
+            "the defeat goes on the next nonce"
+        );
+        // The raise's nonce stays tracked until its confirmation.
+        assert!(service.checkpoint.detached_nonces.contains_key(&3));
+        assert_eq!(service.checkpoint.pending[&0].nonce, Some(4));
+        assert!(!service.checkpoint.pending[&0].attempt.replaced_raise);
+        fixture.chain.lock().unwrap().confirmed_nonce = Some(4);
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.detached_nonces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_raise_mined_after_the_escape_was_defeated_reverts_harmlessly() {
+        let (fixture, _store, _first, _second) = raise_then_successor().await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let raise_hash = service.checkpoint.pending[&0]
+            .transaction_hash
+            .clone()
+            .unwrap();
+        // Someone else defeats the escape before the raise mines.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.active = false;
+            let nullifier = chain.nullifier;
+            chain.challenged.insert(nullifier);
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::ResolvedUnconfirmed
+        );
+        // Then the raise mines, and reverts (NotPendingWithdrawal).
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.confirmed_active = false;
+            chain
+                .receipts
+                .insert(raise_hash, json!({ "status": "0x0" }));
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        assert!(service.checkpoint.detached_nonces.is_empty());
+        let status = service.status();
+        assert_eq!(status.missed_total, 0);
+        assert_eq!(status.status, Severity::Ok, "{:?}", status.alarms);
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Raise]);
+    }
+
+    #[tokio::test]
+    async fn a_raise_no_longer_due_whose_nonce_no_attempt_holds_is_released() {
+        let (_, request) = finalized_v2_request().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        issued_lease(&store, &request);
+        settle(&store, &request, 1);
+        let fixture = escape_at_request(store, &request).await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Raise]);
+        // The raise was dropped from every pool, and another raise already
+        // conceded what is owed.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.transaction_known = false;
+            chain.pending_nonce = None;
+            chain.conceded = 1;
+        }
+        service.poll_once().await.unwrap();
+        assert_eq!(service.checkpoint.pending[&0].nonce, None);
+        assert_eq!(
+            obligation(&service.status(), 0).state,
+            ObligationState::Raised
+        );
+        assert_eq!(fixture.sends().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missed_defeat_is_counted_and_its_closed_leaf_retired() {
+        let fixture = Fixture::new().await;
+        // Every defeat simulation reverts: the defeat is missed.
+        fixture.chain.lock().unwrap().simulation_error =
+            Some(json!({ "code": -32000, "message": "execution reverted" }));
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        assert!(service.poll_once().await.is_err());
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+            chain.head_number += 1;
+        }
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        assert_eq!(status.escapes_finalized_with_successor_evidence_total, 1);
+        assert_eq!(status.missed_raises_total, 0);
+        assert_eq!(
+            status.last_missed.as_ref().unwrap().kind,
+            Some(CallKind::Defeat)
+        );
+        // The escape is paid out: the obligation turns to the note's leaf.
+        let siblings: [Felt252; MERKLE_DEPTH] = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
+            .try_into()
+            .unwrap();
+        let leaf = Felt252::from_u64(0x1eaf);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.pay_out(5);
+            chain.head_number += 3;
+            chain.simulation_error = None;
+            chain.leaf_paths.insert(0, (leaf, siblings));
+            chain.root = zkapi_core::v2::merkle_root(0, &leaf, &siblings);
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending[&0].retire_leaf);
+        // The retirement goes with the indexer's path at the live root.
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Retire]);
+        let expected = VaultCall::Retire {
+            note_id: 0,
+            siblings: Box::new(siblings),
+        };
+        assert_eq!(
+            sends[0]["data"],
+            format!("0x{}", hex::encode(expected.calldata().unwrap()))
+        );
+        let retiring = obligation(&service.status(), 0);
+        assert_eq!(retiring.action, Some(CallKind::Retire));
+        assert_eq!(
+            retiring.severity,
+            Severity::Critical,
+            "the missed defeat still alarms"
+        );
+        // Mined: the leaf is zero at the live root, and the obligation ends.
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.mined_nonce = 4;
+            chain.leaf_paths.insert(0, (Felt252::ZERO, siblings));
+            chain.root = zkapi_core::v2::merkle_root(0, &Felt252::ZERO, &siblings);
+            chain.head_number += 3;
+        }
+        service.poll_once().await.unwrap();
+        assert!(service.checkpoint.pending.is_empty());
+        assert_eq!(service.checkpoint.retired_leaves_total, 1);
+        assert_eq!(kinds(&fixture.sends()), [CallKind::Retire]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_indexer_path_never_sends_a_retirement() {
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service_with(|config| config.retire_on_miss = true);
+        let siblings: [Felt252; MERKLE_DEPTH] = zkapi_core::v2::zero_hashes()[..MERKLE_DEPTH]
+            .try_into()
+            .unwrap();
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain
+                .leaf_paths
+                .insert(0, (Felt252::from_u64(0x1eaf), siblings));
+            // The vault's root moved past the indexer's view.
+            chain.root = Felt252::from_u64(0x5ca1e);
+        }
+        service.checkpoint.pending.insert(
+            0,
+            PendingChallenge {
+                nullifier: ESCAPED,
+                retire_leaf: true,
+                ..Default::default()
+            },
+        );
+        service.persist().unwrap();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
+        let blocked = obligation(&service.status(), 0);
+        assert_eq!(blocked.state, ObligationState::RetiringLeaf);
+        assert_eq!(
+            blocked.blocked_reason,
+            Some(BlockedReason::IndexerPathBehind)
+        );
+    }
+
+    #[tokio::test]
+    async fn both_getters_are_read_at_one_block_and_decoded_strictly() {
+        let fixture = Fixture::new().await;
+        let mut service = fixture.service();
+        service.poll_once().await.unwrap();
+        let reads = fixture.chain.lock().unwrap().escape_reads.clone();
+        assert!(!reads.is_empty());
+        for (kind, block) in reads.iter().filter(|(kind, _)| *kind == "concession") {
+            assert_ne!(block, "latest", "{kind} at {block}");
+            assert!(
+                reads
+                    .iter()
+                    .any(|(other, at)| *other == "withdrawal" && at == block),
+                "pendingConcessions read at {block} without pendingWithdrawals at it"
+            );
+        }
+        let status = obligation(&service.status(), 0);
+        assert_eq!(
+            status.next_nullifier,
+            Some(fixture.chain.lock().unwrap().next_nullifier)
+        );
+        assert_eq!(
+            (status.state_balance, status.conceded),
+            (Some(100), Some(0))
+        );
+
+        // A concession that does not add up to the pending withdrawal, or
+        // that is not three words, fails the poll; nothing is sent.
+        for words in [
+            vec![Felt252::from_u64(9), Felt252::from_u64(99), Felt252::ZERO],
+            vec![Felt252::from_u64(9), Felt252::from_u64(100)],
+            vec![Felt252::ZERO, Felt252::from_u64(100), Felt252::ZERO],
+        ] {
+            let fixture = Fixture::new().await;
+            fixture.chain.lock().unwrap().concession_words = Some(words.clone());
+            let mut service = fixture.service();
+            assert!(service.poll_once().await.is_err(), "{words:?}");
+            assert!(fixture.sends().is_empty(), "{words:?}");
+        }
+        // A malformed concession event fails the scan of its range.
+        let fixture = Fixture::new().await;
+        fixture.chain.lock().unwrap().malformed_concession_event = true;
+        let mut service = fixture.service();
+        let error = service.poll_once().await.unwrap_err().to_string();
+        assert!(
+            error.contains("malformed EscapeConcessionRecorded"),
+            "{error}"
+        );
+        assert_eq!(service.checkpoint.next_block, 0);
+    }
+
+    #[tokio::test]
+    async fn the_scan_records_the_concession_and_raises_of_an_escape() {
+        let fixture = Fixture::new().await;
+        // The vault's reads fail, so only the scan's events are applied.
+        fixture.chain.lock().unwrap().fail_note_one = false;
+        let mut service = fixture.service();
+        service.scan_events(5).await.unwrap();
+        let pending = &service.checkpoint.pending[&0];
+        assert_eq!(pending.nullifier, ESCAPED);
+        assert_eq!(
+            pending.next_nullifier,
+            Some(fixture.chain.lock().unwrap().next_nullifier)
+        );
+        assert_eq!(
+            (pending.state_balance, pending.conceded),
+            (Some(100), Some(0))
+        );
+        let event = |topic: &str, words: &[Felt252]| {
+            json!({ "topics": [format!("0x{}", hex::encode(Keccak256::digest(topic.as_bytes()))),
+                format!("0x{:064x}", 0)], "data": encoded(words) })
+        };
+        assert_eq!(
+            decode_scan_event(&event(
+                CONCESSION_RAISED_EVENT,
+                &[ESCAPED, Felt252::from_u64(7), Felt252::from_u64(93)]
+            ))
+            .unwrap(),
+            ScanEvent::Raised {
+                note: 0,
+                nullifier: ESCAPED,
+                conceded: 7
+            }
+        );
+        // Strict: a uint128 word with high bytes, an extra word, a third topic.
+        let mut wide = Felt252::from_u64(7);
+        wide.0[0] = 1;
+        assert!(decode_scan_event(&event(
+            CONCESSION_RAISED_EVENT,
+            &[ESCAPED, wide, Felt252::from_u64(93)]
+        ))
+        .is_err());
+        assert!(decode_scan_event(&event(CHALLENGED_EVENT, &[ESCAPED, ESCAPED, ESCAPED])).is_err());
+        let mut three_topics = event(CHALLENGED_EVENT, &[ESCAPED, ESCAPED]);
+        three_topics["topics"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(format!("0x{:064x}", 1)));
+        assert!(decode_scan_event(&three_topics).is_err());
+    }
+
+    /// A manifest of the fixture's deployment and mock vault code.
+    fn mock_manifest(fixture: &Fixture, request: &ApiRequestV2) -> DeploymentManifest {
+        let identity = &fixture.service().identity.clone();
+        let keys = crate::native_billing::VaultSigningKeys {
+            state: CurvePointWire {
+                x: request.public_inputs.state_signing_key_x,
+                y: request.public_inputs.state_signing_key_y,
+            },
+            clearance: CurvePointWire {
+                x: Felt252::from_u64(1),
+                y: Felt252::from_u64(2),
+            },
+        };
+        let json =
+            crate::deployment::tests::manifest_json(&format!("0x{:040x}", 0xdead), &keys, identity);
+        DeploymentManifest::parse(&json.to_string()).unwrap()
+    }
+
+    /// The mock vault and adapter answer the startup probes as `manifest`
+    /// pins them, and the database is bound to it.
+    fn answer_probes(fixture: &Fixture, manifest: &DeploymentManifest) {
+        use crate::deployment::*;
+        let identity = fixture.service().identity.clone();
+        // A raw 32-byte word: hashes need not be field elements.
+        let word = |hex: &str| {
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(format!("{:0>64}", hex.trim_start_matches("0x")), &mut bytes)
+                .unwrap();
+            Felt252(bytes)
+        };
+        let mut chain = fixture.chain.lock().unwrap();
+        for (selector, value) in [
+            (CONCESSION_ESCAPE_VERSION_SELECTOR, Felt252::from_u64(1)),
+            (ROOT_HISTORY_WINDOW_SELECTOR, Felt252::from_u64(86_400)),
+            (
+                PROOF_ADAPTER_SELECTOR,
+                word(&manifest.proof_adapter_address),
+            ),
+            (
+                CIRCUIT_ID_HASH_SELECTOR,
+                Felt252(zkapi_proof::compact::CIRCUIT_ID_HASH),
+            ),
+            (
+                REQUEST_VK_HASH_SELECTOR,
+                word(&identity.request_vk_keccak256),
+            ),
+            (
+                WITHDRAWAL_VK_HASH_SELECTOR,
+                word(&identity.withdrawal_vk_keccak256),
+            ),
+        ] {
+            chain.probe_words.insert(selector.to_string(), value);
+        }
+        for (address, code) in [
+            (&manifest.contract_address, b"vault code".as_slice()),
+            (&manifest.proof_adapter_address, b"adapter code".as_slice()),
+            (
+                &manifest.poseidon_library_address,
+                b"poseidon code".as_slice(),
+            ),
+        ] {
+            chain
+                .code
+                .insert(address.clone(), format!("0x{}", hex::encode(code)));
+        }
+        drop(chain);
+        fixture
+            .store
+            .write_deployment_binding(&manifest.binding(1))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_deployment_is_verified_by_binding_probes_and_timing() {
+        let (_, request) = finalized_v2_request().await;
+        let timing = ChallengeTiming {
+            settlement_window_seconds: 21_905,
+            settlement_poll_seconds: 2,
+        };
+        let mismatch = |result: Result<DeploymentBinding, DeploymentCheckError>| match result {
+            Err(DeploymentCheckError::Mismatch(message)) => message,
+            other => panic!("expected a mismatch, got {other:?}"),
+        };
+        let fixture = Fixture::new().await;
+        let manifest = mock_manifest(&fixture, &request);
+        answer_probes(&fixture, &manifest);
+        let mut service = fixture.service();
+        let binding = service.verify_deployment(&manifest, timing).await.unwrap();
+        assert_eq!(
+            binding.circuit_id.as_deref(),
+            Some(zkapi_proof::compact::CIRCUIT_ID)
+        );
+        assert!(service.status().config_warnings.is_empty());
+
+        // A raise lead the challenge period cannot hold is refused.
+        let mut late = fixture.service_with(|config| config.raise_lead_seconds = 70_000);
+        assert!(mismatch(late.verify_deployment(&manifest, timing).await)
+            .contains("--raise-lead-seconds"));
+        // A vault before revision 3, another adapter verifying key, or other
+        // runtime code is refused, each before anything is polled.
+        for (change, message) in [
+            (
+                (|chain: &mut MockChain| {
+                    chain.probe_words.insert(
+                        crate::deployment::CONCESSION_ESCAPE_VERSION_SELECTOR.into(),
+                        Felt252::ZERO,
+                    );
+                }) as fn(&mut MockChain),
+                "CONCESSION_ESCAPE_VERSION",
+            ),
+            (
+                |chain| {
+                    chain.probe_words.insert(
+                        crate::deployment::REQUEST_VK_HASH_SELECTOR.into(),
+                        Felt252::from_u64(5),
+                    );
+                },
+                "REQUEST_VK_HASH",
+            ),
+            (
+                |chain| {
+                    for code in chain.code.values_mut() {
+                        *code = "0x00".into();
+                    }
+                },
+                "runtime codehash",
+            ),
+        ] {
+            let fixture = Fixture::new().await;
+            answer_probes(&fixture, &manifest);
+            change(&mut fixture.chain.lock().unwrap());
+            let mut service = fixture.service();
+            assert!(
+                mismatch(service.verify_deployment(&manifest, timing).await).contains(message),
+                "{message}"
+            );
+            assert!(service
+                .status()
+                .config_warnings
+                .iter()
+                .any(|warning| warning.contains("deployment not verified")));
+        }
+        // A manifest of another vault, or a database bound to another
+        // challenge period, is refused.
+        let fixture = Fixture::new().await;
+        answer_probes(&fixture, &manifest);
+        let mut other = manifest.clone();
+        other.contract_address = format!("0x{:040x}", 0xbeef);
+        assert!(
+            mismatch(fixture.service().verify_deployment(&other, timing).await)
+                .contains("not vault")
+        );
+        let mut period = manifest.clone();
+        period.challenge_period = 7_200;
+        assert!(
+            mismatch(fixture.service().verify_deployment(&period, timing).await)
+                .contains("challenge period")
+        );
+        // An unreachable RPC is retried, never taken for a verdict.
+        fixture.chain.lock().unwrap().fail_all = true;
+        assert!(matches!(
+            fixture.service().verify_deployment(&manifest, timing).await,
+            Err(DeploymentCheckError::Unavailable(_))
+        ));
     }
 }

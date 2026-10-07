@@ -21,8 +21,26 @@ pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY
 pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
 pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
 pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
-/// Read at runtime only, after a clearance ownership proof verified.
+/// Read by the root poller (O5) and after a clearance ownership proof verified.
 pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
+/// Nullifier flags, read before signing (O7) and before serving request data.
+pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
+pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
+/// Every root the vault ever set (Amendment A1); read for a clearance
+/// ownership proof at a root the server has not seen recently.
+pub const KNOWN_ROOTS_SELECTOR: &str = "0x12ad7381"; // knownRoots(uint256)
+/// keccak256 of `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)`,
+/// the event that names an escape's `nextNullifier` (§4.2 step 11). Its
+/// nullifier is not indexed: a scan reads every such log and compares.
+pub const ESCAPE_CONCESSION_RECORDED_TOPIC: &str =
+    "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d";
+/// The block span of one eth_getLogs call of a publication scan (the
+/// indexer's default `--max-block-range`).
+pub const PUBLICATION_SCAN_CHUNK_BLOCKS: u64 = 1_000;
+/// The largest JSON-RPC response body read: a getter's word, or a block
+/// header with its transaction hashes, or a chunk of logs.
+const MAX_RESPONSE_BYTES: usize = 65_536;
+const MAX_BLOCK_OR_LOGS_RESPONSE_BYTES: usize = 4 << 20;
 
 #[derive(Clone)]
 pub struct NativeBillingConfig {
@@ -337,7 +355,185 @@ impl NativeBillingOracle {
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
     }
 
+    /// Whether the vault ever set `root` (`knownRoots(root)`, Amendment A1)
+    /// at "latest", after an eth_chainId check.
+    pub async fn vault_known_root(&self, root: &Felt252) -> Result<bool, ServerError> {
+        async {
+            self.assert_chain().await?;
+            let data = format!("{KNOWN_ROOTS_SELECTOR}{}", hex::encode(root.as_bytes()));
+            let raw = self.call(&self.contract_address, &data).await?;
+            if raw.len() != 66 {
+                return Err(invalid("invalid vault knownRoots response length"));
+            }
+            match decode_word(&raw, 0)? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(invalid("invalid vault knownRoots boolean")),
+            }
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    /// One raw 32-byte word from a getter of the contract at `address`, at
+    /// "latest", after an eth_chainId check.
+    pub async fn contract_word(
+        &self,
+        address: &str,
+        selector: &str,
+    ) -> Result<[u8; 32], ServerError> {
+        self.assert_chain().await?;
+        let raw = self.call(address, selector).await?;
+        let word = raw
+            .strip_prefix("0x")
+            .filter(|word| word.len() == 64)
+            .ok_or_else(|| {
+                invalid("getter returned no 32-byte word (is the contract deployed at this address on this chain?)")
+            })?;
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(word, &mut bytes).map_err(|_| invalid("malformed ABI word"))?;
+        Ok(bytes)
+    }
+
+    /// keccak256 of the runtime code at `address` at "latest" (eth_getCode),
+    /// after an eth_chainId check. An address without code is an error.
+    pub async fn code_hash(&self, address: &str) -> Result<[u8; 32], ServerError> {
+        self.assert_chain().await?;
+        let code = self
+            .rpc("eth_getCode", json!([address, "latest"]))
+            .await?
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| invalid("invalid eth_getCode response"))?;
+        let body = code
+            .strip_prefix("0x")
+            .ok_or_else(|| invalid("invalid eth_getCode response"))?;
+        if body.is_empty() {
+            return Err(invalid("no contract code at this address on this chain"));
+        }
+        let bytes = hex::decode(body).map_err(|_| invalid("invalid eth_getCode response"))?;
+        Ok(Keccak256::digest(&bytes).into())
+    }
+
+    /// A vault `mapping(uint256 => bool)` flag at "latest" (usedNullifiers,
+    /// challengedNullifiers), after an eth_chainId check.
+    pub async fn nullifier_flag(
+        &self,
+        selector: &str,
+        nullifier: &Felt252,
+    ) -> Result<bool, ServerError> {
+        self.assert_chain().await?;
+        let data = format!("{selector}{}", hex::encode(nullifier.as_bytes()));
+        let raw = self.call(&self.contract_address, &data).await?;
+        if raw.len() != 66 {
+            return Err(invalid("invalid vault nullifier response length"));
+        }
+        match decode_word(&raw, 0)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("invalid vault nullifier boolean")),
+        }
+    }
+
+    /// The number and timestamp of block `tag` ("latest" or a quantity).
+    async fn block_time(&self, tag: Value) -> Result<(u64, u64), ServerError> {
+        let block = self
+            .rpc_limited(
+                "eth_getBlockByNumber",
+                json!([tag, false]),
+                MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
+            )
+            .await?;
+        let field = |name: &str| {
+            block
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(quantity)
+                .ok_or_else(|| invalid("invalid block response"))
+        };
+        Ok((field("number")?, field("timestamp")?))
+    }
+
+    /// Whether the vault named `nullifier` as an escape's `nextNullifier`
+    /// (`EscapeConcessionRecorded`) in any block from the last one before
+    /// `since` (a UNIX time) to the latest, after an eth_chainId check. The
+    /// first block of the window is found by bisection on block timestamps;
+    /// its logs are read in calls of [`PUBLICATION_SCAN_CHUNK_BLOCKS`]. A
+    /// window of more than `max_blocks` blocks, or any failed or malformed
+    /// read, is an error, never "not named".
+    pub async fn escape_named_next_nullifier(
+        &self,
+        nullifier: &Felt252,
+        since: u64,
+        max_blocks: u64,
+    ) -> Result<bool, ServerError> {
+        self.assert_chain().await?;
+        let (latest, latest_time) = self.block_time(json!("latest")).await?;
+        // `start` is at or before every block at `since`: a block with a
+        // timestamp at most `since`, or the genesis. Timestamps increase
+        // strictly on Ethereum, so going back `latest_time - since` blocks
+        // reaches one; elsewhere the distance doubles until it does.
+        let mut distance = latest_time.saturating_sub(since).max(1);
+        let mut start = latest;
+        let mut start_time = latest_time;
+        while start > 0 && start_time > since {
+            start = start.saturating_sub(distance);
+            start_time = self.block_time(json!(format!("0x{start:x}"))).await?.1;
+            distance = distance.saturating_mul(2);
+        }
+        // Narrow it to the last block before `since` when that saves calls.
+        let mut after = latest;
+        while start_time <= since && after - start > PUBLICATION_SCAN_CHUNK_BLOCKS {
+            let middle = start + (after - start) / 2;
+            let middle_time = self.block_time(json!(format!("0x{middle:x}"))).await?.1;
+            if middle_time <= since {
+                start = middle;
+            } else {
+                after = middle;
+            }
+        }
+        if latest - start >= max_blocks {
+            return Err(invalid("publication scan window exceeds its block limit"));
+        }
+        let wanted = format!("0x{}", hex::encode(nullifier.as_bytes()));
+        let mut from = start;
+        while from <= latest {
+            let to = latest.min(from.saturating_add(PUBLICATION_SCAN_CHUNK_BLOCKS - 1));
+            let logs = self
+                .rpc_limited(
+                    "eth_getLogs",
+                    json!([{
+                        "address": self.contract_address,
+                        "topics": [ESCAPE_CONCESSION_RECORDED_TOPIC],
+                        "fromBlock": format!("0x{from:x}"),
+                        "toBlock": format!("0x{to:x}"),
+                    }]),
+                    MAX_BLOCK_OR_LOGS_RESPONSE_BYTES,
+                )
+                .await?;
+            let logs = logs
+                .as_array()
+                .ok_or_else(|| invalid("invalid eth_getLogs response"))?;
+            for log in logs {
+                if next_nullifier_of(log, &self.contract_address)? == wanted {
+                    return Ok(true);
+                }
+            }
+            from = to + 1;
+        }
+        Ok(false)
+    }
+
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ServerError> {
+        self.rpc_limited(method, params, MAX_RESPONSE_BYTES).await
+    }
+
+    async fn rpc_limited(
+        &self,
+        method: &str,
+        params: Value,
+        limit: usize,
+    ) -> Result<Value, ServerError> {
         let response = self
             .http
             .post(&self.config.rpc_url)
@@ -345,7 +541,8 @@ impl NativeBillingOracle {
             .send()
             .await
             .map_err(|_| invalid("native billing oracle RPC unavailable"))?;
-        if !response.status().is_success() || response.content_length().is_some_and(|n| n > 65_536)
+        if !response.status().is_success()
+            || response.content_length().is_some_and(|n| n > limit as u64)
         {
             return Err(invalid("native billing oracle RPC rejected the read"));
         }
@@ -356,7 +553,7 @@ impl NativeBillingOracle {
             .await
             .map_err(|_| invalid("native billing oracle RPC unavailable"))?
         {
-            if body.len().saturating_add(chunk.len()) > 65_536 {
+            if body.len().saturating_add(chunk.len()) > limit {
                 return Err(invalid("native billing oracle RPC response too large"));
             }
             body.extend_from_slice(&chunk);
@@ -534,6 +731,44 @@ impl NativeBillingOracle {
         }
         Ok(())
     }
+}
+
+/// A JSON-RPC quantity: 0x and at most 16 hex digits.
+fn quantity(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+}
+
+/// The `nextNullifier` word (0x and 64 lowercase hex digits) of an
+/// `EscapeConcessionRecorded` log of `vault`. Any other log in the answer
+/// is malformed: the filter asked for this event of this vault only.
+fn next_nullifier_of(log: &Value, vault: &str) -> Result<String, ServerError> {
+    let malformed = || invalid("malformed EscapeConcessionRecorded log");
+    let address = log
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(malformed)?;
+    let topic = log
+        .get("topics")
+        .and_then(Value::as_array)
+        .and_then(|topics| topics.first())
+        .and_then(Value::as_str)
+        .ok_or_else(malformed)?;
+    let data = log
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|data| data.strip_prefix("0x"))
+        .ok_or_else(malformed)?;
+    if !address.eq_ignore_ascii_case(vault)
+        || !topic.eq_ignore_ascii_case(ESCAPE_CONCESSION_RECORDED_TOPIC)
+        || data.len() != 3 * 64
+        || !data.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(malformed());
+    }
+    Ok(format!("0x{}", data[..64].to_ascii_lowercase()))
 }
 
 fn valid_address(value: &str) -> bool {
@@ -828,11 +1063,22 @@ mod tests {
             ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
             ("currentRoot()", CURRENT_ROOT_SELECTOR),
+            ("knownRoots(uint256)", KNOWN_ROOTS_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
             assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
         }
         assert_eq!(CURRENT_ROOT_SELECTOR, "0xfdab463d");
+        assert_eq!(KNOWN_ROOTS_SELECTOR, "0x12ad7381");
+        assert_eq!(
+            ESCAPE_CONCESSION_RECORDED_TOPIC,
+            format!(
+                "0x{}",
+                hex::encode(Keccak256::digest(
+                    b"EscapeConcessionRecorded(uint32,uint256,uint128,uint128)"
+                ))
+            )
+        );
         // Independent literals from the ABI, rather than the encoder above.
         assert_eq!(
             [
@@ -888,6 +1134,170 @@ mod tests {
             decode_field_word(&format!("0x{}", hex::encode(coordinate.as_bytes()))).unwrap(),
             coordinate
         );
+    }
+
+    /// The publication scan behind recovery's indexer fallback: it finds
+    /// the first block of its window by bisection on timestamps, reads the
+    /// vault's EscapeConcessionRecorded logs from there to the latest block
+    /// in chunks, and refuses a window above its limit, a malformed log and
+    /// a wrong chain.
+    #[tokio::test]
+    async fn the_publication_scan_reads_the_vaults_successor_nullifiers_since_a_time() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        const LATEST: u64 = 100_000;
+        const GENESIS_TIME: u64 = 1_600_000_000;
+        let time = |block: u64| GENESIS_TIME + 12 * block;
+        #[derive(Default)]
+        struct Chain {
+            /// (block, data) of each EscapeConcessionRecorded log.
+            logs: Vec<(u64, String)>,
+            ranges: Vec<(u64, u64)>,
+            block_reads: usize,
+            chain_id: &'static str,
+        }
+        let chain = Arc::new(Mutex::new(Chain {
+            chain_id: "0xaa36a7",
+            ..Default::default()
+        }));
+        let vault = "0x00000000000000000000000000000000000000aa";
+        let quantity = |value: &Value| {
+            u64::from_str_radix(value.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+        };
+        let app = Router::new().route(
+            "/",
+            post({
+                let chain = chain.clone();
+                move |Json(request): Json<Value>| {
+                    let chain = chain.clone();
+                    async move {
+                        let mut chain = chain.lock().unwrap();
+                        let params = &request["params"];
+                        let result = match request["method"].as_str().unwrap() {
+                            "eth_chainId" => json!(chain.chain_id),
+                            "eth_getBlockByNumber" => {
+                                chain.block_reads += 1;
+                                let number = if params[0] == "latest" {
+                                    LATEST
+                                } else {
+                                    quantity(&params[0])
+                                };
+                                assert_eq!(params[1], false);
+                                json!({"number": format!("0x{number:x}"),
+                                    "timestamp": format!("0x{:x}", time(number)),
+                                    "transactions": []})
+                            }
+                            "eth_getLogs" => {
+                                let filter = &params[0];
+                                assert_eq!(filter["address"], vault);
+                                assert_eq!(
+                                    filter["topics"],
+                                    json!([ESCAPE_CONCESSION_RECORDED_TOPIC])
+                                );
+                                let range =
+                                    (quantity(&filter["fromBlock"]), quantity(&filter["toBlock"]));
+                                chain.ranges.push(range);
+                                let logs: Vec<Value> = chain
+                                    .logs
+                                    .iter()
+                                    .filter(|(block, _)| (range.0..=range.1).contains(block))
+                                    .map(|(block, data)| {
+                                        json!({"address": vault,
+                                            "topics": [ESCAPE_CONCESSION_RECORDED_TOPIC,
+                                                format!("0x{:064x}", 7)],
+                                            "data": data,
+                                            "blockNumber": format!("0x{block:x}")})
+                                    })
+                                    .collect();
+                                json!(logs)
+                            }
+                            method => panic!("unexpected {method}"),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let oracle = NativeBillingOracle::new(
+            NativeBillingConfig {
+                rpc_url,
+                feed_address: quote().feed_address,
+                decimals: 8,
+                max_age_seconds: 3600,
+            },
+            11155111,
+            vault.into(),
+        )
+        .unwrap();
+        let named = Felt252::from_u64(0x4e);
+        let data = |nullifier: &Felt252| {
+            format!(
+                "0x{}{:064x}{:064x}",
+                hex::encode(nullifier.as_bytes()),
+                5_000_000u64,
+                0
+            )
+        };
+        // The window starts within a chunk before the first block at `since`.
+        let since = time(95_000) + 5;
+        let first_at_since = 95_001;
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.logs.push((94_000, data(&named)));
+            chain.logs.push((99_999, data(&Felt252::from_u64(0x99))));
+        }
+        assert!(!oracle
+            .escape_named_next_nullifier(&named, since, 50_000)
+            .await
+            .unwrap());
+        let (ranges, block_reads) = {
+            let chain = chain.lock().unwrap();
+            (chain.ranges.clone(), chain.block_reads)
+        };
+        let start = ranges[0].0;
+        assert!(
+            start <= first_at_since && first_at_since - start <= PUBLICATION_SCAN_CHUNK_BLOCKS,
+            "{start}"
+        );
+        assert!(block_reads <= 12, "{block_reads}");
+        // Contiguous chunks of at most PUBLICATION_SCAN_CHUNK_BLOCKS up to the latest.
+        let mut next = start;
+        for (from, to) in &ranges {
+            assert_eq!(*from, next);
+            assert!(to - from < PUBLICATION_SCAN_CHUNK_BLOCKS);
+            next = to + 1;
+        }
+        assert_eq!(next, LATEST + 1);
+        // A log in the window names it.
+        chain.lock().unwrap().logs.push((95_500, data(&named)));
+        assert!(oracle
+            .escape_named_next_nullifier(&named, since, 50_000)
+            .await
+            .unwrap());
+        // A window above the limit is refused, never "not named".
+        let error = oracle
+            .escape_named_next_nullifier(&named, time(10_000), 50_000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("block limit"), "{error}");
+        // A malformed log fails the scan.
+        chain.lock().unwrap().logs.push((99_000, "0x1234".into()));
+        assert!(oracle
+            .escape_named_next_nullifier(&Felt252::from_u64(0x77), since, 50_000)
+            .await
+            .is_err());
+        // So does a wrong chain.
+        chain.lock().unwrap().logs.pop();
+        chain.lock().unwrap().chain_id = "0x1";
+        assert!(oracle
+            .escape_named_next_nullifier(&named, since, 50_000)
+            .await
+            .is_err());
+        task.abort();
     }
 
     #[test]

@@ -3,7 +3,9 @@
 set -eu
 
 # Match the artifacts installed by docker/Dockerfile; allow an explicit override.
-ZKAPI_PROOF_SETUP_DIR=${ZKAPI_PROOF_SETUP_DIR:-/srv/zkapi/protocol/setup/v2}
+ZKAPI_PROOF_SETUP_DIR=${ZKAPI_PROOF_SETUP_DIR:-/srv/zkapi/protocol/setup/v2-concession}
+# The deployment manifest (trusted_deployment profile) compose.yml mounts.
+ZKAPI_DEPLOYMENT_MANIFEST=${ZKAPI_DEPLOYMENT_MANIFEST:-/srv/zkapi/deployment.json}
 
 require() {
     for name in "$@"; do
@@ -14,9 +16,23 @@ require() {
     done
 }
 
+# A launcher setting that must be a decimal number of seconds; an unset or
+# empty value means the default.
+seconds() {
+    value=$(printenv "$1" || true)
+    value=${value:-$2}
+    case "$value" in
+        '' | *[!0-9]* | 0?* | ??????????*)
+            echo "$1 must be a decimal number of seconds" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$value"
+}
+
 require CHAIN_ID VAULT_ADDRESS DEPLOY_BLOCK CIRCUIT_ID
-if [ "$CIRCUIT_ID" != zkapi-v2-note-bound-v1 ]; then
-    echo "This image requires the zkapi-v2-note-bound-v1 circuit and a fresh vault" >&2
+if [ "$CIRCUIT_ID" != zkapi-v2-concession-v1 ]; then
+    echo "This image requires the zkapi-v2-concession-v1 circuit and a fresh vault" >&2
     exit 1
 fi
 
@@ -27,8 +43,9 @@ case "${1:-}" in
         # itself: it refuses development keys in any spelling (by derived public
         # key), weak or reused seeds, and keys that differ from the vault's,
         # before it opens /data/server.db. A string match here would be bypassable.
-        # ZKAPI_ALLOW_LEGACY_CLEARANCE, ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE and
-        # ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS also reach serverd from the environment.
+        # ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS, ZKAPI_ROOT_MAX_STALENESS_SECONDS,
+        # ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS and ZKAPI_ALLOW_LEGACY_CLEARANCE (which
+        # serverd refuses on this circuit) also reach serverd from the environment.
         set -- zkapi --protocol-version 2 --chain-id "$CHAIN_ID" \
             --contract-address "$VAULT_ADDRESS" \
             --request-charge-cap "$REQUEST_CHARGE_CAP" \
@@ -42,11 +59,20 @@ case "${1:-}" in
             --openrouter-lease-ttl-seconds "${LEASE_TTL_SECONDS:-300}" \
             --openrouter-settlement-grace-seconds "${SETTLEMENT_GRACE_SECONDS:-5}" \
             --openrouter-settlement-deadline-seconds "${ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS:-21600}" \
+            --deployment "$ZKAPI_DEPLOYMENT_MANIFEST" \
             --db-path /data/server.db
         if [ -n "${OA_ORG_URL:-}" ]; then
             set -- "$@" --oa-org-url "$OA_ORG_URL"
         fi
         exec "$@"
+        ;;
+    db-init)
+        # Run once before the challenger and the server: creates (or migrates)
+        # /data/server.db with its append-only request evidence and binds it to
+        # the deployment manifest and the loaded verifying keys. Idempotent for
+        # the same deployment; refuses a database bound to anything else.
+        exec zkapi --proof-setup-dir "$ZKAPI_PROOF_SETUP_DIR" \
+            db init --deployment "$ZKAPI_DEPLOYMENT_MANIFEST" --db /data/server.db
         ;;
     indexer)
         require RPC_URL
@@ -61,10 +87,20 @@ case "${1:-}" in
     challenger)
         require ZKAPI_CHALLENGE_RPC_URL ZKAPI_CHALLENGE_SENDER \
             ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI
-        # The RPC, sender and fee settings reach zkapi-challenged from the
-        # environment. Its status listener stays on the container's loopback,
-        # for the healthcheck and `docker compose exec`; never publish it.
+        # The API server's settlement window (lease TTL + grace + settlement
+        # deadline, from the deployment.env the server reads) for the
+        # challenger's startup timing checks; it may not exceed the manifest's
+        # settlement_window_seconds.
+        ttl=$(seconds LEASE_TTL_SECONDS 300)
+        grace=$(seconds SETTLEMENT_GRACE_SECONDS 5)
+        deadline=$(seconds ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS 21600)
+        # The RPC, sender, fee, raise-lead, raise-minimum and retire-on-miss
+        # settings reach zkapi-challenged from the environment. Its status
+        # listener stays on the container's loopback, for the healthcheck and
+        # `docker compose exec`; never publish it.
         exec zkapi-challenged --indexer-url http://indexer:3001 \
+            --deployment "$ZKAPI_DEPLOYMENT_MANIFEST" \
+            --settlement-window-seconds "$((ttl + grace + deadline))" \
             --chain-id "$CHAIN_ID" --contract-address "$VAULT_ADDRESS" \
             --from-block "$DEPLOY_BLOCK" --confirmations "${CHALLENGE_CONFIRMATIONS:-2}" \
             --db-path /data/server.db --checkpoint /data/challenges.json \
@@ -72,7 +108,7 @@ case "${1:-}" in
             --status-listen 127.0.0.1:3002
         ;;
     *)
-        echo "Usage: zkapi-run server|indexer|challenger" >&2
+        echo "Usage: zkapi-run server|db-init|indexer|challenger" >&2
         exit 2
         ;;
 esac

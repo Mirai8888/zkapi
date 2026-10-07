@@ -1,7 +1,7 @@
 name: zkapi
 
 x-daemon: &daemon
-  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+  image: zkapi/aws:${ZKAPI_IMAGE_TAG:-concession-v1}
   build:
     context: ../..
     dockerfile: docker/Dockerfile
@@ -37,17 +37,44 @@ services:
       retries: 6
       start_period: 900s
 
+  # Creates or migrates /data/server.db and binds it to the deployment
+  # manifest, before the challenger and the server start (order: indexer,
+  # db-init, challenger, server).
+  db-init:
+    <<: *daemon
+    command: ["db-init"]
+    restart: "no"
+    env_file:
+      - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - &manifest
+        type: bind
+        source: ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.json
+        target: /srv/zkapi/deployment.json
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      indexer:
+        condition: service_started
+
   server:
     <<: *daemon
     command: ["server"]
     env_file:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/server.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - *manifest
     depends_on:
       # Not service_healthy: a stale, diverged or replaying indexer answers 503,
       # which the server tolerates; it must not keep the API down.
       indexer:
         condition: service_started
+      db-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:3000/health"]
       interval: 10s
@@ -63,11 +90,15 @@ services:
     env_file:
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/deployment.env
       - ${ZKAPI_CONFIG_DIR:-/etc/zkapi}/challenge.env
+    volumes:
+      - ${ZKAPI_DATA_DIR:-/var/lib/zkapi}:/data
+      - *manifest
     depends_on:
-      # The challenger opens the server database read-only and waits for its
-      # deployment binding; an unhealthy API or indexer must never keep it down.
-      server:
-        condition: service_started
+      # The challenger opens the server database read-only: `zkapi db init`
+      # created it and its deployment binding. An unhealthy API or indexer
+      # must never keep it down.
+      db-init:
+        condition: service_completed_successfully
       signer:
         condition: service_healthy
     healthcheck:
@@ -80,7 +111,7 @@ services:
       start_period: 60s
 
   signer:
-    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+    image: zkapi/signer:${ZKAPI_IMAGE_TAG:-concession-v1}
     build:
       context: ./signer
     profiles: ["challenge"]
@@ -107,7 +138,7 @@ services:
         max-file: "5"
 
   gateway:
-    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-note-bound-v1}
+    image: zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1}
     build:
       context: ../..
       dockerfile: docker/aws/Dockerfile.gateway

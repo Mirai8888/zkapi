@@ -22,7 +22,10 @@ WORKDIR /srv/zkapi
 COPY --from=builder /app/target/release/zkapi /usr/local/bin/zkapi
 COPY --from=builder /app/target/release/zkapi-indexerd /usr/local/bin/zkapi-indexerd
 COPY --from=builder /app/target/release/zkapi-challenged /usr/local/bin/zkapi-challenged
-COPY --from=builder /app/protocol/setup/v2 /srv/zkapi/protocol/setup/v2
+# The ceremony setup of circuit zkapi-v2-concession-v1. A release build loads
+# only its pinned mpc-1 keys, which G-SETUP commits: until then the daemons
+# refuse to start.
+COPY --from=builder /app/protocol/setup/v2-concession /srv/zkapi/protocol/setup/v2-concession
 
 COPY --chmod=755 docker/aws/run-daemon.sh /usr/local/bin/zkapi-run
 

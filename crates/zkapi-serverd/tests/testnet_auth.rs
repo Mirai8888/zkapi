@@ -37,7 +37,10 @@ fn config(protected: bool) -> ServerConfig {
             decimals: 8,
             max_age_seconds: 4500,
         }),
-        proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+        proof_setup_dir: format!(
+            "{}/../../protocol/setup/v2-concession-dev",
+            env!("CARGO_MANIFEST_DIR")
+        ),
         ..Default::default()
     }
 }

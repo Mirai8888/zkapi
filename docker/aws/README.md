@@ -1,8 +1,13 @@
 # Native ETH operator deployment
 
-This image runs the native ETH API, indexer and escape challenger with the exact
-`protocol/setup/v2` artifacts. Supply the matching vault/signing keys and pinned
-native oracle configuration. Upgrading a running deployment to this release is
+This image runs the native ETH API, indexer and escape challenger of circuit
+`zkapi-v2-concession-v1` (vault revision 3) with the exact
+`protocol/setup/v2-concession` artifacts, the multi-party ceremony setup
+`mpc-1`. A release build loads only the pinned ceremony keys, so the daemons
+refuse to start until G-SETUP has committed them; a vault of circuit
+`zkapi-v2-note-bound-v1` keeps its own stack from the
+`release/v2-note-bound` branch. Supply the matching vault/signing keys, the
+deployment manifest and pinned native oracle configuration. Upgrading a running deployment to this release is
 covered in [the hardened-vault migration guide](../../docs/migration-hardened-vault.md).
 
 Build on a Linux VM with Docker Engine and Compose, from the complete source
@@ -19,6 +24,7 @@ Create these root-owned, mode `0600` files without printing their contents:
 | File | Contents |
 | --- | --- |
 | `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
+| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile `Deploy.s.sol` writes (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status": "not_deployed"` placeholder is refused. |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
 | `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. To switch an existing database between these key sources, follow [Changing the key source](../../docs/native-eth-billing.md#changing-the-key-source): the server refuses to start while leases or key deletions of the other source still need its credential (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true` starts anyway and strands them). For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
@@ -43,7 +49,9 @@ editing one, recreate each service that reads it, for example
 rather than setting it empty: `signer.env` treats an empty value as the
 default, and so does the launcher for the settings it passes on, but the
 daemons refuse an empty value for others at startup, for example
-`ZKAPI_ALLOW_LEGACY_CLEARANCE` and `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI`.
+`ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS` and `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI`.
+`ZKAPI_ALLOW_LEGACY_CLEARANCE=true` is refused: this circuit signs a clearance
+only against a kind-2 ownership proof.
 
 ### Signing seeds
 
@@ -76,13 +84,29 @@ were passed to the vault constructor. An unreachable RPC is tried five times,
 1, 2, 4 and 8 seconds apart (each call waits up to 15 seconds); the server then
 exits and Compose restarts it. The healthcheck allows 120 seconds for this.
 
-After a successful check the server records a `deployment_binding` row (chain,
-vault, both public keys and `challengePeriod()`) in its database. A restart on
+`zkapi db init` (the `db-init` service) creates the database before any daemon
+starts: its schema, the append-only `request_evidence` table and its triggers,
+and a `deployment_binding` row from `deployment.json` (chain, vault, both public
+keys, `challenge_period`, circuit, setup and both verifying-key hashes, which
+must equal the keys in the proof setup directory), marked unverified. On its
+first start the server checks that binding against the vault as above and runs
+the startup probes: the vault's `CONCESSION_ESCAPE_VERSION()` is 1 and its
+`ROOT_HISTORY_WINDOW()` 86400, its `proofAdapter()` is the manifest's adapter,
+the adapter's `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()` and `WITHDRAWAL_VK_HASH()`
+equal this build's circuit and loaded keys, and the runtime codehashes of the
+vault, the adapter and the Poseidon library equal the manifest's. Each fails
+closed. It also refuses a lease TTL + grace + settlement deadline longer than
+the manifest's `settlement_window_seconds`.
+
+After a successful check the server records a verified `deployment_binding` row
+(chain, vault, both public keys, `challengePeriod()`, circuit, setup and
+verifying-key hashes) in its database. A restart on
 that database with the same chain, vault and seeds starts without the RPC and
 re-verifies in the background (from 1 second, doubling to 60). Only a definitive
 contradiction, vault keys or `challengePeriod()` that differ from the record,
-stops the server; an unavailable or wrong-chain RPC is logged and retried. A
-database bound to another chain or vault is refused before any RPC call, so use
+or a startup probe that finds another value, stops the server; an unavailable
+or wrong-chain RPC is logged and retried. A database bound to another chain,
+vault, circuit, setup or verifying key is refused before any RPC call, so use
 one data directory per deployment. After a crash that leaves an unfinished
 SQLite transaction, the server cannot read the binding read-only and runs the
 RPC check again. The challenger refuses to start until this row exists.
@@ -96,9 +120,13 @@ Allow these calls on `ZKAPI_NATIVE_BILLING_RPC_URL`; it must also support the
 | `eth_call` `0x15fa2a9a`, `0x230e2a24` | vault | `latest` | `stateSigningKeyX()`, `stateSigningKeyY()` |
 | `eth_call` `0xdc41d636`, `0x112cd6bc` | vault | `latest` | `clearanceSigningKeyX()`, `clearanceSigningKeyY()` |
 | `eth_call` `0xf3f480d9` | vault | `latest` | `challengePeriod()` |
-| `eth_call` `0xfdab463d` | vault | `latest` | `currentRoot()`, for clearance ownership proofs and the starting root while the indexer has no verified one |
+| `eth_call` `0xfdab463d` | vault | `latest` | `currentRoot()`: polled with the indexer root (admission accepts only a root both report, refreshed within `ZKAPI_ROOT_MAX_STALENESS_SECONDS`, default 60), for clearance ownership proofs, and the starting root |
+| `eth_call` `0x5e00b426`, `0x1fe72de0`, `0xefc91e58` | vault | `latest` | Startup probes: `CONCESSION_ESCAPE_VERSION()`, `ROOT_HISTORY_WINDOW()`, `proofAdapter()` |
+| `eth_call` `0xda0e8385`, `0xfe351488`, `0x7fcd0926` | adapter | `latest` | Startup probes: `CIRCUIT_ID_HASH()`, `REQUEST_VK_HASH()`, `WITHDRAWAL_VK_HASH()` |
+| `eth_getCode` | vault, adapter, Poseidon library | `latest` | Startup probes: runtime codehashes |
+| `eth_call` `0x6cda756a` | vault | `latest` | `challengedNullifiers(uint256)`, before serving request evidence or a recovered response |
 | `eth_call` `0x4d1352fd` | vault | `latest` | `nativeAssetWeiPerUnit()` |
-| `eth_call` `0xaad24061` | vault | `latest` | `usedNullifiers(uint256)` before key issuance |
+| `eth_call` `0xaad24061` | vault | `latest` | `usedNullifiers(uint256)` before key issuance, before signing a settled request's successor (an exit consuming it defers the signature), and before serving request evidence or a recovered response |
 | `eth_call` `0x313ce567` | feed | `latest` | `decimals()` |
 | `eth_call` `0xfeaf968c`, `0x9a6fc8f5` | feed | `finalized` | `latestRoundData()`, `getRoundData(uint80)` |
 
@@ -149,6 +177,16 @@ defaults to 10 gwei. The tip cap `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI`
 defaults to the lower of the fee cap and 10 times the default tip (10 gwei with
 the 1 gwei default tip). `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` is no longer
 supported, and the signer refuses to start while it is present, even empty.
+`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2) caps the nonces on which
+it signs a leaf retirement per rolling 24 hours, and a note's retirement on a
+new nonce waits until its earlier nonce is mined (`retirement_in_flight`). A
+compromised challenger host can therefore spend at most that many retirements
+(each up to `ZKAPI_CHALLENGE_MAX_GAS` x fee cap) of the float per day, whether
+they retire a leaf or revert. Fee replacements on a counted nonce are free; a
+further retirement is refused with `retirement_budget_exhausted` (the
+challenger reports `signer_refused`), and defeats and raises are never
+affected. One missed defeat takes one unit, plus one for each re-send after a
+root race.
 
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
@@ -159,44 +197,43 @@ for the signer and in `deployment.env` for the daemon (the signer reads only
 `signer.env`). The signer refuses a costlier bid before any upstream call
 (`tx_fee_above_cap`). The daemon bids within the lower of its own value and the
 signer's, which `zkapi_signerStatus` reports, and its `/status` warns when the
-two differ. A real challenge has a gas limit of about 7.53M, so at 1 ETH no bid
-exceeds about 132 gwei, whatever the fee caps. The middle column is the ceiling
-at which every challenge can bid the full fee cap, with room up to a 7.6M gas
-limit:
+two differ. The challenger sends three calls; their gas limits (from the
+design estimates; re-measure on the deployed vault) and the highest bid each
+allows at the default 1 ETH are:
 
-| Fee cap | 7.6M gas x fee cap | Highest bid at the default 1 ETH |
+| Call | Gas limit | Highest bid at 1 ETH |
 | --- | --- | --- |
-| 10 gwei (Sepolia default) | 0.076 ETH | 10 gwei |
-| 100 gwei | 0.76 ETH | 100 gwei |
-| 300 gwei | 2.28 ETH | about 132 gwei; the daemon warns that its fee cap exceeds the ceiling |
+| Defeat (`challengeEscapeWithdrawal`) | 600,000, or the estimate plus 20% when higher | about 1,666 gwei |
+| Raise (`raiseEscapeConcession`) | 450,000, or the estimate plus 20% when higher | about 2,222 gwei |
+| Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%, about 7.2M | about 138.9 gwei |
 
-For a higher fee cap, raise the node's `--rpc.txfeecap` and
-`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`
-to at least the middle column (2.28 ETH for a 300 gwei fee cap), then recreate
-the signer and the challenger (above), or keep the fee cap within the ceiling.
-A hosted provider's cap usually cannot be raised. A value above the node's cap
-makes the signer report `upstream_tx_fee_cap`, which the daemon treats as
-critical at once. It then bids within 10/11 of the lowest refused fee until it
-restarts, and its `/status` warns with that fee
+Defeats and raises are deadline-bound and fit any realistic fee cap at 1 ETH.
+A leaf retirement has no deadline; to let it bid a fee cap above about 138.9
+gwei, raise the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
+together in `signer.env` and `deployment.env` (2.4 ETH for a 300 gwei fee cap
+at 8M gas), then recreate the signer and the challenger (above). A hosted
+provider's cap usually cannot be raised. A value above the node's cap makes the
+signer report `upstream_tx_fee_cap`, which the daemon treats as critical at
+once. It then bids within 10/11 of the lowest refused fee until it restarts,
+and its `/status` warns with that fee
 ([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
 signer also warns `tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x
 its fee cap exceeds the ceiling; see
 [Node transaction fee cap](signer/README.md#node-transaction-fee-cap).
 
 Fund the sender with at least (N + K) x gas limit x the highest bid, that is the
-fee cap or, when lower, the ceiling / gas limit. N is the number of challenges
-that may be pending at once and K a budget of reverted attempts. That is 0.75
-ETH per challenge at a 100 gwei cap, and at most the ceiling (1 ETH by default)
-per challenge at any cap. The signer's status warns `balance_below_required`
-below its `required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH
-at 100 gwei and the default 12M gas), which is more than one challenge needs:
-fund up to it, or lower `ZKAPI_CHALLENGE_MAX_GAS` toward the challenge's gas
-limit while keeping a margin above it, for example 8M (0.8 ETH at 100 gwei). A
-challenge's gas limit is its gas estimate plus 20%, about 7.53M as measured;
-re-measure after redeploying the vault. The signer refuses a larger gas limit
-with `gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
-critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised: at 7.6M a
-challenge 0.9% costlier than measured is refused.
+fee cap or, when lower, the ceiling / gas limit. N is the number of
+transactions that may be pending at once and K a budget of reverted attempts.
+At a 100 gwei cap that is 0.06 ETH per defeat and about 0.72 ETH per leaf
+retirement; size N for `ceil(m/2)` defeats per note (a user holding `m`
+archived states can force that many), at most 64 concurrent escapes and a 20%
+margin. The signer's status warns `balance_below_required` below its
+`required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH at 100
+gwei and the default 12M gas): fund up to it, or lower
+`ZKAPI_CHALLENGE_MAX_GAS` while keeping a margin above a leaf retirement, for
+example 8M (0.8 ETH at 100 gwei). The signer refuses a larger gas limit with
+`gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
+critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised.
 
 `challenge.env` holds the daemon's own bounds, which it proposes to the signer
 (its transaction fee cap is in `deployment.env`, above):
@@ -207,23 +244,49 @@ challenge 0.9% costlier than measured is refused.
 | `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; a higher tip cap leaves more before it, within the signer's tip cap (10 gwei by default, 5 times the default priority fee; raise the signer's first). The daemon does not read the signer's fee or tip cap, so a cap above the signer's makes escalated bids fail with `fee_out_of_bounds` (`signer_refused`, critical at once) instead of bidding at the signer's cap. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
 
+The challenger also reads from `deployment.env` (see
+[`deployment.env.example`](deployment.env.example)):
+
+| Variable | Requirement |
+| --- | --- |
+| `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
+| `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. |
+
+The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
+SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which
+may not exceed the manifest's `settlement_window_seconds`) and the mounted
+manifest to the challenger. At startup it checks the manifest against the vault:
+`CONCESSION_ESCAPE_VERSION() == 1`, `ROOT_HISTORY_WINDOW() == 86400`, the
+adapter's circuit and verifying-key hashes, the three runtime codehashes and
+`challengePeriod()`, and the timing checks above. It retries a failed RPC read
+and exits on a mismatch.
+
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the
 container. The Compose healthcheck reads its `/livez`; never publish the port or
 route it through the gateway, because its status shows when challenges are
-blocked. The daemon opens `/data/server.db` read-only and needs the server's
-`deployment_binding` row: start the server first. See
+blocked. The daemon opens `/data/server.db` read-only and needs the schema and
+`deployment_binding` row `zkapi db init` writes: it refuses an older database
+with "run `zkapi db init` first". See
 [challenge operation](../../docs/challenge-service.md).
 
 ## Starting the deployment
 
-Start the API first, then the challenge profile:
+Start in this order: the indexer, `zkapi db init` (the one-shot `db-init`
+service), the challenger, then the API. The challenger must be healthy before
+the first deposit.
 
 ```sh
 sudo docker compose -f docker/aws/compose.yml --profile challenge config --quiet
+sudo docker compose -f docker/aws/compose.yml up -d --wait indexer
+sudo docker compose -f docker/aws/compose.yml run --rm db-init
+sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --wait challenger
 sudo docker compose -f docker/aws/compose.yml up -d --wait server
-sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --wait
 sudo docker compose -f docker/aws/compose.yml --profile challenge ps
 ```
+
+`db-init` is idempotent for the same deployment and refuses a database bound to
+anything else; `server` and `challenger` also wait for it to complete.
 
 `--wait` also waits for the indexer, whose healthcheck allows 900 seconds for a
 full replay from `DEPLOY_BLOCK`; it turns healthy as soon as the replay verifies.
@@ -233,7 +296,8 @@ can run before a signer is available. Omitting it starts only the API, indexer
 and gateway; such a deployment does not have escape-challenge protection. The
 challenger requires RPC `eth_sendTransaction`; an ordinary public RPC
 cannot act as its signer. The included restricted signer sidecar requires an explicit supported chain
-(1 or 11155111) and accepts only challenge calls to its
+(1 or 11155111) and accepts only the challenger's defeat, raise and
+leaf-retirement calls to its
 configured vault. Its chain must match the RPC, public manifest and daemon. Never publish its RPC port.
 Keep the funded sender exclusive to this daemon and deployment. Keep the API
 running whenever the challenger runs: its settlement produces the challenge
@@ -333,12 +397,11 @@ dc exec -T indexer curl -sS http://127.0.0.1:3001/metrics
 # Signer: fee policy, balance and warnings.
 dc exec -T challenger curl -sS -X POST http://signer:8547 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"zkapi_signerStatus","params":[]}'
-# API, on the gateway's ZKAPI_HTTP_PORT (8080 by default): false while legacy
-# clearance is enabled.
-curl -fsS http://127.0.0.1:8080/health | jq .clearance_ownership_proof_required
-# API: the legacy proof-less clearance budget and its refusals.
-curl -fsS http://127.0.0.1:8080/health | jq '{legacy_clearance_window_used, legacy_clearance_window_limit, legacy_clearance_rejected_total}'
-# Settlement: pending leases, deadlines and open reviews (operator-only route).
+# API, on the gateway's ZKAPI_HTTP_PORT (8080 by default): the statement served.
+curl -fsS http://127.0.0.1:8080/health | jq '{circuit_id, setup_id, exit_concession, settlement_window_seconds}'
+# Settlement: pending leases, deadlines and open reviews, and the settled
+# leases whose signature an exit defers (counts.exit_deferred) or ended
+# (counts.exited_unsigned) (operator-only route).
 dc exec -T server curl -fsS 'http://127.0.0.1:3000/v1/dashboard/settlement?limit=50'
 ```
 
@@ -355,10 +418,11 @@ Alert on:
   nothing itself: the `exec` fails, and none of its other signals below can
   fire;
 - any `critical` entry in the challenger's `/status` `alarms` (it then answers
-  503 on `/health`): a missed deadline, including an escape with evidence
-  found paid out past its deadline (the latest miss stays critical for an
-  hour); an obligation with evidence whose
-  deadline is within a quarter of `challengePeriod()`; an obligation blocked by
+  503 on `/health`): a missed defeat (an escape paid out although verified
+  request evidence at its successor nullifier existed before its deadline) or
+  a missed raise (an escape paid out with a concession below what the server
+  was owed); the latest miss stays critical for an hour; an obligation ready
+  to defeat or raise whose deadline is within a quarter of `challengePeriod()`; an obligation blocked by
   `evidence_invalid`, `evidence_db_error`, `indexer_invalid_response`,
   `indexer_diverged`, `signer_refused` or `upstream_tx_fee_cap`, or by any
   other reason (including `fee_reserve_held`) for 1800 seconds; stale polls; a
@@ -368,10 +432,14 @@ Alert on:
   differs from the daemon's, a transaction fee the signer's node refused
   (`upstream_tx_fee_cap`), a fee cap above the ceiling, or an indexer
   pending-escapes list that disagrees with the vault;
-- the challenger log lines `MISSED escape challenge deadline`,
-  `indexer mirror diverged from vault currentRoot`, and
+- the challenger log lines `MISSED escape deadline` (with `missed="defeat"`
+  or `missed="raise"`), `escape paid out after a missed defeat; retiring the
+  closed note's leaf`, `indexer mirror diverged from vault currentRoot`, and
   `challenge obligation status changed` at error level, and a rising
-  `missed_total` in `/status`;
+  `missed_total`, `escapes_finalized_with_successor_evidence_total` or
+  `missed_raises_total` in `/status`. A `retiring_leaf` obligation is a warning
+  until its `retireClosedLeaf` mines; it needs the indexer's path for the
+  note;
 - indexer `/health` not 200 for more than two minutes (outside a planned replay),
   an increase in its `divergence_count`, `rebuild_count` or
   `missed_re_escape_count` (`zkapi_indexer_divergences_total`,
@@ -383,8 +451,8 @@ Alert on:
   challenge and re-escape of a note, or that a reorganization below the
   checkpoint replaced an escape: check that RPC's log completeness, then resync
   (below). Each is counted once per escape, logged at warn level for a
-  challenge and at error level for a finalization, and the counts restart with
-  the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
+  defeat or a raise (`event="raised"`, `missed_re_escape_raised_count`) and at
+  error level for a finalization, and the counts restart with the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
   the vault finalized that escape (it paid the destination or credited the
   payout to it), so also confirm that the challenger tracked it;
 - the indexer's `root` differing from `currentRoot()` read at its `served_block`
@@ -419,23 +487,19 @@ Alert on:
   the credit as that runbook says;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
   `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
-  suppress the last only while the signer's
-  `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` x 7.6M gas is at most its
-  `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, and check that again after every fee-cap
-  change, because with a challenger from an earlier release the same warning
-  also covers fee caps at which every challenge is refused (this release's
-  challenger instead bids no higher than the ceiling / gas limit); see the
-  signer README, Upgrading from 0.1, step 2),
+  the challenger bids no higher than the ceiling / gas limit, so the last
+  means only that a leaf retirement may not bid the full fee cap; see the
+  signer README, Deploying with a concession-exit vault, step 2),
   signer `/health` failures, and signer audit lines
   `"event":"challenge_refused"` with reason `base_fee_above_max_fee`,
   `insufficient_balance`, `tx_fee_above_cap`, `upstream_tx_fee_cap` or
   `broadcast_ambiguous`;
-- `clearance_ownership_proof_required: false` after the announced end of the
-  legacy clearance window;
-- a rising `legacy_clearance_rejected_total` in the API `/health`, or the server
-  log line `legacy clearance budget exhausted` (at most once a minute): someone
-  is spending the shared proof-less clearance budget, and clients without an
-  ownership proof cannot mutually close until the next minute;
+- sustained `root_unavailable` refusals, or the server log line `the indexer
+  root and the vault's currentRoot() disagree`: the indexer lags or diverges, or
+  the RPC fails, and no request is admitted;
+- a growing `counts.exit_deferred` or `counts.exited_unsigned` on the settlement
+  dashboard, or the server log lines `exit_deferred` and `ExitedUnsigned`: exits
+  consumed requests' nullifiers before their successors were signed;
 - sustained `gateway_rate_limited` lines in the gateway log, per zone.
 
 Acknowledge a settlement review after handling it, with the host's `sqlite3`.
@@ -659,10 +723,12 @@ sudo docker compose -f docker/aws/compose.yml --profile challenge exec -T challe
 sudo docker compose -f docker/aws/compose.yml logs --tail=50 server challenger
 ```
 
-Verify that health and attestation report protocol 2, the selected chain and the
-configured vault, and that `/health` reports `clearance_ownership_proof_required:
-true` unless legacy clearance is deliberately enabled. Confirm the server log
-line `server signing keys match the vault's immutable keys`, and compare the
+Verify that health and attestation report protocol 2, the selected chain, the
+configured vault, `circuit_id` `zkapi-v2-concession-v1`, `setup_id` `mpc-1`,
+`exit_concession` 1 and the deployment's `settlement_window_seconds`. Confirm
+the server log lines `server signing keys match the vault's immutable keys` and
+`the vault, adapter and Poseidon library match the deployment manifest`, and
+compare the
 attestation keys with the vault's getters as numbers (the attestation omits
 leading zeros):
 
@@ -707,7 +773,7 @@ checks the launcher and the gateway configuration; with an `nginx` binary on
 `PATH` (or `NGINX_BIN`) the gateway test also runs the configuration against a
 stub API, and `ZKAPI_REQUIRE_NGINX=1` makes a missing binary a failure. Check the
 built gateway image with
-`sudo docker run --rm --user 101:101 --read-only --tmpfs /tmp --entrypoint nginx zkapi/gateway:${ZKAPI_IMAGE_TAG:-note-bound-v1} -t`.
+`sudo docker run --rm --user 101:101 --read-only --tmpfs /tmp --entrypoint nginx zkapi/gateway:${ZKAPI_IMAGE_TAG:-concession-v1} -t`.
 Use a separately authorized native ETH lifecycle check for the intended network;
 read-only health/quote checks alone do not establish paid inference, withdrawal
 or live escape-challenge success. Preserve server data, checkpoints and signer

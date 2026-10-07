@@ -13,21 +13,25 @@ const REPORTED_ENV = [
     'ZKAPI_STATE_SEED',
     'ZKAPI_CLEAR_SEED',
     'ZKAPI_ALLOW_LEGACY_CLEARANCE',
-    'ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE',
     'ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS',
+    'ZKAPI_ROOT_MAX_STALENESS_SECONDS',
+    'ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS',
     'ZKAPI_CHALLENGE_RPC_URL',
     'ZKAPI_CHALLENGE_SENDER',
     'ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI',
     'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI',
     'ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI',
     'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI',
+    'ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS',
+    'ZKAPI_CHALLENGE_RAISE_MIN_UNITS',
+    'ZKAPI_CHALLENGE_RETIRE_ON_MISS',
 ];
 
 const BASE_ENV = {
     CHAIN_ID: '11155111',
     VAULT_ADDRESS: '0x0000000000000000000000000000000000000001',
     DEPLOY_BLOCK: '1',
-    CIRCUIT_ID: 'zkapi-v2-note-bound-v1',
+    CIRCUIT_ID: 'zkapi-v2-concession-v1',
     REQUEST_CHARGE_CAP: '50000',
     ZKAPI_NATIVE_BILLING_RPC_URL: 'https://rpc.example',
     ZKAPI_NATIVE_PRICE_FEED_ADDRESS: '0x0000000000000000000000000000000000000003',
@@ -84,7 +88,7 @@ for (const role of ['server', 'challenger']) {
         test(`${role} launches with ${override ? 'explicit' : 'default'} proof artifacts`, async () => {
             const result = await launch(role, { set: override ? { ZKAPI_PROOF_SETUP_DIR: override } : {} });
             assert.equal(result.status, 0, result.stderr);
-            assert.equal(flag(result.args, '--proof-setup-dir'), override || '/srv/zkapi/protocol/setup/v2');
+            assert.equal(flag(result.args, '--proof-setup-dir'), override || '/srv/zkapi/protocol/setup/v2-concession');
             if (role === 'server') {
                 assert.equal(flag(result.args, '--native-billing-rpc-url'), BASE_ENV.ZKAPI_NATIVE_BILLING_RPC_URL);
                 assert.equal(flag(result.args, '--native-price-feed-address'), BASE_ENV.ZKAPI_NATIVE_PRICE_FEED_ADDRESS);
@@ -164,22 +168,139 @@ test('server requires both signing seeds and starts nothing without them', async
     }
 });
 
-test('server passes legacy clearance settings only through the environment', async () => {
-    const legacyFlags = ['--allow-legacy-clearance', '--legacy-clearance-max-per-minute', '--clearance-root-window-seconds'];
+test('server passes clearance, root and lease-ceiling settings only through the environment', async () => {
+    const flags = ['--allow-legacy-clearance', '--clearance-root-window-seconds',
+        '--root-max-staleness-seconds', '--request-limit-max-usd-micros'];
     const defaults = await launch('server');
     assert.equal(defaults.status, 0, defaults.stderr);
-    for (const name of legacyFlags) assert.ok(!defaults.args.includes(name), name);
+    for (const name of flags) assert.ok(!defaults.args.includes(name), name);
     assert.equal(defaults.received.ZKAPI_ALLOW_LEGACY_CLEARANCE, undefined);
 
     const settings = {
+        // serverd refuses this one on the concession circuit; the launcher
+        // still leaves the decision to it.
         ZKAPI_ALLOW_LEGACY_CLEARANCE: 'true',
-        ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE: '30',
         ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS: '600',
+        ZKAPI_ROOT_MAX_STALENESS_SECONDS: '30',
+        ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS: '6000000',
     };
-    const legacy = await launch('server', { set: settings });
-    assert.equal(legacy.status, 0, legacy.stderr);
-    for (const name of legacyFlags) assert.ok(!legacy.args.includes(name), name);
-    for (const [name, value] of Object.entries(settings)) assert.equal(legacy.received[name], value);
+    const configured = await launch('server', { set: settings });
+    assert.equal(configured.status, 0, configured.stderr);
+    for (const name of flags) assert.ok(!configured.args.includes(name), name);
+    for (const [name, value] of Object.entries(settings)) assert.equal(configured.received[name], value);
+});
+
+test('the deployment env example sets the canary lease ceiling and no legacy clearance', async () => {
+    const example = await readFile(resolve('docker/aws/deployment.env.example'), 'utf8');
+    assert.match(example, /^CIRCUIT_ID=zkapi-v2-concession-v1$/m);
+    assert.match(example, /^ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS=6000000$/m);
+    assert.doesNotMatch(example, /^ZKAPI_ALLOW_LEGACY_CLEARANCE=/m);
+    assert.doesNotMatch(example, /LEGACY_CLEARANCE_MAX_PER_MINUTE/);
+});
+
+for (const role of ['server', 'challenger']) {
+    test(`${role} reads the mounted deployment manifest, or an explicit one`, async () => {
+        const defaults = await launch(role);
+        assert.equal(defaults.status, 0, defaults.stderr);
+        assert.equal(flag(defaults.args, '--deployment'), '/srv/zkapi/deployment.json');
+        const explicit = await launch(role, { set: { ZKAPI_DEPLOYMENT_MANIFEST: '/custom/deployment.json' } });
+        assert.equal(flag(explicit.args, '--deployment'), '/custom/deployment.json');
+    });
+}
+
+// The documented parameter sets (concession-exit spec, section 10.4).
+const PARAMETER_SETS = [
+    { name: 'Mainnet', challengePeriod: 172_800, deadline: 21_600, raiseLead: 21_600, window: 21_905 },
+    { name: 'Sepolia', challengePeriod: 43_200, deadline: 14_400, raiseLead: 21_600, window: 14_705 },
+    { name: 'drill', challengePeriod: 7_200, deadline: 1_800, raiseLead: 1_800, window: 2_105 },
+];
+
+test('challenger passes the server settlement window for its startup timing checks', async () => {
+    const defaults = await launch('challenger');
+    assert.equal(defaults.status, 0, defaults.stderr);
+    assert.equal(flag(defaults.args, '--settlement-window-seconds'), '21905');
+    for (const set of PARAMETER_SETS) {
+        const result = await launch('challenger', { set: { ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS: String(set.deadline) } });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(flag(result.args, '--settlement-window-seconds'), String(set.window), set.name);
+    }
+    const explicit = await launch('challenger', { set: { LEASE_TTL_SECONDS: '600', SETTLEMENT_GRACE_SECONDS: '10', ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS: '1800' } });
+    assert.equal(flag(explicit.args, '--settlement-window-seconds'), '2410');
+    // An empty value means the default, as for the server.
+    const empty = await launch('challenger', { set: { LEASE_TTL_SECONDS: '', SETTLEMENT_GRACE_SECONDS: '' } });
+    assert.equal(flag(empty.args, '--settlement-window-seconds'), '21905');
+});
+
+test('challenger refuses a settlement setting that is not a number of seconds', async () => {
+    for (const [name, value] of [
+        ['LEASE_TTL_SECONDS', '5m'],
+        ['SETTLEMENT_GRACE_SECONDS', '-5'],
+        ['ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS', '021600'],
+        ['ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS', '1e4'],
+        ['ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS', '9999999999'],
+    ]) {
+        const result = await launch('challenger', { set: { [name]: value } });
+        assert.equal(result.status, 1, `${name}=${value}`);
+        assert.equal(result.stderr.trim(), `${name} must be a decimal number of seconds`);
+        assert.deepEqual(result.args, []);
+    }
+});
+
+test('challenger takes its raise and retirement settings from the environment', async () => {
+    const set = { ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS: '1800', ZKAPI_CHALLENGE_RAISE_MIN_UNITS: '1000', ZKAPI_CHALLENGE_RETIRE_ON_MISS: 'false' };
+    const result = await launch('challenger', { set });
+    assert.equal(result.status, 0, result.stderr);
+    for (const name of ['--raise-lead-seconds', '--raise-min-units', '--retire-on-miss']) {
+        assert.ok(!result.args.includes(name), name);
+    }
+    assert.deepEqual(
+        Object.fromEntries(Object.keys(set).map((name) => [name, result.received[name]])),
+        set,
+    );
+});
+
+test('the deployment env example passes the Sepolia startup timing checks', async () => {
+    // Sepolia (its CHAIN_ID) with challengePeriod 43,200: the server's G5 check
+    // and the challenger's raise check, with the 2-second settlement poll.
+    const example = await readFile(resolve('docker/aws/deployment.env.example'), 'utf8');
+    const value = (name) => Number(new RegExp(`^${name}=([0-9]+)$`, 'm').exec(example)?.[1]);
+    assert.equal(value('CHAIN_ID'), 11155111);
+    const sepolia = PARAMETER_SETS[1];
+    const window = value('LEASE_TTL_SECONDS') + value('SETTLEMENT_GRACE_SECONDS') + value('ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS');
+    assert.equal(window, sepolia.window);
+    assert.equal(value('ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS'), sepolia.raiseLead);
+    for (const set of PARAMETER_SETS) {
+        const window = 300 + 5 + set.deadline;
+        assert.equal(window, set.window, set.name);
+        assert.ok(window + 2 * 2 + 600 <= set.challengePeriod / 2, `${set.name} G5`);
+        assert.ok(window + set.raiseLead + 4 * 2 + 1200 <= set.challengePeriod, `${set.name} raise`);
+    }
+    // The Mainnet settlement deadline does not fit Sepolia's period.
+    assert.ok(300 + 5 + 21_600 + 2 * 2 + 600 > sepolia.challengePeriod / 2);
+});
+
+test('db-init binds the server database to the manifest and the proof setup', async () => {
+    for (const override of [null, '/custom/proofs']) {
+        const result = await launch('db-init', { set: override ? { ZKAPI_PROOF_SETUP_DIR: override } : {} });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(flag(result.args, '--proof-setup-dir'), override || '/srv/zkapi/protocol/setup/v2-concession');
+        const db = result.args.indexOf('db');
+        assert.deepEqual(result.args.slice(db, db + 2), ['db', 'init']);
+        assert.equal(flag(result.args, '--deployment'), '/srv/zkapi/deployment.json');
+        assert.equal(flag(result.args, '--db'), '/data/server.db');
+        // No seeds, keys or RPC are needed or passed.
+        assert.ok(!result.args.some(arg => arg.includes('seed')));
+        assert.equal(result.received.ZKAPI_STATE_SEED, 'test-state-seed');
+    }
+});
+
+test('every role refuses another circuit before starting anything', async () => {
+    for (const role of ['server', 'db-init', 'indexer', 'challenger']) {
+        const result = await launch(role, { set: { CIRCUIT_ID: 'zkapi-v2-note-bound-v1' } });
+        assert.equal(result.status, 1, role);
+        assert.equal(result.stderr.trim(), 'This image requires the zkapi-v2-concession-v1 circuit and a fresh vault');
+        assert.deepEqual(result.args, []);
+    }
 });
 
 test('indexer launches with the deployment chain, confirmations and head-age limit', async () => {
@@ -239,6 +360,7 @@ test('challenger serves status on loopback and takes its fees from the environme
     assert.equal(flag(result.args, '--confirmations'), '2');
     assert.equal(flag(result.args, '--db-path'), '/data/server.db');
     assert.equal(flag(result.args, '--checkpoint'), '/data/challenges.json');
+    assert.equal(flag(result.args, '--deployment'), '/srv/zkapi/deployment.json');
     for (const name of ['--max-fee-per-gas-wei', '--max-priority-fee-per-gas-wei', '--priority-fee-per-gas-wei', '--rpc-url', '--sender']) {
         assert.ok(!result.args.includes(name), name);
     }
@@ -264,6 +386,6 @@ test('challenger receives the shared transaction fee cap from deployment.env thr
 test('unknown roles print the usage and exit 2', async () => {
     const result = await launch('indexer-resync');
     assert.equal(result.status, 2);
-    assert.equal(result.stderr.trim(), 'Usage: zkapi-run server|indexer|challenger');
+    assert.equal(result.stderr.trim(), 'Usage: zkapi-run server|db-init|indexer|challenger');
     assert.deepEqual(result.args, []);
 });

@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "description": "Shared vectors for the exit decisions of circuit zkapi-v2-concession-v1 (design \u00a76.3 C4, \u00a76.4 E0-E6). The Rust companion wallet (zkapi-client exit_policy) and the browser SDK must reproduce every expected value. Times are UNIX seconds, amounts are billing units.",
+ "description": "Shared vectors for the exit decisions of circuit zkapi-v2-concession-v1 (design \u00a76.3 C3 and C4, \u00a76.4 E0-E6). The Rust companion wallet (zkapi-client exit_policy) and the browser SDK must reproduce every expected value. Times are UNIX seconds, amounts are billing units.",
  "constants": {
   "call_timeout_seconds": 20,
   "recovery_budget_seconds": 120,
@@ -14,7 +14,8 @@
   "max_unsettled_escape_after_seconds": 604800,
   "lock_release_margin_seconds": 900,
   "exit_proof_validity_seconds": 10800,
-  "ownership_proof_validity_seconds": 3600
+  "ownership_proof_validity_seconds": 3600,
+  "ownership_resend_margin_seconds": 5
  },
  "e_low": [
   {
@@ -929,6 +930,38 @@
    "conceded": 1001,
    "bound_at_state": 1000,
    "expected": false
+  }
+ ],
+ "ownership_proof": [
+  {
+   "name": "no ownership proof of this state was sent: make one",
+   "newest_valid_until": null,
+   "now": 1000,
+   "expected": "new"
+  },
+  {
+   "name": "the state's proof is live: send it again, also under a new lock",
+   "newest_valid_until": 1006,
+   "now": 1000,
+   "expected": "resend"
+  },
+  {
+   "name": "within the resend margin, still accepted: none until it expires",
+   "newest_valid_until": 1005,
+   "now": 1000,
+   "expected": "wait"
+  },
+  {
+   "name": "valid until now: none yet",
+   "newest_valid_until": 1000,
+   "now": 1000,
+   "expected": "wait"
+  },
+  {
+   "name": "expired: one more",
+   "newest_valid_until": 999,
+   "now": 1000,
+   "expected": "new"
   }
  ]
 }

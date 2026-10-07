@@ -1,8 +1,9 @@
 //! Shared vectors for SDK parity (design §11 WP-E: "S1–S6, C1–C5 and E0–E7
 //! parity with the SDK through shared vectors").
 //!
-//! - `vectors/exit-policy.json`: the exit decisions (C4, E0–E6, record
-//!   classes, the E5 payout matcher), hand-written from the design.
+//! - `vectors/exit-policy.json`: the exit decisions (C3's ownership proofs,
+//!   C4, E0–E6, record classes, the E5 payout matcher), hand-written from
+//!   the design.
 //! - `vectors/successor-checks.json`: one note state and request journal,
 //!   and signed responses that must install, be archived as
 //!   `invalid_successor` (S3, S4, S5) or be rejected (S1, S2, S6).
@@ -92,6 +93,10 @@ fn exit_policy_vectors() {
             "ownership_proof_validity_seconds",
             zkapi_client::wallet::OWNERSHIP_PROOF_VALIDITY_SECONDS,
         ),
+        (
+            "ownership_resend_margin_seconds",
+            exit_policy::OWNERSHIP_RESEND_MARGIN_SECONDS,
+        ),
     ] {
         assert_eq!(constants[name].as_u64(), Some(value), "{name}");
     }
@@ -176,6 +181,18 @@ fn exit_policy_vectors() {
             serde_json::to_value(matched).unwrap(),
             case["expected"],
             "{case}"
+        );
+    }
+    for case in vectors["ownership_proof"].as_array().unwrap() {
+        assert_eq!(
+            serde_json::to_value(exit_policy::ownership_proof_action(
+                opt_u64(&case["newest_valid_until"]),
+                case["now"].as_u64().unwrap()
+            ))
+            .unwrap(),
+            case["expected"],
+            "{}",
+            case["name"]
         );
     }
     for case in vectors["concession_allowed"].as_array().unwrap() {

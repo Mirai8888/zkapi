@@ -65,19 +65,33 @@ pub const OWNERSHIP_PROOF_VALIDITY_SECONDS: u64 = 3_600;
 /// How far ahead of the server's clock this device's clock may run before an
 /// ownership proof's `valid_until` exceeds the server's 3,600-second window.
 pub const OWNERSHIP_CLOCK_SKEW_MARGIN_SECONDS: u64 = 300;
-/// A kept ownership proof is resent only while it stays valid this long.
-const OWNERSHIP_RESEND_MARGIN_SECONDS: u64 = 5;
+#[cfg(test)]
+use crate::exit_policy::OWNERSHIP_RESEND_MARGIN_SECONDS;
 
 /// C5's record (§6.2 "ownership-proof-sent flag"): the note state whose
 /// ownership proof was sent, or may have been. No request proof is made from
 /// that state afterwards.
 pub const OWNERSHIP_PROOF_MARKER_FILE: &str = "oa-ownership-proof-sent.json";
 
+fn ownership_proof_still_valid() -> ClientError {
+    ClientError::ExitLockConflict(
+        "an ownership proof of this state is still valid; another is made only after it expires"
+            .into(),
+    )
+}
+
 #[derive(Serialize, Deserialize)]
 struct OwnershipProofMarker {
     version: u8,
     note_id: u32,
     nullifier: Felt252,
+    /// The proof sent and its `valid_until` (0 and none in markers of
+    /// earlier builds): C3's one live ownership proof of the state outlives
+    /// the lock it was made under, which the user may cancel (E6).
+    #[serde(default)]
+    valid_until: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership: Option<ClearanceOwnershipProofV2C>,
 }
 
 pub struct Wallet {
@@ -941,7 +955,8 @@ impl Wallet {
 
     /// E6: the user cancels an exit that released no kind-0 or kind-1 proof.
     /// An ownership proof sent under it still keeps the state request-free
-    /// (C5).
+    /// (C5), and stays the state's one live ownership proof (C3): C5's
+    /// marker keeps it for the next lock.
     pub fn cancel_exit_lock(&mut self) -> Result<(), ClientError> {
         let Some(lock) = self.exit_lock()? else {
             return Ok(());
@@ -1038,12 +1053,19 @@ impl Wallet {
     /// Whether an ownership proof of the current state was sent, or may have
     /// been (C5).
     pub fn ownership_proof_sent_at_current_state(&self) -> Result<bool, ClientError> {
+        Ok(self.ownership_marker_at_current_state()?.is_some())
+    }
+
+    /// C5's marker, when it names the current state.
+    fn ownership_marker_at_current_state(
+        &self,
+    ) -> Result<Option<OwnershipProofMarker>, ClientError> {
         let Some(state) = self.state.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
         let bytes = match std::fs::read(&self.ownership_marker_path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let marker: OwnershipProofMarker = serde_json::from_slice(&bytes)
@@ -1053,15 +1075,24 @@ impl Wallet {
                 "ownership marker has an unknown version".into(),
             ));
         }
-        Ok(marker.note_id == state.note_id && marker.nullifier == state_nullifier(state))
+        Ok(
+            (marker.note_id == state.note_id && marker.nullifier == state_nullifier(state))
+                .then_some(marker),
+        )
     }
 
-    fn record_ownership_marker(&self) -> Result<(), ClientError> {
+    fn record_ownership_marker(
+        &self,
+        ownership: &ClearanceOwnershipProofV2C,
+        valid_until: u64,
+    ) -> Result<(), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let marker = OwnershipProofMarker {
             version: 1,
             note_id: state.note_id,
             nullifier: state_nullifier(state),
+            valid_until,
+            ownership: Some(ownership.clone()),
         };
         let bytes = serde_json::to_vec(&marker)
             .map_err(|error| ClientError::Serialization(error.to_string()))?;
@@ -1190,10 +1221,11 @@ impl Wallet {
 
     /// The ownership proof (kind 2) a clearance request carries for the
     /// current state, valid for `OWNERSHIP_PROOF_VALIDITY_SECONDS` less a
-    /// clock-skew margin. At most one is live per lock (C3): while the one
-    /// released earlier is valid it is returned again, so a retry resends
-    /// the same proof. Recorded as released, and the state marked for C5,
-    /// before it is returned.
+    /// clock-skew margin. At most one is live per state (C3), across locks:
+    /// while the one released earlier is valid it is returned again, so a
+    /// retry resends the same proof, also under a new lock after the user
+    /// cancelled the one it was made under (E6). Recorded as released, and
+    /// the state marked for C5 with the proof, before it is returned.
     pub fn ownership_proof(
         &self,
         active_root: Felt252,
@@ -1201,13 +1233,46 @@ impl Wallet {
     ) -> Result<ClearanceOwnershipProofV2C, ClientError> {
         let lock = self.lock_for_proof(ExitMode::Mutual)?;
         let now = now_seconds();
-        if let Some(kept) = lock.live_ownership_proof(now, OWNERSHIP_RESEND_MARGIN_SECONDS) {
-            return Ok(kept.clone());
+        // The state's newest ownership proof: one released under this lock,
+        // or the one C5's marker keeps (made under an earlier lock).
+        let mut newest: Option<(u64, Option<ClearanceOwnershipProofV2C>, bool)> = None;
+        for proof in lock.released.iter().filter(|proof| proof.kind == 2) {
+            if newest
+                .as_ref()
+                .is_none_or(|(valid_until, ..)| proof.valid_until > *valid_until)
+            {
+                newest = Some((proof.valid_until, proof.ownership.clone(), true));
+            }
         }
-        if lock.ownership_proof_live(now) {
-            return Err(ClientError::ExitLockConflict(
-                "an ownership proof of this state is still valid; another is made only after it expires".into(),
-            ));
+        if let Some(marker) = self.ownership_marker_at_current_state()? {
+            if newest
+                .as_ref()
+                .is_none_or(|(valid_until, ..)| marker.valid_until > *valid_until)
+            {
+                newest = Some((marker.valid_until, marker.ownership, false));
+            }
+        }
+        match exit_policy::ownership_proof_action(newest.as_ref().map(|(at, ..)| *at), now) {
+            exit_policy::OwnershipProofAction::New => {}
+            exit_policy::OwnershipProofAction::Resend => {
+                if let Some((valid_until, Some(kept), in_lock)) = newest {
+                    if !in_lock {
+                        self.record_release(
+                            lock,
+                            ReleasedProof {
+                                kind: 2,
+                                valid_until,
+                                conceded: 0,
+                                tx_hash: None,
+                                ownership: Some(kept.clone()),
+                            },
+                        )?;
+                    }
+                    return Ok(kept);
+                }
+                return Err(ownership_proof_still_valid());
+            }
+            exit_policy::OwnershipProofAction::Wait => return Err(ownership_proof_still_valid()),
         }
         let valid_until = now
             + OWNERSHIP_PROOF_VALIDITY_SECONDS.saturating_sub(OWNERSHIP_CLOCK_SKEW_MARGIN_SECONDS);
@@ -1224,7 +1289,7 @@ impl Wallet {
             public_inputs,
             proof,
         };
-        self.record_ownership_marker()?;
+        self.record_ownership_marker(&ownership, valid_until)?;
         self.record_release(
             lock,
             ReleasedProof {
@@ -2927,10 +2992,16 @@ mod tests {
             .unwrap();
         assert_eq!(resent.proof, first.proof);
         let path = fixture.state_dir.join(EXIT_LOCK_FILE);
+        let marker = fixture.state_dir.join(OWNERSHIP_PROOF_MARKER_FILE);
+        // The proof's lifetime, in the lock and in C5's marker alike.
         let set_valid_until = |valid_until: u64| {
             let mut lock = ExitLock::load(&path).unwrap().unwrap();
             lock.released[0].valid_until = valid_until;
             lock.save(&path).unwrap();
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+            saved["valid_until"] = serde_json::json!(valid_until);
+            std::fs::write(&marker, serde_json::to_vec(&saved).unwrap()).unwrap();
         };
         // Still accepted by the server, too close to expiry to resend.
         set_valid_until(now_seconds() + OWNERSHIP_RESEND_MARGIN_SECONDS - 1);
@@ -2954,6 +3025,64 @@ mod tests {
             fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
             2
         );
+    }
+
+    /// C3 across locks: cancelling the lock an ownership proof was made
+    /// under (E6 allows it, no kind-0 or kind-1 proof was released) does not
+    /// let a new lock make a second live one. The kept proof is sent again
+    /// and recorded under the new lock; near its expiry none is made, and
+    /// after it one more is.
+    #[test]
+    fn a_cancelled_lock_makes_no_second_live_ownership_proof() {
+        let mut fixture = fixture("http://127.0.0.1:1");
+        fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        let first = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        let relock = |fixture: &mut Fixture| {
+            fixture.wallet.cancel_exit_lock().unwrap();
+            assert!(fixture.wallet.exit_lock().unwrap().is_none());
+            fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        };
+        relock(&mut fixture);
+        let again = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        assert_eq!(again.proof, first.proof);
+        let lock = fixture.wallet.exit_lock().unwrap().unwrap();
+        assert_eq!(
+            (lock.released.len(), lock.released[0].kind),
+            (1, 2),
+            "the resent proof is recorded under the new lock"
+        );
+        let marker = fixture.state_dir.join(OWNERSHIP_PROOF_MARKER_FILE);
+        let set_valid_until = |valid_until: u64| {
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+            saved["valid_until"] = serde_json::json!(valid_until);
+            std::fs::write(&marker, serde_json::to_vec(&saved).unwrap()).unwrap();
+        };
+        set_valid_until(now_seconds() + OWNERSHIP_RESEND_MARGIN_SECONDS - 1);
+        relock(&mut fixture);
+        assert!(matches!(
+            fixture
+                .wallet
+                .ownership_proof(fixture.root, fixture.siblings.clone()),
+            Err(ClientError::ExitLockConflict(_))
+        ));
+        set_valid_until(now_seconds() - 1);
+        relock(&mut fixture);
+        let second = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        assert_ne!(second.proof, first.proof);
+        assert!(fixture
+            .wallet
+            .ownership_proof_sent_at_current_state()
+            .unwrap());
     }
 
     /// E3 "lost ε" takes a finalized response's charge only when it passes

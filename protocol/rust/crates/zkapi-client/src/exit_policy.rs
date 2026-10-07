@@ -34,6 +34,8 @@ pub const MAX_UNSETTLED_ESCAPE_AFTER_SECONDS: u64 = 604_800;
 /// E6: a released exit proof is dead once a finalized block's timestamp is
 /// past its `valid_until` by more than this.
 pub const LOCK_RELEASE_MARGIN_SECONDS: u64 = 900;
+/// C3: a kept ownership proof is resent only while it stays valid this long.
+pub const OWNERSHIP_RESEND_MARGIN_SECONDS: u64 = 5;
 
 /// Archive dispositions (they match the SDK's `zkapiRequestArchive.mjs`).
 pub mod disposition {
@@ -381,6 +383,33 @@ pub fn decide(facts: &ExitFacts) -> ExitDecision {
 /// The concession range C3 allows in escape mode: `[0, bound_at_state]`.
 pub fn concession_allowed(conceded: u128, bound_at_state: u128) -> bool {
     conceded <= bound_at_state
+}
+
+/// C3, mode `mutual`: the ownership proof (kind 2) a clearance request at a
+/// state carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipProofAction {
+    /// The state's live ownership proof, sent again.
+    Resend,
+    /// None: the state's ownership proof is too near its expiry to resend
+    /// but the server may still accept it; another is made once it expired.
+    Wait,
+    /// A new ownership proof.
+    New,
+}
+
+/// C3: at most one live ownership proof per state, across exit locks (a
+/// user may cancel the lock one was made under, E6). `newest_valid_until`
+/// is the newest `valid_until` of the state's ownership proofs sent so far.
+pub fn ownership_proof_action(newest_valid_until: Option<u64>, now: u64) -> OwnershipProofAction {
+    match newest_valid_until {
+        Some(valid_until) if valid_until > now.saturating_add(OWNERSHIP_RESEND_MARGIN_SECONDS) => {
+            OwnershipProofAction::Resend
+        }
+        Some(valid_until) if valid_until >= now => OwnershipProofAction::Wait,
+        _ => OwnershipProofAction::New,
+    }
 }
 
 /// A released exit proof, as E6 sees it.

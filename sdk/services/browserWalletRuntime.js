@@ -3771,13 +3771,12 @@ class BrowserWalletRuntime extends EventTarget {
         // A released escape keeps the note on escapes until it is dead.
         const request = lock.mode === 'escape' && releasedExitProofs(lock).length ? 'escape' : requested;
 
-        // An active key of this tab is closed first, in one bounded call, so
-        // that a finished chat settles into a fresh state (E2).
-        await this.exitRetireLeaseLocked({ signal });
-
-        // E1, bounded, and skipped once must_initiate_by has passed.
+        // E1, bounded, and skipped once must_initiate_by has passed. An active
+        // key of this tab is closed first, in one bounded call, so that a
+        // finished chat settles into a fresh state (E2).
         let recovery = { installed: false, lateSuccessor: false, reading: null, response: null };
         if (now < deadline) {
+            await this.exitRetireLeaseLocked({ signal });
             onProgress('recovering', 'Checking for a settled private request…');
             recovery = await this.exitRecoveryPassLocked({ signal, onProgress });
             if (recovery.installed) return WITHDRAWAL_RESTART;

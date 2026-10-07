@@ -322,7 +322,15 @@ export function createHarness(BrowserWalletRuntime, {
             if (operation === 'withdrawalNullifier') return nullifierFor(payload.state.current_anchor);
             if (operation === 'successorNullifier') return successorFor(payload.state.current_anchor);
             if (operation === 'verifyRequest') return worker.verify(payload);
-            if (operation === 'notePathMatches') return true;
+            if (operation === 'notePathMatches') return worker.pathMatches ? worker.pathMatches(payload) : true;
+            if (operation === 'rebuildTreePath') {
+                // The rebuilt path at the last event's root (per-event checks
+                // run in the real worker: zkapi-tree-rebuild tests).
+                worker.rebuilds = (worker.rebuilds || 0) + 1;
+                const root = payload.events.at(-1).root;
+                return { active_root: root, note_id: payload.noteId,
+                    siblings: Array.from({ length: 32 }, (_, index) => `${root}${index.toString(16)}`) };
+            }
             if (operation === 'checkUnrecoverableResponse') {
                 // S1, S2, S4 and S6 as the WebAssembly checks them, in the
                 // harness's terms: this state's nullifier, a signed response

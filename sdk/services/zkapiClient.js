@@ -3741,7 +3741,9 @@ class ZkapiClient extends EventTarget {
             }
             if (durableMode === 'escape' && !clearanceReserved) {
                 await browserWalletRuntime.clearPreparedWithdrawal();
-                onStatus('No escape transaction was submitted. Your private balance is ready to use.');
+                // E6: its proof was released, so the exit lock holds the
+                // balance until that proof is dead; another escape is allowed.
+                onStatus('No escape transaction was submitted. This balance stays withdrawal-only until its escape proof expires; you can escape again.');
                 this.rememberWithdrawal(null);
             } else if (successfulAttempts.length) {
                 onStatus('A mutual-close transaction mined, but the latest vault state has not caught up yet. Check again shortly.');
@@ -4852,18 +4854,44 @@ class ZkapiClient extends EventTarget {
     async cancelPreparedWithdrawal(onStatus = () => {}) {
 
         const prepared = this.config?.prepared_withdrawal;
-        if (!prepared) return false;
-        if (prepared.mode === 'mutual' || prepared.clearance_reserved === true) {
+        if (!prepared && !this.config?.exit?.lock) return false;
+        if (prepared && (prepared.mode === 'mutual' || prepared.clearance_reserved === true)) {
             throw new Error('This balance already has a mutual-close authorization. Finish it, use the escape hatch, or set it aside before funding another balance.');
         }
-        if (prepared.transaction_hash) {
+        if (prepared?.transaction_hash) {
             throw new Error('This transaction was already submitted. Check its on-chain status instead of canceling it.');
         }
-        await browserWalletRuntime.clearPreparedWithdrawal();
+        if (prepared) await browserWalletRuntime.clearPreparedWithdrawal();
         this.rememberWithdrawal(null);
+        // E6: the exit lock is released now only if no escape or close proof
+        // was released; otherwise once every released proof is dead.
+        try {
+            await browserWalletRuntime.cancelExit();
+        } catch (error) {
+            if (error?.code !== 'exit_locked') throw error;
+            await this.refresh();
+            const after = Number(error.data?.releasable_after);
+            onStatus(Number.isSafeInteger(after)
+                ? `Withdrawal canceled. Its escape proof was already released, so this balance stays withdrawal-only until ${new Date(after * 1_000).toLocaleString()}; you can still escape.`
+                : 'Withdrawal canceled. Its escape proof was already released, so this balance stays withdrawal-only until that proof expires; you can still escape.');
+            return true;
+        }
         await this.refresh();
         onStatus('Withdrawal canceled. Your private balance is ready to use.');
         return true;
+    }
+
+    /** E7: an encrypted exit kit of the selected balance (JSON) for the user to keep. */
+    async exportExitKit(passphrase) {
+        await this.init();
+        return browserWalletRuntime.exportExitKit({ passphrase });
+    }
+
+    /** The user's own exit RPC (design §6.4 E0, §6.6), persisted for this origin; null clears it. */
+    setExitRpcUrl(url) {
+        const saved = browserWalletRuntime.setExitRpcUrl(url);
+        this.emitChange('exit-rpc');
+        return saved;
     }
 
     async restoreWithdrawal(recordId, onStatus = () => {}) {

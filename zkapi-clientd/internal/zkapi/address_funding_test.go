@@ -59,6 +59,8 @@ type addressFixture struct {
 	cachedVersion, leafVersion int
 	mined                      map[string]uint32
 	minedExpiry                map[uint32]uint64
+	// minedRoot is NoteDeposited.newRoot of each mined deposit, by hash.
+	minedRoot map[string]*big.Int
 	// Block headers served by eth_getBlockByHash, by lowercase hash.
 	headers map[string]*types.Header
 	// Companion wallet state for activation and rebind.
@@ -485,8 +487,12 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 				id = uint32(len(f.leaves))
 				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
 				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
+				if f.minedRoot == nil {
+					f.minedRoot = map[string]*big.Int{}
+				}
+				f.minedRoot[hash], _ = f.tree()
 			}
-			receipt["logs"] = depositEventReceipt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id]).Logs
+			receipt["logs"] = depositEventReceiptAt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id], f.minedRoot[hash]).Logs
 			f.allowance = "0x0"
 		}
 	}

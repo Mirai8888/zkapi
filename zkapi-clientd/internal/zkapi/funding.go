@@ -462,7 +462,11 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if record.Active {
 		return nil, errors.New("this deposit was already activated; restore its wallet state instead of reinitializing it")
 	}
-	body, _ := json.Marshal(map[string]any{"secret": record.Secret, "note_id": noteID, "amount": record.Amount, "expiry_ts": expiry})
+	activation := map[string]any{"secret": record.Secret, "note_id": noteID, "amount": record.Amount, "expiry_ts": expiry}
+	if root, siblings, ok := depositTimePath(receipt, record, noteID, expiry); ok {
+		activation["deposit_root"], activation["deposit_siblings"] = root, siblings
+	}
+	body, _ := json.Marshal(activation)
 	_, err = h.client.request(ctx, http.MethodPost, "/funding/api/deposit/confirm", body)
 	if err != nil {
 		return nil, err
@@ -562,6 +566,43 @@ func matchDepositEvent(receipt ethReceipt, record depositRecord, now int64) (uin
 		return matchingNote, matchingExpiry, nil
 	}
 	return 0, 0, errors.New("deposit receipt must contain exactly one event matching this private note")
+}
+
+// depositTimePath is Amendment A1's deposit-time Merkle path: the root this
+// deposit set (NoteDeposited.newRoot) and the zero path the deposit was signed
+// with, which are the note's siblings at that root. The vault accepts every
+// root it ever held, so the companion exits with them without the indexer or
+// a log rebuild. Nothing is returned unless the path proves the note's leaf
+// at that root; the companion checks it again before keeping it.
+func depositTimePath(receipt ethReceipt, record depositRecord, noteID uint32, expiry uint64) (string, []string, bool) {
+	if len(record.ZeroPath) != merkleDepth {
+		return "", nil, false
+	}
+	commitment, ok := parseFieldElement(record.Commitment)
+	if !ok {
+		return "", nil, false
+	}
+	siblings := make([]*big.Int, merkleDepth)
+	for i, sibling := range record.ZeroPath {
+		if siblings[i], ok = parseFieldElement(sibling); !ok {
+			return "", nil, false
+		}
+	}
+	leaf := noteLeaf(noteID, commitment, record.Amount, expiry)
+	computed := merkleRoot(noteID, leaf, siblings)
+	for _, log := range receipt.Logs {
+		if log.Removed || !strings.EqualFold(log.Address, record.Contract) || len(log.Topics) != 3 || !strings.EqualFold(log.Topics[0], depositEventTopic) || !isHex(log.Topics[1], 32) || !isHex(log.Data, 96) {
+			continue
+		}
+		if note, ok := new(big.Int).SetString(log.Topics[1][2:], 16); !ok || !note.IsUint64() || note.Uint64() != uint64(noteID) {
+			continue
+		}
+		root, ok := new(big.Int).SetString(log.Data[130:194], 16)
+		if ok && root.Cmp(computed) == 0 {
+			return fmt.Sprintf("0x%064x", root), record.ZeroPath, true
+		}
+	}
+	return "", nil, false
 }
 
 // Deposit witnesses describe the current shared tree, not private wallet

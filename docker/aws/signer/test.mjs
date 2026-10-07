@@ -641,7 +641,7 @@ test('audit logging can never change the RPC outcome', async () => {
 
 test('RPC method allowlist excludes generic signing, account management, fee oracles and raw broadcasts', async () => {
   const feeHistory = { oldestBlock: '0xf', baseFeePerGas: ['0x3b9aca00', '0x3b9aca00'], gasUsedRatio: [0.5], reward: [['0x3b9aca00']] };
-  const { signer, calls } = fixture({ eth_feeHistory: feeHistory });
+  const { signer, calls } = fixture({ eth_feeHistory: feeHistory, eth_getCode: '0x6000' });
   for (const method of ['eth_sendRawTransaction', 'eth_sign', 'personal_sign', 'eth_signTypedData_v4', 'personal_unlockAccount', 'admin_peers', 'debug_traceCall', 'eth_signTransaction', 'eth_accounts', 'eth_gasPrice', 'eth_maxPriorityFeePerGas']) {
     await assert.rejects(signer.handle(method, []), { code: -32601 });
   }
@@ -649,7 +649,10 @@ test('RPC method allowlist excludes generic signing, account management, fee ora
   assert.equal(await signer.handle('eth_blockNumber', []), '0x1');
   assert.equal(await signer.handle('eth_getBalance', [sender, 'latest']), ONE_ETH);
   assert.deepEqual(await signer.handle('eth_feeHistory', ['0x1', 'latest', [50]]), feeHistory);
-  assert.deepEqual(calls.map(c => [c.method, c.params]), [['eth_blockNumber', []], ['eth_getBalance', [sender, 'latest']], ['eth_feeHistory', ['0x1', 'latest', [50]]]]);
+  // The challenger's startup codehash probes read code through the signer.
+  assert.equal(await signer.handle('eth_getCode', [vault, 'latest']), '0x6000');
+  assert.deepEqual(calls.map(c => [c.method, c.params]), [['eth_blockNumber', []], ['eth_getBalance', [sender, 'latest']],
+    ['eth_feeHistory', ['0x1', 'latest', [50]]], ['eth_getCode', [vault, 'latest']]]);
 });
 
 test('signer status reports policy, base fee, balance coverage and warnings', async () => {

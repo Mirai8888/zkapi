@@ -3449,6 +3449,8 @@ name = "zkapi-serverd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ark-bn254",
+ "ark-relations",
  "axum",
  "base64",
  "clap",

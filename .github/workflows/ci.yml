@@ -331,8 +331,13 @@ jobs:
       - name: Every encoder's golden escape and close lands on an Anvil vault
         run: node scripts/check-withdrawal-golden.mjs
 
-  # Full local lifecycle: real vault, proofs, API server, indexer and
-  # challenger on Anvil, with mock provider and price feed (docs/v2-acceptance.md).
+  # The end-to-end acceptance of circuit zkapi-v2-concession-v1 and the
+  # §10.7 Phase B drill scenarios that run on a local chain
+  # (docs/v2-acceptance.md): contracts deployed by Deploy.s.sol and finalized
+  # on chain, real proofs, the drill build of serverd (--adversary),
+  # indexerd, challengerd behind the signer sidecar, the browser SDK with its
+  # WebAssembly in Node and the clientd companion, on Anvil with mock
+  # provider, OA org and price feed. Writes the run's gas.json.
   lifecycle-acceptance:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -349,10 +354,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The version the contracts job pins.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
 
-      - name: Run the v2 lifecycle acceptance
+      - name: Run the concession-exit acceptance and drills
         run: bash scripts/run-v2-acceptance.sh
 
       - name: Keep acceptance evidence

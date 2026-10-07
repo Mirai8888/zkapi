@@ -46,10 +46,13 @@ export const ESCAPE_FINALIZED_TOPIC = id('EscapeWithdrawalFinalized(uint32,uint2
 export const DEFAULT_RETIREMENT_LOOKBACK_BLOCKS = 50_400n;
 export const MAX_RETIREMENT_LOOKBACK_BLOCKS = 5_000_000n;
 export const RETIREMENT_LOG_RANGE_BLOCKS = 10_000n;
+// eth_getCode: zkapi-challenged checks the vault's, adapter's and Poseidon
+// library's runtime codehashes against its deployment manifest through this
+// RPC before it polls (design §5.5 startup probes).
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
   'eth_getTransactionReceipt', 'eth_getTransactionByHash',
-  'eth_getTransactionCount', 'eth_call', 'eth_estimateGas', 'eth_getBalance', 'eth_feeHistory',
+  'eth_getTransactionCount', 'eth_call', 'eth_estimateGas', 'eth_getBalance', 'eth_feeHistory', 'eth_getCode',
 ]);
 // Callers may propose both EIP-1559 fee fields (or neither). Every other fee
 // or envelope field (gasPrice, type, accessList, input, blob fields) is refused.

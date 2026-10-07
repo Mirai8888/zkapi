@@ -20,8 +20,8 @@ import {
 } from './zkapiRequestArchive.mjs';
 import {
     EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, exitLockRefusal,
-    exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, recordReleasedProof,
-    releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
+    exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, ownershipOutcome,
+    recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
 import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
 import { buildExitKitPayload, sealExitKit } from './zkapiExitKit.mjs';
@@ -3836,6 +3836,7 @@ class BrowserWalletRuntime extends EventTarget {
                 noteId: Number(this.runtime.state.note_id), destination: prepared?.destination || null,
                 withdrawalNullifier: prepared?.withdrawalNullifier || null, clearanceReserved: true,
                 ...(prepared?.clearance?.signature ? { clearance: prepared.clearance } : {}),
+                ...(prepared?.clearanceOutcome ? { clearanceOutcome: prepared.clearanceOutcome } : {}),
                 createdAt: Number(prepared?.createdAt || Date.now())
             };
         }
@@ -4048,14 +4049,27 @@ class BrowserWalletRuntime extends EventTarget {
             unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds, mustInitiateBy: deadline };
         const escapeAtFor = createdAt => createdAt == null ? null : escapeAt({ createdAt,
             settlementDeadline: recovery.reading?.settlementDeadline ?? null, ...timing });
-        const lostEpsilonCharge = status.fresh ? null : await this.lostEpsilonCharge(state, recovery);
-        let decision = chooseExit({ request, now, mustInitiateBy: deadline, status,
-            escapeAtSeconds: escapeAtFor(status.newestCreatedAt), lostEpsilonCharge, earlyConcession });
+        // E2.4 on a retry: once the server answered this state's ownership
+        // proof with nullifier_used (kept with the lock, or with the
+        // withdrawal-only marker after a cancel), the state is decided as
+        // unresolved (E3) and no clearance is asked again.
+        const clearance = this.clearanceAnswerAt(state, nullifier);
+        const decisionStatus = clearance.claimed ? { ...status, fresh: false } : status;
+        const lostEpsilonCharge = decisionStatus.fresh ? null : await this.lostEpsilonCharge(state, recovery);
+        let decision = chooseExit({ request, now, mustInitiateBy: deadline, status: decisionStatus,
+            escapeAtSeconds: escapeAtFor(status.newestCreatedAt) ?? (clearance.claimed ? now : null),
+            lostEpsilonCharge, earlyConcession });
         if (decision.action === 'wait') {
             if (lockSetHere && !(this.runtime.exitLock?.released || []).length) {
                 await this.commit({ ...this.runtime, exitLock: null });
             }
-            throw this.settlementPendingError(decision, status, deadline);
+            throw this.settlementPendingError(decision, status, deadline,
+                clearance.claimed ? { code: 'nullifier_used' } : null);
+        }
+        if (decision.action === 'mutual' && clearance.sent && !validClearance(existing, nullifier)) {
+            // C3 allows one ownership proof per lock, and this one was
+            // answered without a clearance (E2.5), or its answer was lost.
+            decision = { action: 'escape', conceded: 0n, rule: 'E2.fallback', clearanceError: clearance.outcome };
         }
         if (decision.action === 'mutual') {
             if (!reprove && this.reusablePlan(existing, { mode: 'mutual', destination, state, nullifier, conceded: 0n })) {
@@ -4069,6 +4083,10 @@ class BrowserWalletRuntime extends EventTarget {
             if (outcome === WITHDRAWAL_RESTART) return outcome;
             if (outcome.plan) return outcome.plan;
             const next = afterClearanceFailure(outcome.error);
+            if (next.action === 'refuse') {
+                throw new BrowserWalletHttpError('This balance’s exit is frozen at another step (C3).', 409,
+                    outcome.error?.code || 'exit_locked');
+            }
             if (next.action === 'reconsider') {
                 // E2.4: the server claims a reservation; decide as at an
                 // unresolved state, from the newest released record.
@@ -4188,16 +4206,47 @@ class BrowserWalletRuntime extends EventTarget {
         const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
             method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
         });
-        if (!answer.reachable) return { error: { code: 'unreachable', status: answer.status ?? null } };
-        if (!answer.ok) return { error: { code: answer.code, status: answer.status } };
-        const clearance = answer.body;
-        if (!clearance?.signature || clearance.withdrawal_nullifier == null || !sameFelt(clearance.withdrawal_nullifier, nullifier)) {
-            return { error: { code: 'clearance_invalid' } };
+        let result;
+        let outcome;
+        if (!answer.reachable) {
+            result = { error: { code: 'unreachable', status: answer.status ?? null } };
+            outcome = 'unreachable';
+        } else if (!answer.ok) {
+            result = { error: { code: answer.code, status: answer.status } };
+            outcome = answer.code === 'nullifier_used' ? 'nullifier_used' : 'refused';
+        } else if (!answer.body?.signature || answer.body.withdrawal_nullifier == null
+            || !sameFelt(answer.body.withdrawal_nullifier, nullifier)) {
+            result = { error: { code: 'clearance_invalid' } };
+            outcome = 'invalid';
+        } else {
+            result = { clearance: answer.body };
+            outcome = 'granted';
         }
-        // Keep the clearance with the withdrawal-only marker: a close proof
-        // re-proved later needs no second ownership proof.
-        await this.commit({ ...this.runtime, preparedWithdrawal: { ...this.runtime.preparedWithdrawal, clearance } });
-        return { clearance };
+        // The answer is kept with the lock and the withdrawal-only marker, so
+        // a retry decides as this attempt does (E2.4, E2.5) without a second
+        // ownership proof; a clearance is kept for a later close proof.
+        await this.commit({
+            ...this.runtime,
+            exitLock: recordClearanceOutcome(this.runtime.exitLock, { outcome, code: result.error?.code || null }),
+            preparedWithdrawal: { ...this.runtime.preparedWithdrawal, clearanceOutcome: outcome,
+                ...(result.clearance ? { clearance: result.clearance } : {}) }
+        });
+        return result;
+    }
+
+    /**
+     * The server's answer to this state's ownership proof: { sent, outcome,
+     * claimed }. `claimed` (nullifier_used) also survives a cancel, through
+     * the withdrawal-only marker bound to this state's nullifier.
+     */
+    clearanceAnswerAt(state, nullifier) {
+        const lock = this.runtime?.exitLock;
+        const here = Boolean(lock && Number(lock.noteId) === Number(state.note_id) && sameFelt(lock.anchor, state.current_anchor));
+        const outcome = here ? ownershipOutcome(lock) : null;
+        const marker = this.runtime?.preparedWithdrawal;
+        const markerClaim = marker?.clearanceOutcome === 'nullifier_used' && preparedWithdrawalNullifier(marker) != null
+            && sameFelt(preparedWithdrawalNullifier(marker), nullifier);
+        return { sent: outcome != null, outcome, claimed: outcome === 'nullifier_used' || markerClaim };
     }
 
     /**
@@ -4301,7 +4350,8 @@ class BrowserWalletRuntime extends EventTarget {
             boundAtState: String(state.bound_at_state || 0),
             validUntil,
             ...(pathSource ? { pathSource } : {}),
-            ...(warnings.length ? { warnings } : {})
+            ...(warnings.length ? { warnings } : {}),
+            ...(existing?.clearanceOutcome ? { clearanceOutcome: existing.clearanceOutcome } : {})
         };
         const carried = clearance || (validClearance(existing, nullifier) ? existing.clearance : null);
         if (carried?.signature) decorated.clearance = carried;

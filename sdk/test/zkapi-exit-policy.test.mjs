@@ -5,7 +5,7 @@ import test from 'node:test';
 import {
     EXIT_TIMING, RECORD_CLASS, afterClearanceFailure, chooseExit, escapeAt, exitCostWarning, exitLockRefusal,
     exitLockReleasable, exitRecordClass, lowExpiry, matchEscapePayout, mustInitiateBy, nearExpiry, newExitLock,
-    recordReleasedProof, recordReleasedTransaction, releasedExitProofs, requestRecordsAtState, stateExitStatus,
+    ownershipOutcome, recordClearanceOutcome, recordReleasedProof, recordReleasedTransaction, releasedExitProofs, requestRecordsAtState, stateExitStatus,
     switchExitLock, unsettledEscapeAfterSeconds
 } from '../services/zkapiExitPolicy.mjs';
 import { buildRequestJournalRecord, requestObservation } from '../services/zkapiRequestArchive.mjs';
@@ -147,6 +147,24 @@ test('E2–E3 decision table, including the choice of the conceded amount', () =
     for (const error of [{ code: 'stale_root' }, { status: 503 }, new Error('timeout'), null]) {
         assert.deepEqual(afterClearanceFailure(error), { action: 'escape', conceded: 0n, rule: 'E2.fallback' });
     }
+    // The client's own C3 refusals are no server answer: never an escape.
+    for (const code of ['ownership_proof_sent', 'exit_locked', 'exit_lock_state', 'exit_lock_mode']) {
+        assert.deepEqual(afterClearanceFailure({ code }), { action: 'refuse', rule: 'C3' }, code);
+    }
+});
+
+test('E2.4/E2.5: the answer to a lock\'s ownership proof is kept with it', () => {
+    let lock = newExitLock({ noteId: 7, anchor: '0x12', mode: 'mutual', now: 100 });
+    assert.equal(ownershipOutcome(lock), null, 'no ownership proof released');
+    lock = recordReleasedProof(lock, { kind: 2, validUntil: 3_700, at: 100 });
+    assert.equal(ownershipOutcome(lock), 'unknown', 'released, answer not recorded');
+    const answered = recordClearanceOutcome(lock, { outcome: 'nullifier_used', code: 'nullifier_used' });
+    assert.equal(ownershipOutcome(answered), 'nullifier_used');
+    assert.deepEqual(answered.released[0], { kind: 2, valid_until: 3_700, conceded: '0', at: 100,
+        outcome: 'nullifier_used', code: 'nullifier_used' });
+    assert.throws(() => recordClearanceOutcome(lock, { outcome: 'maybe' }), { code: 'exit_input_invalid' });
+    // Later releases (a close or an escape proof) keep it.
+    assert.equal(ownershipOutcome(recordReleasedProof(answered, { kind: 0, validUntil: 9_000, at: 200 })), 'nullifier_used');
 });
 
 test('C3: a held lock freezes requests and allows only its own mode at its own state', () => {

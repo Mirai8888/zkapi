@@ -347,6 +347,73 @@ test('E2: a clearance refused with nullifier_used decides as E3; unreachable or 
     }
 });
 
+test('E2.4: a retry after nullifier_used still waits for T, asks no second clearance, and only an explicit escape escapes early', async () => {
+    const h = await walletWithResolvedRequest();
+    const created = Math.floor((await records())[0].createdAt / 1_000);
+    let clearances = 0;
+    h.server.clearance = () => {
+        clearances += 1;
+        throw new HttpError('The nullifier is used.', 409, 'nullifier_used');
+    };
+    const waitsForT = error => {
+        assert.equal(error.code, 'request_settlement_pending');
+        assert.equal(error.data.clearance_error_code, 'nullifier_used');
+        assert.equal(error.data.escape_at, (created + W + 900) * 1_000);
+        return true;
+    };
+    // Any UI retries after an error: every retry decides as the first did.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForT);
+    }
+    assert.equal(clearances, 1, 'one clearance request');
+    assert.equal(proofsOf(h, 'ownership').length, 1, 'one ownership proof');
+    assert.equal(proofsOf(h, 'escape').length, 0, 'no escape before T');
+    assert.deepEqual((await saved()).exitLock.released.map(entry => [entry.kind, entry.outcome]), [[2, 'nullifier_used']]);
+    // A cancel releases the lock; the withdrawal-only marker keeps the answer.
+    await h.runtime.cancelExit();
+    assert.equal((await saved()).preparedWithdrawal.clearanceOutcome, 'nullifier_used');
+    await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForT);
+    assert.equal(clearances, 1);
+    assert.equal(proofsOf(h, 'ownership').length, 1);
+    // Before T only an explicit escape escapes: the forced choice (E3).
+    const forced = await h.runtime.prepareWithdrawal('escape', DESTINATION, { earlyConcession: 'bound' });
+    assert.equal(forced.decision.rule, 'E3.forced');
+    assert.equal(forced.public_inputs.conceded, BOUND);
+    // At T the mutual request escapes conceding the bound (E3.T).
+    const later = await walletWithResolvedRequest();
+    later.server.clearance = () => { throw new HttpError('The nullifier is used.', 409, 'nullifier_used'); };
+    await assert.rejects(later.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForT);
+    const restore = Date.now;
+    Date.now = () => (created + W + 900) * 1_000 + 60_000;
+    try {
+        const plan = await later.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'escape');
+        assert.equal(plan.decision.rule, 'E3.T');
+        assert.equal(plan.public_inputs.conceded, BOUND);
+    } finally {
+        Date.now = restore;
+    }
+});
+
+test('E2.5 on a retry: an ownership proof answered without a clearance escapes with c = 0, never a second proof', async () => {
+    for (const [answer, outcome] of [[() => { throw new HttpError('Unavailable', 503, 'service_unavailable'); }, 'unreachable'],
+        [() => { throw new HttpError('Invalid ownership proof.', 400, 'invalid_ownership_proof'); }, 'refused']]) {
+        const h = await walletWithResolvedRequest();
+        h.server.clearance = answer;
+        // The first attempt fails after the answer (the escape proof cannot be made).
+        h.worker.mutate = plan => { if (plan.mode === 'escape') throw new Error('proving failed'); };
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), /proving failed/);
+        assert.deepEqual((await saved()).exitLock.released.map(entry => [entry.kind, entry.outcome]), [[2, outcome]]);
+        h.worker.mutate = null;
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'escape', outcome);
+        assert.equal(plan.decision.rule, 'E2.fallback');
+        assert.equal(plan.decision.clearance_error_code, outcome);
+        assert.equal(plan.public_inputs.conceded, 0);
+        assert.equal(proofsOf(h, 'ownership').length, 1, 'one ownership proof per lock');
+    }
+});
+
 test('E2: a fresh state closes cooperatively, journaling the close proof with its plan', async () => {
     const h = await freshWallet();
     h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });

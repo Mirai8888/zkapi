@@ -260,7 +260,42 @@ export function chooseExit({ request, now, mustInitiateBy: deadline, status, esc
  */
 export function afterClearanceFailure(error) {
     if (error?.code === 'nullifier_used') return { action: 'reconsider', rule: 'E2.nullifier_used' };
+    // The client's own C3 refusals are not server answers: they never turn
+    // a mutual request into an escape (only a server refusal does, E2.5).
+    if (LOCAL_CLEARANCE_REFUSALS.has(error?.code)) return { action: 'refuse', rule: 'C3' };
     return { action: 'escape', conceded: 0n, rule: 'E2.fallback' };
+}
+
+const LOCAL_CLEARANCE_REFUSALS = new Set(['ownership_proof_sent', 'exit_locked', 'exit_lock_state', 'exit_lock_mode',
+    'conceded_exceeds_bound']);
+
+// What the server answered to a released ownership proof (kind 2).
+export const CLEARANCE_OUTCOMES = Object.freeze(['granted', 'nullifier_used', 'refused', 'unreachable', 'invalid']);
+
+/**
+ * The lock with the server's answer to its released ownership proof, so a
+ * retry decides as the first attempt did (E2.4, E2.5) without a second one.
+ */
+export function recordClearanceOutcome(lock, { outcome, code = null }) {
+    if (!CLEARANCE_OUTCOMES.includes(outcome)) throw exitError('Unknown clearance outcome.', 'exit_input_invalid');
+    let marked = false;
+    const released = (lock.released || []).map(entry => {
+        if (marked || Number(entry.kind) !== WITHDRAWAL_KIND.ownership) return entry;
+        marked = true;
+        return { ...entry, outcome, ...(code ? { code: String(code) } : {}) };
+    });
+    return { ...lock, released };
+}
+
+/**
+ * The answer to the lock's released ownership proof: null when none was
+ * released, 'unknown' when one left but no answer was recorded (a crash or
+ * an abort in between), else one of CLEARANCE_OUTCOMES.
+ */
+export function ownershipOutcome(lock) {
+    const entry = (lock?.released || []).find(item => Number(item.kind) === WITHDRAWAL_KIND.ownership);
+    if (!entry) return null;
+    return CLEARANCE_OUTCOMES.includes(entry.outcome) ? entry.outcome : 'unknown';
 }
 
 // ---- exit_lock (C3, E6) ----

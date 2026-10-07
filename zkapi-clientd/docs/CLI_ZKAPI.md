@@ -121,9 +121,11 @@ Do not delete recovery data to bypass a configuration mismatch.
 
 A note of the earlier vault (circuit `zkapi-v2-note-bound-v1`) lives in its
 own wallet directory, which this release never opens. When one is still open,
-startup prints a warning naming its directory: withdraw it with the earlier
-zkapi-clientd release line, which keeps that vault's exit routes, then fund
-this release.
+startup prints a warning naming its directory: withdraw it with zkapi-clientd
+0.1.7 from the earlier release line (`release/v2-note-bound`), which closes
+deposits on that vault and keeps its mutual close and an escape (`withdraw
+--escape`, with a runbook in that release's `docs/LEGACY_ESCAPE.md`), then
+fund this release.
 
 Payment state (the local signing address and its key, pending deposits and
 their recovery records) is kept per deployment as well, in

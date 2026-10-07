@@ -49,6 +49,12 @@ const RequiredCircuitID = "zkapi-v2-concession-v1"
 // placeholder: its vault is not deployed yet.
 var ErrDeploymentNotDeployed = errors.New("deployment_not_deployed: the zkAPI concession-exit vault is not deployed on this network yet, so this release cannot fund, use or withdraw a note there; a note of the earlier vault is withdrawn with the earlier (legacy) zkapi-clientd release")
 
+// LegacyRelease is the earlier vault's point release (design §10.7 D step
+// 2): deposits closed, the mutual close, and an escape with its runbook
+// (docs/LEGACY_ESCAPE.md on that line). A note of the earlier vault is
+// withdrawn with it.
+const LegacyRelease = "zkapi-clientd 0.1.7 (release line release/v2-note-bound)"
+
 // legacyDeploymentIDs are the earlier vaults' deployments (circuit
 // zkapi-v2-note-bound-v1). Their wallets live in their own state directories,
 // which this release never opens; an open note there gets a warning.
@@ -68,7 +74,7 @@ func LegacyWalletWarning(stateDir, network string) string {
 	for _, id := range legacyDeploymentIDs[network] {
 		dir := filepath.Join(stateDir, network, id)
 		if _, err := os.Lstat(filepath.Join(dir, "note_state.json")); err == nil {
-			return fmt.Sprintf("A private note of the earlier zkAPI vault (deployment %s) is still open in %s. This release serves only the concession-exit vault and never opens that wallet; withdraw the note with the earlier zkapi-clientd release (the legacy release line, release/v2-note-bound), which keeps its exit routes, then fund this release.", id, dir)
+			return fmt.Sprintf("A private note of the earlier zkAPI vault (deployment %s) is still open in %s. This release serves only the concession-exit vault and never opens that wallet; withdraw the note with the earlier zkapi-clientd release, %s, which closes deposits there and keeps that vault's mutual close and escape (withdraw --escape), then fund this release.", id, dir, LegacyRelease)
 		}
 	}
 	return ""

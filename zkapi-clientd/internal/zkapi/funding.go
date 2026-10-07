@@ -188,7 +188,7 @@ func LegacyFundingWarning(root, network string) string {
 	dir := filepath.Join(root, network)
 	for _, name := range []string{"address-funding.json", "pending-deposit.json"} {
 		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
-			return fmt.Sprintf("The earlier zkapi-clientd release's payment address and deposit recovery files are in %s. They belong to the earlier vault's note: this release keeps its own payment state per deployment and never reads or changes them. Keep them for the earlier release (the legacy release line, release/v2-note-bound), which withdraws that note.", dir)
+			return fmt.Sprintf("The earlier zkapi-clientd release's payment address and deposit recovery files are in %s. They belong to the earlier vault's note: this release keeps its own payment state per deployment and never reads or changes them. Keep them for the earlier release, %s, which withdraws that note.", dir, LegacyRelease)
 		}
 	}
 	return ""

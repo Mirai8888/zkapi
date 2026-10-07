@@ -228,7 +228,7 @@ func TestAnOpenLegacyNoteWarnsInsteadOfRefusingToStart(t *testing.T) {
 			t.Fatal(err)
 		}
 		warning := LegacyWalletWarning(stateDir, "mainnet")
-		if !strings.Contains(warning, id) || !strings.Contains(warning, "earlier zkapi-clientd release") {
+		if !strings.Contains(warning, id) || !strings.Contains(warning, "earlier zkapi-clientd release") || !strings.Contains(warning, LegacyRelease) || !strings.Contains(LegacyRelease, "0.1.7") {
 			t.Fatalf("no warning for an open legacy note: %q", warning)
 		}
 		cmd, err := CompanionCommand(context.Background(), Config{Network: "mainnet", BridgeToken: testBridgeToken, HTTPClient: &http.Client{}}, CompanionConfig{Binary: binary, SetupDir: devSetupDir, StateDir: stateDir, ProxyURL: "http://bridge:private-local-token@127.0.0.1:8791"})

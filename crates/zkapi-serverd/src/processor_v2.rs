@@ -368,6 +368,9 @@ pub struct RequestProcessor {
     /// vault RPC, for the signing gate (O7) and the publication check.
     #[cfg(test)]
     pub(crate) test_chain: Option<Arc<Mutex<TestChain>>>,
+    /// Drill builds: how this server misbehaves (`zkapi --adversary`).
+    #[cfg(feature = "adversary")]
+    adversary: Option<crate::adversary::AdversaryMode>,
     // Keep the database exclusive for this processor's full lifetime, including
     // background tasks that may outlive an HTTP listener.
     _writer_lock: Option<crate::writer_lock::ServerWriterLock>,
@@ -483,8 +486,17 @@ impl RequestProcessor {
             oa_usage_backoff_until: AtomicU64::new(0),
             #[cfg(test)]
             test_chain: Some(Arc::default()),
+            #[cfg(feature = "adversary")]
+            adversary: crate::adversary::mode(),
             _writer_lock: writer_lock,
         })
+    }
+
+    /// Drill builds: make this processor misbehave (tests set it per
+    /// processor; the binary sets the process mode before construction).
+    #[cfg(feature = "adversary")]
+    pub fn set_adversary(&mut self, mode: Option<crate::adversary::AdversaryMode>) {
+        self.adversary = mode;
     }
 
     /// Admit `request`, settle it at `charge_gwei` and sign its successor at
@@ -1366,6 +1378,17 @@ impl RequestProcessor {
             return Err(ServerError::ProtocolMismatch(
                 "native expiry check deployment mismatch".into(),
             ));
+        }
+        #[cfg(feature = "adversary")]
+        if self.adversary == Some(crate::adversary::AdversaryMode::LieExpired) {
+            // Whatever was reserved: the client may reuse its anchor, and the
+            // server keeps the proof of a reservation it denies.
+            return Ok(serde_json::json!({
+                "status": "expired_unaccepted", "client_request_id": client_request_id,
+                "request_nullifier": request.public_inputs.request_nullifier,
+                "payload_hash": request.payload_hash,
+                "server_time_ms": current_timestamp().saturating_mul(1000),
+            }));
         }
         self.ensure_unaccepted(client_request_id, request).await?;
         // Admission rejects an expired quote whatever the configuration, so a
@@ -3153,6 +3176,12 @@ impl RequestProcessor {
     /// charge, after the caller established its nullifier is unspent. The
     /// transcript is written once (`finalize_signed`).
     fn sign_settled(&self, request: &ApiRequestV2) -> Result<RequestResponseV2, ServerError> {
+        #[cfg(feature = "adversary")]
+        if self.adversary == Some(crate::adversary::AdversaryMode::Withhold) {
+            return Err(ServerError::Internal(
+                "adversary withhold: the successor is never signed".into(),
+            ));
+        }
         let nullifier = request.public_inputs.request_nullifier;
         let record = self
             .store
@@ -3186,20 +3215,44 @@ impl RequestProcessor {
                 }
             )));
         };
-        let settled = SettledCharge {
+        #[allow(unused_mut)]
+        let mut settled = SettledCharge {
             charge,
             basis,
             response_code: record.response_code.unwrap_or(200),
             response_payload: record.response_payload.clone().unwrap_or_default(),
             settled_at: record.settled_at.unwrap_or_default(),
         };
-        let signed = build_signed_successor(
+        #[cfg(feature = "adversary")]
+        if self.adversary == Some(crate::adversary::AdversaryMode::Overcharge) {
+            // Charge one unit above the request's bound, persisted as its
+            // settled charge, so the overcharged successor is what recovery
+            // serves.
+            settled.charge = request.public_inputs.solvency_bound.saturating_add(1);
+            self.store
+                .overcharge_for_adversary(&nullifier, settled.charge)?;
+        }
+        #[cfg(feature = "adversary")]
+        let adversarial = crate::adversary::successor(
+            self.adversary,
             &*self.signer,
             &self.config.successor_deployment(),
             request,
             &settled,
             current_timestamp(),
-        )?;
+        );
+        #[cfg(not(feature = "adversary"))]
+        let adversarial: Option<Result<crate::successor::SignedSuccessor, ServerError>> = None;
+        let signed = match adversarial {
+            Some(signed) => signed?,
+            None => build_signed_successor(
+                &*self.signer,
+                &self.config.successor_deployment(),
+                request,
+                &settled,
+                current_timestamp(),
+            )?,
+        };
         let mut transcript = signed.transcript;
         transcript.created_at = record.created_at;
         transcript.exit_deferred_since = record.exit_deferred_since;
@@ -7954,6 +8007,91 @@ mod tests {
                 .await,
             Err(ServerError::InvalidRequest(_))
         ));
+    }
+
+    /// Drill builds (§5.5, §10.7 B): each adversary mode misbehaves as its
+    /// drill expects, and the client's checks (S1-S6) refuse what it signs.
+    #[cfg(feature = "adversary")]
+    #[test]
+    fn adversary_modes_misbehave_and_clients_refuse_their_successors() {
+        use crate::adversary::AdversaryMode;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let setup = |mode: Option<AdversaryMode>, secret: u64| {
+            let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+            processor.config.request_charge_cap = 400_000;
+            processor.set_adversary(mode);
+            // Each note has a random secret, so its own nullifier.
+            let _ = secret;
+            let note = crate::test_support::processor_note(&processor, oa_seeds(), 2_000_000);
+            let now = current_timestamp();
+            let payload = crate::test_support::lease_payload(&processor.config, now);
+            let prepared = note.prepare_request("adversary", payload, now, 400_000);
+            (processor, note, prepared)
+        };
+        for (mode, check) in [
+            (AdversaryMode::BornSpent, "S4"),
+            (AdversaryMode::RandomAnchor, "S4"),
+            (AdversaryMode::Overcharge, "S3"),
+        ] {
+            let (processor, note, prepared) = setup(Some(mode), 7);
+            let response = processor.finalize_test_lease(&prepared.request, 1).unwrap();
+            let error =
+                crate::test_support::complete_response(&note.deployment, &prepared, &response)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.starts_with(check), "{mode:?}: {error}");
+        }
+        // reuse-anchor: a second successor is signed at the first's anchor.
+        let (processor, _, first) = setup(Some(AdversaryMode::ReuseAnchor), 8);
+        let anchor = processor
+            .finalize_test_lease(&first.request, 1)
+            .unwrap()
+            .next_anchor;
+        let (processor, note, second) = setup(Some(AdversaryMode::ReuseAnchor), 9);
+        let response = processor.finalize_test_lease(&second.request, 1).unwrap();
+        assert_eq!(response.next_anchor, anchor);
+        assert!(
+            crate::test_support::complete_response(&note.deployment, &second, &response)
+                .unwrap_err()
+                .to_string()
+                .starts_with("S4")
+        );
+        // withhold: settled, never signed; recovery answers without a
+        // successor.
+        let (processor, _, prepared) = setup(Some(AdversaryMode::Withhold), 10);
+        let error = processor
+            .finalize_test_lease(&prepared.request, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("withhold"), "{error}");
+        let record = processor
+            .store
+            .lookup_by_nullifier(&prepared.request.public_inputs.request_nullifier)
+            .unwrap();
+        assert!(record.settled_unsigned());
+        let recovery = processor
+            .recover_now(&prepared.request.client_request_id)
+            .unwrap();
+        assert!(recovery.request_response.is_none());
+        // lie-expired: a reserved request is called expired, and its proof
+        // kept; an honest server refuses.
+        for (mode, lies) in [(Some(AdversaryMode::LieExpired), true), (None, false)] {
+            let (processor, _, prepared) = setup(mode, 11);
+            let request = &prepared.request;
+            assert!(processor.validate_and_reserve(request).unwrap().is_none());
+            let answer = runtime.block_on(
+                processor.expire_unaccepted_native_lease(&request.client_request_id, request),
+            );
+            if lies {
+                assert_eq!(answer.unwrap()["status"], "expired_unaccepted");
+                assert!(processor
+                    .store
+                    .lookup_by_nullifier(&request.public_inputs.request_nullifier)
+                    .is_some());
+            } else {
+                assert!(answer.is_err());
+            }
+        }
     }
 
     #[test]

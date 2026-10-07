@@ -25,6 +25,11 @@ struct Cli {
         hide_env_values = true
     )]
     proof_setup_dir: String,
+    /// Drill and acceptance builds only: make serverd misbehave (§5.5). A
+    /// release build has no such flag and rejects it.
+    #[cfg(feature = "adversary")]
+    #[arg(long, value_enum, global = true)]
+    adversary: Option<zkapi_serverd::adversary::AdversaryMode>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -333,6 +338,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    #[cfg(feature = "adversary")]
+    if let Some(mode) = cli.adversary {
+        anyhow::ensure!(
+            matches!(cli.command, Commands::Serverd { .. }),
+            "--adversary applies to serverd only"
+        );
+        zkapi_serverd::adversary::set(mode)?;
+    }
 
     match cli.command.clone() {
         Commands::Setup { output_dir } => {
@@ -718,6 +731,54 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Release builds have no `--adversary` (§5.5): it is an unknown
+    /// argument wherever it is placed.
+    #[cfg(not(feature = "adversary"))]
+    #[test]
+    fn release_builds_reject_the_adversary_flag() {
+        for argv in [
+            ["zkapi", "--adversary", "hang", "serverd"],
+            ["zkapi", "serverd", "--adversary", "hang"],
+        ] {
+            let error = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{error}"
+            );
+        }
+    }
+
+    /// Drill builds accept each mode, before or after the subcommand.
+    #[cfg(feature = "adversary")]
+    #[test]
+    fn drill_builds_accept_the_adversary_modes() {
+        use zkapi_serverd::adversary::AdversaryMode;
+        for (name, mode) in [
+            ("withhold", AdversaryMode::Withhold),
+            ("born-spent", AdversaryMode::BornSpent),
+            ("reuse-anchor", AdversaryMode::ReuseAnchor),
+            ("random-anchor", AdversaryMode::RandomAnchor),
+            ("overcharge", AdversaryMode::Overcharge),
+            ("lie-expired", AdversaryMode::LieExpired),
+            ("hang", AdversaryMode::Hang),
+        ] {
+            let cli = Cli::try_parse_from([
+                "zkapi",
+                "--adversary",
+                name,
+                "serverd",
+                "--native-billing-rpc-url",
+                "https://rpc.example",
+                "--native-price-feed-address",
+                "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+            ])
+            .unwrap();
+            assert_eq!(cli.adversary, Some(mode));
+        }
+        assert!(Cli::try_parse_from(["zkapi", "--adversary", "steal", "serverd"]).is_err());
+    }
 
     #[test]
     fn retired_wallet_and_auth_commands_are_rejected() {

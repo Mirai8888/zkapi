@@ -40,6 +40,11 @@ zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser", optional = 
 # Builds examples/v2_acceptance_wallet.rs. Off by default until zkapi-browser
 # builds against circuit zkapi-v2-concession-v1 (WP-F restores it).
 acceptance-wallet = ["dep:zkapi-browser"]
+# Drill and acceptance builds only: `zkapi --adversary <mode> serverd` makes
+# the server misbehave (withhold, born-spent, reuse-anchor, random-anchor,
+# overcharge, lie-expired, hang). Never enabled by a release or Docker build;
+# a release binary rejects the flag (CI checks it).
+adversary = []
 
 [[example]]
 name = "v2_acceptance_wallet"

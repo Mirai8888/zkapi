@@ -1021,6 +1021,27 @@ impl NullifierStore {
             .map_err(|e| ServerError::Database(format!("evidence read failed: {e}")))
     }
 
+    /// Drill builds (`--adversary overcharge`): rewrite a settled, unsigned
+    /// request's charge, which no honest path ever does.
+    #[cfg(feature = "adversary")]
+    pub(crate) fn overcharge_for_adversary(
+        &self,
+        nullifier: &Felt252,
+        charge: u128,
+    ) -> Result<(), ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        conn.execute(
+            "UPDATE nullifiers SET settled_charge = ?1
+             WHERE nullifier = ?2 AND status = 'Reserved' AND settled_charge IS NOT NULL",
+            params![sql_charge(charge)?, nullifier.to_hex()],
+        )
+        .map_err(|e| ServerError::Database(format!("overcharge failed: {e}")))?;
+        Ok(())
+    }
+
     /// The evidence rows at `nullifier`, oldest first, each decoded on its
     /// own: a row that does not decode is reported with its id and why,
     /// without hiding the others (the challenger may defeat with any row

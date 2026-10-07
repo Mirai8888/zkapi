@@ -803,7 +803,11 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             get(handle_request_evidence),
         )
         .merge(dashboard)
-        .layer(DefaultBodyLimit::max(PROTOCOL_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(PROTOCOL_BODY_LIMIT_BYTES));
+    // A drill build's `hang` mode holds every connection (§5.5).
+    #[cfg(feature = "adversary")]
+    let router = router.layer(middleware::from_fn(crate::adversary::hang_layer));
+    let router = router
         .layer(middleware::from_fn_with_state(
             password.clone(),
             require_testnet_password,

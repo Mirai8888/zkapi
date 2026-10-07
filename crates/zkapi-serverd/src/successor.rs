@@ -146,21 +146,70 @@ pub fn build_signed_successor<S: StateSigner + ?Sized>(
             "refusing to sign a charge above the request's solvency bound".into(),
         ));
     }
+    let next_anchor = derived_anchor(&public.request_nullifier);
+    assemble_successor(
+        signer,
+        deployment,
+        request,
+        settled,
+        (settled.charge, next_anchor),
+        now,
+        true,
+    )
+}
+
+/// A successor at any `charge` and `next_anchor`, signed without the anchor
+/// assertion: the `adversary` feature's born-spent, reused-anchor,
+/// random-anchor and overcharging servers (§5.5). Never built without it.
+#[cfg(feature = "adversary")]
+pub(crate) fn build_adversarial_successor<S: StateSigner + ?Sized>(
+    signer: &S,
+    deployment: &Deployment,
+    request: &ApiRequestV2,
+    settled: &SettledCharge,
+    successor: (u128, Felt252),
+    now: u64,
+) -> Result<SignedSuccessor, ServerError> {
+    assemble_successor(signer, deployment, request, settled, successor, now, false)
+}
+
+/// `C' = C_anon − charge·G + δ·H` with a fresh `δ`, signed at `next_anchor`
+/// (through `sign_successor_state` when `checked`), and its transcript.
+fn assemble_successor<S: StateSigner + ?Sized>(
+    signer: &S,
+    deployment: &Deployment,
+    request: &ApiRequestV2,
+    settled: &SettledCharge,
+    (charge, next_anchor): (u128, Felt252),
+    now: u64,
+    checked: bool,
+) -> Result<SignedSuccessor, ServerError> {
+    let public = &request.public_inputs;
     let anonymous = CurvePointWire {
         x: public.anonymous_commitment_x,
         y: public.anonymous_commitment_y,
     };
     let blind_delta = random_scalar();
-    let next_commitment = server_update(&anonymous, settled.charge, &blind_delta)
+    let next_commitment = server_update(&anonymous, charge, &blind_delta)
         .map_err(|error| ServerError::InvalidProof(error.to_string()))?;
-    let next_anchor = derived_anchor(&public.request_nullifier);
-    let state_signature = sign_successor_state(
-        signer,
-        deployment,
-        &public.request_nullifier,
-        &next_commitment,
-        &next_anchor,
-    )?;
+    let state_signature = if checked {
+        sign_successor_state(
+            signer,
+            deployment,
+            &public.request_nullifier,
+            &next_commitment,
+            &next_anchor,
+        )?
+    } else {
+        signer.sign_state(&core::state_message(
+            deployment.protocol_version,
+            deployment.chain_id,
+            &deployment.contract_address,
+            &next_commitment.x,
+            &next_commitment.y,
+            &next_anchor,
+        ))
+    };
     let response_hash = canonical_response_hash(settled.response_payload.as_bytes());
     let proof_bytes = base64::engine::general_purpose::STANDARD
         .decode(&request.proof.proof)
@@ -171,7 +220,7 @@ pub fn build_signed_successor<S: StateSigner + ?Sized>(
         reservation_kind: "openrouter_lease".into(),
         client_request_id: Some(request.client_request_id.clone()),
         payload_hash: Some(request.payload_hash),
-        charge_applied: Some(settled.charge),
+        charge_applied: Some(charge),
         response_code: Some(settled.response_code),
         response_payload: Some(settled.response_payload.clone()),
         response_hash: Some(response_hash),
@@ -199,7 +248,7 @@ pub fn build_signed_successor<S: StateSigner + ?Sized>(
         response_code: settled.response_code,
         response_payload: settled.response_payload.clone(),
         response_hash,
-        charge_applied: settled.charge,
+        charge_applied: charge,
         next_commitment,
         next_anchor,
         blind_delta_srv: blind_delta,

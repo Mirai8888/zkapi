@@ -268,6 +268,13 @@ impl PublicationCache {
     }
 }
 
+/// The lease row a new reservation is written with.
+struct IssuanceLease<'a> {
+    lease_config: &'a OpenRouterLeaseConfig,
+    spending_limit_usd: f64,
+    oa_request_id: Option<&'a str>,
+}
+
 /// What signing a settled request's successor did (`sign_successor`).
 #[derive(Debug, Clone)]
 pub enum SignOutcome {
@@ -971,9 +978,6 @@ impl RequestProcessor {
             self.native_oracle
                 .assert_fresh(&billing_quote, current_timestamp())?;
         }
-        if self.validate_and_reserve(request)?.is_some() {
-            return Err(ServerError::Replay);
-        }
         let key_name = format!("zkapi-{}", request.client_request_id);
         // The verified proof may expose a coarse solvency tier above the
         // deployment's minimum request cap. Bind that exact tier to the child
@@ -984,11 +988,29 @@ impl RequestProcessor {
                 "lease spending limit must be positive".to_string(),
             ));
         }
+        // A new reservation is written with its evidence and its settleable
+        // provisioning lease row in one transaction: a crash can never leave
+        // a reservation that no settlement sweep visits.
+        let issuance = existing_lease.is_none().then_some(IssuanceLease {
+            lease_config,
+            spending_limit_usd,
+            oa_request_id: oa_request_id.as_deref(),
+        });
+        if self
+            .validate_and_reserve_with(request, issuance.as_ref())?
+            .is_some()
+        {
+            return Err(ServerError::Replay);
+        }
         let mut issued_at = current_timestamp();
         let mut ttl_seconds = lease_config.ttl_seconds;
         let existing = self
             .store
             .try_lookup_openrouter_lease(&request.client_request_id)?;
+        // The lease row this call just wrote with the reservation is new: no
+        // retry handling applies to it.
+        let created_now = existing_reservation.is_none() && existing_lease.is_none();
+        let existing = existing.filter(|_| !created_now);
         if let Some(existing) = existing.as_ref() {
             let persisted_binding = api_request_binding(&existing.api_request)?;
             if existing.request_nullifier != request.public_inputs.request_nullifier
@@ -1025,8 +1047,9 @@ impl RequestProcessor {
                 self.sign_if_settled(request).await;
                 return Err(ServerError::OaKeyPolicyRejected);
             }
-        } else {
-            // Persist a settleable lease before any further I/O. A chain or
+        } else if !created_now {
+            // A reservation from before reservations carried their lease row:
+            // persist a settleable lease before any further I/O. A chain or
             // provider failure from here on leaves a provisioning row, which
             // settles at zero, rather than a bare nullifier reservation.
             self.create_issuance_lease(
@@ -1250,21 +1273,38 @@ impl RequestProcessor {
         spending_limit_usd: f64,
         oa_request_id: Option<&str>,
     ) -> Result<(), ServerError> {
-        let now = current_timestamp();
-        let expires_at = now.saturating_add(lease_config.ttl_seconds);
         self.store
-            .create_openrouter_lease_bound(&NewOpenRouterLease {
+            .create_openrouter_lease_bound(&self.issuance_lease_row(
                 request,
-                key_source: lease_config.source.label(),
-                issued_at: now,
-                expires_at,
-                settle_after: expires_at.saturating_add(lease_config.settlement_grace_seconds),
-                spending_limit_usd,
-                oa_client_request_id: oa_request_id,
-                ttl_seconds: Some(lease_config.ttl_seconds),
-                settlement_deadline_at: Some(self.new_lease_deadline(lease_config, now)),
-                delivered: Some(false),
-            })
+                &IssuanceLease {
+                    lease_config,
+                    spending_limit_usd,
+                    oa_request_id,
+                },
+                current_timestamp(),
+            ))
+    }
+
+    fn issuance_lease_row<'a>(
+        &self,
+        request: &'a ApiRequestV2,
+        issuance: &IssuanceLease<'a>,
+        now: u64,
+    ) -> NewOpenRouterLease<'a> {
+        let lease_config = issuance.lease_config;
+        let expires_at = now.saturating_add(lease_config.ttl_seconds);
+        NewOpenRouterLease {
+            request,
+            key_source: lease_config.source.label(),
+            issued_at: now,
+            expires_at,
+            settle_after: expires_at.saturating_add(lease_config.settlement_grace_seconds),
+            spending_limit_usd: issuance.spending_limit_usd,
+            oa_client_request_id: issuance.oa_request_id,
+            ttl_seconds: Some(lease_config.ttl_seconds),
+            settlement_deadline_at: Some(self.new_lease_deadline(lease_config, now)),
+            delivered: Some(false),
+        }
     }
 
     /// An activated key that issuance will never return; its lease settles
@@ -2788,9 +2828,20 @@ impl RequestProcessor {
 
     /// Validate proof/deployment bindings and reserve the request nullifier.
     /// Returns a prior finalized response for an idempotent replay.
+    #[cfg(test)]
     fn validate_and_reserve(
         &self,
         request: &ApiRequestV2,
+    ) -> Result<Option<RequestResponseV2>, ServerError> {
+        self.validate_and_reserve_with(request, None)
+    }
+
+    /// `validate_and_reserve`, writing `issuance`'s lease row in the
+    /// reservation's transaction.
+    fn validate_and_reserve_with(
+        &self,
+        request: &ApiRequestV2,
+        issuance: Option<&IssuanceLease<'_>>,
     ) -> Result<Option<RequestResponseV2>, ServerError> {
         let public = &request.public_inputs;
         let payload_hash = canonical_payload_hash(request.payload.as_bytes());
@@ -2884,7 +2935,10 @@ impl RequestProcessor {
         // above and keeps its original quote even after expiration.
         self.native_oracle
             .assert_fresh(&self.lease_authorization(request)?.1, current_timestamp())?;
-        self.store.reserve_openrouter_lease(request)?;
+        let lease = issuance
+            .map(|issuance| self.issuance_lease_row(request, issuance, current_timestamp()));
+        self.store
+            .reserve_openrouter_lease_with(request, lease.as_ref())?;
         Ok(None)
     }
 
@@ -6521,6 +6575,79 @@ mod tests {
             charge_applied: None,
             solvency_bound: request.public_inputs.solvency_bound,
         }
+    }
+
+    /// O2 and the transactional reserve: a new request's reservation, its
+    /// evidence and its provisioning lease row are written together or not
+    /// at all, so no reservation is left that no sweep settles.
+    #[test]
+    fn a_new_reservation_is_written_with_its_evidence_and_lease_row_or_not_at_all() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.request_charge_cap = 400_000;
+        let note = crate::test_support::processor_note(&processor, oa_seeds(), 2_000_000);
+        let now = current_timestamp();
+        let prepared = note.prepare_request(
+            "atomic-lease",
+            crate::test_support::lease_payload(&processor.config, now),
+            now,
+            400_000,
+        );
+        let request = &prepared.request;
+        let nullifier = request.public_inputs.request_nullifier;
+        let lease_config = processor.config.openrouter_leases.clone().unwrap();
+        let issuance = IssuanceLease {
+            lease_config: &lease_config,
+            spending_limit_usd: 0.4,
+            oa_request_id: Some("bound-upstream-id"),
+        };
+        processor.store.execute_for_test(
+            "CREATE TRIGGER inject_lease_failure BEFORE INSERT ON openrouter_leases
+             BEGIN SELECT RAISE(ABORT, 'injected lease failure'); END",
+            [],
+        );
+        let error = processor
+            .validate_and_reserve_with(request, Some(&issuance))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected lease failure"),
+            "{error}"
+        );
+        assert!(processor.store.lookup_by_nullifier(&nullifier).is_none());
+        assert!(processor
+            .store
+            .request_evidence(&nullifier)
+            .unwrap()
+            .is_empty());
+        processor
+            .store
+            .execute_for_test("DROP TRIGGER inject_lease_failure", []);
+        assert!(processor
+            .validate_and_reserve_with(request, Some(&issuance))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            record_of(&processor, request).status,
+            NullifierStatus::Reserved
+        );
+        let evidence = processor.store.request_evidence(&nullifier).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].public_inputs, request.public_inputs);
+        let lease = processor
+            .store
+            .lookup_openrouter_lease("atomic-lease")
+            .unwrap();
+        assert_eq!(lease.status, "provisioning");
+        assert_eq!(lease.delivered, Some(false));
+        assert_eq!(
+            lease.oa_client_request_id.as_deref(),
+            Some("bound-upstream-id")
+        );
+        assert!(lease.settlement_deadline_at.is_some());
+        // The verified evidence is the request's real proof.
+        assert!(processor
+            .verifier
+            .verify(&evidence[0].public_inputs, &request.proof)
+            .unwrap());
     }
 
     // ---- Admission: root freshness (O5) and the lease ceiling (§5.2) -------

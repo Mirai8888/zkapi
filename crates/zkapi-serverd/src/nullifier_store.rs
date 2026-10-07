@@ -929,6 +929,27 @@ impl NullifierStore {
     /// either both rows exist or neither does (O2). A request whose proof is
     /// not a 256-byte Groth16 proof reserves nothing.
     pub fn reserve_openrouter_lease(&self, request: &ApiRequestV2) -> Result<(), ServerError> {
+        self.reserve_openrouter_lease_with(request, None)
+    }
+
+    /// `reserve_openrouter_lease`, also inserting the lease's issuance row
+    /// (`lease`) in the same transaction, so that no reservation is ever left
+    /// without the lease row that settles it.
+    pub fn reserve_openrouter_lease_with(
+        &self,
+        request: &ApiRequestV2,
+        lease: Option<&NewOpenRouterLease<'_>>,
+    ) -> Result<(), ServerError> {
+        if let Some(lease) = lease {
+            if lease.request.client_request_id != request.client_request_id
+                || lease.request.public_inputs.request_nullifier
+                    != request.public_inputs.request_nullifier
+            {
+                return Err(ServerError::Internal(
+                    "the lease row is not the reserved request's".into(),
+                ));
+            }
+        }
         let binding = api_request_binding(request)?;
         request_proof_bytes(request)?;
         let mut conn = self
@@ -949,6 +970,9 @@ impl NullifierStore {
             now,
         )?;
         insert_evidence(&transaction, request, "reserve", now)?;
+        if let Some(lease) = lease {
+            insert_lease_row(&transaction, lease)?;
+        }
         transaction
             .commit()
             .map_err(|e| ServerError::Database(format!("reservation commit failed: {e}")))
@@ -1562,39 +1586,11 @@ impl NullifierStore {
         &self,
         lease: &NewOpenRouterLease<'_>,
     ) -> Result<(), ServerError> {
-        let request = lease.request;
-        let request_json = serde_json::to_string(request).map_err(|error| {
-            ServerError::Database(format!("lease serialization failed: {error}"))
-        })?;
         let conn = self
             .conn
             .lock()
             .map_err(|error| ServerError::Database(format!("lock poisoned: {error}")))?;
-        conn.execute(
-            "INSERT INTO openrouter_leases (
-                client_request_id, request_nullifier, api_request_json, key_source, status,
-                issued_at, expires_at, settle_after, spending_limit_usd, updated_at, oa_client_request_id,
-                oa_provisioning_outcome, ttl_seconds, settlement_deadline_at, delivered
-             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                request.client_request_id,
-                request.public_inputs.request_nullifier.to_hex(),
-                request_json,
-                lease.key_source,
-                lease.issued_at as i64,
-                lease.expires_at as i64,
-                lease.settle_after as i64,
-                lease.spending_limit_usd,
-                current_timestamp() as i64,
-                lease.oa_client_request_id,
-                if lease.key_source == "oa_org" { "not_started" } else { "may_have_issued" },
-                lease.ttl_seconds.map(sql_time),
-                lease.settlement_deadline_at.map(sql_time),
-                lease.delivered,
-            ],
-        )
-        .map_err(|error| ServerError::Database(format!("lease insert failed: {error}")))?;
-        Ok(())
+        insert_lease_row(&conn, lease)
     }
 
     /// Durably fence upstream I/O before sending an OA issuance request. Only
@@ -3575,6 +3571,38 @@ fn sql_time(value: u64) -> i64 {
 /// solvency bound, which admission keeps below 2^53.
 fn sql_charge(value: u128) -> Result<i64, ServerError> {
     i64::try_from(value).map_err(|_| ServerError::Internal("charge exceeds i64".into()))
+}
+
+/// Insert a new lease row (`NullifierStore::create_openrouter_lease_bound`).
+fn insert_lease_row(conn: &Connection, lease: &NewOpenRouterLease<'_>) -> Result<(), ServerError> {
+    let request = lease.request;
+    let request_json = serde_json::to_string(request)
+        .map_err(|error| ServerError::Database(format!("lease serialization failed: {error}")))?;
+    conn.execute(
+            "INSERT INTO openrouter_leases (
+                client_request_id, request_nullifier, api_request_json, key_source, status,
+                issued_at, expires_at, settle_after, spending_limit_usd, updated_at, oa_client_request_id,
+                oa_provisioning_outcome, ttl_seconds, settlement_deadline_at, delivered
+             ) VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                request.client_request_id,
+                request.public_inputs.request_nullifier.to_hex(),
+                request_json,
+                lease.key_source,
+                lease.issued_at as i64,
+                lease.expires_at as i64,
+                lease.settle_after as i64,
+                lease.spending_limit_usd,
+                current_timestamp() as i64,
+                lease.oa_client_request_id,
+                if lease.key_source == "oa_org" { "not_started" } else { "may_have_issued" },
+                lease.ttl_seconds.map(sql_time),
+                lease.settlement_deadline_at.map(sql_time),
+                lease.delivered,
+            ],
+        )
+        .map_err(|error| ServerError::Database(format!("lease insert failed: {error}")))?;
+    Ok(())
 }
 
 fn insert_reservation(

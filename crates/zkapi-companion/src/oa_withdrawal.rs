@@ -1302,6 +1302,40 @@ pub(crate) mod tests {
         assert!(release(&config, &completed, &note, unasked).is_err());
     }
 
+    /// A saved mutual plan is a kind-1 close of the reserved state: no other
+    /// kind, no concession and no successor nullifier.
+    #[test]
+    fn a_plan_must_be_the_reserved_states_mutual_close() {
+        let (_directory, config, note) = fixture();
+        let record = reserve(&config, &note, [1; 20]).unwrap();
+        validate_plan(&record, &plan(&record)).unwrap();
+        type Mutation = (&'static str, fn(&mut WithdrawalPlan));
+        let mutations: [Mutation; 7] = [
+            ("escape kind", |plan| plan.public_inputs.kind = 0),
+            ("ownership kind", |plan| plan.public_inputs.kind = 2),
+            ("unknown kind", |plan| plan.public_inputs.kind = 3),
+            ("conceded", |plan| plan.public_inputs.conceded = 1),
+            ("next nullifier", |plan| {
+                plan.public_inputs.next_nullifier = Felt252::ONE
+            }),
+            ("balance", |plan| plan.public_inputs.final_balance -= 1),
+            ("destination", |plan| {
+                plan.public_inputs.destination = [2; 20]
+            }),
+        ];
+        for (case, mutate) in mutations {
+            let mut changed = plan(&record);
+            mutate(&mut changed);
+            assert!(
+                matches!(
+                    validate_plan(&record, &changed),
+                    Err(AuthError::WithdrawalConflict)
+                ),
+                "{case}"
+            );
+        }
+    }
+
     #[test]
     fn destination_is_an_explicit_nonzero_evm_address() {
         let (_directory, config, _note) = fixture();

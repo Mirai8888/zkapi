@@ -5259,16 +5259,25 @@ mod oa_withdrawal_tests {
     /// was set aside unsettled (the legacy proof-less clearance is gone).
     #[tokio::test]
     async fn every_clearance_request_carries_an_ownership_proof() {
-        for archived in [false, true] {
-            let run =
-                prepare_with(Route::Oa, 3, archived, Clearance::RequireProof, "unknown").await;
-            assert!(run.result.is_ok(), "{archived}: {:?}", run.result);
-            assert_eq!(run.requests.len(), 1, "{archived}");
+        // A manifest without `vault_revision` (0) once chose a proof-less
+        // clearance at a state with a request set aside.
+        for (vault_revision, archived) in [(0, false), (0, true), (3, false), (3, true)] {
+            let case = format!("revision {vault_revision}, archived {archived}");
+            let run = prepare_with(
+                Route::Oa,
+                vault_revision,
+                archived,
+                Clearance::RequireProof,
+                "unknown",
+            )
+            .await;
+            assert!(run.result.is_ok(), "{case}: {:?}", run.result);
+            assert_eq!(run.requests.len(), 1, "{case}");
             assert_eq!(run.requests[0].withdrawal_nullifier, run.nullifier);
             assert_eq!(run.phase, "reserved");
             assert_eq!(run.ownership_proof_sent, Some(true));
             // The recovery attempt before the gate found nothing to install.
-            assert_eq!(run.reads, usize::from(archived), "{archived}");
+            assert_eq!(run.reads, usize::from(archived), "{case}");
         }
         // A request that owns the nullifier refuses the clearance and
         // reserves nothing new; the refusal is reported.

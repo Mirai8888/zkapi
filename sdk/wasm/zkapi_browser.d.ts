@@ -25,6 +25,12 @@ export class BrowserRequestProver {
     prepare_request(config_json: string, state_json: string, args_json: string): string;
 }
 
+/**
+ * S1, S2, S4 and S6 of a response whose journal is lost; returns
+ * `{charge_applied, next_anchor}` (JSON).
+ */
+export function browser_check_unrecoverable_response(config_json: string, state_json: string, response_json: string): string;
+
 export function browser_circuit_id(): string;
 
 export function browser_complete_response(config_json: string, args_json: string): string;
@@ -32,6 +38,11 @@ export function browser_complete_response(config_json: string, args_json: string
 export function browser_confirm_deposit(config_json: string, args_json: string): string;
 
 export function browser_generate_deposit(): string;
+
+/**
+ * Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+ */
+export function browser_note_path_matches(state_json: string, path_json: string): boolean;
 
 export function browser_prepare_request(config_json: string, state_json: string, args_json: string, proving_key: Uint8Array): string;
 
@@ -66,10 +77,12 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_browsernotetree_free: (a: number, b: number) => void;
     readonly __wbg_browserrequestprover_free: (a: number, b: number) => void;
+    readonly browser_check_unrecoverable_response: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly browser_circuit_id: () => [number, number];
     readonly browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly browser_generate_deposit: () => [number, number, number, number];
+    readonly browser_note_path_matches: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly browser_setup_id: () => [number, number];

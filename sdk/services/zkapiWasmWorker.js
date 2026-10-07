@@ -1,10 +1,12 @@
 import init, {
     BrowserNoteTree,
     BrowserRequestProver,
+    browser_check_unrecoverable_response,
     browser_circuit_id,
     browser_complete_response,
     browser_confirm_deposit,
     browser_generate_deposit,
+    browser_note_path_matches,
     browser_prepare_withdrawal,
     browser_setup_id,
     browser_successor_nullifier,
@@ -114,17 +116,20 @@ function sameFelt(left, right) {
 }
 
 /**
- * Rebuild the vault's note tree from its leaf-changing logs (design §6.6):
- * apply each event in log order and require the computed root to equal the
- * event's own root, then return the note's path at the last root.
+ * Rebuild the vault's note tree from its logs (design §6.6): apply each
+ * leaf-changing event in log order and require the computed root to equal
+ * the event's own root; every other root-bearing event ('root_check') must
+ * report the current computed root. Returns the note's path at the last root.
  */
 function rebuildTreePath(events, noteId) {
     if (!Array.isArray(events) || !events.length) throw new Error('The tree rebuild needs the vault logs.');
     const tree = new BrowserNoteTree();
     try {
         events.forEach((entry, index) => {
-            const { root, ...event } = entry || {};
-            const computed = parse(tree.apply(JSON.stringify(event)));
+            const { root, name: _name, ...event } = entry || {};
+            const computed = event.event === 'root_check'
+                ? parse(tree.root())
+                : parse(tree.apply(JSON.stringify(event)));
             if (!sameFelt(computed, root)) {
                 throw new Error(`tree_root_mismatch: the vault log ${index} reports root ${root}; the rebuilt tree has ${computed}.`);
             }
@@ -177,6 +182,20 @@ export async function execute(operation, payload) {
                 JSON.stringify(payload.config),
                 JSON.stringify(payload.args)
             ));
+        case 'checkUnrecoverableResponse':
+            // Lost ε (design §6.4 E3): S1, S2, S4 and S6 of a finalized
+            // response whose journal is gone; returns its charge.
+            return parse(browser_check_unrecoverable_response(
+                JSON.stringify(payload.config),
+                JSON.stringify(payload.state),
+                JSON.stringify(payload.response)
+            ));
+        case 'notePathMatches':
+            // A saved deposit-time path is kept only if it reaches its root.
+            return browser_note_path_matches(JSON.stringify(payload.state), JSON.stringify({
+                active_root: payload.path?.active_root,
+                siblings: payload.path?.siblings
+            }));
         case 'withdrawalNullifier':
             return parse(browser_withdrawal_nullifier(JSON.stringify(payload.state)));
         case 'successorNullifier':

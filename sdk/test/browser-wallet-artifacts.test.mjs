@@ -72,6 +72,8 @@ test('browser build contains every wallet WASM operation', () => {
         'browser_successor_nullifier',
         'browser_prepare_withdrawal',
         'browser_verify_request',
+        'browser_check_unrecoverable_response',
+        'browser_note_path_matches',
         'browsernotetree_new',
         'browsernotetree_apply',
         'browsernotetree_root',

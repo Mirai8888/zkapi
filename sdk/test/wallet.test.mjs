@@ -161,6 +161,8 @@ test("every vault selector and event topic is the keccak of its signature", () =
       "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3"],
     noteDeposited: ["NoteDeposited(uint32,bytes32,uint128,uint64,uint256)",
       "0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063"],
+    expiredClaimedEvent: ["ExpiredClaimed(uint32,uint128,uint256)",
+      "0x5534ce4a9fb7fe545375064cc186660ac10ba2152cb1592b29b244d2fe169ae4"],
   };
   for (const [name, [signature, pinned]] of Object.entries(topics)) {
     assert.equal(keccak256(signature), pinned, signature);

@@ -3,10 +3,12 @@
 export const memory: WebAssembly.Memory;
 export const __wbg_browsernotetree_free: (a: number, b: number) => void;
 export const __wbg_browserrequestprover_free: (a: number, b: number) => void;
+export const browser_check_unrecoverable_response: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const browser_circuit_id: () => [number, number];
 export const browser_complete_response: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_confirm_deposit: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const browser_generate_deposit: () => [number, number, number, number];
+export const browser_note_path_matches: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const browser_prepare_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
 export const browser_prepare_withdrawal: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
 export const browser_setup_id: () => [number, number];

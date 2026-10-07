@@ -59,6 +59,9 @@ const ABI = Object.freeze({
   escapeConcessionRaisedEvent: "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c",
   // ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot)
   closedLeafRetiredEvent: "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3",
+  // ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 newRoot): the
+  // root word carries the unchanged currentRoot (no leaf removal).
+  expiredClaimedEvent: "0x5534ce4a9fb7fe545375064cc186660ac10ba2152cb1592b29b244d2fe169ae4",
   // A finalized escape whose push to the destination failed credits it instead:
   // EscapePayoutDeferred(uint32 indexed noteId, address indexed destination, uint128 amount)
   // precedes EscapeWithdrawalFinalized in the same receipt.
@@ -483,6 +486,7 @@ const VAULT_EVENTS = Object.freeze({
   [ABI.escapeConcessionRaisedEvent]: { name: "EscapeConcessionRaised", topics: 2, words: 3 },
   [ABI.escapeChallengedEvent]: { name: "EscapeWithdrawalChallenged", topics: 2, words: 2 },
   [ABI.closedLeafRetiredEvent]: { name: "ClosedLeafRetired", topics: 2, words: 1 },
+  [ABI.expiredClaimedEvent]: { name: "ExpiredClaimed", topics: 2, words: 2 },
 });
 
 /**
@@ -526,6 +530,8 @@ function decodeVaultEvent(log, vaultAddress) {
       };
     case "EscapeWithdrawalChallenged":
       return { ...base, nullifier: words[0], root: words[1] };
+    case "ExpiredClaimed":
+      return { ...base, depositAmount: boundedWord(words[0], 128, "ExpiredClaimed.depositAmount"), root: words[1] };
     default:
       return { ...base, newRoot: words[0] };
   }

@@ -402,10 +402,12 @@ Before proving an escape, the wallet does the following:
      event's root checked. The rebuild uses the user's exit RPC
      (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it) or
      the pinned RPC.
-2. It refuses with `device_not_newest` when the chain shows the successor
-   state was already used, which means another device is newer.
-3. It runs a last recovery pass. Advisory warnings, such as the server
-   flagging the nullifier, never block the escape.
+2. It asks the server for a request proof at the successor state
+   (`GET /v2/nullifiers/{successor}/evidence`). A proof that verifies locally
+   refuses the escape with `device_not_newest`: another device is newer. Any
+   other answer, or none, is ignored.
+3. It runs a last recovery pass. Advisory warnings never block the escape,
+   for example when the RPC reports either nullifier as already challenged.
 4. It records the proof in the exit lock before the proof is broadcast.
 
 The **exit lock** starts with the first exit decision at a state and freezes

@@ -31,24 +31,13 @@ tower-http = { version = "0.6", features = ["cors"] }
 futures-util = "0.3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# The scripts/v2-acceptance.mjs wallet driver (examples/v2_acceptance_wallet.rs)
-# only: it drives the browser wallet crate, which is being ported to circuit
-# zkapi-v2-concession-v1 separately. Never part of a server build.
-zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser", optional = true }
 
 [features]
-# Builds examples/v2_acceptance_wallet.rs. Off by default until zkapi-browser
-# builds against circuit zkapi-v2-concession-v1 (WP-F restores it).
-acceptance-wallet = ["dep:zkapi-browser"]
 # Drill and acceptance builds only: `zkapi --adversary <mode> serverd` makes
 # the server misbehave (withhold, born-spent, reuse-anchor, random-anchor,
 # overcharge, lie-expired, hang). Never enabled by a release or Docker build;
 # a release binary rejects the flag (CI checks it).
 adversary = []
-
-[[example]]
-name = "v2_acceptance_wallet"
-required-features = ["acceptance-wallet"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -58,3 +47,7 @@ tempfile = { workspace = true }
 # the published development fixtures. Dev-dependency features never reach a
 # release build (resolver 2).
 zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup", "dev-fixtures"] }
+# The scripts/v2-acceptance.mjs wallet driver (examples/v2_acceptance_wallet.rs)
+# runs the browser wallet core of circuit zkapi-v2-concession-v1. A
+# dev-dependency: never part of a server build.
+zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser" }

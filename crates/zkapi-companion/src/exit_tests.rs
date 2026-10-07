@@ -1314,6 +1314,21 @@ async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
         lock.released.iter().filter(|proof| proof.kind == 1).count(),
         4
     );
+    // E6 released the lock once every close was dead: the next close takes
+    // it again before it is proved.
+    std::fs::remove_file(harness.config.state_dir.join("exit_lock.json")).unwrap();
+    age(now_seconds() - 60, false);
+    let relocked = harness
+        .service
+        .oa_prepare_withdrawal([0x22; 20], false)
+        .await
+        .unwrap();
+    assert!(relocked.public_inputs.valid_until >= now_seconds() + 10_000);
+    let lock = harness.wallet().exit_lock().unwrap().unwrap();
+    assert_eq!(
+        (lock.mode, lock.released.len()),
+        (zkapi_client::exit_lock::ExitMode::Mutual, 1)
+    );
 }
 
 /// §1.2(6), §6.7: with the owner's exit RPC configured, a pinned RPC that is

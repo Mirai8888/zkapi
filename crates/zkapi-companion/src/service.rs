@@ -4007,12 +4007,17 @@ fn reprove_close(
     if wallet.current_nullifier() != Some(record.nullifier) {
         return Err(AuthError::WithdrawalConflict);
     }
-    let (public_inputs, proof) = match wallet.mutual_close_from_clearance(
-        record.destination,
-        saved.public_inputs.active_root,
-        saved.siblings.clone(),
-        signature,
-    ) {
+    // The lock is durable before the proof (§6.2): still held in mutual mode
+    // here, unless E6 released it once the earlier closes were dead.
+    let locked = wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual);
+    let (public_inputs, proof) = match locked.and_then(|_| {
+        wallet.mutual_close_from_clearance(
+            record.destination,
+            saved.public_inputs.active_root,
+            saved.siblings.clone(),
+            signature,
+        )
+    }) {
         Ok(built) => built,
         Err(zkapi_client::error::ClientError::ExitLockConflict(_)) => {
             return Err(AuthError::EscapeRequired(serde_json::json!({

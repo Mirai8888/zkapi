@@ -52,6 +52,13 @@ pub(crate) struct Reservation {
     /// steps 4 and 5): the exit decision then waits (E3) or escapes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clearance_outcome: Option<zkapi_client::exit_policy::MutualOutcome>,
+    /// The verified clearance signature of this reservation's nullifier.
+    /// It signs only the nullifier, not the close's `valid_until`, so a
+    /// close that expired (L6) is proved again from it without another
+    /// ownership proof or clearance request. `None` before the clearance,
+    /// and in a reservation saved before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance_signature: Option<zkapi_types::SchnorrSignature>,
 }
 
 impl Reservation {
@@ -218,6 +225,26 @@ pub(crate) fn load(config: &AuthConfig) -> Result<Option<Reservation>, AuthError
     Ok(Some(record))
 }
 
+/// Whether `reserve` would refuse `state` and `destination` with a
+/// conflict, without changing anything: checked before any operator call,
+/// so a conflicting request fails the same way whatever the operator does.
+pub(crate) fn check_reservable(
+    config: &AuthConfig,
+    state: &NoteState,
+    destination: [u8; 20],
+) -> Result<(), AuthError> {
+    if let Some(previous) = load(config)? {
+        let replaced = (previous.complete && previous.snapshot.note_id != state.note_id)
+            || superseded(&previous, state, crate::service::now_seconds());
+        if !replaced
+            && (previous.destination != destination || !same_state(&previous.snapshot, state))
+        {
+            return Err(AuthError::WithdrawalConflict);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn reserve(
     config: &AuthConfig,
     state: &NoteState,
@@ -236,6 +263,13 @@ pub(crate) fn reserve(
                 config,
                 &previous,
                 "reservation",
+                &serde_json::to_vec(&previous).map_err(|_| storage_error())?,
+            )?;
+        } else if superseded(&previous, state, crate::service::now_seconds()) {
+            archive(
+                config,
+                &previous,
+                "superseded",
                 &serde_json::to_vec(&previous).map_err(|_| storage_error())?,
             )?;
         } else {
@@ -257,9 +291,30 @@ pub(crate) fn reserve(
         ownership_proof_sent: Some(false),
         escape_payout_credited: false,
         clearance_outcome: None,
+        clearance_signature: None,
     };
     save(config, &record)?;
     Ok(record)
+}
+
+/// Whether `previous`, an incomplete reservation, belongs to an earlier
+/// state of the note `state` now holds, and no close it may hold can still
+/// land. A successor installs only after every released close of its state
+/// is dead (E6), so such a reservation's clearance can never pay again: it
+/// says nothing about the newer state, whose own mutual close it must not
+/// block. Its ownership proof stays recorded (C5 is per nullifier).
+fn superseded(previous: &Reservation, state: &NoteState, now: u64) -> bool {
+    !previous.complete
+        && previous.snapshot.note_id == state.note_id
+        && state.state_seq > previous.snapshot.state_seq
+        && previous.nullifier
+            != v2::nullifier(&state.secret_s, state.note_id, &state.current_anchor)
+        && previous.plan.as_ref().is_none_or(|plan| {
+            plan.public_inputs
+                .valid_until
+                .saturating_add(zkapi_client::exit_policy::LOCK_RELEASE_MARGIN_SECONDS)
+                < now
+        })
 }
 
 pub(crate) fn save(config: &AuthConfig, record: &Reservation) -> Result<(), AuthError> {
@@ -927,6 +982,58 @@ pub(crate) mod tests {
                 proof: "test-proof".into(),
             },
         }
+    }
+
+    /// A reservation of an earlier state of the note (a successor installed
+    /// since, which E6 allows only once its closes are dead) gives way to the
+    /// current state's own mutual close; one of a state that is not older,
+    /// or whose close may still land, still conflicts.
+    #[test]
+    fn a_reservation_of_an_earlier_state_gives_way_to_the_current_state() {
+        let (_directory, config, note) = fixture();
+        let mut first = reserve(&config, &note, [1; 20]).unwrap();
+        first.ownership_proof_sent = Some(true);
+        save(&config, &first).unwrap();
+        let mut next = note.clone();
+        next.current_anchor = Felt252::from_u64(0x55);
+        next.state_seq += 1;
+        next.current_balance -= 10;
+        // A close of the earlier state that may still land conflicts.
+        first.plan = Some(plan(&first));
+        save(&config, &first).unwrap();
+        assert!(matches!(
+            check_reservable(&config, &next, [2; 20]),
+            Err(AuthError::WithdrawalConflict)
+        ));
+        assert!(matches!(
+            reserve(&config, &next, [2; 20]),
+            Err(AuthError::WithdrawalConflict)
+        ));
+        // Dead (valid_until + 900 passed): the earlier reservation is
+        // archived and the current state reserved.
+        if let Some(plan) = first.plan.as_mut() {
+            plan.public_inputs.valid_until = crate::service::now_seconds() - 1_000;
+        }
+        save(&config, &first).unwrap();
+        check_reservable(&config, &next, [2; 20]).unwrap();
+        let replaced = reserve(&config, &next, [2; 20]).unwrap();
+        assert_eq!(replaced.snapshot.current_anchor, next.current_anchor);
+        assert_eq!(replaced.destination, [2; 20]);
+        assert!(std::fs::read_dir(config.state_dir.join("archive"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with("-superseded.json")));
+        // A state that is not newer than the reserved one conflicts.
+        let mut sideways = note.clone();
+        sideways.current_anchor = Felt252::from_u64(0x66);
+        sideways.state_seq = next.state_seq;
+        assert!(matches!(
+            reserve(&config, &sideways, [2; 20]),
+            Err(AuthError::WithdrawalConflict)
+        ));
     }
 
     pub(crate) fn receipt(record: &Reservation, hash: &str) -> Value {

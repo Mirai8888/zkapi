@@ -41,12 +41,15 @@ pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(exit_policy::CALL_
 #[cfg(test)]
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(not(test))]
-const RECOVERY_BUDGET: Duration = Duration::from_secs(exit_policy::RECOVERY_BUDGET_SECONDS);
+pub(crate) const RECOVERY_BUDGET: Duration =
+    Duration::from_secs(exit_policy::RECOVERY_BUDGET_SECONDS);
 #[cfg(test)]
-const RECOVERY_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const RECOVERY_BUDGET: Duration = Duration::from_secs(3);
 
-/// A prepared plan is handed out again only while it stays valid this long.
-const PLAN_REUSE_MARGIN_SECONDS: u64 = 1_800;
+/// A prepared plan (an escape, or a mutual close) is handed out again only
+/// while it stays valid this long; a plan closer to its `valid_until` is
+/// proved again.
+pub(crate) const PLAN_REUSE_MARGIN_SECONDS: u64 = 1_800;
 /// How often a recovery install may restart the decision at a new state.
 const MAX_STATE_RESTARTS: usize = 3;
 
@@ -260,6 +263,51 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
     exit_policy::e_low(expiry_ts, pinned, exit)
 }
 
+/// The RPCs an exit reads the chain through, in order: the owner's exit RPC
+/// when one is configured, then the pinned RPC (§1.2(6), §6.7: an exit never
+/// waits on the pinned RPC alone).
+pub(crate) fn exit_rpcs(config: &AuthConfig) -> Vec<Rpc> {
+    [
+        config.exit_rpc_url.as_deref(),
+        config.demo_rpc_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|url| Rpc::new(url).ok())
+    .collect()
+}
+
+/// The RPC whose answer closes the note or releases the exit lock (E5, E6):
+/// the owner's exit RPC when one is configured, otherwise the pinned RPC.
+/// The pinned RPC is operator-influenced (§2.1), so it never decides alone
+/// when the owner named an RPC of their own.
+pub(crate) fn deciding_rpc(config: &AuthConfig) -> Result<Rpc, AuthError> {
+    let url = config
+        .exit_rpc_url
+        .as_deref()
+        .or(config.demo_rpc_url.as_deref())
+        .ok_or_else(|| {
+            AuthError::InvalidInput("the deployment names no RPC to confirm the exit".into())
+        })?;
+    Rpc::new(url)
+}
+
+/// A lock this exit call holds at the end with nothing released under it
+/// (a decision only, an E3 wait, a refusal or a failure before any proof)
+/// is removed: no proof left, so nothing on chain needs it (E6 "no kind-0 or
+/// kind-1 proof was released"), and the decision that needed it for C1 is
+/// over. Requests resume, as the SDK does. A lock that released any proof,
+/// an ownership proof included, stays.
+pub(crate) fn drop_unused_lock(wallet: &mut Wallet) -> Result<(), AuthError> {
+    if wallet
+        .exit_lock()?
+        .is_some_and(|lock| lock.released.is_empty())
+    {
+        wallet.cancel_exit_lock()?;
+    }
+    Ok(())
+}
+
 /// E1 then E2/E3 for the wallet's current state. Sets nothing; the caller
 /// holds the exit lock.
 pub(crate) async fn decide(
@@ -371,14 +419,7 @@ pub(crate) async fn escape_path(
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
     let leaf = wallet.current_note_leaf().ok_or(AuthError::NoActiveNote)?;
     let vault = chain::vault_address(&config.contract_address)?;
-    let rpcs: Vec<Rpc> = [
-        config.exit_rpc_url.as_deref(),
-        config.demo_rpc_url.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|url| Rpc::new(url).ok())
-    .collect();
+    let rpcs = exit_rpcs(config);
     // The indexer's path, at a root the vault confirms it held.
     let from_indexer = async {
         let root = indexer.root().await.ok()?;
@@ -567,10 +608,20 @@ impl AuthService {
             .as_deref()
             .map(parse_conceded)
             .transpose()?;
-        // A live key would let a chat race the decision; it is retired first.
+        // A live key would let a chat race the decision; it is retired first,
+        // within one E1 budget (E0): the retirement and recovery calls go to
+        // the operator, which may stall them.
         if self.direct_lease.lock().await.is_some() {
-            if let Err(error) = self.settle_for_withdrawal().await {
-                tracing::debug!(%error, "the live lease did not settle before the escape decision");
+            match tokio::time::timeout(RECOVERY_BUDGET, self.settle_for_withdrawal()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "the live lease did not settle before the escape decision");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "the live lease did not settle within the exit's recovery budget"
+                    );
+                }
             }
         }
         let mut lease = self.direct_lease.lock().await;
@@ -657,6 +708,32 @@ impl AuthService {
         .await
     }
 
+    /// `POST /oa/v1/withdraw/escape/cancel`: E6 "no kind-0 or kind-1 proof
+    /// was released and the user cancels". Removes the exit lock, so
+    /// requests resume (except from a state whose ownership proof left,
+    /// C5). Refused with `exit_lock_conflict` while a released escape or
+    /// close may still land: such a lock is released only once the note
+    /// closes or every released proof is dead (the status route).
+    pub async fn oa_escape_cancel(&self) -> Result<Value, AuthError> {
+        let config = self.config.clone();
+        let wallet_mutex = self.wallet_mutex.clone();
+        spawn_blocking(move || {
+            let _guard = wallet_mutex
+                .lock()
+                .map_err(|_| AuthError::Wallet("wallet lock unavailable".into()))?;
+            let _lockfile = acquire_wallet_lock(&config.state_dir)?;
+            let mut wallet = load_wallet(&config)?;
+            let lock = wallet.exit_lock()?;
+            wallet.cancel_exit_lock()?;
+            Ok(json!({
+                "status": "cancelled",
+                "had_lock": lock.is_some(),
+                "ownership_proof_sent": wallet.ownership_proof_sent_at_current_state()?,
+            }))
+        })
+        .await
+    }
+
     /// `POST /oa/v1/withdraw/escape/finalize`: check a finalized
     /// `finalizeEscapeWithdrawal` (anyone's) and close the note.
     pub async fn oa_escape_finalize(&self, transaction_hash: String) -> Result<Value, AuthError> {
@@ -713,8 +790,42 @@ async fn prepare_escape_locked(
             return Ok(plan_json(&record, config, &[]));
         }
     }
+    let result = decide_and_prove_escape(
+        config,
+        indexer,
+        wallet,
+        destination,
+        destination_hex,
+        confirmed,
+        early_exit,
+    )
+    .await;
+    // Only a prepared escape released a proof; anything else leaves no lock
+    // behind unless an earlier proof (an ownership proof) needs it.
+    if !result
+        .as_ref()
+        .is_ok_and(|value| value["status"] == "prepared")
+    {
+        drop_unused_lock(wallet)?;
+    }
+    result
+}
+
+async fn decide_and_prove_escape(
+    config: &AuthConfig,
+    indexer: &IndexerClient,
+    wallet: &mut Wallet,
+    destination: [u8; 20],
+    destination_hex: String,
+    confirmed: Option<u128>,
+    early_exit: Option<EarlyExit>,
+) -> Result<Value, AuthError> {
+    // How the mutual close of this very state ended, if one was tried. A
+    // reservation of an earlier state of the note says nothing about this
+    // one.
+    let current = wallet.current_nullifier();
     let mutual_outcome = crate::oa_withdrawal::load(config)?
-        .filter(|reservation| reservation.snapshot.note_id == state.note_id)
+        .filter(|reservation| Some(reservation.nullifier) == current)
         .and_then(|reservation| reservation.clearance_outcome);
     for _ in 0..MAX_STATE_RESTARTS {
         // E2 step 1: the lock before E1. A lock that already released an
@@ -759,11 +870,13 @@ async fn prepare_escape_locked(
         if recovery_pass(wallet, decided.facts.must_initiate_by).await == Recovered::Installed {
             continue;
         }
-        let start_block = match config.demo_rpc_url.as_deref().map(Rpc::new) {
-            Some(Ok(rpc)) => rpc.block("latest").await.map(|(number, _)| number).ok(),
-            _ => None,
+        let mut start_block = config.deploy_block;
+        for rpc in exit_rpcs(config) {
+            if let Ok((number, _)) = rpc.block("latest").await {
+                start_block = number;
+                break;
+            }
         }
-        .unwrap_or(config.deploy_block);
         let bound = wallet.state().map_or(0, |state| state.bound_at_state);
         let (public_inputs, proof) =
             wallet.withdrawal_escape_hatch(destination, conceded, root, siblings)?;
@@ -787,7 +900,7 @@ async fn prepare_escape_locked(
             state_balance: (public_inputs.final_balance + public_inputs.conceded).to_string(),
             conceded_at_init: public_inputs.conceded.to_string(),
             bound_at_state: bound.to_string(),
-            destination: destination_hex,
+            destination: destination_hex.clone(),
             valid_until: public_inputs.valid_until,
             start_block,
             reason: reason.into(),
@@ -836,18 +949,26 @@ async fn escape_status_locked(
     if record.phase == "complete" {
         return Ok(status);
     }
-    let Some(rpc) = config
-        .demo_rpc_url
-        .as_deref()
-        .and_then(|url| Rpc::new(url).ok())
-    else {
-        return Ok(status);
-    };
     let vault = chain::vault_address(&config.contract_address)?;
-    let Ok(view) = chain::read_note(&rpc, &vault, record.note_id, "latest").await else {
+    // What is shown comes from the first RPC that answers, the owner's exit
+    // RPC first: a pinned RPC that is down or refuses does not hide the
+    // escape's progress.
+    let mut read = None;
+    for rpc in exit_rpcs(config) {
+        if let Ok(view) = chain::read_note(&rpc, &vault, record.note_id, "latest").await {
+            read = Some((rpc, view));
+            break;
+        }
+    }
+    let Some((rpc, view)) = read else {
         status["chain"] = json!("unavailable");
         return Ok(status);
     };
+    status["chain_rpc"] = json!(if config.exit_rpc_url.as_deref() == Some(rpc.url()) {
+        "exit"
+    } else {
+        "pinned"
+    });
     match view.pending {
         Some(pending) if pending.nullifier == record.withdrawal_nullifier => {
             status["phase"] = json!("pending");
@@ -868,16 +989,29 @@ async fn escape_status_locked(
                 status["phase"] = json!("defeated");
                 status["error"] = json!("device_not_newest");
             }
-            // E6: release the lock once every released proof is dead.
-            if let Ok((_, finalized_ts)) = rpc.block("finalized").await {
-                if wallet.release_exit_lock(NoteChainStatus::Active, Some(finalized_ts))? {
-                    status["exit_lock"] = Value::Null;
-                    if status["phase"] != "defeated" {
-                        status["phase"] = json!("expired");
+            // E6: release the lock once every released proof is dead: at a
+            // finalized block past each valid_until + 900, the note Active
+            // with no pending exit. Only the deciding RPC (the owner's exit
+            // RPC when configured) may say so: a lock released on a false
+            // answer would let a late successor install while the escape
+            // can still land.
+            if let Ok(decider) = deciding_rpc(config) {
+                if let Ok((block, finalized_ts)) = decider.block("finalized").await {
+                    let tag = format!("0x{block:x}");
+                    let settled = chain::read_note(&decider, &vault, record.note_id, &tag)
+                        .await
+                        .is_ok_and(|view| view.status == 1 && view.pending.is_none());
+                    if settled
+                        && wallet.release_exit_lock(NoteChainStatus::Active, Some(finalized_ts))?
+                    {
+                        status["exit_lock"] = Value::Null;
+                        if status["phase"] != "defeated" {
+                            status["phase"] = json!("expired");
+                        }
+                        let mut expired = record.clone();
+                        expired.phase = status["phase"].as_str().unwrap_or("expired").into();
+                        save_record(config, &expired)?;
                     }
-                    let mut expired = record.clone();
-                    expired.phase = status["phase"].as_str().unwrap_or("expired").into();
-                    save_record(config, &expired)?;
                 }
             }
         }
@@ -986,9 +1120,10 @@ async fn finalize_escape_locked(
         }
         return Err(AuthError::WithdrawalConflict);
     }
-    let rpc = Rpc::new(config.demo_rpc_url.as_deref().ok_or_else(|| {
-        AuthError::InvalidInput("the deployment names no RPC to confirm the payout".into())
-    })?)?;
+    // The payout closes the note: the owner's exit RPC decides when one is
+    // configured, so a pinned RPC that is down or lies neither blocks nor
+    // forges the close.
+    let rpc = deciding_rpc(config)?;
     let receipt = rpc
         .receipt(hash)
         .await?

@@ -96,6 +96,7 @@ pub fn build_router_with_token(service: Arc<AuthService>, token: Option<String>)
         .route("/oa/v1/withdraw/escape/submit", post(oa_escape_submit))
         .route("/oa/v1/withdraw/escape/status", get(oa_escape_status))
         .route("/oa/v1/withdraw/escape/finalize", post(oa_escape_finalize))
+        .route("/oa/v1/withdraw/escape/cancel", post(oa_escape_cancel))
         .route("/oa/v1/deposit/path", get(oa_deposit_path))
         .route("/healthz", get(healthz))
         .route("/request", post(core_request))
@@ -293,6 +294,13 @@ async fn oa_escape_submit(
 
 async fn oa_escape_status(State(service): State<Arc<AuthService>>) -> Response {
     match service.oa_escape_status().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_escape_cancel(State(service): State<Arc<AuthService>>) -> Response {
+    match service.oa_escape_cancel().await {
         Ok(value) => Json(value).into_response(),
         Err(error) => generic_error(error),
     }
@@ -1100,7 +1108,7 @@ mod tests {
         assert_eq!(value["withdrawal_bridge_version"], 1);
         assert_eq!(value["bridge_version"], 5);
         assert_eq!(value["exit_concession"], 1);
-        assert_eq!(value["escape_routes_version"], 1);
+        assert_eq!(value["escape_routes_version"], 2);
         assert_eq!(value["setup_id"], "dev");
         assert_eq!(value["settlement_window_seconds"], 21_905);
         assert_eq!(value["circuit_id"], "zkapi-v2-concession-v1");

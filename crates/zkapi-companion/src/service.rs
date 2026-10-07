@@ -781,12 +781,13 @@ impl AuthService {
     pub fn oa_bridge_status(&self) -> serde_json::Value {
         serde_json::json!({
             // 5: circuit zkapi-v2-concession-v1 with the escape routes
-            // /oa/v1/withdraw/escape/{prepare,submit,status,finalize}.
+            // /oa/v1/withdraw/escape/{prepare,submit,status,finalize};
+            // escape_routes_version 2 adds /oa/v1/withdraw/escape/cancel.
             "bridge_version": 5,
             "exit_concession": 1,
             "setup_id": self.config.setup_id,
             "settlement_window_seconds": self.config.settlement_window_seconds,
-            "escape_routes_version": 1,
+            "escape_routes_version": 2,
             "session_events_version": 1,
             "deployment_id": self.config.deployment_id,
             "contract_address": self.config.contract_address,
@@ -901,131 +902,43 @@ impl AuthService {
             }
             let runtime = current_thread_runtime()?;
             runtime.block_on(async move {
-                // A reservation that already holds its close is handed out
-                // again, whatever happened since.
+                // A reservation that already holds its close hands it out
+                // again while it stays valid. A close nearer its valid_until
+                // is proved again (the vault refuses it afterwards, L6): from
+                // the kept clearance signature, which signs only the
+                // nullifier, at the plan's own root and path. A reservation
+                // saved before the signature was kept asks for the clearance
+                // again below (the server signs a reserved nullifier again).
                 if let Some(record) = existing.as_ref().filter(|record| !record.complete) {
                     if let Some(plan) = &record.plan {
                         if record.destination != destination {
                             return Err(AuthError::WithdrawalConflict);
                         }
-                        return Ok(plan.clone());
-                    }
-                }
-                // E2 step 1: the exit lock, in mutual mode, before E1. An
-                // escape already released from this state keeps the exit in
-                // escape mode.
-                if let Err(zkapi_client::error::ClientError::ExitLockConflict(_)) =
-                    wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual)
-                {
-                    return Err(AuthError::EscapeRequired(serde_json::json!({
-                        "action": "escape", "reason": "escape_in_progress"
-                    })));
-                }
-                // An explicit mutual retry asks for the clearance again; a
-                // refusal recorded earlier steers only the escape route.
-                let decided = exit::decide(&config, &mut wallet, None, None, true).await?;
-                if let Some(response) = &decided.installed {
-                    session_events
-                        .settled(response, wallet.state().map(|state| state.current_balance));
-                }
-                match decided.decision {
-                    zkapi_client::exit_policy::ExitDecision::Mutual => {}
-                    // E3: a released request is unresolved; wait for it.
-                    zkapi_client::exit_policy::ExitDecision::Wait { .. } => {
-                        return Err(AuthError::PendingSettlement)
-                    }
-                    zkapi_client::exit_policy::ExitDecision::Escape { .. } => {
-                        return Err(AuthError::EscapeRequired(decided.to_json()))
-                    }
-                }
-                let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
-                let mut record = crate::oa_withdrawal::reserve(&config, &state, destination)?;
-                if record.complete {
-                    return record.plan.ok_or(AuthError::WithdrawalConflict);
-                }
-                // E2 step 3: ownership proof, clearance, close. A retry
-                // resends the ownership proof still valid from an earlier
-                // attempt (at most one is live, C3).
-                let mut reproved = false;
-                let (public_inputs, proof, siblings) = loop {
-                    let root = indexer.root().await?;
-                    let siblings = indexer.note_path(state.note_id).await?;
-                    // Saved before the request leaves: whatever answer follows
-                    // (a gateway 429, a 5xx, none at all), the ownership proof
-                    // may have reached someone, and it names this state's
-                    // nullifier.
-                    let mut storage_failure = None;
-                    let closed = wallet
-                        .withdrawal_mutual_close_recorded(
-                            destination,
-                            root,
-                            siblings.clone(),
-                            || {
-                                crate::oa_withdrawal::record_ownership_proof_sent(
-                                    &config,
-                                    &mut record,
-                                )
-                                .map_err(|error| {
-                                    let message = error.to_string();
-                                    storage_failure = Some(error);
-                                    zkapi_client::error::ClientError::Serialization(message)
-                                })
-                            },
-                        )
-                        .await;
-                    if let Some(error) = storage_failure {
-                        return Err(error);
-                    }
-                    use zkapi_client::error::ClientError;
-                    let outcome = match closed {
-                        Ok((public_inputs, proof)) => break (public_inputs, proof, siblings),
-                        Err(ClientError::StaleRoot) if !reproved => {
-                            reproved = true;
-                            continue;
+                        if plan.public_inputs.valid_until
+                            > now_seconds() + exit::PLAN_REUSE_MARGIN_SECONDS
+                        {
+                            return Ok(plan.clone());
                         }
-                        // E2 step 4: the server claims a reservation.
-                        Err(ClientError::ClearanceRefused(code)) if code == "nullifier_used" => {
-                            zkapi_client::exit_policy::MutualOutcome::NullifierUsed
+                        if let Some(signature) = record.clearance_signature {
+                            return reprove_close(&config, &wallet, record.clone(), &signature);
                         }
-                        // Not the operator's answer.
-                        Err(
-                            error @ (ClientError::TestnetPasswordRequired
-                            | ClientError::ProofGeneration(_)
-                            | ClientError::Io(_)
-                            | ClientError::Serialization(_)
-                            | ClientError::ExitLockConflict(_)
-                            | ClientError::NoActiveNote),
-                        ) => return Err(error.into()),
-                        // E2 step 5: any other refusal, or unreachable.
-                        Err(error) => {
-                            tracing::warn!(%error, "the clearance was refused or unreachable; the exit continues as an escape");
-                            zkapi_client::exit_policy::MutualOutcome::RefusedOrUnreachable
-                        }
-                    };
-                    record.clearance_outcome = Some(outcome);
-                    crate::oa_withdrawal::save(&config, &record)?;
-                    if outcome == zkapi_client::exit_policy::MutualOutcome::RefusedOrUnreachable {
-                        wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
                     }
-                    let decided =
-                        exit::decide(&config, &mut wallet, Some(outcome), None, false).await?;
-                    return Err(match decided.decision {
-                        zkapi_client::exit_policy::ExitDecision::Wait { .. } => {
-                            AuthError::PendingSettlement
-                        }
-                        _ => AuthError::EscapeRequired(decided.to_json()),
-                    });
-                };
-                let plan = WithdrawalPlan {
-                    mode: WithdrawalMode::Mutual,
-                    public_inputs,
-                    siblings,
-                    proof,
-                };
-                crate::oa_withdrawal::validate_plan(&record, &plan)?;
-                record.plan = Some(plan.clone());
-                crate::oa_withdrawal::save(&config, &record)?;
-                Ok(plan)
+                }
+                let result = mutual_close_locked(
+                    &config,
+                    &indexer,
+                    &mut wallet,
+                    &session_events,
+                    destination,
+                )
+                .await;
+                // E3's wait, a refusal or a failure before any proof left
+                // releases nothing: the lock this attempt set is removed and
+                // chats resume. A lock that released a proof stays.
+                if result.is_err() {
+                    exit::drop_unused_lock(&mut wallet)?;
+                }
+                result
             })
         })
         .await;
@@ -2766,16 +2679,38 @@ impl AuthService {
         )
     }
 
+    /// The request's bound must be the budget of the model tier `limit` at
+    /// the request's own quote, or, by C2, the one bound already fixed at
+    /// the request's state when that covers the tier: every request proof at
+    /// a state carries `bound_at_state`, and `state_solvency_bound` reuses a
+    /// larger one for a cheaper tier.
     fn check_request_budget(&self, request: &ApiRequestV2, limit: u128) -> Result<(), AuthError> {
         if let Some(quote) = crate::oa_native::saved_quote(&self.config, &request.payload)? {
             let expected = quote
                 .budget_units(limit)?
                 .max(self.config.request_charge_cap);
-            if request.public_inputs.solvency_bound != expected {
+            let bound = request.public_inputs.solvency_bound;
+            if bound != expected && !(bound > expected && bound == self.fixed_bound_of(request)?) {
                 return Err(AuthError::LeasePending("saved authorization uses another model budget; resume the original tier or wait for settlement".into()));
             }
         }
         Ok(())
+    }
+
+    /// `bound_at_state` of the note state `request` was made at, or 0 when
+    /// the wallet is at another state (or holds none).
+    fn fixed_bound_of(&self, request: &ApiRequestV2) -> Result<u128, AuthError> {
+        let path = self.config.state_dir.join("note_state.json");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let state = zkapi_client::note_state::NoteState::load(&path)?;
+        let nullifier = core_v2::nullifier(&state.secret_s, state.note_id, &state.current_anchor);
+        Ok(if nullifier == request.public_inputs.request_nullifier {
+            state.bound_at_state
+        } else {
+            0
+        })
     }
 
     async fn prepare_direct_lease_request(
@@ -2843,9 +2778,8 @@ impl AuthService {
                     }
                 }
             }
-            let (active_root, siblings) = runtime.block_on(async move {
-                Ok::<_, AuthError>((indexer.root().await?, indexer.note_path(note_id).await?))
-            })?;
+            let (active_root, siblings) =
+                runtime.block_on(async move { indexer.root_and_path(note_id).await })?;
             let mut solvency_bound = wallet.configured_solvency_bound();
             let authorization = if config.billing_asset == "native_eth" {
                 let quote = runtime.block_on(crate::oa_native::verified_quote(&config))?;
@@ -3405,8 +3339,7 @@ impl AuthService {
                     return Err(AuthError::PendingSettlement);
                 }
                 let note_id = wallet.state().ok_or(AuthError::NoActiveNote)?.note_id;
-                let root = indexer.root().await?;
-                let siblings = indexer.note_path(note_id).await?;
+                let (root, siblings) = indexer.root_and_path(note_id).await?;
                 let plan_siblings = siblings.clone();
                 // The exit lock is durable before any exit proof exists; the
                 // wallet records each proof as released before returning it
@@ -3894,8 +3827,7 @@ async fn build_request_preview(
         serde_json::to_string(&request).map_err(|err| AuthError::Serialization(err.to_string()))?;
     let payload_hash = hash_payload(&payload);
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-    let active_root = indexer.root().await?;
-    let merkle_siblings = indexer.note_path(state.note_id).await?;
+    let (active_root, merkle_siblings) = indexer.root_and_path(state.note_id).await?;
     let registration_commitment = core_v2::registration_commitment(&state.secret_s);
     let note_leaf = core_v2::note_leaf(
         state.note_id,
@@ -3936,6 +3868,169 @@ async fn build_request_preview(
         state_sig_root: config.state_signing_key.x,
         runtime_proof_backend: config.proof_backend_label().to_string(),
     })
+}
+
+/// E2 for the mutual close, under the wallet's locks: the exit lock in
+/// mutual mode before E1, the decision, then the ownership proof (kind 2),
+/// the clearance and the close (kind 1). The caller removes a lock that
+/// released nothing when this fails.
+async fn mutual_close_locked(
+    config: &AuthConfig,
+    indexer: &IndexerClient,
+    wallet: &mut Wallet,
+    session_events: &crate::oa_events::SessionEvents,
+    destination: [u8; 20],
+) -> Result<WithdrawalPlan, AuthError> {
+    use zkapi_client::error::ClientError;
+    use zkapi_client::exit_policy::{ExitDecision, MutualOutcome};
+    // E2 step 1: the exit lock, in mutual mode, before E1. An escape already
+    // released from this state keeps the exit in escape mode.
+    if let Err(ClientError::ExitLockConflict(_)) =
+        wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual)
+    {
+        return Err(AuthError::EscapeRequired(serde_json::json!({
+            "action": "escape", "reason": "escape_in_progress"
+        })));
+    }
+    // An explicit mutual retry asks for the clearance again; a refusal
+    // recorded earlier steers only the escape route.
+    let decided = exit::decide(config, wallet, None, None, true).await?;
+    if let Some(response) = &decided.installed {
+        session_events.settled(response, wallet.state().map(|state| state.current_balance));
+    }
+    match decided.decision {
+        ExitDecision::Mutual => {}
+        // E3: a released request is unresolved; wait for it.
+        ExitDecision::Wait { .. } => return Err(AuthError::PendingSettlement),
+        ExitDecision::Escape { .. } => return Err(AuthError::EscapeRequired(decided.to_json())),
+    }
+    let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
+    crate::oa_withdrawal::check_reservable(config, &state, destination)?;
+    // The path first, bounded (E0): the indexer is the operator's, these
+    // locks are the ones every exit route takes, and an indexer that does
+    // not answer leaves no reservation behind.
+    let mut path = Some(indexer.root_and_path(state.note_id).await?);
+    let mut record = crate::oa_withdrawal::reserve(config, &state, destination)?;
+    if record.complete {
+        return record.plan.ok_or(AuthError::WithdrawalConflict);
+    }
+    // E2 step 3: ownership proof, clearance, close. A retry resends the
+    // ownership proof still valid from an earlier attempt (at most one is
+    // live, C3).
+    let mut reproved = false;
+    let (public_inputs, proof, siblings, signature) = loop {
+        let (root, siblings) = match path.take() {
+            Some(path) => path,
+            None => indexer.root_and_path(state.note_id).await?,
+        };
+        // Saved before the request leaves: whatever answer follows (a
+        // gateway 429, a 5xx, none at all), the ownership proof may have
+        // reached someone, and it names this state's nullifier.
+        let mut storage_failure = None;
+        let closed = wallet
+            .withdrawal_mutual_close_cleared(destination, root, siblings.clone(), || {
+                crate::oa_withdrawal::record_ownership_proof_sent(config, &mut record).map_err(
+                    |error| {
+                        let message = error.to_string();
+                        storage_failure = Some(error);
+                        ClientError::Serialization(message)
+                    },
+                )
+            })
+            .await;
+        if let Some(error) = storage_failure {
+            return Err(error);
+        }
+        let outcome = match closed {
+            Ok((public_inputs, proof, signature)) => {
+                break (public_inputs, proof, siblings, signature)
+            }
+            Err(ClientError::StaleRoot) if !reproved => {
+                reproved = true;
+                continue;
+            }
+            // E2 step 4: the server claims a reservation.
+            Err(ClientError::ClearanceRefused(code)) if code == "nullifier_used" => {
+                MutualOutcome::NullifierUsed
+            }
+            // Not the operator's answer.
+            Err(
+                error @ (ClientError::TestnetPasswordRequired
+                | ClientError::ProofGeneration(_)
+                | ClientError::Io(_)
+                | ClientError::Serialization(_)
+                | ClientError::ExitLockConflict(_)
+                | ClientError::NoActiveNote),
+            ) => return Err(error.into()),
+            // E2 step 5: any other refusal, or unreachable.
+            Err(error) => {
+                tracing::warn!(%error, "the clearance was refused or unreachable; the exit continues as an escape");
+                MutualOutcome::RefusedOrUnreachable
+            }
+        };
+        record.clearance_outcome = Some(outcome);
+        crate::oa_withdrawal::save(config, &record)?;
+        if outcome == MutualOutcome::RefusedOrUnreachable {
+            wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
+        }
+        let decided = exit::decide(config, wallet, Some(outcome), None, false).await?;
+        return Err(match decided.decision {
+            ExitDecision::Wait { .. } => AuthError::PendingSettlement,
+            _ => AuthError::EscapeRequired(decided.to_json()),
+        });
+    };
+    let plan = WithdrawalPlan {
+        mode: WithdrawalMode::Mutual,
+        public_inputs,
+        siblings,
+        proof,
+    };
+    crate::oa_withdrawal::validate_plan(&record, &plan)?;
+    record.plan = Some(plan.clone());
+    record.clearance_signature = Some(signature);
+    crate::oa_withdrawal::save(config, &record)?;
+    Ok(plan)
+}
+
+/// A close of `record`'s state proved again from its kept clearance
+/// signature, with a new `valid_until`, at the saved plan's root and path
+/// (any root the vault ever held stays known, Amendment A1). Needs the exit
+/// lock in mutual mode at that state: an escape released since keeps the
+/// exit in escape mode.
+fn reprove_close(
+    config: &AuthConfig,
+    wallet: &Wallet,
+    mut record: crate::oa_withdrawal::Reservation,
+    signature: &zkapi_types::SchnorrSignature,
+) -> Result<WithdrawalPlan, AuthError> {
+    let saved = record.plan.clone().ok_or(AuthError::WithdrawalConflict)?;
+    if wallet.current_nullifier() != Some(record.nullifier) {
+        return Err(AuthError::WithdrawalConflict);
+    }
+    let (public_inputs, proof) = match wallet.mutual_close_from_clearance(
+        record.destination,
+        saved.public_inputs.active_root,
+        saved.siblings.clone(),
+        signature,
+    ) {
+        Ok(built) => built,
+        Err(zkapi_client::error::ClientError::ExitLockConflict(_)) => {
+            return Err(AuthError::EscapeRequired(serde_json::json!({
+                "action": "escape", "reason": "escape_in_progress"
+            })))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let plan = WithdrawalPlan {
+        mode: WithdrawalMode::Mutual,
+        public_inputs,
+        siblings: saved.siblings,
+        proof,
+    };
+    crate::oa_withdrawal::validate_plan(&record, &plan)?;
+    record.plan = Some(plan.clone());
+    crate::oa_withdrawal::save(config, &record)?;
+    Ok(plan)
 }
 
 /// C2: the bound of a request at a state whose earlier request proofs carry
@@ -4521,8 +4616,19 @@ mod oa_withdrawal_tests {
     async fn reservation_survives_failed_prepare_and_blocks_all_spending_paths() {
         let (_directory, config, note) = fixture();
         let service = AuthService::new(config.clone()).unwrap();
-        // The indexer fixture is unreachable. Persistence must happen first.
-        assert!(service.oa_prepare_withdrawal([1; 20], false).await.is_err());
+        // The indexer fixture is unreachable: the mutual close fails before
+        // anything is reserved or proved (its path is read first, E0).
+        assert!(matches!(
+            service.oa_prepare_withdrawal([1; 20], false).await,
+            Err(AuthError::Indexer(_))
+        ));
+        assert_eq!(
+            service.oa_withdrawal_status().await.unwrap()["phase"],
+            "none"
+        );
+        assert!(load_wallet(&config).unwrap().exit_lock().unwrap().is_none());
+        // A reservation, once made, blocks every spending path.
+        oa_withdrawal::reserve(&config, &note, [1; 20]).unwrap();
         assert_eq!(
             service.oa_withdrawal_status().await.unwrap()["phase"],
             "reserved"
@@ -4643,6 +4749,11 @@ mod oa_withdrawal_tests {
             }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        // The §6.2 write order: the request fixed the state's bound first.
+        let mut note = note;
+        note.bound_at_state = 1_000;
+        note.save(&config.state_dir.join("note_state.json"))
+            .unwrap();
         let journal_path = config.state_dir.join("pending_journal.json");
         zkapi_client::journal::PendingRequestJournal::write(
             &journal_path,
@@ -4659,10 +4770,11 @@ mod oa_withdrawal_tests {
         )
         .unwrap();
         let service = AuthService::new(config.clone()).unwrap();
-        assert!(matches!(
-            service.oa_prepare_withdrawal([1; 20], false).await,
-            Err(AuthError::PendingSettlement)
-        ));
+        let prepared = service.oa_prepare_withdrawal([1; 20], false).await;
+        assert!(
+            matches!(prepared, Err(AuthError::PendingSettlement)),
+            "{prepared:?}"
+        );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(oa_withdrawal::load(&config).unwrap().is_none());
         std::fs::write(&journal_path, "malformed").unwrap();
@@ -5062,6 +5174,15 @@ mod oa_withdrawal_tests {
         wallet
             .confirm_deposit(Felt252::from_u64(42), 0, 1_500_000, expiry_ts)
             .unwrap();
+        // The §6.2 write order: a request released at this state fixed the
+        // state's bound before its journal existed.
+        if pending_retry || archive == Archive::Record {
+            let path = config.state_dir.join("note_state.json");
+            let mut state = zkapi_client::note_state::NoteState::load(&path).unwrap();
+            state.bound_at_state = 1_000;
+            state.save(&path).unwrap();
+            wallet = load_wallet(&config).unwrap();
+        }
         let note = wallet.state().unwrap().clone();
         let nullifier = core_v2::nullifier(&note.secret_s, note.note_id, &note.current_anchor);
         let damage_archive = || {
@@ -7167,7 +7288,11 @@ mod oa_request_archive_tests {
         wallet
             .confirm_deposit(Felt252::from_u64(42), 7, 1_500_000, 4_000_000_000)
             .unwrap();
-        let note = wallet.state().unwrap().clone();
+        // The §6.2 write order: the retry fixed the state's bound first.
+        let mut note = wallet.state().unwrap().clone();
+        note.bound_at_state = 50_000;
+        note.save(&config.state_dir.join("note_state.json"))
+            .unwrap();
         let nullifier = core_v2::nullifier(&note.secret_s, note.note_id, &note.current_anchor);
         let retry = lease_request("retry", nullifier, 50_000);
         PendingRequestJournal::write(
@@ -8111,6 +8236,38 @@ mod oa_native_recovery_tests {
             serde_json::to_value(restored).unwrap(),
             serde_json::to_value(request).unwrap()
         );
+    }
+    /// C2 then the native lease's budget check: a state whose bound was
+    /// fixed by an earlier request (set aside, say, after stale_root) proves
+    /// a cheaper tier's request at that bound, and the lease check accepts
+    /// it instead of leaving a never-sent journal that blocks every tier. A
+    /// tier the bound does not cover, or a bound at another state, is still
+    /// refused.
+    #[tokio::test]
+    async fn a_reused_state_bound_passes_the_native_budget_check() {
+        let (_directory, config, mut request) = fixture();
+        // 1,200,000 units: the three-dollar tier at the fixture's quote.
+        request.public_inputs.solvency_bound = 1_200_000;
+        let path = config.state_dir.join("note_state.json");
+        let mut state = zkapi_client::note_state::NoteState::load(&path).unwrap();
+        state.bound_at_state = 1_200_000;
+        state.save(&path).unwrap();
+        let service = AuthService::new(config.clone()).unwrap();
+        assert_eq!(state_solvency_bound(1_200_000, 400_000).unwrap(), 1_200_000);
+        for limit in [1_000_000, 2_000_000, 3_000_000] {
+            service.check_request_budget(&request, limit).unwrap();
+        }
+        assert!(service.check_request_budget(&request, 4_500_000).is_err());
+        // Without a fixed bound at the request's state, only the tier's own
+        // budget passes.
+        state.bound_at_state = 0;
+        state.save(&path).unwrap();
+        assert!(service.check_request_budget(&request, 1_000_000).is_err());
+        service.check_request_budget(&request, 3_000_000).unwrap();
+        state.bound_at_state = 1_200_000;
+        state.current_anchor = Felt252::from_u64(77);
+        state.save(&path).unwrap();
+        assert!(service.check_request_budget(&request, 1_000_000).is_err());
     }
     #[test]
     fn settlement_changed_quote_preserves_note_and_journal() {

@@ -168,16 +168,26 @@ class PreparationTests(unittest.TestCase):
             log = root / "cargo.log"
             fake_cargo = bin_dir / "cargo"
             fake_cargo.write_text('#!/bin/sh\nprintf \'%s\\t%s\\n\' "$(pwd -P)" "$*" >> "$FAKE_CARGO_LOG"\n'
+                                  'printf \'%s\\n\' "${ZKAPI_REQUIRE_ANVIL:-unset}" >> "$FAKE_CARGO_LOG.anvil"\n'
                                   'test "$(pwd -P)" != "$FAKE_CARGO_FAIL_IN"\n')
             fake_cargo.chmod(0o755)
             prepared = Path(os.path.realpath(fixture.prepared))
             protocol_rust = prepared / "protocol/rust"
 
-            def run_tests(fail_in=""):
-                if log.exists():
-                    log.unlink()
-                environment = dict(fixture.environment, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            # PATH without Foundry: the fixture's stand-in cargo, git and the
+            # system tools only.
+            system_path = os.pathsep.join(
+                directory for directory in os.environ["PATH"].split(os.pathsep)
+                if not (Path(directory) / "forge").exists() and not (Path(directory) / "anvil").exists())
+
+            def run_tests(fail_in="", extra_path=None):
+                for stale in (log, Path(f"{log}.anvil")):
+                    if stale.exists():
+                        stale.unlink()
+                path = os.pathsep.join(filter(None, [str(bin_dir), extra_path, system_path]))
+                environment = dict(fixture.environment, PATH=path,
                                    FAKE_CARGO_LOG=str(log), FAKE_CARGO_FAIL_IN=fail_in)
+                environment.pop("ZKAPI_REQUIRE_ANVIL", None)
                 result = subprocess.run(["bash", str(fixture.scripts / "test-companion.sh"), str(fixture.prepared)],
                                         env=environment, text=True, capture_output=True, timeout=60)
                 calls = [tuple(line.split("\t")) for line in log.read_text().splitlines()] if log.exists() else []
@@ -190,6 +200,19 @@ class PreparationTests(unittest.TestCase):
                 (str(protocol_rust), "test --release --locked -p zkapi-client"),
             ])
             self.assertIn("Tested zkapi-companion, zkapi-auth and zkapi-client", result.stdout)
+            self.assertIn("the Anvil adapter test is skipped", result.stdout)
+            self.assertEqual(Path(f"{log}.anvil").read_text().split(), ["unset", "unset"])
+
+            # With Foundry on PATH the Anvil adapter test is required.
+            foundry = root / "foundry"
+            foundry.mkdir()
+            for name in ("forge", "anvil"):
+                (foundry / name).write_text("#!/bin/sh\nexit 0\n")
+                (foundry / name).chmod(0o755)
+            result, calls = run_tests(extra_path=str(foundry))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("the Anvil adapter test is required", result.stdout)
+            self.assertEqual(Path(f"{log}.anvil").read_text().split()[0], "1")
 
             # A failing protocol crate test fails the run.
             result, calls = run_tests(fail_in=str(protocol_rust))

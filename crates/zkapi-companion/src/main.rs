@@ -84,6 +84,58 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ClientModeArg::Proxy)]
         mode: ClientModeArg,
     },
+    /// Exit kits (`zkapi-exit-kit-v1`): an encrypted backup of the note
+    /// state an escape needs, and an escape from one without this device's
+    /// wallet, host or operator. The passphrase comes from
+    /// ZKAPI_EXIT_KIT_PASSPHRASE, --passphrase-file, or the first line of
+    /// standard input.
+    ExitKit {
+        #[command(subcommand)]
+        action: ExitKitAction,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ExitKitAction {
+    /// Write the kit of the wallet in --state-dir.
+    Export {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The deployment manifest the wallet belongs to.
+        #[arg(long)]
+        deployment: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Escape from a kit (design §6.4 E4): prints the vault, the calldata and
+    /// the payout, or signs and submits with --private-key-file.
+    Escape {
+        #[arg(long)]
+        kit: PathBuf,
+        /// The payout address.
+        #[arg(long)]
+        destination: String,
+        /// Your Ethereum RPC: codehash checks, a Merkle path rebuild when the
+        /// kit holds none, advisory reads and submission.
+        #[arg(long)]
+        rpc: Option<String>,
+        /// The amount to concede, at most the kit's bound_at_state.
+        #[arg(long, default_value_t = 0)]
+        conceded: u128,
+        /// Where the kit's state, exit lock and released proofs are kept.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Skip the stale-device pre-check: no operator call at all.
+        #[arg(long)]
+        offline: bool,
+        /// Sign and submit with the secp256k1 key in this file (hex).
+        #[arg(long, requires = "rpc")]
+        private_key_file: Option<PathBuf>,
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -219,7 +271,132 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Commands::ExitKit { action } => run_exit_kit(action, cli.proof_setup_dir).await,
     }
+}
+
+fn read_passphrase(file: Option<&std::path::Path>) -> anyhow::Result<String> {
+    if let Ok(passphrase) = std::env::var("ZKAPI_EXIT_KIT_PASSPHRASE") {
+        return Ok(passphrase);
+    }
+    let text = match file {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => {
+            eprintln!("Exit kit passphrase:");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line
+        }
+    };
+    Ok(text.trim_end_matches(['\r', '\n']).to_string())
+}
+
+async fn run_exit_kit(
+    action: ExitKitAction,
+    proof_setup_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use zkapi_companion::exit_kit;
+    match action {
+        ExitKitAction::Export {
+            state_dir,
+            deployment,
+            out,
+            passphrase_file,
+        } => {
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&deployment)?)?;
+            let contents = exit_kit::export(&state_dir, &manifest)?;
+            let passphrase = read_passphrase(passphrase_file.as_deref())?;
+            let file = exit_kit::encrypt(&contents, &passphrase)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            let mut handle = options.open(&out)?;
+            handle.write_all(&serde_json::to_vec_pretty(&file)?)?;
+            handle.sync_all()?;
+            println!(
+                "wrote {} (note {}, state {}, bound {})",
+                out.display(),
+                contents.note.note_id,
+                contents.state_seq,
+                contents.bound_at_state
+            );
+            Ok(())
+        }
+        ExitKitAction::Escape {
+            kit,
+            destination,
+            rpc,
+            conceded,
+            work_dir,
+            offline,
+            private_key_file,
+            passphrase_file,
+        } => {
+            let proof_setup_dir = proof_setup_dir.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "set ZKAPI_PROOF_SETUP_DIR (or --proof-setup-dir) to the bundled proving keys"
+                )
+            })?;
+            let file: exit_kit::KitFile = serde_json::from_slice(&std::fs::read(&kit)?)?;
+            let contents = exit_kit::decrypt(&file, &read_passphrase(passphrase_file.as_deref())?)?;
+            let destination = parse_address(&destination)?;
+            let work_dir = work_dir.unwrap_or_else(|| {
+                let id = contents.trusted_deployment["deployment_id"]
+                    .as_str()
+                    .unwrap_or("deployment");
+                default_client_state_dir(&format!("exit-kit-{id}-note-{}", contents.note.note_id))
+            });
+            ensure_private_state_dir(&work_dir)?;
+            let mut result = exit_kit::escape(
+                &contents,
+                &exit_kit::EscapeOptions {
+                    destination,
+                    conceded,
+                    rpc_url: rpc.clone(),
+                    work_dir,
+                    proof_setup_dir: proof_setup_dir.to_string_lossy().into_owned(),
+                    offline,
+                },
+            )
+            .await?;
+            if let (Some(key_file), Some(rpc)) = (private_key_file, rpc) {
+                let text = std::fs::read_to_string(&key_file)?;
+                let secret: [u8; 32] = hex::decode(text.trim().trim_start_matches("0x"))
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("the private key file must hold 32 hex bytes")
+                    })?;
+                let rpc = zkapi_companion::chain::Rpc::new(&rpc)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let to = parse_address(result["to"].as_str().unwrap_or(""))?;
+                let hash = exit_kit::sign_and_send(
+                    &rpc,
+                    &secret,
+                    contents.note.chain_id,
+                    &to,
+                    result["data"].as_str().unwrap_or(""),
+                )
+                .await?;
+                result["transaction_hash"] = serde_json::json!(hash);
+            }
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+    }
+}
+
+fn parse_address(text: &str) -> anyhow::Result<[u8; 20]> {
+    text.strip_prefix("0x")
+        .and_then(|digits| hex::decode(digits).ok())
+        .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+        .filter(|address| *address != [0; 20])
+        .ok_or_else(|| anyhow::anyhow!("{text} is not a nonzero 20-byte 0x address"))
 }
 
 fn log_filter() -> tracing_subscriber::EnvFilter {
@@ -609,6 +786,7 @@ mod tests {
                 assert!(no_fund);
                 assert!(matches!(mode, ClientModeArg::DirectOpenrouter));
             }
+            Commands::ExitKit { .. } => panic!("parsed as the client"),
         }
         // The setup directory may also come as a flag (the environment
         // variable is the clientd path).
@@ -633,7 +811,55 @@ mod tests {
                 assert_eq!(initial_credits, 2_000_000);
                 assert!(matches!(mode, ClientModeArg::Proxy));
             }
+            Commands::ExitKit { .. } => panic!("parsed as an exit kit"),
         }
+    }
+
+    #[test]
+    fn exit_kit_escape_parses_its_arguments() {
+        let cli = Cli::try_parse_from([
+            "zkapi-walletd",
+            "exit-kit",
+            "escape",
+            "--kit",
+            "kit.json",
+            "--destination",
+            "0x2222222222222222222222222222222222222222",
+            "--rpc",
+            "http://127.0.0.1:8545",
+            "--conceded",
+            "500",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ExitKit {
+                action:
+                    ExitKitAction::Escape {
+                        conceded,
+                        rpc,
+                        offline,
+                        ..
+                    },
+            } => {
+                assert_eq!(conceded, 500);
+                assert_eq!(rpc.as_deref(), Some("http://127.0.0.1:8545"));
+                assert!(!offline);
+            }
+            _ => panic!("not an exit kit escape"),
+        }
+        // A key without an RPC to submit through is refused.
+        assert!(Cli::try_parse_from([
+            "zkapi-walletd",
+            "exit-kit",
+            "escape",
+            "--kit",
+            "k",
+            "--destination",
+            "0x1",
+            "--private-key-file",
+            "key",
+        ])
+        .is_err());
     }
 
     fn manifest_json() -> serde_json::Value {

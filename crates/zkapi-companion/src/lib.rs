@@ -2,6 +2,7 @@ pub mod chain;
 pub mod compat;
 pub mod config;
 pub mod error;
+pub mod exit_kit;
 pub mod indexer;
 mod oa_withdrawal;
 pub mod routes;

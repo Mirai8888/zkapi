@@ -751,8 +751,8 @@ records of other deployments (`deployment_id`, `record_id`, `note_id`, `mode`,
 `phase`; no note state). A host should not offer a deposit while it is
 non-empty. The one exception is an escape on an older deployment that its
 operator announced as stuck because its destination rejects ETH
-([migration guide](../docs/migration-hardened-vault.md#phase-3-stop-deposits-to-the-legacy-vault-and-drain-it),
-Phase 3, step 2): when that deployment's entry has `runtime: false` and each
+([migration runbook](../docs/migration-concession-vault.md#phase-e-drain-and-retire-the-legacy-vault),
+Phase E, step 3): when that deployment's entry has `runtime: false` and each
 of its withdrawals is such an announced escape (`mode: "escape"`, matched by
 `noteId`), the host may configure the newer profile and offer deposits, and
 shows the owner that note ID and how to finalize it on chain. Never clear site
@@ -785,12 +785,17 @@ SDK. A host serves it beside this one on the same origin:
 
 Both share IndexedDB `zkapi-browser-wallet-v1` (version 3) and its lock.
 Neither rewrites the other deployment's records, and each runtime refuses a
-runtime slot that holds the other's note. The host lists two package entries
-(`zkapi-sdk-legacy` and `zkapi-sdk`), and each resolves its own WebAssembly,
-keys and worker. A small loader calls `readBrowserWalletHoldings()` and
-`import()`s the legacy entry while a legacy runtime holds an open note, and
-this one otherwise. [`examples/sample-host`](../examples/sample-host) builds
-both and holds that loader.
+runtime slot that holds the other's note. The host lists two package entries,
+`zkapi-sdk-legacy` (the config-only re-cut of `release/v2-note-bound`, tagged
+`legacy-recut-<n>`, whose profiles close deposits) and `zkapi-sdk` (tagged
+`v2c-<tag>`), and each resolves its own WebAssembly, keys and worker. A small
+loader calls `readBrowserWalletHoldings()` and `import()`s the legacy entry
+while a legacy runtime holds an open note, and this one otherwise; a legacy
+withdrawal still open while the slot is empty also needs the legacy build.
+One SDK runs per page, so switching builds reloads the page.
+[`examples/sample-host`](../examples/sample-host) builds both and holds that
+loader. The operator's side of the move is in the
+[migration runbook](../docs/migration-concession-vault.md#side-by-side-browser-builds).
 
 ## Native ETH deployments
 

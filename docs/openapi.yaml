@@ -1,15 +1,15 @@
 openapi: 3.1.0
 info:
   title: zkAPI v2
-  version: 2.1.0-testnet
+  version: 2.2.0-concession
   description: >-
-    Native ETH lease, settlement and withdrawal Groth16 protocol API.
-    Sepolia deployments may require a shared password, advertised by public
-    /health testnet_password_required. All service routes then require the
+    Native ETH lease, settlement and withdrawal Groth16 protocol API of
+    circuit zkapi-v2-concession-v1 (vault revision 3). Sepolia deployments may
+    require a shared password, advertised by public /health
+    testnet_password_required. All service routes then require the
     TestnetPassword header and return 401 testnet_password_required when absent
     or incorrect. Mainnet does not use this gate. Mutual-close clearance
-    requires an escape-form withdrawal proof of note ownership unless /health
-    reports clearance_ownership_proof_required false.
+    requires a kind-2 ownership proof of the note.
 security:
   - TestnetPassword: []
   - {}
@@ -22,13 +22,10 @@ paths:
         "200":
           description: >-
             Public health, including chain_id, current_root,
-            testnet_password_required, clearance_ownership_proof_required, and
-            the transitional proof-less clearance budget:
-            legacy_clearance_window_used and legacy_clearance_window_limit (new
-            proof-less reservations this minute, out of the per-minute budget;
-            the limit is 0 while legacy clearance is off) and
-            legacy_clearance_rejected_total (proof-less requests refused by the
-            budget since the process started)
+            testnet_password_required, clearance_ownership_proof_required
+            (always true), and the served statement: circuit_id, setup_id,
+            exit_concession (1) and settlement_window_seconds. The statement
+            fields are informational; clients use their build-pinned values.
   /v2/auth:
     get:
       summary: Validate the Sepolia service password without side effects
@@ -62,9 +59,9 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/OpenRouterLease"}
-        "400": {description: Invalid request, proof, or disabled lease mode}
+        "400": {description: "Invalid request, proof, or disabled lease mode, or request_limit_exceeded: the lease budget exceeds the server's per-request ceiling (nothing reserved)"}
         "404": {$ref: "#/components/responses/LeaseRecordUnreadable"}
-        "409": {description: Existing active or settling lease, or a used nullifier}
+        "409": {description: "Existing active or settling lease, a used nullifier, or stale_root: the request's root is not the exact current root"}
         "429":
           description: >-
             OA key capacity is temporarily limited, or the reference gateway
@@ -74,6 +71,13 @@ paths:
             Retry-After:
               description: Seconds until the server recommends retrying the same request
               schema: {type: integer, minimum: 0}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "503":
+          description: >-
+            root_unavailable (retriable): the indexer's root and the vault's
+            currentRoot() disagree, or have not agreed recently enough
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -201,7 +205,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: {$ref: "#/components/schemas/ClearanceRequestV2"}
+            schema: {$ref: "#/components/schemas/ClearanceRequestV2C"}
       responses:
         "200":
           description: >-
@@ -212,33 +216,32 @@ paths:
               schema: {$ref: "#/components/schemas/ClearanceResponseV2"}
         "400":
           description: >-
-            clearance_ownership_required (no ownership_proof; nothing reserved;
-            not retriable), invalid_proof, invalid_request (nullifier,
-            has_clearance or signing-key mismatch), or protocol_mismatch
+            clearance_ownership_required (no ownership_proof; nothing
+            reserved; not retriable), invalid_proof, invalid_request (a body
+            that does not parse, or a nullifier, kind, zero field, validity
+            window or signing-key mismatch), or protocol_mismatch
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "409":
           description: >-
-            stale_root (retriable; latest_root is the vault's currentRoot();
-            retry the same body, then prove again) or nullifier_used
+            stale_root (retriable; the root is not one the server saw within
+            its window, the vault's currentRoot(), or any root the vault ever
+            held; latest_root is the vault's currentRoot()) or nullifier_used
+            (the nullifier has a request row)
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "429": {$ref: "#/components/responses/GatewayRateLimited"}
+        "500":
+          description: internal_error (retriable), for example a failed vault root read
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
         "503":
           description: >-
             capacity_exhausted (ownership-proof verification is busy; retry the
-            same body after a backoff) or legacy_clearance_capacity (no
-            ownership_proof while --allow-legacy-clearance is set, and this
-            minute's proof-less budget, shared by every caller, is spent;
-            nothing was reserved; send the ownership proof, or retry after
-            Retry-After). Only a server that verifies ownership proofs returns
-            legacy_clearance_capacity.
-          headers:
-            Retry-After:
-              description: With legacy_clearance_capacity, seconds until the next budget minute
-              schema: {type: integer, minimum: 1, maximum: 60}
+            same body after a backoff)
           content:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
@@ -260,6 +263,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/RecoveryResponseV2"}
         "500": {$ref: "#/components/responses/DatabaseError"}
+        "503": {$ref: "#/components/responses/ChainReadUnavailable"}
   /v2/nullifiers/{nullifier}:
     get:
       summary: Recover a transcript or reservation state by nullifier
@@ -283,6 +287,48 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/ErrorResponse"}
         "500": {$ref: "#/components/responses/DatabaseError"}
+        "503": {$ref: "#/components/responses/ChainReadUnavailable"}
+  /v2/nullifiers/{nullifier}/evidence:
+    get:
+      summary: The request proof reserved at a nullifier, for a wallet's stale-device check
+      parameters:
+        - in: path
+          name: nullifier
+          required: true
+          schema: {$ref: "#/components/schemas/Felt"}
+      responses:
+        "200":
+          description: >-
+            The public inputs and proof of the earliest request the server
+            reserved at the nullifier. A wallet asks for its state's successor
+            nullifier before an escape; a proof that verifies there means
+            another device holds a newer state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RequestEvidence"}
+        "400":
+          description: invalid_request for a malformed nullifier
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "404":
+          description: The server holds no request at the nullifier
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {const: not_found}
+        "410":
+          description: >-
+            published (not retriable): the nullifier is public on chain, and
+            evidence of a public nullifier is never served
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorResponse"}
+        "500": {$ref: "#/components/responses/DatabaseError"}
+        "503": {$ref: "#/components/responses/ChainReadUnavailable"}
 components:
   securitySchemes:
     TestnetPassword:
@@ -291,6 +337,22 @@ components:
       name: X-ZKAPI-Testnet-Password
       description: Required only when Sepolia health reports testnet_password_required.
   responses:
+    ChainReadUnavailable:
+      description: >-
+        chain_read_unavailable (retriable): the server could not tell whether
+        the nullifier is published on chain (the vault's flags, its indexer's
+        published-nullifier table, or a scan of the vault's logs of at most
+        50,000 blocks), so it answers nothing. Clients treat it as an
+        unreachable server.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: "#/components/schemas/ErrorResponse"}
+              - type: object
+                properties:
+                  error_code: {const: chain_read_unavailable}
+                  retriable: {const: true}
     LeaseRecordUnreadable:
       description: >-
         lease_record_unreadable (not retriable): the server holds a lease row
@@ -385,9 +447,10 @@ components:
         payload_hash: {type: string, pattern: "^0x[0-9a-f]+$"}
         public_inputs: {type: object, additionalProperties: true}
         proof: {$ref: "#/components/schemas/Groth16Proof"}
-    WithdrawalPublicInputsV2:
+    WithdrawalPublicInputsV2C:
       type: object
-      description: The 14 withdrawal public inputs, in circuit order.
+      description: The 16 withdrawal public inputs, in circuit order. Unknown fields are refused.
+      additionalProperties: false
       required:
         - protocol_version
         - chain_id
@@ -401,8 +464,10 @@ components:
         - final_balance
         - destination
         - withdrawal_nullifier
-        - has_clearance
-        - withdrawal_tag
+        - kind
+        - next_nullifier
+        - conceded
+        - valid_until
       properties:
         protocol_version: {const: 2}
         chain_id: {type: integer, minimum: 1}
@@ -413,43 +478,50 @@ components:
         clearance_signing_key_x: {$ref: "#/components/schemas/Felt"}
         clearance_signing_key_y: {$ref: "#/components/schemas/Felt"}
         note_id: {type: integer, minimum: 0, maximum: 4294967295}
-        final_balance: {type: integer, minimum: 0, description: Final balance in gwei}
+        final_balance: {type: integer, minimum: 0, description: "Payout in gwei: the state balance minus conceded"}
         destination:
           type: array
-          description: Payout address as 20 byte values
+          description: Payout address as 20 byte values; all zero for kind 2
           minItems: 20
           maxItems: 20
           items: {type: integer, minimum: 0, maximum: 255}
         withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
-        has_clearance: {type: boolean}
-        withdrawal_tag: {$ref: "#/components/schemas/Felt"}
-    ClearanceOwnershipProof:
+        kind: {type: integer, enum: [0, 1, 2], description: "0 escape, 1 mutual close, 2 ownership proof"}
+        next_nullifier: {$ref: "#/components/schemas/Felt", description: "The successor's nullifier for kind 0; zero otherwise"}
+        conceded: {type: integer, minimum: 0, description: "Amount an escape gives up, in gwei; zero unless kind 0"}
+        valid_until: {type: integer, minimum: 0, description: "Last UNIX second at which the vault (kinds 0 and 1) or the server (kind 2) accepts the proof"}
+    ClearanceOwnershipProofV2C:
       type: object
       description: >-
-        Escape-form withdrawal proof for the same nullifier, built for the real
-        destination and current balance. It is also a valid escape input. On a
-        vault other than vault_revision 2, a challenge with a request proof for
-        the same state consumes the nullifier, so never send it from a state
-        whose request proof may have left the device, and never send a request
-        proof from a state after sending its ownership proof.
+        A kind-2 ownership proof for the same nullifier: zero destination,
+        conceded amount and next nullifier, and a valid_until no earlier than
+        now and at most 3600 seconds ahead. The vault refuses kind 2, so it
+        cannot start an escape. A client never sends a request proof from a
+        state after sending its ownership proof.
       additionalProperties: false
       required: [public_inputs, proof]
       properties:
         public_inputs:
           allOf:
-            - {$ref: "#/components/schemas/WithdrawalPublicInputsV2"}
+            - {$ref: "#/components/schemas/WithdrawalPublicInputsV2C"}
             - type: object
               properties:
-                has_clearance: {const: false}
+                kind: {const: 2}
+                conceded: {const: 0}
         proof: {$ref: "#/components/schemas/Groth16Proof"}
-    ClearanceRequestV2:
+    ClearanceRequestV2C:
       type: object
+      additionalProperties: false
       required: [withdrawal_nullifier, ownership_proof]
       properties:
         withdrawal_nullifier: {$ref: "#/components/schemas/Felt"}
-        ownership_proof:
-          $ref: "#/components/schemas/ClearanceOwnershipProof"
-          description: Optional only while the server runs with --allow-legacy-clearance.
+        ownership_proof: {$ref: "#/components/schemas/ClearanceOwnershipProofV2C"}
+    RequestEvidence:
+      type: object
+      required: [public_inputs, proof]
+      properties:
+        public_inputs: {type: object, additionalProperties: true, description: RequestPublicInputsV2}
+        proof: {$ref: "#/components/schemas/Groth16Proof"}
     ClearanceResponseV2:
       type: object
       required: [status, withdrawal_nullifier, signature]
@@ -491,7 +563,9 @@ components:
           properties:
             x: {$ref: "#/components/schemas/Felt"}
             y: {$ref: "#/components/schemas/Felt"}
-        next_anchor: {$ref: "#/components/schemas/Felt"}
+        next_anchor:
+          $ref: "#/components/schemas/Felt"
+          description: Always Poseidon(zkapi.v2c.anchor, request_nullifier); clients refuse any other
         blind_delta_srv: {$ref: "#/components/schemas/Felt"}
         next_state_signature: {$ref: "#/components/schemas/SchnorrSignature"}
         policy_reason_code: {type: integer}
@@ -501,26 +575,33 @@ components:
       required: [status, nullifier_status]
       properties:
         status: {type: string, enum: [ok, not_found]}
-        nullifier_status: {type: string, enum: [reserved, finalized, clearance_reserved, unknown]}
+        nullifier_status: {type: string, enum: [reserved, exit_deferred, exited_unsigned, finalized, clearance_reserved, unknown]}
         request_response:
           $ref: "#/components/schemas/RequestResponseV2"
-          description: Present only once the request is finalized
+          description: >-
+            Present only once the successor is signed (finalized), and omitted
+            once the nullifier is published on chain
         settlement_deadline:
           type: integer
           description: >-
-            For a reserved lease request, the UNIX time by which the server
-            finalizes it; omitted if the lease row cannot be read
+            For a reserved lease request whose charge is not settled yet, the
+            UNIX time by which the server settles it; omitted if the lease row
+            cannot be read, and once the nullifier is published on chain
     OpenRouterLeaseStatus:
       type: object
       required: [status, client_request_id, issued_at, expires_at, settle_after, spending_limit_usd]
       properties:
         status:
           type: string
-          enum: [provisioning, active, retiring, disabled, revoking, finalized, cancelled]
+          enum: [provisioning, active, retiring, disabled, revoking, finalized, exit_deferred, exited_unsigned, cancelled]
           description: >-
-            cancelled marks a corrupt server record that is never signed
-            unless the operator repairs it and reopens the lease, which returns
-            it to a pending status
+            finalized means the charge is settled; the successor may still be
+            unsigned, so read the nullifier's recovery status. exit_deferred:
+            an exit consumed the nullifier before the successor was signed,
+            which is signed only if that exit is defeated; exited_unsigned: it
+            never will be. cancelled marks a corrupt server record that is
+            never signed unless the operator repairs it and reopens the lease,
+            which returns it to a pending status
         client_request_id: {type: string}
         issued_at: {type: integer}
         expires_at: {type: integer}
@@ -551,11 +632,13 @@ components:
           type: string
           description: >-
             Stable machine code. OA limits use oa_minute_request_limit,
-            oa_hourly_issuance_budget, or oa_rate_limited. Clearance adds
-            clearance_ownership_required, nullifier_used, capacity_exhausted
-            and legacy_clearance_capacity. Lease routes add
-            lease_record_unreadable (HTTP 404, not retriable). The reference
-            gateway uses gateway_rate_limited.
+            oa_hourly_issuance_budget, or oa_rate_limited. Admission adds
+            root_unavailable (503) and request_limit_exceeded (400). Clearance
+            adds clearance_ownership_required, nullifier_used and
+            capacity_exhausted. Recovery and evidence
+            add chain_read_unavailable (503) and published (410). Lease routes
+            add lease_record_unreadable (HTTP 404, not retriable). The
+            reference gateway uses gateway_rate_limited.
         error_message: {type: string}
         retriable: {type: boolean}
         latest_root: {type: string, pattern: "^0x[0-9a-f]+$"}
@@ -564,8 +647,7 @@ components:
           type: integer
           minimum: 0
           description: >-
-            Present with OA rate limits and legacy_clearance_capacity, and
-            matches the Retry-After header.
+            Present with OA rate limits, and matches the Retry-After header.
     OpenRouterLease:
       type: object
       required: [status, client_request_id, api_key, openrouter_api_base, issued_at, expires_at, valid_for_seconds, settle_after, spending_limit_usd, key_source]

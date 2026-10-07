@@ -1,15 +1,19 @@
 # Native ETH deployment
 
-The source supports native ETH vaults and the note-bound Groth16 circuit
-`zkapi-v2-note-bound-v1`. The current selected setup remains a single-party
-experimental setup; publishing code does not establish an independent audit or
-setup ceremony. See [setup provenance](../protocol/setup/v2/README.md).
+The source supports native ETH vaults of circuit `zkapi-v2-concession-v1`
+(vault revision 3). The committed keys are the single-party development setup
+`dev`, which release builds refuse; production keys come from the multi-party
+ceremony in [the ceremony setup](../protocol/setup/v2-concession/README.md),
+which has not run yet. Publishing code does not establish an independent
+audit or setup ceremony.
 
-Configure the exact circuit artifacts, contract and signing-key pins, oracle
-feed, and denomination for the vault. Preserve persistent operator state and
-keep wallet journals bound to their configuration. An existing deployment
-upgrades to this release, and moves to a newly deployed vault, as described in
-[the hardened-vault migration guide](migration-hardened-vault.md).
+Configure the exact circuit artifacts, contract, code-hash and signing-key
+pins, oracle feed, and denomination for the vault. Preserve persistent
+operator state and keep wallet journals bound to their configuration. A
+deployment of the legacy circuit `zkapi-v2-note-bound-v1` keeps running from
+the release line `release/v2-note-bound`; moving its users to a revision-3
+vault is described in
+[the concession-vault migration runbook](migration-concession-vault.md).
 
 ## Build services
 
@@ -21,7 +25,8 @@ cargo build --release --workspace
 `--native-price-feed-address` (or corresponding `ZKAPI_NATIVE_*` variables), plus
 an OA org/service credential or direct OpenRouter management credential.
 Supply chain ID, vault, gwei request cap, both signing seeds (required; see
-below), database path, indexer URL and the exact proof directory. Run
+below), the deployment manifest (`--deployment`), database path, indexer URL
+and the exact proof directory. Run
 `zkapi serverd --help` for flags. `--native-price-feed-decimals` (default 8) and
 `--native-price-max-age-seconds` (default 4500) must equal the published
 manifest. Native prices come from the pinned finalized oracle round; a generic
@@ -92,52 +97,93 @@ requires the row and refuses a database bound elsewhere. The RPC must allow
 
 If a deployment ever ran with the development keys, or with keys different from
 its vault's, treat it as compromised and follow
-[the compromise procedure](migration-hardened-vault.md#if-development-or-mismatched-keys-were-ever-served).
+[the compromise procedure](migration-concession-vault.md#if-development-or-mismatched-keys-were-ever-served).
 
 ## Contracts
 
-`demo/contracts/script/Deploy.s.sol` deploys the real Groth16 adapter and a
-native-only vault; its header lists the environment it reads, and
-`demo/contracts/foundry.toml` notes how to run it with `forge script`. `PRIVATE_KEY`
-pays for the deployment. `OWNER` is required except on local chains (31337 and
-1337, where it defaults to the deployer), and the script prints a warning on
-Mainnet when `OWNER` has no code. `TREASURY` is required off local chains. It
-also reads `OUTPUT_PATH`, the state and clearance public-key coordinates
-(`STATE_SIGNING_KEY_X/Y`, `CLEARANCE_SIGNING_KEY_X/Y`), optional `CHAIN_ID`
-(checked against the connected chain), `REQUEST_CHARGE_CAP` and
-`CHALLENGE_PERIOD_SECONDS`. Pass `REQUEST_CHARGE_CAP` explicitly: the script
-default is 1,000,000 gwei, while the published deployments use 50,000.
-`CHALLENGE_PERIOD_SECONDS` defaults to 24 hours and is immutable; it bounds the
-challenger's whole response time, so consider a longer window. The deployment
-output is constructor metadata, including `owner`, `treasuryChangeDelay` and
-`rootHistoryWindow`; prepare the public SDK manifest with circuit/key hashes and
-oracle/deployment pins separately. The vault accepts native ETH.
+`demo/contracts/script/Deploy.s.sol` links (or deploys) the `Bn254Poseidon`
+library, deploys the circuit's Groth16 adapter and the native-only vault with
+its 11 constructor arguments, and checks the adapter's circuit and
+verifying-key hashes against the setup manifest and the vault's getters
+against the inputs. Its header lists the environment it reads, and
+`demo/contracts/foundry.toml` notes how to run it with `forge script`. The
+script links the library itself; no `FOUNDRY_REMAPPINGS` override is needed.
 
-forge cannot link `Bn254Poseidon` through the relative remappings in the
-committed `foundry.toml`, so pass a canonical absolute remapping when running
-the script (CI simulates exactly this):
+| Variable | Meaning |
+| --- | --- |
+| `PRIVATE_KEY` | Pays for the deployment |
+| `OWNER` | Vault owner; required except on local chains (31337, 1337), where it defaults to the deployer. Use a multisig or timelock; the script warns on Mainnet when it has no code |
+| `TREASURY` | Payout address of spent balances and expired deposits; required off local chains |
+| `OUTPUT_PATH` | Absolute path of the final deployment manifest; the script writes `$OUTPUT_PATH.pending` |
+| `STATE_SIGNING_KEY_X/Y`, `CLEARANCE_SIGNING_KEY_X/Y` | The public keys `zkapi signing-keys` prints; points of Baby-JubJub's prime-order subgroup, distinct, and off local chains not the published development keys |
+| `CHALLENGE_PERIOD_SECONDS` | Escape window; default 24 hours. Immutable; it bounds the challenger's whole response time. Plan 172,800 on Mainnet and 43,200 on Sepolia |
+| `NOTE_TTL_SECONDS` | Note lifetime; default 30 days |
+| `MAX_PAUSE_DURATION_SECONDS` | Longest a pause blocks escapes and closes; at least twice the challenge period. Required except on local chains (default 7 days). Plan 3,888,000 (45 days) on Mainnet |
+| `REQUEST_CHARGE_CAP` | Per-request gwei limit; the script default is 1,000,000, the published deployments use 50,000, so pass it explicitly |
+| `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
+| `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains: the Sepolia drill vault only, never Mainnet, which refuses it. Recorded as `allowDevSetup`; default 0 |
+| `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
+| `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
+
+The setup policy is enforced by the script: off local chains a single-party
+setup needs `ALLOW_DEV_SETUP=1` and Mainnet refuses it, and an `mpc-1` setup
+must have the verifying keys of the committed
+`protocol/setup/v2-concession/manifest.json`, which the ceremony commits with
+its keys. Local chains accept any setup id.
 
 ```sh
 cd demo/contracts
 mkdir -p ../../.demo
-FOUNDRY_REMAPPINGS="zkapi-contracts/=$(cd ../../protocol/contracts/src && pwd -P)/" \
-  OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
+OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
   forge script script/Deploy.s.sol --rpc-url "$RPC_URL" --broadcast   # plus the variables above
+cd ../..
+node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending \
+  --rpc "$RPC_URL" --finalize .demo/deployment.json --confirmations 64
 ```
+
+The script runs locally before it sends anything, so `$OUTPUT_PATH.pending`
+describes the simulated deployment: `deploymentStatus` `"pending"` (or
+`"simulated"` without `--broadcast`), the linked addresses, the three runtime
+code hashes and `deployBlockLowerBound`, the chain head the simulation ran on,
+which is not the vault's creation block. The deployment is final only after
+`expected-codehashes.mjs --finalize`, run from the repository root after
+`--broadcast`: it reads the creation receipts from forge's broadcast log
+(`demo/contracts/broadcast/Deploy.s.sol/<chain>/run-latest.json`, or
+`--broadcast-log FILE`), requires each creation to have succeeded at the
+manifest's address, the runtime code hashes on chain to be the expected ones,
+and the vault's owner and treasury to be the manifest's, and only then writes
+`$OUTPUT_PATH` with `deploymentStatus: "deployed"`, `deployBlock` (the block
+that created the vault) and `deployTransactions`. A mismatch exits 1 and any
+other failure 2, and neither writes the output. Finalize after finality, for
+example `--confirmations 64` on Sepolia and Mainnet (the default is 1), and
+keep the broadcast log until then. Re-audit a deployment later with
+`node scripts/expected-codehashes.mjs --deployment .demo/deployment.json --check --rpc "$RPC_URL"`,
+which compares the code hashes only.
+
+Every profile, the server stack's `deployment.json`, the SDK and clientd
+profiles, takes its pins and `deploy_block` from the finalized manifest only,
+never from `.pending` or `deployBlockLowerBound`; serverd, `zkapi db init`, the
+companion, the SDK build and clientd refuse a `pending` or `simulated` status.
+The profile is the snake_case `trusted_deployment` form of those fields; the
+[migration runbook](migration-concession-vault.md#b2-production-sepolia), step
+5, maps them.
 
 The owner controls an emergency pause and the treasury address. Use a multisig,
 ideally behind a timelock, never a single deployer key:
 
-- `pause()` stops `deposit`, `mutualClose`, `initiateEscapeWithdrawal`,
-  `claimExpired`, `setTreasury`, `acceptTreasury`, `withdrawTreasuryArrears`
-  and `renounceOwnership`. `challengeEscapeWithdrawal`,
-  `finalizeEscapeWithdrawal` and `claimEscapePayout` stay open, so disputes in
-  flight still resolve and credited escape payouts can be delivered, and
-  `cancelTreasuryChange`, `transferOwnership` and `acceptOwnership` stay open.
-  The NatSpec of `pause()` in `ZkApiVault.sol` lists both sets, and
-  `test_pauseGuardCoverage` checks that list against the vault's pause guards.
-  `pause()` and `unpause()` emit `Paused(address)` and `Unpaused(address)` and
-  revert when redundant.
+- `pause()` stops `deposit`, `claimExpired`, `setTreasury`, `acceptTreasury`,
+  `withdrawTreasuryArrears` and `renounceOwnership` until `unpause()`, and
+  `mutualClose` and `initiateEscapeWithdrawal` for at most
+  `maxPauseDuration()`: from `pausedAt() + maxPauseDuration()` they reopen
+  while the vault is still paused. `challengeEscapeWithdrawal`,
+  `raiseEscapeConcession`, `finalizeEscapeWithdrawal`, `claimEscapePayout`
+  and `retireClosedLeaf` stay open, so escapes in flight still resolve and
+  credited escape payouts can be delivered, and `cancelTreasuryChange`,
+  `transferOwnership` and `acceptOwnership` stay open. A new pause needs
+  `PAUSE_COOLDOWN()` (one day) since the latest unpause (`PauseCooldown()`).
+  The NatSpec of `pause()` in `ZkApiVault.sol` lists these sets. `pause()` and
+  `unpause()` emit `Paused(address)` and `Unpaused(address)` and revert when
+  redundant.
 - Ownership transfers are two-step. `transferOwnership(address)` only sets
   `pendingOwner()` (event `OwnershipTransferStarted(previousOwner, newOwner)`).
   The new owner, for example the multisig, must then call `acceptOwnership()`
@@ -154,14 +200,12 @@ ideally behind a timelock, never a single deployer key:
   and alert on any `OwnershipTransferStarted` you did not send. The `OWNER`
   passed to `Deploy.s.sol` takes effect at deployment without an acceptance
   step, so verify it before deploying. See
-  [the owner key rotation runbook](migration-hardened-vault.md#operations-runbooks).
-- A pause has no time limit: the owner, or whoever controls its key, can stop
-  every new exit indefinitely. It cannot move deposits. Paused time extends
-  every note's claim time, and after any unpause `claimExpired` waits at least
-  `unpauseClaimGrace()`, the larger of `challengePeriod()` and one day.
-  `effectiveExpiry(noteId)` returns the earliest claim time assuming no further
-  pause; `notes(noteId)` keeps the nominal expiry. Inference ends at the nominal
-  expiry regardless.
+  [the owner key rotation runbook](migration-concession-vault.md#owner-key-rotation).
+- Paused time extends every note's claim time, and after any unpause
+  `claimExpired` waits at least `unpauseClaimGrace()`, the larger of
+  `challengePeriod()` and one day. `effectiveExpiry(noteId)` returns the
+  earliest claim time assuming no further pause; `notes(noteId)` keeps the
+  nominal expiry. Inference ends at the nominal expiry regardless.
 - `setTreasury(address)` only schedules a change (`TreasuryChangeScheduled`).
   `acceptTreasury()` applies it (`TreasurySet`) after `treasuryChangeDelay()`,
   the larger of `challengePeriod()` and two days, counted in unpaused time;
@@ -173,18 +217,18 @@ ideally behind a timelock, never a single deployer key:
   with an `EscapePayoutDeferred` event, and anyone can deliver it with
   `claimEscapePayout(destination)`, also while paused. Alert on
   `EscapePayoutDeferred` and follow the
-  [escape payout credit runbook](migration-hardened-vault.md#operations-runbooks).
+  [escape payout credit runbook](migration-concession-vault.md#escape-payout-credits).
   A mutual close to a destination that rejects ETH reverts, and withdrawals to
   the zero address or the vault itself revert `InvalidDestination()`.
 
-Withdrawal proofs may use the current root or one replaced within
-`ROOT_HISTORY_WINDOW()` (one day), while their Merkle siblings must match the
-current root; an older root reverts `UnknownRoot()`. A successful challenge
-releases the escape's nullifier but marks it in `challengedNullifiers`, so no
-escape can use it again. Vaults deployed before this release have none of these
-protections; see
+Withdrawal proofs may use any root the vault ever held (`knownRoots`); no
+withdrawal needs Merkle siblings, and an unknown root reverts `UnknownRoot()`.
+An escape consumes its nullifier and its successor's; a request proof at the
+successor defeats it and marks the escaped nullifier in
+`challengedNullifiers`, and a request proof at the escaped nullifier raises
+its concession. The legacy vaults have none of these rules; see
 [owner and operator powers](../docs-site/content/docs/protocol.mdx#owner-and-operator-powers)
-and the migration guide.
+and the migration runbook.
 
 Use a fresh directory when intentionally generating a new Groth16 setup.
 Keep challenger coverage and persistent server/indexer state available whenever
@@ -193,19 +237,25 @@ the vault holds funds.
 ## Runtime
 
 The [Docker guide](../docker/aws/README.md) configures API, indexer, gateway,
-challenger and a restricted private signer. The challenger needs a funded
-exclusive account, EIP-1559 fee caps whose bids fit the transaction fee cap of
-the node behind its signer (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH,
-which allows about 132 gwei for a challenge), and the API server: it challenges
-only with finalized settlements, and owners recover their signed state from the
-API after a challenge. Keep the API running for every challenge window; see
+challenger and a restricted private signer. Start them in this order: the
+indexer, `zkapi db init` (which creates the database with its append-only
+request evidence and binds it to the deployment manifest), the challenger,
+then the API server; the challenger must be healthy before the first deposit.
+The challenger needs a funded exclusive account, EIP-1559 fee caps whose bids
+fit the transaction fee cap of the node behind its signer
+(`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, default 1 ETH, which allows about 1,666 gwei
+for a 600,000-gas defeat and about 138.9 gwei for a leaf retirement), and the
+API server's database: it defeats and raises with the request evidence the
+server records. Keep the API running for every challenge window; see
 [challenge operation](challenge-service.md).
 
 Every lease settles by a write-once deadline: issuance + TTL + grace +
 `--openrouter-settlement-deadline-seconds` (default 21600), at worst at the
 proof's solvency bound. The server refuses to start unless TTL + grace +
 deadline + twice the settlement poll + 600 seconds is at most half the vault's
-`challengePeriod()`. See
+`challengePeriod()`, and unless TTL + grace + deadline is at most the
+manifest's `settlement_window_seconds`; the challenger also checks that its
+raise lead fits the challenge period. See
 [settlement terminality](native-eth-billing.md#settlement-terminality).
 
 The indexer (`zkapi-indexerd` or `zkapi indexer`) needs an RPC with EIP-1898
@@ -240,8 +290,11 @@ for. It then:
 
 Its native billing RPC is a loopback mock price feed that forwards every other
 read to Anvil. Use [`scripts/v2-acceptance.mjs`](../scripts/v2-acceptance.mjs)
-as the reference for a local deployment.
+as the reference for a local deployment. CI's contracts job also broadcasts the
+demo deployment to Anvil and finalizes its manifest.
 
 The host application packages the SDK assets for the selected network. Review
-its trusted config against finalized on-chain deployment state, the public
-manifest and the selected proof hashes before enabling funding.
+its trusted config against the finalized deployment manifest, on-chain state,
+the published expected code hashes and the selected proof hashes before
+enabling funding. Until a revision-3 vault exists on a network, its packaged
+profile is a `not_deployed` placeholder that the SDK build refuses.

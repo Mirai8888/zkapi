@@ -384,8 +384,10 @@ replacement behaviour on Sepolia before Mainnet.
 
 Each vault runs as its own stack: serverd, challenger, indexer, data directory,
 signer and a fresh sender key. Never repoint a signer or challenger away from a
-vault that still has active notes or pending escapes; a revision-2 vault's
-stack keeps its earlier signer image, whose challenge calls this signer refuses.
+vault that still has active notes or pending escapes. A legacy vault (circuit
+`zkapi-v2-note-bound-v1`) keeps the signer image of its own release line,
+`release/v2-note-bound`: this signer refuses its challenge calls
+(`0x8a43467c`).
 
 1. Copy [`../signer.env.example`](../signer.env.example), set the new vault,
    chain, upstream RPC and fresh key, the fee cap (required on Mainnet), and

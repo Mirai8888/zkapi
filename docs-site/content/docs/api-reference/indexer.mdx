@@ -4,8 +4,10 @@ description: Contract-event mirror and depth-32 Merkle paths
 ---
 
 The indexer applies native vault events to a local Merkle tree. The browser
-uses it for proving and deposits; the server uses it to track the active root;
-the challenge service uses it for restoration paths.
+uses it for deposits and, when it has no deposit-time path, for proving; the
+server uses it to confirm the current root and to learn which nullifiers are
+public; the challenge service uses it for a leaf retirement's path and as a
+hint of pending escapes. Defeats and raises need no indexer.
 
 | Method and path | Result |
 | --- | --- |
@@ -15,14 +17,23 @@ the challenge service uses it for restoration paths.
 | `GET /v1/tree/next-note-id` | `{ next_note_id, root, block_number, block_hash }` |
 | `GET /v1/tree/snapshot` | `{ root, next_note_id, leaves, block_number, block_hash }` |
 | `GET /v1/tree/notes/{note_id}/path` | Occupied leaf, 32 siblings, `root`, `block_number`, `block_hash` |
-| `GET /v1/tree/notes/{note_id}/zero-path` | Empty-leaf path for insertion or restoration, with the same fields |
-| `GET /v1/escapes/pending` | Pending escape withdrawals in the served view (internal) |
+| `GET /v1/tree/notes/{note_id}/zero-path` | Empty-slot path for a deposit, with the same fields; deprecated (`Deprecation: true`) |
+| `GET /v1/tree/roots/{root}` | `{ root, known, current_root, block_number, block_hash }`: whether the vault ever set `root` |
+| `GET /v1/nullifiers/{nullifier}/published` | `{ nullifier, published, block_number, block_hash }`: whether a vault event named it as an exit's nullifier or successor nullifier |
+| `GET /v1/escapes/pending` | Pending escape withdrawals in the served view, with their concessions (internal) |
 
-The root, leaf, and siblings use canonical BN254 field encodings. The indexer
-consumes deposit, close, escape, challenge, finalization, and expiry events
-from Ethereum JSON-RPC and ignores other vault events. The block fields name
-the block whose vault state the response describes; a path's siblings hash to
-its `root`.
+The root, leaf, and siblings use canonical BN254 field encodings; a path
+parameter that is not one answers `400 invalid_request`. The indexer decodes
+`NoteDeposited`, `MutualClose`, `EscapeWithdrawalInitiated`,
+`EscapeConcessionRecorded`, `EscapeConcessionRaised`,
+`EscapeWithdrawalChallenged`, `EscapeWithdrawalFinalized`, `ExpiredClaimed`
+and `ClosedLeafRetired` strictly from Ethereum JSON-RPC and ignores other
+vault events. The tree is append-only: only `NoteDeposited` sets a leaf and
+only `ClosedLeafRetired` zeroes one, and every other event's root must equal
+the computed root. The indexer also keeps every root the vault ever set (the
+vault accepts withdrawal proofs at any of them) and every nullifier a vault
+event published. The block fields name the block whose vault state the
+response describes; a path's siblings hash to its `root`.
 
 An indexer cannot forge membership: clients and contracts recompute roots from
 the supplied paths. Incorrect or stale paths can cause proving or transaction
@@ -49,14 +60,14 @@ The indexer keeps serving that view, with `/health` `ok`, until it publishes a
 new one: while its RPC cannot verify the new head, for up to
 `--stale-after-secs` (120 s) before it reports `stale`; while the re-derived
 view disagrees with the vault, until it declares the mirror diverged, after
-three polls and at least 30 seconds. Deposits and withdrawals built from such a
-view revert `StaleRoot()` or `UnknownRoot()`; build them again from a fresh
-path. The challenger compares paths with the vault's live root and is not
-misled.
+three polls and at least 30 seconds. A deposit built from such a view reverts
+`StaleRoot()`, and a withdrawal at a root the vault never held
+`UnknownRoot()`; build them again from a fresh path. The challenger checks a
+retirement's path against the vault's live root and is not misled.
 
-While no verified view is available, every tree route and
-`/v1/escapes/pending` return `503` with `Retry-After: 5` and the same public
-body:
+While no verified view is available, every tree route,
+`/v1/nullifiers/{nullifier}/published` and `/v1/escapes/pending` return `503`
+with `Retry-After: 5` and the same public body:
 
 ```json
 {"status":"unavailable","error_code":"indexer_unavailable","error_message":"the indexer has no verified view of the vault state; retry later","retriable":true,"retry_after_seconds":5}
@@ -67,41 +78,42 @@ tree. The public body never reveals the indexer's internal state.
 `GET /health` returns `200` only with status `ok`; otherwise it returns `503`
 with status `syncing`, `stale`, `diverged`, or `rebuilding`. Its body reports
 the head, served and confirmed blocks, roots, lag, failures, divergence and
-rebuild counts, and `missed_re_escape_count` with its subset
-`missed_re_escape_finalized_count`, exported as
-`zkapi_indexer_missed_re_escapes_total{event="challenged"}` and
-`{event="finalized"}` on `/metrics`. These count committed challenges and
-finalizations of an escape the indexer never saw initiated, once per escape:
-its RPC's logs missed a challenge and re-escape of the note, or a
-reorganization below the checkpoint replaced the escape. The indexer applies
-such an event and keeps serving. Each is logged once, a challenge at WARN and
+rebuild counts, `known_root_count`, `published_nullifier_count`, and
+`missed_re_escape_count` with its subsets `missed_re_escape_finalized_count`
+and `missed_re_escape_raised_count`, exported as
+`zkapi_indexer_missed_re_escapes_total{event="challenged"}`,
+`{event="finalized"}` and `{event="raised"}` on `/metrics`. These count
+committed defeats, raises and finalizations of an escape the indexer never saw
+initiated, once per escape: its RPC's logs missed an escape of the note, or a
+reorganization below the checkpoint replaced it. The indexer applies such an
+event and keeps serving. Each is logged once, a defeat or a raise at WARN and
 a finalization at ERROR. The counts restart with the process. The view becomes
 `stale` after `--stale-after-secs` (default 120) without a verified poll, or
 when the RPC's head block is older than `--max-head-age-secs` (default 180;
 `0` disables the check for chains that mine on demand). Keep `/health`,
-`/metrics` and `/v1/escapes/pending` internal; the reference gateway proxies
-only `/v1/tree/` to the indexer.
+`/metrics`, `/v1/nullifiers/` and `/v1/escapes/pending` internal; the
+reference gateway proxies only `/v1/tree/` to the indexer.
 
 `GET /v1/escapes/pending` returns
-`{ block_number, block_hash, root, escapes: [{ note_id, withdrawal_nullifier, challenge_deadline }] }`
-from the same verified view. The root check covers the list only through the
-notes' leaves: an open escape zeroes its note's leaf, so the list leaves no open
-escape out, short of a reorganization below the checkpoint or a stale log
-backend. Each entry is the last one the indexer applied from the vault's logs,
-and is a hint. A challenge restores the leaf, so if the RPC's logs miss both a
-challenge and a later re-escape of the same note, the entry keeps the
-challenged escape's nullifier and deadline until the note's next challenge or
-finalization. If they miss a finalization, or both a challenge and a later
-mutual close or expiry claim, the note stays listed with no open escape until a
-resync. Read `pendingWithdrawals(noteId)` from the vault before acting on an
-entry. The challenge service uses the list to find escapes its own log scan
-missed, and tracks the escape the vault holds.
+`{ block_number, block_hash, root, escapes: [{ note_id, withdrawal_nullifier, challenge_deadline, final_balance, next_nullifier, state_balance, conceded }] }`
+from the same verified view. Escapes change no leaf, so the root check does
+not cover the list at all: each entry is the last one the indexer applied from
+the vault's logs, and is a hint. Logs that miss an escape, its defeat or its
+finalization leave the list wrong until a later event of the note or a resync.
+Read `pendingWithdrawals(noteId)` and `pendingConcessions(noteId)` from the
+vault before acting on an entry. The challenge service tracks escapes from its
+own event scan and the vault, and uses the list only to find escapes its scan
+missed.
 
 Both `zkapi-indexerd` and `zkapi indexer` accept `--confirmations`,
 `--chain-id`, `--resync`, `--stale-after-secs`, `--max-block-range` (default
 1000, above `--confirmations`) and `--max-head-age-secs`. `--resync`, or a
 `<cursor>.resync` file, archives the checkpoint and replays from
-`--from-block`. A checkpoint is bound to one chain and vault. The RPC must
+`--from-block`. A checkpoint (version 3) is bound to one chain, vault and
+circuit, and records the last block with a lifecycle event, so a deep
+reorganization near one rebuilds the mirror. A version-2 checkpoint, whose
+tree removed leaves on exits, is archived and replayed. At startup the
+indexer requires the vault's `CONCESSION_ESCAPE_VERSION()` to be 1. The RPC must
 support `eth_getBlockByHash`, `eth_getLogs` results with block hashes and log
 indexes, and EIP-1898 `eth_call` by `{ blockHash, requireCanonical: true }`
 with state for at least the confirmation depth; archive state is not required.
@@ -119,8 +131,9 @@ Clients can rebuild the tree and derive paths locally without revealing a
 particular note ID in a request URL. Every client receives the same snapshot
 for the same view.
 
-Use current-root sibling paths when submitting a deposit, withdrawal, or
-challenge restoration. A withdrawal proof may use a root the vault replaced
-within the last day, but its siblings must still match the current root. A
-challenge separately supplies the original archived request proof with its
-historical root; do not rewrite its public inputs to the indexer's latest root.
+Use current-root sibling paths when submitting a deposit or a leaf
+retirement. A withdrawal proof may use any root the vault ever held, including
+the one of the wallet's deposit-time path, and needs no siblings at
+submission. A defeat or raise supplies the original request proof with its
+historical root; do not rewrite its public inputs to the indexer's latest
+root.

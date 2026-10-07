@@ -128,8 +128,12 @@ A local Ethereum signing key and private recovery journals are stored in
 owner-only files. Public funding addresses, amounts, withdrawal destinations
 and chain transactions are visible to RPC providers and chain observers. The
 client sends chain reads and transactions only to the RPC packaged with the
-release, and refuses a wallet companion that reports another RPC, indexer or
-protocol server.
+release, and to your own exit RPC when you configure one
+(`config --exit-rpc-url`), and refuses a wallet companion that reports another
+RPC, indexer or protocol server. Deployment checks then also run through the
+exit RPC, and an escape reads and sends only through it, so that RPC's
+provider sees the note's exit and your interest in the vault, as any wallet's
+RPC would. An exit RPC on another chain is never trusted.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
@@ -231,6 +235,8 @@ endpoint, which is also used by the web client; that does not add ticket
 wallet, issuance or redemption support. Exact balances and prompt sizes do
 not choose the bucket.
 
-The protocol is experimental and uses a single-party Groth16 setup. See the
+The protocol is experimental. Release builds load only the keys of the
+multi-party setup, which has not run yet; until then the packaged profiles
+are placeholders and no note can be funded. See the
 repository's [concession exit design](../../docs/design/concession-exit.md)
 and [native ETH architecture](../../docs/architecture.md).

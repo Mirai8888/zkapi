@@ -220,39 +220,6 @@ export function exitRpcUrl(value) {
     return url.href;
 }
 
-/** Whether a failed vault read says the vault lacks that view (a revert or no word), not that the RPC failed. */
-export function vaultViewMissing(error) {
-    return error?.code === 'rpc_call_reverted' || error?.code === 'vault_value_invalid';
-}
-
-/** The configuration error of a vault_revision 2 profile whose vault lacks the hardened interface. */
-export function vaultRevisionMismatch() {
-    return Object.assign(new Error('browser-config.json declares trusted_deployment.vault_revision 2, but the pinned vault does not implement the hardened vault interface. The host must correct its trusted deployment profile before this wallet can be used.'), {
-        code: 'vault_revision_mismatch'
-    });
-}
-
-// ROOT_HISTORY_WINDOW(), a constant only the hardened (vault_revision 2) vault has.
-const ROOT_HISTORY_WINDOW_SELECTOR = '0x1fe72de0';
-const HARDENED_ROOT_HISTORY_WINDOW_SECONDS = 86_400n;
-
-/**
- * Before a vault_revision 2 profile enables hardened behaviour, read one view
- * only the hardened vault has: ROOT_HISTORY_WINDOW() must be one day. A
- * revert, no word or another value is vault_revision_mismatch; a failed read
- * is thrown unchanged, as the denomination check does.
- */
-export async function assertHardenedVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {
-    let window;
-    try {
-        window = await readVaultWord(funding, ROOT_HISTORY_WINDOW_SELECTOR, { signal });
-    } catch (error) {
-        if (vaultViewMissing(error)) throw vaultRevisionMismatch();
-        throw error;
-    }
-    if (window !== HARDENED_ROOT_HISTORY_WINDOW_SECONDS) throw vaultRevisionMismatch();
-}
-
 export async function assertNativeVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {
     validateNativeFunding(funding);
     if (BigInt(await rpc(funding, 'eth_chainId', [], signal)) !== BigInt(funding.chain_id)) {

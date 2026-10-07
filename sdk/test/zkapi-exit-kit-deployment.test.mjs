@@ -30,6 +30,12 @@ test('Keccak-256 matches the independent test implementation and known vectors',
 });
 
 test('an exit kit round-trips under its passphrase and nothing else', async () => {
+    // Hosts and the companion's parity tests open kits through the package's
+    // ./exit-kit export.
+    const { readFile } = await import('node:fs/promises');
+    const packageJson = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
+    const exported = await import(new URL(`../.${packageJson.exports['./exit-kit']}`, import.meta.url).href);
+    assert.equal(exported.openExitKit, openExitKit);
     const trusted = { deployment_id: 'v2c', contract_address: STATE.contract_address, vault_runtime_codehash: `0x${'aa'.repeat(32)}` };
     const merklePath = { active_root: '0x77', siblings: Array.from({ length: 32 }, (_, index) => `0x${index.toString(16)}`) };
     const payload = buildExitKitPayload({ trustedDeployment: trusted, state: { ...STATE, extra: 'not copied' }, stateSeq: 4,

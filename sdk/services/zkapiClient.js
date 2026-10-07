@@ -42,7 +42,7 @@ const {
     parseWithdrawalReceipt
 } = walletCodec;
 
-// A hardened vault (vault_revision 2) closes an escape even when its push to
+// The vault (revision 2 and later) closes an escape even when its push to
 // the destination fails (the destination rejects ETH or needs more than
 // ESCAPE_PAYOUT_GAS): the balance is then credited to
 // escapePayoutCredits(destination) and reaches it only through
@@ -5344,7 +5344,7 @@ class ZkapiClient extends EventTarget {
             }, blockTag]
         });
         if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) {
-            throw Object.assign(new Error('The vault did not return an escape payout credit. Only a vault_revision 2 vault holds escape payouts.'), {
+            throw Object.assign(new Error('The vault did not return an escape payout credit. This build expects a concession vault (revision 3), which holds escape payouts.'), {
                 code: 'vault_value_invalid'
             });
         }

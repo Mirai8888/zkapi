@@ -22,7 +22,10 @@ use sha3::{Digest, Keccak256};
 use zkapi_types::Felt252;
 
 use crate::events::VaultEvent;
-use crate::poller::event_topic;
+use crate::poller::{
+    event_topic, CLOSED_LEAF_RETIRED, CONCESSION_RAISED, CONCESSION_RECORDED, ESCAPE_CHALLENGED,
+    ESCAPE_FINALIZED, ESCAPE_INITIATED, EXPIRED_CLAIMED, MUTUAL_CLOSE, NOTE_DEPOSITED,
+};
 use crate::tree_mirror::TreeMirror;
 
 pub(crate) const VAULT: &str = "0x00000000000000000000000000000000000000aa";
@@ -41,11 +44,23 @@ pub(crate) enum Tx {
     Close {
         note_id: u32,
     },
+    /// An escape at `nullifier`; its successor nullifier is `nullifier + 1`.
+    /// Emits EscapeWithdrawalInitiated and EscapeConcessionRecorded.
     Escape {
         note_id: u32,
         nullifier: u64,
     },
+    /// Raise the pending escape's concession to `conceded` (at most 15).
+    Raise {
+        note_id: u32,
+        conceded: u128,
+    },
+    /// A defeat of the pending escape.
     Challenge {
+        note_id: u32,
+    },
+    /// `retireClosedLeaf` of a closed note.
+    Retire {
         note_id: u32,
     },
     Finalize {
@@ -92,6 +107,9 @@ struct Faults {
     latest: Option<u64>,
     /// Header-by-number answers from a stale fork (a load-balancer backend).
     stale_headers: HashMap<u64, String>,
+    /// The vault answers CONCESSION_ESCAPE_VERSION() with this value; `None`
+    /// reverts, as a vault before revision 3 does.
+    escape_version: Option<u64>,
     fail: HashMap<String, u32>,
     rate_limit: HashMap<String, u32>,
 }
@@ -124,7 +142,7 @@ impl Chain {
         let mut logs = Vec::new();
         for tx in txs {
             let mirror = Arc::make_mut(state.as_mut().expect("vault is deployed"));
-            logs.push(apply(mirror, tx));
+            logs.extend(apply(mirror, tx));
         }
         let hash = block_hash(self.fork, number);
         self.hashes.insert(hash.clone(), number);
@@ -216,14 +234,19 @@ impl Chain {
         match params[0]["data"].as_str().unwrap_or_default() {
             "0xfdab463d" => Ok(json!(felt_word(state.root()))),
             "0x7a2043a3" => Ok(json!(format!("0x{:064x}", state.next_note_id()))),
+            "0x5e00b426" => match self.faults.escape_version {
+                Some(version) => Ok(json!(format!("0x{version:064x}"))),
+                None => Err((-32000, "execution reverted".to_string())),
+            },
             _ => Err((-32000, "execution reverted".to_string())),
         }
     }
 }
 
-/// Apply a vault call to the reference mirror and return the log it emits.
-fn apply(mirror: &mut TreeMirror, tx: Tx) -> MockLog {
+/// Apply a vault call to the reference mirror and return the logs it emits.
+fn apply(mirror: &mut TreeMirror, tx: Tx) -> Vec<MockLog> {
     let destination = format!("0x{:064x}", 0xd0d0_u64);
+    let note_topic = |note_id: u32| format!("0x{note_id:064x}");
     match tx {
         Tx::Deposit { commitment } => {
             let note_id = mirror.next_note_id();
@@ -234,10 +257,10 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> MockLog {
                 expiry_ts: EXPIRY_TS,
                 new_root: Felt252::ZERO,
             });
-            MockLog {
+            vec![MockLog {
                 topics: vec![
-                    event_topic("NoteDeposited(uint32,bytes32,uint128,uint64,uint256)"),
-                    format!("0x{note_id:064x}"),
+                    event_topic(NOTE_DEPOSITED),
+                    note_topic(note_id),
                     format!("0x{commitment:064x}"),
                 ],
                 data: words(&[
@@ -245,7 +268,7 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> MockLog {
                     format!("{EXPIRY_TS:064x}"),
                     felt_hex(mirror.root()),
                 ]),
-            }
+            }]
         }
         Tx::Close { note_id } => {
             let nullifier = Felt252::from_u64(7_000 + u64::from(note_id));
@@ -254,57 +277,84 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> MockLog {
                 nullifier,
                 final_balance: 10,
             });
-            MockLog {
-                topics: vec![
-                    event_topic("MutualClose(uint32,uint256,uint128,address)"),
-                    format!("0x{note_id:064x}"),
-                ],
+            vec![MockLog {
+                topics: vec![event_topic(MUTUAL_CLOSE), note_topic(note_id)],
                 data: words(&[
                     felt_hex(nullifier),
                     format!("{:064x}", 10),
                     strip(&destination),
                 ]),
-            }
+            }]
         }
         Tx::Escape { note_id, nullifier } => {
             let deadline = escape_deadline(nullifier);
-            mirror.process_event(&VaultEvent::EscapeWithdrawalInitiated {
-                note_id,
-                nullifier: Felt252::from_u64(nullifier),
-                final_balance: 10,
-                challenge_deadline: deadline,
-                new_root: Felt252::ZERO,
-            });
-            MockLog {
-                topics: vec![
-                    event_topic(
-                        "EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)",
-                    ),
-                    format!("0x{note_id:064x}"),
-                ],
-                data: words(&[
-                    format!("{nullifier:064x}"),
-                    format!("{:064x}", 10),
-                    strip(&destination),
-                    format!("{deadline:064x}"),
-                    felt_hex(mirror.root()),
-                ]),
+            let next = nullifier + 1;
+            for event in [
+                VaultEvent::EscapeWithdrawalInitiated {
+                    note_id,
+                    nullifier: Felt252::from_u64(nullifier),
+                    final_balance: 10,
+                    challenge_deadline: deadline,
+                    current_root: Felt252::ZERO,
+                },
+                VaultEvent::EscapeConcessionRecorded {
+                    note_id,
+                    next_nullifier: Felt252::from_u64(next),
+                    state_balance: 15,
+                    conceded: 5,
+                },
+            ] {
+                mirror.process_event(&event);
             }
+            vec![
+                MockLog {
+                    topics: vec![event_topic(ESCAPE_INITIATED), note_topic(note_id)],
+                    data: words(&[
+                        format!("{nullifier:064x}"),
+                        format!("{:064x}", 10),
+                        strip(&destination),
+                        format!("{deadline:064x}"),
+                        felt_hex(mirror.root()),
+                    ]),
+                },
+                MockLog {
+                    topics: vec![event_topic(CONCESSION_RECORDED), note_topic(note_id)],
+                    data: words(&[
+                        format!("{next:064x}"),
+                        format!("{:064x}", 15),
+                        format!("{:064x}", 5),
+                    ]),
+                },
+            ]
+        }
+        Tx::Raise { note_id, conceded } => {
+            let nullifier = pending_nullifier(mirror, note_id);
+            mirror.process_event(&VaultEvent::EscapeConcessionRaised {
+                note_id,
+                nullifier,
+                conceded,
+                final_balance: 15 - conceded,
+            });
+            vec![MockLog {
+                topics: vec![event_topic(CONCESSION_RAISED), note_topic(note_id)],
+                data: words(&[
+                    felt_hex(nullifier),
+                    format!("{conceded:064x}"),
+                    format!("{:064x}", 15 - conceded),
+                ]),
+            }]
         }
         Tx::Challenge { note_id } => {
             let nullifier = pending_nullifier(mirror, note_id);
             mirror.process_event(&VaultEvent::EscapeWithdrawalChallenged {
                 note_id,
                 nullifier,
-                restored_root: Felt252::ZERO,
+                current_root: Felt252::ZERO,
             });
-            MockLog {
-                topics: vec![
-                    event_topic("EscapeWithdrawalChallenged(uint32,uint256,uint256)"),
-                    format!("0x{note_id:064x}"),
-                ],
+            vec![MockLog {
+                topics: vec![event_topic(ESCAPE_CHALLENGED), note_topic(note_id)],
                 data: words(&[felt_hex(nullifier), felt_hex(mirror.root())]),
-            }
+            }]
         }
         Tx::Finalize { note_id } => {
             let nullifier = pending_nullifier(mirror, note_id);
@@ -313,33 +363,37 @@ fn apply(mirror: &mut TreeMirror, tx: Tx) -> MockLog {
                 nullifier,
                 final_balance: 10,
             });
-            MockLog {
-                topics: vec![
-                    event_topic("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)"),
-                    format!("0x{note_id:064x}"),
-                ],
+            vec![MockLog {
+                topics: vec![event_topic(ESCAPE_FINALIZED), note_topic(note_id)],
                 data: words(&[
                     felt_hex(nullifier),
                     format!("{:064x}", 10),
                     strip(&destination),
                 ]),
-            }
+            }]
         }
         Tx::Claim { note_id } => {
             mirror.process_event(&VaultEvent::ExpiredClaimed {
                 note_id,
                 deposit_amount: DEPOSIT_AMOUNT,
+                current_root: Felt252::ZERO,
+            });
+            vec![MockLog {
+                topics: vec![event_topic(EXPIRED_CLAIMED), note_topic(note_id)],
+                data: words(&[format!("{DEPOSIT_AMOUNT:064x}"), felt_hex(mirror.root())]),
+            }]
+        }
+        Tx::Retire { note_id } => {
+            mirror.process_event(&VaultEvent::ClosedLeafRetired {
+                note_id,
                 new_root: Felt252::ZERO,
             });
-            MockLog {
-                topics: vec![
-                    event_topic("ExpiredClaimed(uint32,uint128,uint256)"),
-                    format!("0x{note_id:064x}"),
-                ],
-                data: words(&[format!("{DEPOSIT_AMOUNT:064x}"), felt_hex(mirror.root())]),
-            }
+            vec![MockLog {
+                topics: vec![event_topic(CLOSED_LEAF_RETIRED), note_topic(note_id)],
+                data: words(&[felt_hex(mirror.root())]),
+            }]
         }
-        Tx::Raw { topics, data } => MockLog { topics, data },
+        Tx::Raw { topics, data } => vec![MockLog { topics, data }],
     }
 }
 
@@ -373,7 +427,10 @@ impl MockChain {
             fork: 0,
             blocks: Vec::new(),
             hashes: HashMap::new(),
-            faults: Faults::default(),
+            faults: Faults {
+                escape_version: Some(1),
+                ..Faults::default()
+            },
             calls: Vec::new(),
             timestamp: None,
         };
@@ -499,6 +556,11 @@ impl MockChain {
             Some(hash) => chain.faults.stale_headers.insert(number, hash),
             None => chain.faults.stale_headers.remove(&number),
         });
+    }
+
+    /// The vault's CONCESSION_ESCAPE_VERSION() (`None`: the getter reverts).
+    pub(crate) fn set_escape_version(&self, version: Option<u64>) {
+        self.with(|chain| chain.faults.escape_version = version);
     }
 
     /// Timestamp for blocks mined from now on (`None`: wall clock).

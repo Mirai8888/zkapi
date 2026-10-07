@@ -46,8 +46,9 @@ impl SyncStatus {
 
 /// A mirror state the vault had at a recorded block hash, as verified by
 /// `currentRoot()` and `nextNoteId()` read at that block. That check covers
-/// the open-escape entries only through their notes' leaves (see
-/// `PendingEscape`).
+/// the tree (deposits and retirements); note statuses, open escapes and
+/// published nullifiers come from the same logs but are not covered by it
+/// (see `PendingEscape`).
 #[derive(Clone)]
 pub struct TreeView {
     pub mirror: Arc<TreeMirror>,
@@ -130,6 +131,7 @@ struct State {
     rebuild_count: u64,
     missed_re_escapes_challenged: u64,
     missed_re_escapes_finalized: u64,
+    missed_re_escapes_raised: u64,
     stale_reported: bool,
     head_stale_reported: bool,
 }
@@ -169,6 +171,7 @@ impl IndexerService {
                 rebuild_count: 0,
                 missed_re_escapes_challenged: 0,
                 missed_re_escapes_finalized: 0,
+                missed_re_escapes_raised: 0,
                 stale_reported: false,
                 head_stale_reported: false,
             }),
@@ -253,8 +256,12 @@ impl IndexerService {
             rebuild_count: state.rebuild_count,
             missed_re_escape_count: state
                 .missed_re_escapes_challenged
-                .saturating_add(state.missed_re_escapes_finalized),
+                .saturating_add(state.missed_re_escapes_finalized)
+                .saturating_add(state.missed_re_escapes_raised),
             missed_re_escape_finalized_count: state.missed_re_escapes_finalized,
+            missed_re_escape_raised_count: state.missed_re_escapes_raised,
+            known_root_count: view.map(|view| view.mirror.known_root_count() as u64),
+            published_nullifier_count: view.map(|view| view.mirror.published_count() as u64),
         }
     }
 
@@ -391,6 +398,7 @@ impl IndexerService {
         let count = match closed_by {
             EscapeClose::Challenged => &mut state.missed_re_escapes_challenged,
             EscapeClose::Finalized => &mut state.missed_re_escapes_finalized,
+            EscapeClose::Raised => &mut state.missed_re_escapes_raised,
         };
         *count = count.saturating_add(1);
     }
@@ -510,14 +518,16 @@ impl IndexerService {
         }
         let name = "zkapi_indexer_missed_re_escapes_total";
         out.push_str(&format!(
-            "# HELP {name} Committed challenges or finalizations of an escape the indexer never saw initiated, once per escape, by closing event.\n# TYPE {name} counter\n"
+            "# HELP {name} Committed defeats, raises or finalizations of an escape the indexer never saw initiated, once per escape, by event.\n# TYPE {name} counter\n"
         ));
         for closed_by in EscapeClose::ALL {
             let value = match closed_by {
                 EscapeClose::Challenged => health
                     .missed_re_escape_count
-                    .saturating_sub(health.missed_re_escape_finalized_count),
+                    .saturating_sub(health.missed_re_escape_finalized_count)
+                    .saturating_sub(health.missed_re_escape_raised_count),
                 EscapeClose::Finalized => health.missed_re_escape_finalized_count,
+                EscapeClose::Raised => health.missed_re_escape_raised_count,
             };
             out.push_str(&format!(
                 "{name}{{event=\"{}\"}} {value}\n",
@@ -581,6 +591,15 @@ pub struct HealthResponse {
     /// escape the indexer's pending list never showed.
     #[serde(default)]
     pub missed_re_escape_finalized_count: u64,
+    /// Of those, raises of an escape the pending list never showed.
+    #[serde(default)]
+    pub missed_re_escape_raised_count: u64,
+    /// Roots the vault ever set, in the served view (Amendment A1).
+    #[serde(default)]
+    pub known_root_count: Option<u64>,
+    /// Nullifiers vault events made public, in the served view (§5.2).
+    #[serde(default)]
+    pub published_nullifier_count: Option<u64>,
 }
 
 /// Response type for tree endpoints.
@@ -634,20 +653,39 @@ pub struct TreeSnapshotResponse {
     pub block_hash: String,
 }
 
-/// Escape withdrawals open in the verified view (internal). The view's root
-/// check covers them only through their notes' leaves: an open escape zeroes
-/// its note's leaf, so the list leaves none out (barring the cases in
-/// `PendingEscape`), and the challenger uses it as a completeness check for
-/// its own event scan. Each entry is the last one applied from the logs, a
-/// hint: a missed challenge followed by a re-escape, mutual close or expiry
-/// claim of the note leaves the root unchanged, so an entry can carry a
-/// challenged escape's `withdrawal_nullifier` and `challenge_deadline`, or
-/// outlive the note's escape. Consumers read `pendingWithdrawals(note)` from
-/// the vault.
+/// Escape withdrawals open in the verified view (internal), with their
+/// concession (`next_nullifier`, `state_balance`, `conceded`). Escapes change
+/// no leaf, so the view's root check does not cover the list: the challenger
+/// uses it as a completeness check for its own event scan, and each entry is
+/// the last one applied from the logs, a hint. Consumers read
+/// `pendingWithdrawals(note)` and `pendingConcessions(note)` from the vault.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingEscapesResponse {
     pub block_number: u64,
     pub block_hash: String,
     pub root: Felt252,
     pub escapes: Vec<PendingEscape>,
+}
+
+/// `GET /v1/nullifiers/{N}/published`: whether a vault event made `N`
+/// public, as a `withdrawalNullifier` or `nextNullifier` (§5.2). serverd
+/// never serves evidence or request data of a published nullifier.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PublishedNullifierResponse {
+    pub nullifier: Felt252,
+    pub published: bool,
+    pub block_number: u64,
+    pub block_hash: String,
+}
+
+/// `GET /v1/tree/roots/{root}`: whether the vault ever set `root`, so that
+/// it accepts proofs made at it (`knownRoots`, Amendment A1).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KnownRootResponse {
+    pub root: Felt252,
+    pub known: bool,
+    /// The current root of the served view.
+    pub current_root: Felt252,
+    pub block_number: u64,
+    pub block_hash: String,
 }

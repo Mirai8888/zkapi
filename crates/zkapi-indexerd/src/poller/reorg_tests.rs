@@ -170,14 +170,30 @@ async fn get(base: &str, path: &str) -> (u16, Value) {
     (status, response.json().await.unwrap())
 }
 
-const SERVED_ROUTES: [&str; 6] = [
+const SERVED_ROUTES: [&str; 8] = [
     "/v1/tree/root",
     "/v1/tree/next-note-id",
     "/v1/tree/snapshot",
     "/v1/tree/notes/0/path",
     "/v1/tree/notes/0/zero-path",
+    "/v1/tree/roots/0x1",
+    "/v1/nullifiers/0x1/published",
     "/v1/escapes/pending",
 ];
+
+/// The pending-escapes entry of the mock vault's escape at `nullifier`
+/// (successor `nullifier + 1`, state balance 15, conceded 5).
+fn escape_entry(note_id: u32, nullifier: u64) -> Value {
+    json!({
+        "note_id": note_id,
+        "withdrawal_nullifier": format!("0x{nullifier:x}"),
+        "challenge_deadline": escape_deadline(nullifier),
+        "final_balance": 10,
+        "next_nullifier": format!("0x{:x}", nullifier + 1),
+        "state_balance": 15,
+        "conceded": 5,
+    })
+}
 
 /// `/health` reports `phase`; every tree route fails closed with the
 /// constant public body.
@@ -391,24 +407,38 @@ async fn lagging_get_logs_replica_is_absorbed_below_the_confirmation_depth() {
 }
 
 #[tokio::test]
-async fn reorged_mutual_close_restores_leaf() {
+async fn reorged_mutual_close_reopens_the_note_and_unpublishes_its_nullifier() {
     let chain = MockChain::start().await;
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
     chain.mine_empty(4);
     let mut indexer = Indexer::new(config(&chain, 3, None));
     indexer.poll_to_idle().await;
     let original = indexer.view().mirror.get_leaf(0);
+    let root = indexer.view().root;
     assert!(!original.is_zero());
+    let base = serve(indexer.service.clone()).await;
+    let close_nullifier = "/v1/nullifiers/0x1b58/published";
 
     chain.mine(vec![Tx::Close { note_id: 0 }]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert!(indexer.view().mirror.get_leaf(0).is_zero());
+    // A close does no Merkle work: the leaf and the root stay.
+    assert_eq!(indexer.view().mirror.get_leaf(0), original);
+    assert_eq!(indexer.view().root, root);
+    assert_eq!(
+        indexer.view().mirror.note_status(0),
+        Some(crate::tree_mirror::NoteStatus::Closed)
+    );
+    assert_eq!(get(&base, close_nullifier).await.1["published"], true);
 
     chain.reorg(1, vec![vec![]]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    let base = serve(indexer.service.clone()).await;
+    assert_eq!(
+        indexer.view().mirror.note_status(0),
+        Some(crate::tree_mirror::NoteStatus::Active)
+    );
+    assert_eq!(get(&base, close_nullifier).await.1["published"], false);
     let (status, path) = get(&base, "/v1/tree/notes/0/path").await;
     assert_eq!(status, 200);
     assert_eq!(path["leaf"], json_of(original));
@@ -417,13 +447,14 @@ async fn reorged_mutual_close_restores_leaf() {
 }
 
 #[tokio::test]
-async fn reorged_escape_initiation_restores_leaf_and_pending_list() {
+async fn reorged_escape_initiation_clears_the_pending_list_and_publications() {
     let chain = MockChain::start().await;
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
     chain.mine_empty(4);
     let mut indexer = Indexer::new(config(&chain, 3, None));
     indexer.poll_to_idle().await;
     let base = serve(indexer.service.clone()).await;
+    let leaf = indexer.view().mirror.get_leaf(0);
 
     let escape_block = chain.mine(vec![Tx::Escape {
         note_id: 0,
@@ -435,27 +466,26 @@ async fn reorged_escape_initiation_restores_leaf_and_pending_list() {
     assert_eq!(pending["block_number"], escape_block);
     assert_eq!(pending["block_hash"], chain.hash_at(escape_block));
     assert_eq!(pending["root"], json_of(chain.root_at(escape_block)));
-    assert_eq!(
-        pending["escapes"],
-        json!([{
-            "note_id": 0,
-            "withdrawal_nullifier": "0x384",
-            "challenge_deadline": escape_deadline(900),
-        }])
-    );
+    assert_eq!(pending["escapes"], json!([escape_entry(0, 900)]));
+    // Both nullifiers of the escape are published; the leaf stays.
+    for nullifier in ["0x384", "0x385"] {
+        let (_, body) = get(&base, &format!("/v1/nullifiers/{nullifier}/published")).await;
+        assert_eq!(body["published"], true, "{nullifier}");
+    }
+    assert_eq!(indexer.view().mirror.get_leaf(0), leaf);
 
-    // A reorg removes the initiation: the leaf and the pending list revert.
+    // A reorg removes the initiation: the pending list and the table revert.
     chain.reorg(1, vec![vec![]]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
     let (_, pending) = get(&base, "/v1/escapes/pending").await;
     assert_eq!(pending["escapes"], json!([]));
+    for nullifier in ["0x384", "0x385"] {
+        let (_, body) = get(&base, &format!("/v1/nullifiers/{nullifier}/published")).await;
+        assert_eq!(body["published"], false, "{nullifier}");
+    }
     let (_, path) = get(&base, "/v1/tree/notes/0/path").await;
-    assert_eq!(
-        path["leaf"],
-        json_of(chain.state_at(chain.head()).get_leaf(0))
-    );
-    assert_ne!(path["leaf"], json_of(Felt252::ZERO));
+    assert_eq!(path["leaf"], json_of(leaf));
 }
 
 /// A reorg below the checkpoint that removes a committed `tx`.
@@ -467,8 +497,16 @@ async fn deep_reorg_of_committed(tx: Tx) {
     let mut indexer = Indexer::new(config(&chain, 1, None));
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert!(indexer.view().mirror.get_leaf(0).is_zero());
+    let root = indexer.view().root;
+    assert_ne!(
+        indexer.view().mirror.note_status(0),
+        Some(crate::tree_mirror::NoteStatus::Active)
+    );
 
+    // The replacement chain has the same deposit and no exit: the vault's
+    // root and next note id at the reorganized checkpoint block are
+    // unchanged, but the committed exit is gone. Exits change no root, so
+    // re-anchoring would keep it; the indexer rebuilds instead.
     chain.reorg(
         4,
         vec![
@@ -478,13 +516,18 @@ async fn deep_reorg_of_committed(tx: Tx) {
             vec![],
         ],
     );
+    assert_eq!(chain.root_at(chain.head()), root);
     assert!(indexer.poll().await.is_err());
     assert_eq!(indexer.poll().await.unwrap(), PollOutcome::MoreWork);
     assert_eq!(indexer.service.status(), SyncStatus::Rebuilding);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert!(!indexer.view().mirror.get_leaf(0).is_zero());
+    assert_eq!(
+        indexer.view().mirror.note_status(0),
+        Some(crate::tree_mirror::NoteStatus::Active)
+    );
     assert!(indexer.view().mirror.pending_escapes().is_empty());
+    assert_eq!(indexer.view().mirror.published_count(), 0);
     assert_eq!(indexer.service.health().rebuild_count, 1);
 }
 
@@ -516,42 +559,58 @@ async fn reorged_challenge_and_expired_claim_are_undone() {
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
 
+    use crate::tree_mirror::NoteStatus;
     chain.mine(vec![Tx::Challenge { note_id: 0 }]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
     assert!(indexer.view().mirror.pending_escapes().is_empty());
-    assert!(!indexer.view().mirror.get_leaf(0).is_zero());
+    assert_eq!(
+        indexer.view().mirror.note_status(0),
+        Some(NoteStatus::Active)
+    );
 
     // The challenge is reorged out: the escape is pending again.
     chain.reorg(1, vec![vec![]]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
     assert_eq!(indexer.view().mirror.pending_escapes().len(), 1);
-    assert!(indexer.view().mirror.get_leaf(0).is_zero());
+    assert_eq!(
+        indexer.view().mirror.note_status(0),
+        Some(NoteStatus::PendingWithdrawal)
+    );
 
     chain.mine(vec![Tx::Claim { note_id: 1 }]);
     indexer.poll_to_idle().await;
-    assert!(indexer.view().mirror.get_leaf(1).is_zero());
+    assert_eq!(
+        indexer.view().mirror.note_status(1),
+        Some(NoteStatus::Closed)
+    );
+    assert!(!indexer.view().mirror.get_leaf(1).is_zero());
 
     // The expiry claim is reorged out: the note is active again.
     chain.reorg(1, vec![vec![]]);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert!(!indexer.view().mirror.get_leaf(1).is_zero());
+    assert_eq!(
+        indexer.view().mirror.note_status(1),
+        Some(NoteStatus::Active)
+    );
     assert_eq!(indexer.service.health().rebuild_count, 0);
 }
 
-/// Serve a deposit, then persistently lose the MutualClose log once it is
-/// below the confirmation depth, and poll until the indexer diverges.
-async fn diverge_on_dropped_close() -> (MockChain, Indexer, String, u64) {
+/// Serve a deposit and its mutual close, then persistently lose the
+/// ClosedLeafRetired log once it is below the confirmation depth, and poll
+/// until the indexer diverges.
+async fn diverge_on_dropped_retirement() -> (MockChain, Indexer, String, u64) {
     let chain = MockChain::start().await;
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
+    chain.mine(vec![Tx::Close { note_id: 0 }]);
     chain.mine_empty(3);
     let mut indexer = Indexer::new(config(&chain, 2, None));
     indexer.poll_to_idle().await;
     let served = indexer.view().block_number;
-    let close_block = chain.mine(vec![Tx::Close { note_id: 0 }]);
-    chain.drop_log(close_block, 0);
+    let retire_block = chain.mine(vec![Tx::Retire { note_id: 0 }]);
+    chain.drop_log(retire_block, 0);
     chain.mine_empty(3);
     let base = serve(indexer.service.clone()).await;
     for _ in 0..3 {
@@ -561,12 +620,12 @@ async fn diverge_on_dropped_close() -> (MockChain, Indexer, String, u64) {
     (chain, indexer, base, served)
 }
 
-/// A deposit and the close of that note both missing from the logs leave the
-/// mirror at the vault's root (the note's leaf is zero again) with a stale
-/// next_note_id. Only the nextNoteId comparison of the verified-head check
-/// catches it, and such a view is never served.
+/// A deposit and the close and leaf retirement of that note all missing from
+/// the logs leave the mirror at the vault's root (the note's leaf is zero
+/// again) with a stale next_note_id. Only the nextNoteId comparison of the
+/// verified-head check catches it, and such a view is never served.
 #[tokio::test]
-async fn missed_deposit_and_close_at_the_vaults_root_are_never_served() {
+async fn missed_deposit_close_and_retirement_at_the_vaults_root_are_never_served() {
     let chain = MockChain::start().await;
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
     chain.mine_empty(3);
@@ -575,8 +634,10 @@ async fn missed_deposit_and_close_at_the_vaults_root_are_never_served() {
     assert_serves_head(&chain, &indexer);
     let deposit = chain.mine(vec![Tx::Deposit { commitment: 0xb }]);
     let close = chain.mine(vec![Tx::Close { note_id: 1 }]);
+    let retire = chain.mine(vec![Tx::Retire { note_id: 1 }]);
     chain.drop_log(deposit, 0);
     chain.drop_log(close, 0);
+    chain.drop_log(retire, 0);
     let head = chain.mine_empty(3);
     assert_eq!(chain.root_at(head), chain.root_at(deposit - 1));
     assert_eq!(chain.next_note_id_at(head), 2);
@@ -592,7 +653,7 @@ async fn missed_deposit_and_close_at_the_vaults_root_are_never_served() {
 
 #[tokio::test]
 async fn persistent_log_gap_fails_closed_then_recovers() {
-    let (chain, mut indexer, base, _) = diverge_on_dropped_close().await;
+    let (chain, mut indexer, base, _) = diverge_on_dropped_retirement().await;
     assert_unavailable(&base, "diverged").await;
     let health = indexer.service.health();
     assert!(health.reason.unwrap().contains("vault root"));
@@ -610,7 +671,7 @@ async fn persistent_log_gap_fails_closed_then_recovers() {
 
 #[tokio::test]
 async fn diverged_indexer_stays_unavailable_when_the_rpc_returns_the_old_head() {
-    let (chain, mut indexer, base, served) = diverge_on_dropped_close().await;
+    let (chain, mut indexer, base, served) = diverge_on_dropped_retirement().await;
     assert_eq!(indexer.service.status(), SyncStatus::Diverged);
     // A replica lagging back to the last verified head must not revive it.
     chain.set_latest(Some(served));
@@ -664,7 +725,7 @@ async fn corrupted_checkpoint_is_never_served_and_is_rebuilt() {
         number: 4,
         hash: chain.hash_at(4),
     };
-    super::tests::write_v2_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
+    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &chain.state_at(2));
 
     let mut indexer = Indexer::new(config(&chain, 2, Some(&cursor)));
     let base = serve(indexer.service.clone()).await;
@@ -685,7 +746,7 @@ fn restart_at_head_checkpoint(chain: &MockChain, cursor: &Path, mirror: &TreeMir
         number: head,
         hash: chain.hash_at(head),
     };
-    super::tests::write_v2_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
+    super::tests::write_v3_checkpoint(cursor, VAULT, CHAIN_ID, &anchor, mirror);
     Indexer::new(config(chain, 0, Some(cursor)))
 }
 
@@ -697,6 +758,8 @@ async fn restored_checkpoint_at_the_head_is_published_only_after_it_verifies() {
     chain.mine(vec![Tx::Deposit { commitment: 0xa }]);
     let mut indexer = restart_at_head_checkpoint(&chain, &cursor, &chain.state_at(chain.head()));
     let base = serve(indexer.service.clone()).await;
+    // The vault's revision was probed earlier in this process.
+    indexer.poller.vault_verified = true;
 
     // Neither the startup check nor the head view can read the vault.
     chain.fail_next("eth_call", 2);
@@ -771,13 +834,13 @@ fn checkpoint_for_another_vault_is_refused() {
     let service = IndexerService::new_syncing(settings(12));
 
     let other_vault = "0x00000000000000000000000000000000000000bb";
-    super::tests::write_v2_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v3_checkpoint(&cursor, other_vault, CHAIN_ID, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another vault must be refused");
     };
     assert!(format!("{error:#}").contains("--resync"));
 
-    super::tests::write_v2_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
+    super::tests::write_v3_checkpoint(&cursor, VAULT, 1, &anchor, &TreeMirror::new());
     let Err(error) = JsonRpcLogPoller::new(offline_config(&cursor), &service) else {
         panic!("a checkpoint for another chain must be refused");
     };
@@ -786,7 +849,7 @@ fn checkpoint_for_another_vault_is_refused() {
     assert!(cursor.exists());
 
     // A newer binary's checkpoint is never replaced.
-    std::fs::write(&cursor, r#"{"version":3}"#).unwrap();
+    std::fs::write(&cursor, r#"{"version":4}"#).unwrap();
     assert!(JsonRpcLogPoller::new(offline_config(&cursor), &service).is_err());
     assert!(cursor.exists());
 }
@@ -813,7 +876,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     };
     let service = IndexerService::new_syncing(settings(12));
 
-    super::tests::write_v2_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let mut config = offline_config(&cursor);
     config.resync = true;
     let poller = JsonRpcLogPoller::new(config.clone(), &service).unwrap();
@@ -822,7 +885,7 @@ fn resync_flag_and_sentinel_archive_checkpoint() {
     assert_eq!(archives(dir.path(), "resync").len(), 1);
     drop(poller);
 
-    super::tests::write_v2_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
+    super::tests::write_v3_checkpoint(&cursor, VAULT, CHAIN_ID, &anchor, &TreeMirror::new());
     let sentinel = dir.path().join("indexer.cursor.resync");
     std::fs::write(&sentinel, b"").unwrap();
     config.resync = false;
@@ -1251,13 +1314,7 @@ async fn pending_escapes_follow_initiate_challenge_and_finalize() {
     let mut indexer = Indexer::new(config(&chain, 2, Some(&cursor)));
     indexer.poll_to_idle().await;
     let base = serve(indexer.service.clone()).await;
-    let entry = |note_id: u32, nullifier: u64| {
-        json!({
-            "note_id": note_id,
-            "withdrawal_nullifier": format!("0x{nullifier:x}"),
-            "challenge_deadline": escape_deadline(nullifier),
-        })
-    };
+    let entry = escape_entry;
     let pending = |base: String| async move {
         let (status, body) = get(&base, "/v1/escapes/pending").await;
         assert_eq!(status, 200);
@@ -1280,31 +1337,36 @@ async fn pending_escapes_follow_initiate_challenge_and_finalize() {
     indexer.poll_to_idle().await;
     assert_eq!(pending(base.clone()).await["escapes"], json!([]));
 
-    // G2: the note escapes again under a new nullifier, alongside another.
+    // G2: the note escapes again under a new nullifier, alongside another
+    // escape, which a raise then concedes more of.
     chain.mine(vec![
         Tx::Escape {
             note_id: 0,
-            nullifier: 901,
+            nullifier: 905,
         },
         Tx::Escape {
             note_id: 1,
-            nullifier: 902,
+            nullifier: 910,
         },
     ]);
+    chain.mine(vec![Tx::Raise {
+        note_id: 1,
+        conceded: 12,
+    }]);
     indexer.poll_to_idle().await;
+    let mut raised = entry(1, 910);
+    raised["conceded"] = json!(12);
+    raised["final_balance"] = json!(3);
     assert_eq!(
         pending(base.clone()).await["escapes"],
-        json!([entry(0, 901), entry(1, 902)])
+        json!([entry(0, 905), raised.clone()])
     );
 
     chain.mine(vec![Tx::Finalize { note_id: 0 }]);
     chain.mine_empty(3);
     indexer.poll_to_idle().await;
     assert_serves_head(&chain, &indexer);
-    assert_eq!(
-        pending(base.clone()).await["escapes"],
-        json!([entry(1, 902)])
-    );
+    assert_eq!(pending(base.clone()).await["escapes"], json!([raised]));
     // Complete logs never imply a missed re-escape.
     assert_eq!(indexer.service.health().missed_re_escape_count, 0);
 
@@ -1369,11 +1431,7 @@ async fn hide_pair_below_checkpoint(pair: Vec<Tx>) -> HiddenPair {
 
 /// The listing of escape 900 of note 0, from before the hidden pair.
 fn listed_escape_900() -> Value {
-    json!([{
-        "note_id": 0,
-        "withdrawal_nullifier": "0x384",
-        "challenge_deadline": escape_deadline(900),
-    }])
+    json!([escape_entry(0, 900)])
 }
 
 /// The hidden pair is a challenge of escape 900 and a re-escape 901 of the
@@ -1392,7 +1450,7 @@ async fn missed_re_escape_case(follow_up: Tx, follow_up_kind: EscapeClose) {
         Tx::Challenge { note_id: 0 },
         Tx::Escape {
             note_id: 0,
-            nullifier: 901,
+            nullifier: 905,
         },
     ])
     .await;
@@ -1407,8 +1465,8 @@ async fn missed_re_escape_case(follow_up: Tx, follow_up_kind: EscapeClose) {
     assert_eq!(pending["root"], json_of(chain.root_at(head)));
     assert_eq!(pending["escapes"], stale);
     let vault = chain.state_at(head).pending_escapes();
-    assert_eq!(vault[0].withdrawal_nullifier, Felt252::from_u64(901));
-    assert_eq!(vault[0].challenge_deadline, escape_deadline(901));
+    assert_eq!(vault[0].withdrawal_nullifier, Felt252::from_u64(905));
+    assert_eq!(vault[0].challenge_deadline, escape_deadline(905));
 
     // The mirror never saw 901 initiated. The head view applies the event
     // closing it and still verifies.
@@ -1437,7 +1495,11 @@ async fn missed_re_escape_case(follow_up: Tx, follow_up_kind: EscapeClose) {
     assert_eq!(health.divergence_count, 0);
     assert_eq!(health.rebuild_count, 0);
     let metrics = indexer.service.metrics();
-    for (event, value) in [("challenged", 1 - finalized), ("finalized", finalized)] {
+    for (event, value) in [
+        ("challenged", 1 - finalized),
+        ("finalized", finalized),
+        ("raised", 0),
+    ] {
         let line = format!("zkapi_indexer_missed_re_escapes_total{{event=\"{event}\"}} {value}");
         assert!(metrics.lines().any(|candidate| candidate == line), "{line}");
     }
@@ -1446,13 +1508,13 @@ async fn missed_re_escape_case(follow_up: Tx, follow_up_kind: EscapeClose) {
     let reports = logs.reports(follow_up_kind);
     assert_eq!(reports.len(), 1, "{reports:?}");
     let level = match follow_up_kind {
-        EscapeClose::Challenged => " WARN ",
+        EscapeClose::Challenged | EscapeClose::Raised => " WARN ",
         EscapeClose::Finalized => "ERROR ",
     };
     assert!(reports[0].contains(level), "{}", reports[0]);
     assert!(
         reports[0].contains(&format!(
-            "log 0: note 0 escape 0x385 was {} while escape 0x384 was listed",
+            "log 0: note 0 escape 0x389 was {} while escape 0x384 was listed",
             follow_up_kind.as_str()
         )),
         "{}",
@@ -1473,7 +1535,7 @@ async fn finalization_after_missed_challenge_and_re_escape_applies() {
 /// A challenge followed by a mutual close or an expiry claim of the same
 /// note leaves the root unchanged too. If the logs miss both, the note stays
 /// listed although the vault holds no escape for it, as documented; no later
-/// event can close the entry, only a resync.
+/// event can close the entry, only a resync. (The leaf stays either way.)
 #[tokio::test]
 async fn missed_challenge_and_close_leave_the_note_listed() {
     for closing in [Tx::Close { note_id: 0 }, Tx::Claim { note_id: 0 }] {
@@ -1485,7 +1547,10 @@ async fn missed_challenge_and_close_leave_the_note_listed() {
         assert_eq!(pending["escapes"], listed_escape_900());
         let vault = hidden.chain.state_at(head);
         assert!(vault.pending_escapes().is_empty());
-        assert!(vault.get_leaf(0).is_zero());
+        assert_eq!(
+            vault.note_status(0),
+            Some(crate::tree_mirror::NoteStatus::Closed)
+        );
         let health = hidden.indexer.service.health();
         assert_eq!(health.status, SyncStatus::Ok);
         assert_eq!(health.missed_re_escape_count, 0);
@@ -1493,7 +1558,7 @@ async fn missed_challenge_and_close_leave_the_note_listed() {
 }
 
 /// The provider's log history permanently lacks a challenge of escape 900
-/// and a re-escape 901 of note 0 (block 4); the vault then challenges 901
+/// and a re-escape 905 of note 0 (block 4); the vault then challenges 905
 /// (block 5).
 fn mine_permanent_missed_re_escape(chain: &MockChain) {
     chain.mine(vec![
@@ -1508,11 +1573,13 @@ fn mine_permanent_missed_re_escape(chain: &MockChain) {
         Tx::Challenge { note_id: 0 },
         Tx::Escape {
             note_id: 0,
-            nullifier: 901,
+            nullifier: 905,
         },
     ]);
-    chain.drop_log(pair, 0);
-    chain.drop_log(pair, 1);
+    // The challenge, the initiation and its concession record.
+    for index in 0..3 {
+        chain.drop_log(pair, index);
+    }
     chain.mine(vec![Tx::Challenge { note_id: 0 }]);
 }
 
@@ -1556,7 +1623,7 @@ async fn missed_re_escape_in_held_catch_up_chunks_is_reported_once_they_verify()
     assert_eq!(indexer.service.health().missed_re_escape_count, 1);
     let reports = logs.reports(EscapeClose::Challenged);
     assert_eq!(reports.len(), 1, "{reports:?}");
-    assert!(reports[0].contains("block 5 log 0: note 0 escape 0x385 was challenged"));
+    assert!(reports[0].contains("block 5 log 0: note 0 escape 0x389 was challenged"));
 }
 
 #[tokio::test]

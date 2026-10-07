@@ -12,8 +12,9 @@ use zkapi_types::Felt252;
 
 use crate::poller::{normalize_address, spawn_json_rpc_log_poller, JsonRpcLogPoller, PollerConfig};
 use crate::service::{
-    IndexerService, NextNoteIdResponse, PendingEscapesResponse, ServiceSettings, SyncStatus,
-    TreePathResponse, TreeRootResponse, TreeSnapshotResponse, TreeView,
+    IndexerService, KnownRootResponse, NextNoteIdResponse, PendingEscapesResponse,
+    PublishedNullifierResponse, ServiceSettings, SyncStatus, TreePathResponse, TreeRootResponse,
+    TreeSnapshotResponse, TreeView,
 };
 
 /// Seconds a client should wait before retrying an unavailable indexer.
@@ -145,6 +146,11 @@ pub fn create_router(service: Arc<IndexerService>) -> Router {
         .route("/v1/tree/snapshot", get(handle_snapshot))
         .route("/v1/tree/notes/{note_id}/path", get(handle_note_path))
         .route("/v1/tree/notes/{note_id}/zero-path", get(handle_zero_path))
+        .route("/v1/tree/roots/{root}", get(handle_known_root))
+        .route(
+            "/v1/nullifiers/{nullifier}/published",
+            get(handle_published_nullifier),
+        )
         .route("/v1/escapes/pending", get(handle_pending_escapes))
         .with_state(service)
 }
@@ -248,30 +254,91 @@ async fn handle_note_path(
     }))
 }
 
+/// Deprecated (§5.5): exits and defeats no longer need a zero-slot path.
+/// The siblings are the slot's current siblings; with a zero leaf they hash
+/// to the view's root only for an unused or retired slot.
 async fn handle_zero_path(
     State(service): State<AppState>,
     Path(note_id): Path<u32>,
-) -> Result<Json<TreePathResponse>, IndexerUnavailable> {
+) -> Result<Response, IndexerUnavailable> {
     let view = served_view(&service)?;
-    Ok(Json(TreePathResponse {
-        note_id,
-        leaf: Felt252::ZERO,
-        siblings: view.mirror.get_zero_path(note_id).to_vec(),
-        root: view.root,
-        block_number: view.block_number,
-        block_hash: view.block_hash.clone(),
-    }))
+    Ok((
+        [(header::HeaderName::from_static("deprecation"), "true")],
+        Json(TreePathResponse {
+            note_id,
+            leaf: Felt252::ZERO,
+            siblings: view.mirror.get_zero_path(note_id).to_vec(),
+            root: view.root,
+            block_number: view.block_number,
+            block_hash: view.block_hash.clone(),
+        }),
+    )
+        .into_response())
 }
 
-/// Internal: escape withdrawals open in the verified view. The view's root
-/// check covers them only through their notes' leaves, so no open escape is
-/// left out (barring the cases in `PendingEscape`), and the challenger
-/// reconciles its own escape-event scan against the note ids. Each entry is
-/// the last one applied from the logs, a hint: after a missed challenge
-/// followed by a re-escape, close or claim of the note, which leaves the root
-/// unchanged, it carries a challenged escape's `withdrawal_nullifier` and
-/// `challenge_deadline` or outlives the note's escape. Consumers read
-/// `pendingWithdrawals(note)` from the vault.
+/// 400 for a path parameter that is not a canonical field element.
+fn invalid_felt(name: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "status": "error",
+            "error_code": "invalid_request",
+            "error_message": format!("{name} must be a hex BN254 field element"),
+            "retriable": false,
+        })),
+    )
+        .into_response()
+}
+
+/// Whether the vault ever set `root` (Amendment A1): the vault accepts a
+/// proof at any of them, so a client keeps its deposit-time path.
+async fn handle_known_root(State(service): State<AppState>, Path(root): Path<String>) -> Response {
+    let Ok(root) = Felt252::from_hex(&root) else {
+        return invalid_felt("root");
+    };
+    let view = match served_view(&service) {
+        Ok(view) => view,
+        Err(unavailable) => return unavailable.into_response(),
+    };
+    Json(KnownRootResponse {
+        root,
+        known: view.mirror.is_known_root(&root),
+        current_root: view.root,
+        block_number: view.block_number,
+        block_hash: view.block_hash.clone(),
+    })
+    .into_response()
+}
+
+/// The published-nullifier table (§5.2): whether a vault event in the
+/// verified view names `nullifier` as a `withdrawalNullifier` or
+/// `nextNullifier`. 503 without a verified view, which serverd treats as
+/// unreadable publication and refuses to serve evidence.
+async fn handle_published_nullifier(
+    State(service): State<AppState>,
+    Path(nullifier): Path<String>,
+) -> Response {
+    let Ok(nullifier) = Felt252::from_hex(&nullifier) else {
+        return invalid_felt("nullifier");
+    };
+    let view = match served_view(&service) {
+        Ok(view) => view,
+        Err(unavailable) => return unavailable.into_response(),
+    };
+    Json(PublishedNullifierResponse {
+        nullifier,
+        published: view.mirror.is_published(&nullifier),
+        block_number: view.block_number,
+        block_hash: view.block_hash.clone(),
+    })
+    .into_response()
+}
+
+/// Internal: escape withdrawals open in the verified view, with their
+/// concession. Escapes change no leaf, so the root check does not cover the
+/// list: the challenger reconciles its own escape-event scan against the note
+/// ids, and each entry is a hint. Consumers read `pendingWithdrawals(note)`
+/// and `pendingConcessions(note)` from the vault.
 async fn handle_pending_escapes(
     State(service): State<AppState>,
 ) -> Result<Json<PendingEscapesResponse>, IndexerUnavailable> {
@@ -322,12 +389,14 @@ mod tests {
         format!("http://{addr}")
     }
 
-    const SERVED_ROUTES: [&str; 6] = [
+    const SERVED_ROUTES: [&str; 8] = [
         "/v1/tree/root",
         "/v1/tree/next-note-id",
         "/v1/tree/snapshot",
         "/v1/tree/notes/0/path",
         "/v1/tree/notes/0/zero-path",
+        "/v1/tree/roots/0x1",
+        "/v1/nullifiers/0x1/published",
         "/v1/escapes/pending",
     ];
 
@@ -362,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zero_path_endpoint_returns_zero_leaf() {
+    async fn the_deprecated_zero_path_endpoint_still_answers() {
         let service = Arc::new(IndexerService::new_ready(mirror_with_deposits(1)));
         let base = serve(service).await;
 
@@ -370,13 +439,115 @@ mod tests {
             .await
             .unwrap()
             .error_for_status()
-            .unwrap()
-            .json::<TreePathResponse>()
-            .await
             .unwrap();
-
+        assert_eq!(response.headers()["deprecation"], "true");
+        let response = response.json::<TreePathResponse>().await.unwrap();
         assert_eq!(response.note_id, 0);
         assert_eq!(response.leaf, Felt252::ZERO);
+    }
+
+    /// Two deposits, an escape of note 0 (N = 0x900, N+ = 0x901) and a
+    /// mutual close of note 1 (N = 0x7001), with event roots checked.
+    fn mirror_with_exits() -> TreeMirror {
+        use crate::tree_mirror::tests::{apply_all, Reference};
+        let mut reference = Reference::new();
+        let mut events = vec![reference.deposit(100), reference.deposit(101)];
+        events.extend(reference.escape(0, 0x900));
+        events.push(reference.close(1));
+        let mut mirror = TreeMirror::new();
+        apply_all(&mut mirror, &events);
+        mirror
+    }
+
+    #[tokio::test]
+    async fn published_nullifiers_are_served_from_the_verified_view() {
+        let service = Arc::new(IndexerService::new_syncing(ServiceSettings::default()));
+        service.publish_head(TreeView::new(
+            Arc::new(mirror_with_exits()),
+            12,
+            block_hash("12"),
+        ));
+        service.record_success();
+        let base = serve(service.clone()).await;
+        let published = |nullifier: &'static str| {
+            let base = base.clone();
+            async move {
+                let response = reqwest::get(format!("{base}/v1/nullifiers/{nullifier}/published"))
+                    .await
+                    .unwrap();
+                (
+                    response.status(),
+                    response.json::<serde_json::Value>().await.unwrap(),
+                )
+            }
+        };
+        // The escaped nullifier, its successor and a closed nullifier, in
+        // the short hex serverd sends and in full 32-byte hex.
+        for nullifier in [
+            "0x900",
+            "0x901",
+            "0x1b59",
+            "0x0000000000000000000000000000000000000000000000000000000000000901",
+        ] {
+            let (status, body) = published(nullifier).await;
+            assert_eq!(status, StatusCode::OK, "{nullifier}");
+            assert_eq!(body["published"], true, "{nullifier}");
+            assert_eq!(body["block_number"], 12);
+            assert_eq!(body["block_hash"], block_hash("12"));
+        }
+        let (status, body) = published("0x902").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["published"], false);
+        assert_eq!(body["nullifier"], "0x902");
+        // Not a field element, or not hex: refused, never "not published".
+        for invalid in [
+            "zz",
+            "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001",
+        ] {
+            let (status, body) = published(invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+            assert_eq!(body["error_code"], "invalid_request");
+        }
+        // Without a verified view the table is unreadable: 503, which serverd
+        // turns into chain_read_unavailable rather than serving evidence.
+        service.set_phase(SyncStatus::Diverged, Some("test".into()));
+        let (status, _) = published("0x900").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn known_roots_include_every_root_the_vault_set() {
+        use crate::tree_mirror::tests::Reference;
+        let mut reference = Reference::new();
+        let mut mirror = TreeMirror::new();
+        mirror.apply_event(&reference.deposit(100)).unwrap();
+        let first = mirror.root();
+        mirror.apply_event(&reference.deposit(101)).unwrap();
+        let service = Arc::new(IndexerService::new_ready(mirror));
+        let base = serve(service.clone()).await;
+        let known = |root: Felt252| {
+            let base = base.clone();
+            async move {
+                reqwest::get(format!("{base}/v1/tree/roots/{}", root.to_hex()))
+                    .await
+                    .unwrap()
+                    .json::<KnownRootResponse>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let current = service.view().unwrap().root;
+        for root in [TreeMirror::empty_root(), first, current] {
+            let response = known(root).await;
+            assert!(response.known, "{root}");
+            assert_eq!(response.root, root);
+            assert_eq!(response.current_root, current);
+        }
+        assert!(!known(Felt252::from_u64(77)).await.known);
+        let invalid = reqwest::get(format!("{base}/v1/tree/roots/not-hex"))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -550,6 +721,8 @@ mod tests {
         assert_eq!(health["rebuild_count"], 0);
         assert_eq!(health["missed_re_escape_count"], 0);
         assert_eq!(health["missed_re_escape_finalized_count"], 0);
+        assert_eq!(health["known_root_count"], 3);
+        assert_eq!(health["published_nullifier_count"], 0);
         assert!(serde_json::from_value::<crate::service::HealthResponse>(health).is_ok());
 
         // A head older than max_head_age makes the view stale.
@@ -649,7 +822,13 @@ mod tests {
             nullifier: Felt252::from_u64(0xabc),
             final_balance: 10,
             challenge_deadline: 1_700_086_400,
-            new_root: Felt252::ZERO,
+            current_root: Felt252::ZERO,
+        });
+        mirror.process_event(&VaultEvent::EscapeConcessionRecorded {
+            note_id: 1,
+            next_nullifier: Felt252::from_u64(0xabd),
+            state_balance: 15,
+            conceded: 5,
         });
         let service = Arc::new(IndexerService::new_syncing(ServiceSettings::default()));
         service.publish_head(TreeView::new(Arc::new(mirror), 9, block_hash("09")));
@@ -672,6 +851,10 @@ mod tests {
                     "note_id": 1,
                     "withdrawal_nullifier": "0xabc",
                     "challenge_deadline": 1_700_086_400u64,
+                    "final_balance": 10,
+                    "next_nullifier": "0xabd",
+                    "state_balance": 15,
+                    "conceded": 5,
                 }],
             })
         );
@@ -693,9 +876,11 @@ mod tests {
         service.bump_missed_re_escapes(EscapeClose::Challenged);
         service.bump_missed_re_escapes(EscapeClose::Finalized);
         service.bump_missed_re_escapes(EscapeClose::Challenged);
+        service.bump_missed_re_escapes(EscapeClose::Raised);
         let health = service.health();
-        assert_eq!(health.missed_re_escape_count, 3);
+        assert_eq!(health.missed_re_escape_count, 4);
         assert_eq!(health.missed_re_escape_finalized_count, 1);
+        assert_eq!(health.missed_re_escape_raised_count, 1);
         let base = serve(service).await;
 
         let response = reqwest::get(format!("{base}/metrics")).await.unwrap();
@@ -721,6 +906,7 @@ mod tests {
             "zkapi_indexer_rebuilds_total 0",
             "zkapi_indexer_missed_re_escapes_total{event=\"challenged\"} 2",
             "zkapi_indexer_missed_re_escapes_total{event=\"finalized\"} 1",
+            "zkapi_indexer_missed_re_escapes_total{event=\"raised\"} 1",
             "# TYPE zkapi_indexer_rebuilds_total counter",
             "# TYPE zkapi_indexer_missed_re_escapes_total counter",
             "# TYPE zkapi_indexer_served_block gauge",

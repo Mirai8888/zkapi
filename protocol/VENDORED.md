@@ -24,8 +24,12 @@ apply to this repository. Update these libraries as ordinary tracked files and
 record their new revisions here. `contracts/foundry.lock` records the imported
 direct dependency versions.
 
-The files in `setup/v2/` are unchanged from the pinned protocol revision. In
-particular, this import does not regenerate the proving keys or verifiers.
+The files in `setup/v2/` (the legacy circuit `zkapi-v2-note-bound-v1`) are
+unchanged from the pinned protocol revision; this import does not regenerate
+their proving keys or verifiers. The setups of the current circuit,
+`setup/v2-concession-dev/` and, once its ceremony has run,
+`setup/v2-concession/`, are produced in this repository, as their READMEs
+describe.
 
 ## Included dependency sources
 

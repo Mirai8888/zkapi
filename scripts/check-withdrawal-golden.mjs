@@ -130,7 +130,7 @@ async function startAnvil(chainId) {
   const child = spawn('anvil', ['--port', '0', '--chain-id', String(chainId)], { stdio: ['ignore', 'pipe', 'pipe'] });
   const port = await new Promise((resolve, reject) => {
     let output = '';
-    const timer = setTimeout(() => reject(new Error('anvil did not start')), 30_000);
+    const timer = setTimeout(() => { child.kill(); reject(new Error('anvil did not start')); }, 30_000);
     child.stdout.on('data', chunk => {
       output += chunk;
       const match = output.match(/Listening on \S+:(\d+)/);

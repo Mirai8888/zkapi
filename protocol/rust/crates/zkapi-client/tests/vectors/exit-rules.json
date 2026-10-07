@@ -720,6 +720,68 @@
       "expected": {
         "action": "mutual"
       }
+    },
+    {
+      "name": "E3 lost epsilon is decided at once, also where the records call the state fresh",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [],
+        "lost_epsilon_charge": 400
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 400,
+        "reason": "lost_epsilon"
+      }
+    },
+    {
+      "name": "E2 within an hour of must_initiate_by the cutoff comes before a claimed reservation: escape conceding nothing",
+      "facts": {
+        "now": 1996400,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "discarded_stale_root",
+            "request_time": 1990000,
+            "created_at": 1990000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "escape",
+        "conceded": 0,
+        "reason": "mutual_cutoff"
+      }
+    },
+    {
+      "name": "E2 nullifier_used waits from the newest release at the state, a terminal one too",
+      "facts": {
+        "now": 1000000,
+        "must_initiate_by": 2000000,
+        "settlement_window": 21905,
+        "unsettled_escape_after": 43200,
+        "bound_at_state": 1000,
+        "records": [
+          {
+            "disposition": "late_successor",
+            "request_time": 999000,
+            "created_at": 999000
+          }
+        ],
+        "mutual_outcome": "nullifier_used"
+      },
+      "expected": {
+        "action": "wait",
+        "until": 1021805
+      }
     }
   ],
   "lock_releasable": [

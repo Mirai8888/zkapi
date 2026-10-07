@@ -33,8 +33,9 @@ jobs:
         run: |
           npm test
           ZKAPI_REQUIRE_NGINX=1 node --test docker/aws/*.test.mjs
-          npm run build:browser
-          npm run build:mainnet
+          # build:browser and build:mainnet: a network whose profile is still
+          # a not_deployed placeholder must refuse; a deployed one must build.
+          npm run verify:builds
 
       - name: Test challenge signer
         run: |

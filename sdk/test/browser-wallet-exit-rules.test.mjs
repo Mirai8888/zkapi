@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
     DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, HttpError, VAULT, createHarness, depositPath, derivedAnchor,
-    memoryIndexedDb, noteState, nullifierFor, successorFor
+    memoryIndexedDb, noteState, nullifierFor, successorFor, within
 } from './helpers/request-archive-harness.mjs';
 
 // A crash can be injected into the one write that persists a request: the
@@ -239,7 +239,7 @@ test('E0: a hanging operator cannot hold an exit, and Retry-After is ignored', a
         return new Promise(() => {});
     };
     const started = Date.now();
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    const plan = await within(2_000, h.runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
     assert.ok(Date.now() - started < 2_000, 'every call ended at its timeout');
     assert.equal(plan.mode, 'escape');
     assert.equal(plan.decision.rule, 'E3.forced', 'nothing recovered: a forced escape before T');
@@ -255,7 +255,7 @@ test('E0: a hanging operator cannot hold an exit, and Retry-After is ignored', a
             data: { retry_after_seconds: 3_600 }, url });
     };
     const quick = Date.now();
-    await t.runtime.prepareWithdrawal('escape', DESTINATION);
+    await within(1_000, t.runtime.prepareWithdrawal('escape', DESTINATION), 'the throttled escape');
     assert.ok(Date.now() - quick < 1_000);
     assert.ok(throttled <= 6, 'no retries');
 });
@@ -336,14 +336,20 @@ test('E2: a clearance refused with nullifier_used decides as E3; unreachable or 
     assert.deepEqual((await saved()).exitLock.released.map(entry => entry.kind), [2]);
     await assert.rejects(h.runtime.issueLease('chat'), { code: 'exit_locked' });
 
-    for (const refusal of [new HttpError('Unavailable', 503, 'service_unavailable'),
-        new HttpError('Invalid ownership proof.', 400, 'invalid_ownership_proof'), new TypeError('Failed to fetch')]) {
+    // E0: a timeout, a 5xx, a 401 or a 429 (whatever its Retry-After) is
+    // unreachable; any other answer is a refusal. Both escape with c = 0.
+    const throttled = new HttpError('Too many requests', 429, 'rate_limited', { retry_after_seconds: 3_600 });
+    for (const [refusal, outcome] of [[new HttpError('Unavailable', 503, 'service_unavailable'), 'unreachable'],
+        [throttled, 'unreachable'], [new HttpError('Invalid ownership proof.', 400, 'invalid_ownership_proof'), 'refused'],
+        [new TypeError('Failed to fetch'), 'unreachable']]) {
         const other = await walletWithResolvedRequest();
         other.server.clearance = () => { throw refusal; };
         const plan = await other.runtime.prepareWithdrawal('mutual', DESTINATION);
         assert.equal(plan.mode, 'escape', String(refusal));
         assert.equal(plan.public_inputs.conceded, 0);
         assert.equal(plan.decision.rule, 'E2.fallback');
+        assert.deepEqual((await saved()).exitLock.released.map(entry => [entry.kind, entry.outcome]),
+            [[2, outcome], [0, undefined]], String(refusal));
     }
 });
 

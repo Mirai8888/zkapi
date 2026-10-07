@@ -191,6 +191,18 @@ export function noteState(changes = {}) {
 /** The deposit-time path a note saves (Amendment A1). */
 export const depositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
 
+/**
+ * `promise`, or a failed assertion once `ms` passes: a property broken into
+ * a hang fails its test instead of stalling the suite.
+ */
+export function within(ms, promise, label) {
+    let timer;
+    const deadline = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new assert.AssertionError({ message: `${label} did not end within ${ms} ms` })), ms);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 export class HttpError extends Error {
     constructor(message, status, code, data = {}) {
         super(message);

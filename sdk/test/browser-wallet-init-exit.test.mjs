@@ -7,7 +7,9 @@
 // The proof worker is the request-archive harness's observed fake.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DESTINATION, createHarness, depositPath, memoryIndexedDb, noteState } from './helpers/request-archive-harness.mjs';
+import {
+    DESTINATION, createHarness, depositPath, memoryIndexedDb, noteState, within
+} from './helpers/request-archive-harness.mjs';
 import { deployedProfile } from './helpers/deployed-profile.mjs';
 import { nativeFunding, nativeQuote } from './helpers/native-fixtures.mjs';
 
@@ -166,18 +168,6 @@ function reloadedPage(timing = FAST) {
 }
 
 const elapsed = started => Date.now() - started;
-
-/**
- * `promise`, or a failed assertion once `ms` passes: a property broken into
- * a hang fails its test instead of stalling the suite.
- */
-function within(ms, promise, label) {
-    let timer;
-    const deadline = new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new assert.AssertionError({ message: `${label} did not end within ${ms} ms` })), ms);
-    });
-    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
 const lastWithdrawalProof = () => proofLog.calls.filter(call => call.operation === 'prepareWithdrawal').at(-1);
 
 test('an operator holding every connection open cannot stall initialization or an escape from a live request', async () => {

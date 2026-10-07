@@ -38,6 +38,9 @@ async function discardFirstRequest(h) {
 }
 
 const escapeProofs = h => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'escape');
+// Kind-2 ownership proofs: no destination, no concession, never submittable.
+const ownershipProofs = h => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'ownership');
+const NO_DESTINATION = Array(20).fill(0);
 const mutualProofs = h => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'mutual');
 const clearancePosts = h => h.serverCalls('POST', '/v2/withdraw/clearance');
 const markerOf = async () => {
@@ -48,12 +51,12 @@ const markerOf = async () => {
 const RESERVING = Object.freeze({ phase: 'reserving', mode: 'mutual', clearanceReserved: true,
     withdrawalNullifier: nullifierFor(GENESIS_ANCHOR) });
 
-test('mutual clearance sends an escape-form ownership proof for the same nullifier and destination', async () => {
+test('mutual clearance sends a kind-2 ownership proof for the same nullifier and no destination', async () => {
     const h = await freshWallet({ clearanceOwnershipProof: 'required' });
     let markerBeforeProof = 'not observed';
     const call = h.runtime.worker.call;
     h.runtime.worker.call = async (operation, payload) => {
-        if (operation === 'prepareWithdrawal' && payload.args.mode === 'escape') {
+        if (operation === 'prepareWithdrawal' && payload.args.mode === 'ownership') {
             markerBeforeProof = (await store.readBrowserWallet()).preparedWithdrawal;
         }
         return call(operation, payload);
@@ -65,17 +68,20 @@ test('mutual clearance sends an escape-form ownership proof for the same nullifi
     };
     const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
 
-    const [ownership] = escapeProofs(h);
-    assert.equal(ownership.payload.args.clearance, null);
-    assert.equal(ownership.payload.args.destination, DESTINATION, 'the ownership proof pays the real destination');
+    const [ownership] = ownershipProofs(h);
+    assert.equal(ownership.payload.args.clearance, undefined);
+    assert.equal(ownership.payload.args.destination, undefined, 'the ownership proof names no destination');
+    assert.equal(ownership.payload.args.conceded, undefined);
+    const validity = ownership.payload.args.valid_until - Math.floor(Date.now() / 1000);
+    assert.ok(validity > 3_500 && validity <= 3_600, 'an ownership proof is valid for one hour');
     assert.equal(markerBeforeProof, null, 'local proving precedes the withdrawal-only marker');
     const { body, saved } = atPost;
     assert.deepEqual(Object.keys(body).sort(), ['ownership_proof', 'withdrawal_nullifier']);
     assert.equal(body.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
     assert.deepEqual(Object.keys(body.ownership_proof).sort(), ['proof', 'public_inputs']);
-    assert.equal(body.ownership_proof.public_inputs.has_clearance, false);
+    assert.equal(body.ownership_proof.public_inputs.kind, 2);
     assert.equal(body.ownership_proof.public_inputs.withdrawal_nullifier, body.withdrawal_nullifier);
-    assert.deepEqual(body.ownership_proof.public_inputs.destination, destinationBytes(DESTINATION));
+    assert.deepEqual(body.ownership_proof.public_inputs.destination, NO_DESTINATION);
     assert.equal(body.ownership_proof.public_inputs.final_balance, 5_000_000);
     assert.equal(body.ownership_proof.proof.backend, 'groth16_bn254');
     assert.equal(atPost.proofs, 1, 'only the ownership proof exists when the server is asked');
@@ -104,10 +110,12 @@ test('a mismatched ownership proof fails closed before any server reservation', 
     for (const change of [{ chain_id: 1 }, { contract_address: other }, { state_signing_key_x: '0x1' },
         { clearance_signing_key_y: '0x1' }, { withdrawal_nullifier: '0x1' }, { note_id: 8 },
         { active_root: '0x1' }, { final_balance: 1 }, { destination: destinationBytes(other) },
-        { has_clearance: true }, { protocol_version: 1 }, { request_nullifier: '0x1' },
+        { kind: 0 }, { kind: 1 }, { conceded: 1 }, { next_nullifier: '0x5' }, { valid_until: 1 },
+        { valid_until: Math.floor(Date.now() / 1000) + 7_200 }, { destination: destinationBytes(DESTINATION) },
+        { protocol_version: 1 }, { request_nullifier: '0x1' },
         { authorization_tag: '0x1' }]) {
         const h = await freshWallet({ vaultRevision: 2 });
-        h.worker.mutate = plan => { if (plan.mode === 'escape') Object.assign(plan.public_inputs, change); };
+        h.worker.mutate = plan => { if (plan.mode === 'ownership') Object.assign(plan.public_inputs, change); };
         h.server.clearance = body => clearanceFor(body);
         await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), /does not match/);
         assert.equal(clearancePosts(h).length, 0);
@@ -143,7 +151,7 @@ test('an ownership proof is generated at a transmitted state only after the serv
         ]) {
             h.server.nullifier = reply;
             await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), { code });
-            assert.equal(escapeProofs(h).length, 0, 'no ownership proof is generated');
+            assert.equal(ownershipProofs(h).length, 0, 'no ownership proof is generated');
             assert.ok(clearancePosts(h).every(call => !call.body.ownership_proof));
             assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'a refused gate leaves the note usable');
         }
@@ -153,14 +161,14 @@ test('an ownership proof is generated at a transmitted state only after the serv
             // a submittable escape, so the state gets only a proof-less request.
             await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION),
                 { code: 'transmitted_anchor_ownership_unsafe', status: 409 });
-            assert.equal(escapeProofs(h).length, 0, 'a strict vault never proves ownership at a transmitted state');
+            assert.equal(ownershipProofs(h).length, 0, 'a strict vault never proves ownership at a transmitted state');
             assert.ok(clearancePosts(h).every(call => !call.body.ownership_proof));
             assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'nothing was reserved');
             continue;
         }
         const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
         assert.equal(plan.mode, 'mutual');
-        assert.equal(escapeProofs(h).length, 1);
+        assert.equal(ownershipProofs(h).length, 1);
         assert.ok(clearancePosts(h).at(-1).body.ownership_proof);
     }
 });
@@ -187,7 +195,7 @@ test('a strict vault answers a forged or honest proof requirement at a transmitt
                     return true;
                 });
             }
-            assert.equal(escapeProofs(h).length, 0, `${label}: no escape-form proof exists`);
+            assert.equal(ownershipProofs(h).length, 0, `${label}: no escape-form proof exists`);
             assert.deepEqual(clearancePosts(h).map(post => post.body),
                 [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }, { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }],
                 `${label}: only proof-less requests leave the device`);
@@ -214,14 +222,14 @@ test('a strict vault answers a forged or honest proof requirement at a transmitt
     proofOnlyServer(h, 503, 'legacy_clearance_capacity');
     await assert.rejects(h.runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: h.chain.root }),
         { code: 'transmitted_anchor_ownership_unsafe' });
-    assert.equal(escapeProofs(h).length, 0);
+    assert.equal(ownershipProofs(h).length, 0);
     assert.ok(clearancePosts(h).every(post => !post.body.ownership_proof));
 
     // The prover itself refuses such a state, whoever asks.
     await assert.rejects(h.runtime.generateOwnershipProof({ state, destination: DESTINATION,
         nullifier: nullifierFor(GENESIS_ANCHOR), path: await h.runtime.treePath(7) }),
     { code: 'transmitted_anchor_ownership_unsafe' });
-    assert.equal(escapeProofs(h).length, 0);
+    assert.equal(ownershipProofs(h).length, 0);
 });
 
 test('a strict vault closes a transmitted state through a proof-less clearance the server grants', async () => {
@@ -232,7 +240,7 @@ test('a strict vault closes a transmitted state through a proof-less clearance t
         const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
         assert.equal(plan.mode, 'mutual');
         assert.deepEqual(clearancePosts(h).map(post => post.body), [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }]);
-        assert.equal(escapeProofs(h).length, 0);
+        assert.equal(ownershipProofs(h).length, 0);
         assert.deepEqual(plan.clearance, clearanceFor({ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }));
     }
 });
@@ -247,7 +255,7 @@ test('a strict vault still proves ownership at a state that never left the devic
             assert.equal(plan.mode, 'mutual');
             assert.deepEqual(clearancePosts(h).map(post => Boolean(post.body.ownership_proof)), expected,
                 `${JSON.stringify(profile)} after ${code}`);
-            assert.equal(escapeProofs(h).length, 1);
+            assert.equal(ownershipProofs(h).length, 1);
             assert.equal(h.server.calls.filter(call => call.path.startsWith('/v2/nullifiers/')).length, 0,
                 'an untransmitted state needs no server reading');
         }
@@ -264,14 +272,14 @@ test('a legacy server is asked without a proof first and with one exactly once o
     const posts = clearancePosts(h);
     assert.equal(posts.length, 2);
     assert.deepEqual(posts[0].body, { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) });
-    assert.equal(posts[1].body.ownership_proof.public_inputs.has_clearance, false);
+    assert.equal(posts[1].body.ownership_proof.public_inputs.kind, 2);
     assert.deepEqual(plan.clearance, clearanceFor(posts[1].body));
 
     const legacy = await freshWallet();
     legacy.server.clearance = body => clearanceFor(body);
     await legacy.runtime.prepareWithdrawal('mutual', DESTINATION);
     assert.deepEqual(clearancePosts(legacy).map(call => call.body), [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }]);
-    assert.equal(escapeProofs(legacy).length, 0, 'an accepting legacy server never receives a submittable escape');
+    assert.equal(ownershipProofs(legacy).length, 0, 'an accepting legacy server never receives a submittable escape');
 
     const refusing = await freshWallet();
     refusing.server.clearance = () => { throw new HttpError('An ownership proof is required.', 400, 'clearance_ownership_required'); };
@@ -297,7 +305,7 @@ test('a legacy profile answers a spent legacy-clearance budget with its ownershi
     let markerWhileProving = 'not observed';
     const call = h.runtime.worker.call;
     h.runtime.worker.call = async (operation, payload) => {
-        if (operation === 'prepareWithdrawal' && payload.args.mode === 'escape') {
+        if (operation === 'prepareWithdrawal' && payload.args.mode === 'ownership') {
             markerWhileProving = (await store.readBrowserWallet()).preparedWithdrawal;
         }
         return call(operation, payload);
@@ -318,8 +326,8 @@ test('a legacy profile answers a spent legacy-clearance budget with its ownershi
     assert.equal(markerWhileProving, null, 'the note stays usable while its ownership proof is generated');
     const { body } = posts[1];
     assert.equal(body.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    assert.equal(body.ownership_proof.public_inputs.has_clearance, false);
-    assert.deepEqual(body.ownership_proof.public_inputs.destination, destinationBytes(DESTINATION));
+    assert.equal(body.ownership_proof.public_inputs.kind, 2);
+    assert.deepEqual(body.ownership_proof.public_inputs.destination, NO_DESTINATION);
     assert.equal(plan.mode, 'mutual');
     assert.deepEqual(plan.clearance, clearanceFor(body));
 
@@ -367,7 +375,7 @@ test('a gateway 429 on the clearance is retried with the same body after its ret
         assert.equal(Boolean(JSON.parse(bodies[0]).ownership_proof), proofs, label);
         assert.deepEqual(sleeps, [5_000, 5_000], `${label}: Retry-After outranks the shorter backoff`);
         assert.deepEqual(markers, ['reserving', 'reserving', 'reserving'], label);
-        assert.equal(escapeProofs(h).length, proofs ? 1 : 0, `${label}: one ownership proof at most`);
+        assert.equal(ownershipProofs(h).length, proofs ? 1 : 0, `${label}: one ownership proof at most`);
     }
 });
 
@@ -455,7 +463,7 @@ test('a strict vault keeps the note withdrawal-only after a throttled proof that
         await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error =>
             error.code === 'gateway_rate_limited' && error.data.withdrawal_only === true, label);
         assert.deepEqual(clearancePosts(h).map(post => Boolean(post.body.ownership_proof)), [false, true], label);
-        assert.equal(captured[0].has_clearance, false, label);
+        assert.equal(captured[0].kind, 2, label);
         assert.equal(captured[0].withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR), label);
         assert.deepEqual(await markerOf(), RESERVING, `${label}: the note stays withdrawal-only`);
         await assert.rejects(h.runtime.issueLease('chat'), /Finish the prepared withdrawal/, label);
@@ -519,7 +527,7 @@ test('after a refused proof-less clearance a gate refusal leaves the note usable
     h.server.nullifier = () => { throw new Error('network down'); };
     await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'transmitted_anchor_unconfirmed' });
     assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'not withdrawal-only');
-    assert.equal(escapeProofs(h).length, 0, 'no ownership proof for an unconfirmed transmitted state');
+    assert.equal(ownershipProofs(h).length, 0, 'no ownership proof for an unconfirmed transmitted state');
     assert.ok(clearancePosts(h).every(post => !post.body.ownership_proof));
     const request = await h.runtime.prepareLeaseRequest(() => {});
     assert.equal(request.public_inputs.request_nullifier, nullifierFor(GENESIS_ANCHOR));
@@ -531,7 +539,7 @@ test('after a refused proof-less clearance a gate refusal leaves the note usable
     settling.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
     await assert.rejects(settling.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'request_settlement_pending' });
     assert.equal((await store.readBrowserWallet()).preparedWithdrawal, null, 'not withdrawal-only');
-    assert.equal(escapeProofs(settling).length, 0);
+    assert.equal(ownershipProofs(settling).length, 0);
     await assert.rejects(settling.runtime.prepareLeaseRequest(() => {}), { code: 'request_settlement_pending' });
 });
 
@@ -566,7 +574,7 @@ test('a legacy-profile background mutual answers a spent legacy-clearance budget
     assert.deepEqual(posts.map(post => Boolean(post.body.ownership_proof)), [false, true]);
     assert.equal(posts[1].body.withdrawal_nullifier, nullifier);
     assert.equal(posts[1].body.ownership_proof.public_inputs.note_id, 7);
-    assert.equal(plan.public_inputs.has_clearance, true);
+    assert.equal(plan.public_inputs.kind, 1);
 });
 
 // A server with legacy clearance on reserves a proof-less request, so only an
@@ -594,7 +602,7 @@ test('an answer lost after a proof-less clearance keeps the note withdrawal-only
         await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error => error === failure, label);
         assert.deepEqual(clearancePosts(h).map(post => post.body),
             [{ withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }], `${label}: sent once, without a proof`);
-        assert.equal(escapeProofs(h).length, 0, `${label}: no ownership proof after an answer that may have reserved`);
+        assert.equal(ownershipProofs(h).length, 0, `${label}: no ownership proof after an answer that may have reserved`);
         assert.deepEqual(await markerOf(), RESERVING, `${label}: the server may hold the reservation`);
         await assert.rejects(h.runtime.prepareLeaseRequest(() => {}), /Finish the prepared withdrawal/, label);
 
@@ -605,7 +613,7 @@ test('an answer lost after a proof-less clearance keeps the note withdrawal-only
         assert.deepEqual(posts.map(post => post.body), [
             { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }, { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR) }], label);
         assert.deepEqual(plan.clearance, clearanceFor(posts[1].body), label);
-        assert.equal(escapeProofs(h).length, 0, label);
+        assert.equal(ownershipProofs(h).length, 0, label);
     }
 });
 
@@ -628,7 +636,7 @@ test('an answer lost after the proof-carrying clearance keeps the note withdrawa
         const phasesWhileProving = [];
         const call = h.runtime.worker.call;
         h.runtime.worker.call = async (operation, payload) => {
-            if (operation === 'prepareWithdrawal' && payload.args.mode === 'escape') {
+            if (operation === 'prepareWithdrawal' && payload.args.mode === 'ownership') {
                 phasesWhileProving.push((await store.readBrowserWallet()).preparedWithdrawal?.phase ?? null);
             }
             return call(operation, payload);
@@ -665,7 +673,7 @@ test('a lagging clearance root retries the same ownership proof with backoff, th
     assert.equal(bodies.length, 3);
     assert.ok(bodies.every(body => body === bodies[0]), 'the same proof is retried');
     assert.deepEqual(sleeps, [1, 2]);
-    assert.equal(escapeProofs(h).length, 1);
+    assert.equal(ownershipProofs(h).length, 1);
 
     const stuck = await freshWallet({ clearanceOwnershipProof: 'required' });
     stuck.runtime.postClearance = (body, nullifier, signal) => BrowserWalletRuntime.prototype.postClearance.call(
@@ -676,7 +684,7 @@ test('a lagging clearance root retries the same ownership proof with backoff, th
     };
     await assert.rejects(stuck.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'stale_root' });
     assert.equal(clearancePosts(stuck).length, 5);
-    assert.equal(escapeProofs(stuck).length, 1, 'the runtime never re-proves on its own');
+    assert.equal(ownershipProofs(stuck).length, 1, 'the runtime never re-proves on its own');
 
     // Codes the server never sends for a clearance are not retried.
     const invented = await freshWallet({ clearanceOwnershipProof: 'required' });
@@ -706,15 +714,19 @@ test('a persisted clearance is reused without a second ownership proof or server
     const first = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
     h.chain.root = '0x79';
     const second = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
-    assert.equal(second.public_inputs.active_root, '0x79');
+    // The vault accepts any root it ever held: the close proof is reused.
+    assert.equal(second.public_inputs.active_root, first.public_inputs.active_root);
+    assert.deepEqual(second.proof, first.proof);
     assert.deepEqual(second.clearance, first.clearance);
     const escape = await h.runtime.prepareWithdrawal('escape', DESTINATION);
     assert.deepEqual(escape.clearance, first.clearance, 'an escape carries the clearance for switching back');
     assert.equal(escapeProofs(h).at(-1).payload.args.clearance, null, 'the WASM never sees a clearance on an escape');
+    assert.equal(escapeProofs(h).at(-1).payload.args.conceded, 0);
     const back = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
     assert.equal(back.mode, 'mutual');
     assert.equal(clearancePosts(h).length, 1);
-    assert.equal(escapeProofs(h).length, 2, 'one ownership proof and one real escape proof');
+    assert.equal(ownershipProofs(h).length, 1, 'one ownership proof');
+    assert.equal(escapeProofs(h).length, 1, 'and one real escape proof');
 
     const hardened = await freshWallet({ vaultRevision: 2 });
     hardened.server.clearance = body => clearanceFor(body);
@@ -766,8 +778,8 @@ test('background mutual sends the ownership proof and persists its clearance', a
     const [{ body }] = clearancePosts(h);
     assert.equal(body.withdrawal_nullifier, nullifier);
     assert.equal(body.ownership_proof.public_inputs.note_id, 7);
-    assert.deepEqual(body.ownership_proof.public_inputs.destination, destinationBytes(DESTINATION));
-    assert.equal(plan.public_inputs.has_clearance, true);
+    assert.deepEqual(body.ownership_proof.public_inputs.destination, NO_DESTINATION);
+    assert.equal(plan.public_inputs.kind, 1);
     const saved = (await store.listBrowserWithdrawals(DEPLOYMENT))[0];
     assert.deepEqual(saved.preparedWithdrawal.clearance, clearanceFor(body));
     assert.equal((await store.readBrowserWallet()).state.note_id, 8, 'the selected chat note is untouched');
@@ -775,34 +787,34 @@ test('background mutual sends the ownership proof and persists its clearance', a
     h.chain.root = '0x79';
     await h.runtime.prepareBackgroundWithdrawal(RECORD_ID, { expectedActiveRoot: '0x79' });
     assert.equal(clearancePosts(h).length, 1, 'the persisted clearance is reused');
-    assert.equal(escapeProofs(h).length, 1);
+    assert.equal(ownershipProofs(h).length, 1);
     assert.equal(mutualProofs(h).length, 2);
 });
 
-test('a withdrawal proof is reused with refreshed siblings when a hardened vault root moved', async () => {
+test('a withdrawal proof is reused at any root until near its valid_until', async () => {
     const h = await freshWallet({ vaultRevision: 2 });
     const first = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    const validity = first.public_inputs.valid_until - Math.floor(Date.now() / 1000);
+    assert.ok(validity > 10_700 && validity <= 10_800, 'an exit proof is valid for three hours');
+    assert.equal(first.public_inputs.kind, 0);
+    assert.equal(first.siblings, undefined, 'exits carry no Merkle path');
     h.chain.root = '0x78';
-    const refreshed = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    const reused = await h.runtime.prepareWithdrawal('escape', DESTINATION);
     assert.equal(escapeProofs(h).length, 1, 'no new proof');
-    assert.deepEqual(refreshed.proof, first.proof);
-    assert.deepEqual(refreshed.public_inputs, first.public_inputs);
-    assert.equal(refreshed.siblingsRoot, '0x78');
-    assert.deepEqual(refreshed.siblings, (await h.runtime.treePath(7)).siblings);
-    assert.deepEqual((await store.readBrowserWallet()).preparedWithdrawal.siblings, refreshed.siblings);
-    assert.deepEqual(await h.runtime.prepareWithdrawal('escape', DESTINATION), refreshed);
-    assert.equal(escapeProofs(h).length, 1);
+    assert.deepEqual(reused, first);
 
     const reproved = await h.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true });
     assert.equal(escapeProofs(h).length, 2);
     assert.equal(reproved.public_inputs.active_root, '0x78');
 
-    const strict = await freshWallet();
-    await strict.runtime.prepareWithdrawal('escape', DESTINATION);
-    strict.chain.root = '0x78';
-    const strictPlan = await strict.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(escapeProofs(strict).length, 2, 'an older vault without root history always re-proves');
-    assert.equal(strictPlan.public_inputs.active_root, '0x78');
+    // A proof close to its valid_until is never handed out again.
+    const saved = await store.readBrowserWallet();
+    await store.writeBrowserWallet({ ...saved, preparedWithdrawal: { ...saved.preparedWithdrawal,
+        public_inputs: { ...saved.preparedWithdrawal.public_inputs, valid_until: Math.floor(Date.now() / 1000) + 600 } } });
+    await h.runtime.reload();
+    const fresh = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(escapeProofs(h).length, 3);
+    assert.ok(fresh.public_inputs.valid_until > Math.floor(Date.now() / 1000) + 10_000);
 });
 
 test('withdrawal retries refresh siblings first, then re-prove after a repeated or explicit UnknownRoot rejection', async t => {
@@ -812,8 +824,8 @@ test('withdrawal retries refresh siblings first, then re-prove after a repeated 
         public_inputs: { protocol_version: 2, chain_id: 11155111, contract_address: VAULT, active_root: '0x1',
             state_signing_key_x: '0x1', state_signing_key_y: '0x1', clearance_signing_key_x: '0x1',
             clearance_signing_key_y: '0x1', note_id: 7, final_balance: 5_000_000,
-            destination: destinationBytes(DESTINATION), withdrawal_nullifier: '0x7', has_clearance: false,
-            withdrawal_tag: '0x8' } };
+            destination: destinationBytes(DESTINATION), withdrawal_nullifier: '0x7', kind: 0,
+            next_nullifier: '0x8', conceded: 0, valid_until: 4_000_000_000 } };
     for (const [rejections, expected] of [
         [['stale_root', 'stale_root', 'stop'], [false, false, true]],
         [['unknown_root', 'stop'], [false, true]],

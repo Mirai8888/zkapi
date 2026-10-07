@@ -908,7 +908,10 @@ test('browser withdrawal recovery invariants', async t => {
                         active_root: payload.args.active_root,
                         note_id: 7,
                         final_balance: 1_000_000,
-                        withdrawal_nullifier: '0x777'
+                        withdrawal_nullifier: '0x777',
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
+                        conceded: payload.args.conceded ?? 0,
+                        valid_until: payload.args.valid_until
                     }
                 };
             }
@@ -1008,7 +1011,10 @@ test('browser withdrawal recovery invariants', async t => {
                         active_root: payload.args.active_root,
                         note_id: 7,
                         final_balance: 1_000_000,
-                        withdrawal_nullifier: '0x777'
+                        withdrawal_nullifier: '0x777',
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[payload.args.mode],
+                        conceded: payload.args.conceded ?? 0,
+                        valid_until: payload.args.valid_until
                     }
                 };
             }

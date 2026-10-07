@@ -15,8 +15,8 @@ import { configureBrowserSdk } from '@openanonymity/zkapi-browser-sdk';
 import client from '@openanonymity/zkapi-browser-sdk/client';
 
 configureBrowserSdk({
-  configUrl: '/zkapi/browser-config.json',
-  workerUrl: '/zkapi/assets/zkapiWasmWorker.js',
+  configUrl: '/zkapi/v2c/browser-config.json',
+  workerUrl: '/zkapi/v2c/assets/zkapiWasmWorker.js',
   // Optional: the host may preserve its explicit opt-in privacy proxy policy.
   transport: (url, init, hints) => hostTransport.fetch(url, init, hints)
 });
@@ -75,10 +75,17 @@ endpoints and provider inference never receive this password. A 401 clears
 the rejected credential without replaying a protocol operation; recovery
 journals remain authoritative. Mainnet does no password discovery or prompting.
 
-This SDK requires `proof_setup.circuit_id: "zkapi-v2-note-bound-v1"` in the
+This SDK requires `proof_setup.circuit_id: "zkapi-v2-concession-v1"` in the
 deployment manifest and matching `trusted_deployment.circuit_id` in the host
-config. The vault's immutable verifier, proving keys, and signing-key pins must
-match this circuit. Configuration mismatches are rejected before funding.
+config, a vault with the concession exit (`trusted_deployment.exit_concession:
+1`, vault revision 3), and a `trusted_deployment.setup_id` equal to the setup
+the bundled WebAssembly is built for (`browser_setup_id()`, also
+`setupId` in `sdk/assets/manifest.json`). The vault's immutable verifier,
+proving keys, and signing-key pins must match this circuit. Configuration
+mismatches are rejected before funding; a profile with
+`deployment_status: "not_deployed"` is a placeholder and is refused with
+`deployment_not_deployed`. Notes in a `zkapi-v2-note-bound-v1` vault exit
+through the legacy build of this SDK, served at its own path.
 
 ## External wallets and manual signing
 
@@ -163,20 +170,46 @@ import { build } from 'esbuild';
 import { buildBrowserSdkAssets } from '@openanonymity/zkapi-browser-sdk/build';
 
 await buildBrowserSdkAssets({
-  outDir: 'dist/zkapi',
-  publicPath: '/zkapi/',
+  outDir: 'dist/zkapi/v2c',
+  publicPath: '/zkapi/v2c/', // the default
   network: 'sepolia', // or 'mainnet'
   build
 });
 ```
 
 The helper emits `browser-config.json`, `assets/zkapiWasmWorker.js`,
-`wasm/zkapi_browser_bg.wasm`, `proofs/request.pk`, `proofs/withdrawal.pk`, and
-`sdk-assets.json`. It verifies all source artifact hashes and both proving-key
-pins before returning. The host supplies its esbuild implementation, controls
-its CSP/rewrites, and hashes these emitted assets in its deployment manifest.
-Proof downloads are verified again inside the worker. No private credentials
-are required to build either network.
+`wasm/zkapi_browser_bg.wasm`, `proofs/request.pk`, `proofs/withdrawal.pk`,
+`proofs/request.vk`, and `sdk-assets.json` (schema 2: `circuitId`, `setupId`,
+`sourceRevision`, `publicPath` and the emitted hashes). It verifies all source
+artifact hashes, the WebAssembly's own circuit and setup, and the profile's
+proving- and verifying-key pins before writing anything. It refuses a
+placeholder profile (`deployment_not_deployed`), a profile of another circuit
+(`incompatible_proof_circuit`) or setup (`setup_mismatch`), a profile without
+`exit_concession: 1` (`exit_concession_required`), and a mainnet profile on
+any setup but the ceremony's `mpc-1` (`development_setup_on_mainnet`). Both
+shipped profiles are `not_deployed` placeholders until their vaults exist.
+The default `publicPath` is `/zkapi/v2c/`: proving keys are fetched with
+`cache: 'force-cache'`, so new keys need URLs the legacy build never used.
+The host supplies its esbuild implementation, controls its CSP/rewrites, and
+hashes these emitted assets in its deployment manifest. Proof downloads are
+verified again inside the worker; every key download must carry its SHA-256
+pin. No private credentials are required to build either network.
+
+### Building and checking the WebAssembly
+
+Maintainers build the bundle with `scripts/build-browser-client.sh --setup
+dev|mpc-1`. `mpc-1` is the production bundle, which loads only the ceremony
+keys pinned in `zkapi-proof`; `dev` loads only the development keys of
+`protocol/setup/v2-concession-dev` (CI, tests and the drill vault). The script
+copies the setup's `request.pk`, `withdrawal.pk` and `request.vk` into
+`sdk/assets/proofs/` and rewrites `sdk/assets/manifest.json` with the hashes,
+the setup's VK keccak256 values and `sourceRevision`, the commit the bundle
+was built from (the WebAssembly sources must be committed first). The build is
+reproducible: `rust-toolchain.toml` pins rustc 1.99.0, the script requires
+wasm-bindgen-cli 0.2.117, uses `Cargo.lock` as is, and remaps every absolute
+build path. `npm run verify:wasm` rebuilds into a temporary directory and
+fails unless every `sdk/wasm/` file matches the manifest byte for byte;
+`npm run verify:assets` checks the committed hashes without Rust.
 
 The SDK uses IndexedDB, local/session storage, Web Locks, BroadcastChannel,
 revision checks, and signed receipt validation to manage wallet state. Hosting
@@ -274,8 +307,8 @@ trust anchor and never from the served manifest:
   (a vault whose challenge is non-destructive and that keeps recent roots), an
   escape at a transmitted state is allowed when the server reports the
   nullifier `unknown` or `clearance_reserved` and no challenge was observed.
-  Withdrawal proofs are reused with refreshed Merkle siblings when only the
-  vault root moved. Without it (strict mode) an escape at a transmitted state is
+  Exits carry no Merkle path and the vault accepts any root it ever held,
+  so a withdrawal proof is reused until its `valid_until`. Without it (strict mode) an escape at a transmitted state is
   always refused (`transmitted_anchor_escape_unsafe`), and a moved root always
   re-proves. A declared `2` is checked on chain before it takes effect:
   initialization reads the vault's `ROOT_HISTORY_WINDOW()`, a view only that

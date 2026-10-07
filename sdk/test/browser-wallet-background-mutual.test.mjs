@@ -126,7 +126,7 @@ async function setup(shared = false) {
                 note_id: 7, final_balance: state.current_balance, chain_id: 1,
                 contract_address: VAULT, active_root: args.args.active_root,
                 withdrawal_nullifier: '0x777', destination: [...Buffer.from(DESTINATION.slice(2), 'hex')],
-                has_clearance: true } };
+                kind: 1, next_nullifier: '0x0', conceded: 0, valid_until: args.args.valid_until } };
         } }
     });
     await runtime.reload();
@@ -214,7 +214,7 @@ test('display-only polling cannot discard a proof but a competing prepared plan 
 test('wrong note, vault, root, nullifier, recipient or amount from worker fails closed', async () => {
     for (const patch of [{ note_id: 8 }, { chain_id: 2 }, { contract_address: DESTINATION },
         { active_root: '0x98' }, { withdrawal_nullifier: '0x778' }, { destination: VAULT },
-        { final_balance: 9000000 }, { has_clearance: false }]) {
+        { final_balance: 9000000 }, { kind: 0 }, { kind: 2 }, { conceded: 1 }, { next_nullifier: '0x5' }]) {
         const { runtime, selected, lease } = await setup();
         const call = runtime.worker.call;
         runtime.worker.call = async (method, args) => {

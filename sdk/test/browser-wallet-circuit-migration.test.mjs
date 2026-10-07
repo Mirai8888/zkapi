@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BrowserWalletRuntime } from '../services/browserWalletRuntime.js';
 
-const CIRCUIT_ID = 'zkapi-v2-note-bound-v1';
+const CIRCUIT_ID = 'zkapi-v2-concession-v1';
 
 function manifest() {
     return {
@@ -33,7 +33,7 @@ function manifest() {
 
 test('browser rejects missing, legacy, and unknown circuits with migration guidance', () => {
     const runtime = new BrowserWalletRuntime();
-    for (const circuitId of [undefined, '', 'legacy-unbound', 'unknown-future-circuit']) {
+    for (const circuitId of [undefined, '', 'legacy-unbound', 'zkapi-v2-note-bound-v1', 'unknown-future-circuit']) {
         const deployment = manifest();
         deployment.proof_setup.circuit_id = circuitId;
         assert.throws(() => runtime.validateManifest(deployment), error => {
@@ -56,7 +56,9 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
     runtime.browserConfig = { trusted_deployment: {
         ...deployment,
         ...deployment.proof_setup,
-        ...deployment.privacy_mode
+        ...deployment.privacy_mode,
+        setup_id: 'dev',
+        exit_concession: 1
     } };
     runtime.validateManifestTrust(deployment);
     delete runtime.browserConfig.trusted_deployment.circuit_id;
@@ -116,4 +118,38 @@ test('token deployments are rejected before deployment selection, worker creatio
         assert.equal(runtime.worker, null);
         assert.equal(runtime.initialized, false);
     }
+});
+
+test('a placeholder profile, a profile without the concession exit or an unknown setup never initializes', () => {
+    const runtime = new BrowserWalletRuntime();
+    const deployment = manifest();
+    const trusted = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
+        setup_id: 'dev', exit_concession: 1 };
+    runtime.browserConfig = { trusted_deployment: trusted };
+    runtime.validateManifestTrust(deployment);
+    runtime.browserConfig = { trusted_deployment: { ...trusted, deployment_status: 'not_deployed' } };
+    assert.throws(() => runtime.validateManifestTrust(deployment), { code: 'deployment_not_deployed' });
+    for (const exitConcession of [undefined, 0, 2, '1']) {
+        runtime.browserConfig = { trusted_deployment: { ...trusted, exit_concession: exitConcession } };
+        assert.throws(() => runtime.validateManifestTrust(deployment), { code: 'exit_concession_required' });
+    }
+    // vault_revision 2 alone (the hardened note-bound vault) is not enough.
+    runtime.browserConfig = { trusted_deployment: { ...trusted, exit_concession: undefined, vault_revision: 2 } };
+    assert.throws(() => runtime.validateManifestTrust(deployment), { code: 'exit_concession_required' });
+    for (const setupId of [undefined, 'rehearsal', 'DEV']) {
+        runtime.browserConfig = { trusted_deployment: { ...trusted, setup_id: setupId } };
+        assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted setup_id/);
+    }
+});
+
+test('the proof worker must run a bundle of the pinned circuit and setup', async () => {
+    const runtime = new BrowserWalletRuntime();
+    const identity = { circuit_id: CIRCUIT_ID, setup_id: 'dev' };
+    runtime.worker = { call: async operation => { assert.equal(operation, 'identity'); return identity; } };
+    runtime.browserConfig = { trusted_deployment: { circuit_id: CIRCUIT_ID, setup_id: 'dev' } };
+    await runtime.assertWorkerBundle();
+    runtime.browserConfig = { trusted_deployment: { circuit_id: CIRCUIT_ID, setup_id: 'mpc-1' } };
+    await assert.rejects(runtime.assertWorkerBundle(), { code: 'setup_mismatch' });
+    runtime.browserConfig = { trusted_deployment: { circuit_id: 'zkapi-v2-note-bound-v1', setup_id: 'dev' } };
+    await assert.rejects(runtime.assertWorkerBundle(), { code: 'setup_mismatch' });
 });

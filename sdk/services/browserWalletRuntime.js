@@ -184,7 +184,17 @@ function browserConfigUrl() {
     if (!configured) throw new Error('Configure a trusted configUrl before initializing the zkAPI browser SDK.');
     return configured;
 }
-const REQUIRED_CIRCUIT_ID = 'zkapi-v2-note-bound-v1';
+const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
+// Setups a bundle can be built for; the build-pinned profile names one, and
+// the proof worker must run a bundle of exactly that setup.
+const BUNDLE_SETUP_IDS = Object.freeze(['dev', 'mpc-1']);
+// valid_until of kind 0 and 1 proofs (checked by the vault) and of kind 2
+// ownership proofs (checked by the server), design §6.4 E0.
+const WITHDRAWAL_PROOF_VALIDITY_SECONDS = 10_800;
+const OWNERSHIP_PROOF_VALIDITY_SECONDS = 3_600;
+// A saved withdrawal proof is reused only while this much of its validity
+// remains, so a reused proof can still be signed and included in time.
+const WITHDRAWAL_PROOF_REUSE_MARGIN_SECONDS = 1_800;
 const MAX_RECOVERY_WAIT_MS = 45_000;
 // OA may briefly throttle child-key creation. Keep retrying the same durable,
 // idempotent lease request long enough to cross a one-minute limiter without
@@ -450,6 +460,27 @@ function validClearance(prepared, nullifier) {
         && sameFelt(clearance.withdrawal_nullifier, nullifier));
 }
 
+// Everything of a note state except its bound (bound_at_state), which the
+// prover sets on the state a request proof is made at.
+const STATE_IDENTITY_FIELDS = Object.freeze(['protocol_version', 'chain_id', 'contract_address', 'note_id',
+    'secret_s', 'deposit_amount', 'expiry_ts', 'current_balance', 'balance_blinding', 'current_commitment_x',
+    'current_commitment_y', 'current_anchor', 'is_genesis', 'state_signature', 'prev_anchor']);
+
+function sameStateExceptBound(next, current) {
+    if (!next || typeof next !== 'object' || !current) return false;
+    return STATE_IDENTITY_FIELDS.every(field => JSON.stringify(next[field] ?? null) === JSON.stringify(current[field] ?? null));
+}
+
+function nowSeconds() {
+    return Math.floor(Date.now() / 1000);
+}
+
+/** A saved kind-0/1 proof is reused only while enough of its validity remains. */
+function withdrawalProofStillValid(inputs) {
+    const validUntil = Number(inputs?.valid_until);
+    return Number.isSafeInteger(validUntil) && validUntil - nowSeconds() >= WITHDRAWAL_PROOF_REUSE_MARGIN_SECONDS;
+}
+
 class BrowserWalletRuntime extends EventTarget {
     constructor() {
         super();
@@ -536,6 +567,7 @@ class BrowserWalletRuntime extends EventTarget {
         // burn the nullifier. Require the hardened interface on chain first.
         if (this.vaultCapabilities().hardenedVault) await assertHardenedVault(this.config.funding);
         this.worker = new WorkerBridge();
+        await this.assertWorkerBundle();
         // Initialization participates in the same global lock as every later
         // mutation. This prevents two same-origin deployment tabs from both
         // rebinding the singleton runtime and committing stale snapshots.
@@ -611,7 +643,7 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The selected deployment is not a zkAPI v2 Groth16 deployment.');
         }
         if (manifest.proof_setup?.circuit_id !== REQUIRED_CIRCUIT_ID) {
-            const error = new Error('This deployment uses an incompatible legacy proof circuit. Funding is unavailable until the operator publishes a new vault and note-bound proof setup. Keep existing funds and recovery data with the legacy deployment.');
+            const error = new Error('This deployment uses an incompatible legacy proof circuit. Funding is unavailable until the operator publishes a new vault and concession-exit proof setup. Keep existing funds and recovery data with the legacy deployment.');
             error.code = 'incompatible_proof_circuit';
             throw error;
         }
@@ -643,6 +675,19 @@ class BrowserWalletRuntime extends EventTarget {
         const trusted = this.browserConfig.trusted_deployment;
         if (!trusted) {
             throw new Error('browser-config.json omitted its trusted deployment pins.');
+        }
+        if (trusted.deployment_status === 'not_deployed') {
+            throw new BrowserWalletHttpError('This application pins a placeholder profile: no vault for this proof setup is deployed on this network yet.',
+                409, 'deployment_not_deployed');
+        }
+        // Vault revision 3 only: the concession exit is not a monotone
+        // upgrade of revision 2, so its own capability must be pinned.
+        if (trusted.exit_concession !== 1) {
+            throw new BrowserWalletHttpError('This application build supports only vaults with the concession exit (exit_concession 1).',
+                409, 'exit_concession_required');
+        }
+        if (!BUNDLE_SETUP_IDS.includes(trusted.setup_id)) {
+            throw new Error('browser-config.json contains an invalid trusted setup_id.');
         }
         const requireEqual = (actual, expected, label, normalize = value => String(value)) => {
             if (expected == null || normalize(actual) !== normalize(expected)) {
@@ -774,10 +819,25 @@ class BrowserWalletRuntime extends EventTarget {
         return seconds * 1_000;
     }
 
+    /**
+     * The proof worker must run a bundle of the pinned circuit and setup: a
+     * development bundle never proves for a ceremony profile, nor the reverse.
+     */
+    async assertWorkerBundle() {
+        const trusted = this.browserConfig?.trusted_deployment || {};
+        const identity = await this.worker.call('identity', {});
+        if (identity?.circuit_id !== REQUIRED_CIRCUIT_ID || identity?.circuit_id !== trusted.circuit_id
+            || identity?.setup_id !== trusted.setup_id) {
+            throw new BrowserWalletHttpError(`The proof worker runs ${identity?.circuit_id}/${identity?.setup_id}, `
+                + `but this deployment pins ${trusted.circuit_id}/${trusted.setup_id}.`, 409, 'setup_mismatch');
+        }
+    }
+
     buildClientConfig(manifest, browserConfig) {
         const keyBase = new URL(browserConfig.proving_keys_base_url || './proofs/', browserConfigUrl());
         const requestKey = new URL('request.pk', keyBase).href;
         const withdrawalKey = new URL('withdrawal.pk', keyBase).href;
+        const requestVerifyingKey = new URL('request.vk', keyBase).href;
         const requestCap = Number(manifest.request_charge_cap);
         validateNativeFunding(manifest);
         return {
@@ -811,6 +871,14 @@ class BrowserWalletRuntime extends EventTarget {
                 withdrawal: {
                     url: withdrawalKey,
                     sha256: manifest.proof_setup?.withdrawal_proving_key_sha256
+                }
+            },
+            // The stale-device pre-check verifies operator evidence with the
+            // build-pinned request.vk only.
+            verifying_keys: {
+                request: {
+                    url: requestVerifyingKey,
+                    sha256: browserConfig.trusted_deployment?.request_verifying_key_sha256
                 }
             },
             openrouter: {
@@ -2067,7 +2135,12 @@ class BrowserWalletRuntime extends EventTarget {
         const now = Date.now();
         const quote = await this.nativeBillingQuote(signal);
         throwIfAborted(signal);
-        const spendingLimitCredits = this.leaseBudget(spendingLimitUsd, quote, { checkBalance: true });
+        // C2: every request proof at a state carries the state's one bound.
+        // Once a request at this state left the device, a later one reuses
+        // its bound (a different bound would be refused by the prover).
+        const selectedLimitCredits = this.leaseBudget(spendingLimitUsd, quote, { checkBalance: true });
+        const boundAtState = Number(this.runtime.state.bound_at_state || 0);
+        const spendingLimitCredits = boundAtState > 0 ? boundAtState : selectedLimitCredits;
         onProgress('proving', 'Proving this chat is funded…');
         const prepared = await this.worker.call('prepareRequest', {
             config: {
@@ -2091,12 +2164,16 @@ class BrowserWalletRuntime extends EventTarget {
         throwIfAborted(signal);
         const requestNullifier = prepared.request?.public_inputs?.request_nullifier;
         const record = this.tryRequestJournalRecord(prepared.journal, this.runtime.state);
-        if (!record || (requestNullifier != null && !sameFelt(requestNullifier, prepared.journal.nullifier))) {
+        if (!record || (requestNullifier != null && !sameFelt(requestNullifier, prepared.journal.nullifier))
+            || !sameStateExceptBound(prepared.state, this.runtime.state)
+            || Number(prepared.state.bound_at_state) !== Number(prepared.request?.public_inputs?.solvency_bound)) {
             throw new Error('The prepared request journal is incomplete.');
         }
-        // The journal and its append-only archive record land in ONE durable
-        // write before any POST can carry the proof off this device.
-        await this.commit({ ...this.runtime, journal: prepared.journal }, { requestArchive: [record] });
+        // The state with its bound, the journal and its append-only archive
+        // record land in ONE durable write before any POST can carry the
+        // proof off this device (design §6.2).
+        await this.commit({ ...this.runtime, state: prepared.state, journal: prepared.journal },
+            { requestArchive: [record] });
         return prepared.request;
     }
 
@@ -3284,28 +3361,16 @@ class BrowserWalletRuntime extends EventTarget {
         const provenForState = existing?.mode === mode
             && existing.destination?.toLowerCase() === destination.toLowerCase()
             && existing.proof && existing.public_inputs
+            && Number(existing.public_inputs.kind) === (mode === 'escape' ? 0 : 1)
             && Number(existing.public_inputs.note_id) === Number(state.note_id)
             && sameFelt(existing.public_inputs.withdrawal_nullifier, withdrawalNullifier)
-            && sameFelt(existing.public_inputs.final_balance, state.current_balance);
-        const siblingsRoot = existing?.siblingsRoot ?? existing?.public_inputs?.active_root;
-        // Withdrawal proofs are bound to a vault root. Reuse a durable plan
-        // unchanged while it still matches the canonical tree.
-        if (existing?.mode === mode
-            && existing.destination?.toLowerCase() === destination.toLowerCase()
-            && sameFelt(existing.public_inputs?.active_root, path.active_root)
-            && sameFelt(siblingsRoot, path.active_root)
-            && provenForState) {
-            return existing;
-        }
-        // A hardened vault accepts a recent proof root but checks calldata
-        // siblings against its live root: refresh the path, keep the proof.
-        // A repeated rejection or UnknownRoot() asks for a fresh proof.
-        if (!reprove && provenForState && this.vaultCapabilities().hardenedVault) {
-            if (sameFelt(siblingsRoot, path.active_root)) return existing;
-            const refreshed = { ...existing, siblings: path.siblings, siblingsRoot: path.active_root };
-            await this.commit({ ...this.runtime, preparedWithdrawal: refreshed });
-            return refreshed;
-        }
+            && sameFelt(existing.public_inputs.final_balance, state.current_balance)
+            && Number(existing.public_inputs.conceded) === 0
+            && withdrawalProofStillValid(existing.public_inputs);
+        // The vault accepts any root it ever held and exits do no Merkle
+        // work, so a durable plan stays usable until its valid_until. An
+        // UnknownRoot() or a repeated rejection asks for a fresh proof.
+        if (!reprove && provenForState) return existing;
         const clearanceReserved = existing?.clearanceReserved === true
             || existing?.mode === 'mutual';
         let clearance = persistedClearance;
@@ -3347,6 +3412,10 @@ class BrowserWalletRuntime extends EventTarget {
             args: {
                 mode,
                 destination,
+                // Nothing is conceded here: an escape at a fresh state, or the
+                // override, pays the whole balance (design §6.4 E2, E3).
+                ...(mode === 'escape' ? { conceded: 0 } : {}),
+                valid_until: nowSeconds() + WITHDRAWAL_PROOF_VALIDITY_SECONDS,
                 active_root: path.active_root,
                 merkle_siblings: path.siblings,
                 // The WASM rejects any clearance on an escape.
@@ -3354,6 +3423,9 @@ class BrowserWalletRuntime extends EventTarget {
             },
             provingKey: this.config.proving_keys.withdrawal
         });
+        if (Number(plan?.public_inputs?.kind) !== (mode === 'escape' ? 0 : 1)) {
+            throw new Error('The generated withdrawal proof is of another kind.');
+        }
         plan.destination = destination;
         plan.phase = 'prepared';
         plan.operationId = existing?.operationId || uuid();
@@ -3596,19 +3668,26 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * Assert that a locally generated ownership proof is an escape-form
-     * withdrawal proof for exactly this state, vault, keys, root, balance and
-     * the user's real payout destination. Never a request proof.
+     * Assert that a locally generated ownership proof is a kind-2 withdrawal
+     * proof for exactly this state, vault, keys, root and balance: no
+     * destination, no concession, no successor nullifier, and a fresh
+     * valid_until. The vault rejects kind 2 at every entry point, so it can
+     * never be submitted as an exit. Never a request proof.
      */
-    assertOwnershipProof(plan, { state, nullifier, destination, activeRoot }) {
+    assertOwnershipProof(plan, { state, nullifier, activeRoot }) {
         const inputs = plan?.public_inputs;
         const core = this.config.wallet_core || {};
         const funding = this.config.funding || {};
+        const validUntil = Number(inputs?.valid_until);
         const valid = Boolean(inputs) && typeof inputs === 'object'
-            && (plan.mode == null || plan.mode === 'escape')
+            && plan.mode === 'ownership'
             && plan.proof?.backend === 'groth16_bn254'
             && typeof plan.proof.proof === 'string' && plan.proof.proof.length > 0
-            && inputs.has_clearance === false
+            && inputs.kind === 2
+            && Number(inputs.conceded) === 0
+            && sameFelt(inputs.next_nullifier, 0)
+            && Number.isSafeInteger(validUntil) && validUntil > nowSeconds()
+            && validUntil <= nowSeconds() + OWNERSHIP_PROOF_VALIDITY_SECONDS
             && Number(inputs.protocol_version) === 2
             && Number(inputs.chain_id) === Number(funding.chain_id)
             && sameFelt(inputs.contract_address, funding.contract_address)
@@ -3620,18 +3699,16 @@ class BrowserWalletRuntime extends EventTarget {
             && sameFelt(inputs.withdrawal_nullifier, nullifier)
             && sameFelt(inputs.active_root, activeRoot)
             && sameFelt(inputs.final_balance, state.current_balance)
-            && withdrawalDestinationHex(inputs.destination) === String(destination || '').toLowerCase()
-            && inputs.withdrawal_tag != null
+            && withdrawalDestinationHex(inputs.destination) === `0x${'0'.repeat(40)}`
             && !REQUEST_PUBLIC_INPUT_FIELDS.some(field => field in inputs);
         if (!valid) throw new Error('The generated ownership proof does not match its saved balance and vault.');
     }
 
-    async generateOwnershipProof({ state, destination, nullifier, path }) {
-        // An escape-form proof to the user's REAL destination at the current
-        // balance: it is a submittable escape, so never a placeholder. On a
-        // vault whose challenge burns the nullifier, anyone holding a request
-        // proof sent from this state could submit it and challenge it there,
-        // so such a state never gets one (obtainClearance refuses first).
+    async generateOwnershipProof({ state, nullifier, path }) {
+        // A kind-2 ownership proof at the current balance: it names no
+        // destination and no successor nullifier, and every vault entry point
+        // rejects it, so the server cannot submit it as an exit. It is valid
+        // for one hour (the server's freshness window).
         if (!this.vaultCapabilities().hardenedVault && this.archivedRequestsAt(state).length) {
             throw transmittedOwnershipRefusal(null);
         }
@@ -3639,15 +3716,14 @@ class BrowserWalletRuntime extends EventTarget {
             config: this.config.wallet_core,
             state,
             args: {
-                mode: 'escape',
-                destination,
+                mode: 'ownership',
+                valid_until: nowSeconds() + OWNERSHIP_PROOF_VALIDITY_SECONDS,
                 active_root: path.active_root,
-                merkle_siblings: path.siblings,
-                clearance: null
+                merkle_siblings: path.siblings
             },
             provingKey: this.config.proving_keys.withdrawal
         });
-        this.assertOwnershipProof(ownership, { state, nullifier, destination, activeRoot: path.active_root });
+        this.assertOwnershipProof(ownership, { state, nullifier, activeRoot: path.active_root });
         // Only the public inputs and proof travel; nothing is persisted.
         return { public_inputs: ownership.public_inputs, proof: ownership.proof };
     }
@@ -3768,7 +3844,7 @@ class BrowserWalletRuntime extends EventTarget {
         }
         const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
         if (gate.advanced) return WITHDRAWAL_RESTART;
-        const ownership = await this.generateOwnershipProof({ state, destination, nullifier, path });
+        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
         // Commit the withdrawal-only marker only after local proving, so a
         // proving failure never makes the note withdrawal-only.
         return send({ withdrawal_nullifier: nullifier, ownership_proof: ownership });
@@ -4713,7 +4789,8 @@ class BrowserWalletRuntime extends EventTarget {
         }
         const plan = await this.worker.call('prepareWithdrawal', {
             config: config.wallet_core, state,
-            args: { mode: 'mutual', destination: identity.destination, active_root: path.active_root,
+            args: { mode: 'mutual', destination: identity.destination,
+                valid_until: nowSeconds() + WITHDRAWAL_PROOF_VALIDITY_SECONDS, active_root: path.active_root,
                 merkle_siblings: path.siblings, clearance }, provingKey: config.proving_keys.withdrawal
         });
         const inputs = plan.public_inputs;
@@ -4727,7 +4804,7 @@ class BrowserWalletRuntime extends EventTarget {
             || !sameFelt(inputs?.withdrawal_nullifier, nullifier)
             || !sameFelt(inputs?.final_balance, state.current_balance)
             || String(encodedDestination || '').toLowerCase() !== identity.destination.toLowerCase()
-            || inputs?.has_clearance !== true) {
+            || inputs?.kind !== 1 || Number(inputs?.conceded) !== 0 || !sameFelt(inputs?.next_nullifier, 0)) {
             throw new Error('The generated withdrawal proof does not match its saved balance and vault.');
         }
         Object.assign(plan, { destination: identity.destination, mode: 'mutual', phase: 'prepared',

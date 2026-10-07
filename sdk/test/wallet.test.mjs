@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { readFileSync } from "node:fs";
+
 import wallet from "../wallet.js";
+import { keccak256, selector } from "./helpers/keccak.mjs";
 
 test("escape-period labels follow the deployed vault duration", () => {
   assert.equal(wallet.ABI.currentRoot, "fdab463d");
@@ -45,56 +48,257 @@ test("NoteDeposited receipt parsing returns canonical note id and expiry", () =>
   });
 });
 
-function withdrawalPlan(mode = "mutual") {
+const GOLDEN = JSON.parse(readFileSync(new URL("./fixtures/vault-calldata-golden.json", import.meta.url), "utf8"));
+const PROOF_BYTES = Buffer.from(Array.from({ length: 256 }, (_, index) => index));
+const SCALAR_MODULUS_MINUS_ONE = "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000";
+const SUCCESSOR = "0x2a5c6b0e9f1d3b7a8c4e2f6a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f2a3b4c";
+
+// The statements of the golden vectors in sdk/test/fixtures/vault-calldata-golden.json
+// (generated with Foundry `cast calldata` from the vault revision 3 signatures).
+function escapePlan(changes = {}) {
   return {
-    mode,
+    mode: "escape",
     public_inputs: {
-      protocol_version: 1,
+      protocol_version: 2,
       chain_id: 11_155_111,
       contract_address: "0x590df9abbfb21074016daa486c771ae0af729ee2",
-      active_root: "0x11",
+      active_root: SCALAR_MODULUS_MINUS_ONE,
       state_signing_key_x: "0x12",
       state_signing_key_y: "0x13",
       clearance_signing_key_x: "0x14",
       clearance_signing_key_y: "0x15",
       note_id: 21,
-      final_balance: 1_850_000,
+      final_balance: Number.MAX_SAFE_INTEGER,
       destination: Array(20).fill(0x22),
       withdrawal_nullifier: "0x16",
-      has_clearance: mode === "mutual",
-      withdrawal_tag: "0x17",
+      kind: 0,
+      next_nullifier: SUCCESSOR,
+      conceded: 100,
+      valid_until: 1_800_010_800,
+      ...changes,
     },
-    siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`),
-    proof: {
-      backend: "groth16_bn254",
-      proof: Buffer.from(Array.from({ length: 256 }, (_, index) => index)).toString("base64"),
-    },
+    proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") },
   };
 }
 
-test("mutual-close calldata encodes the exact static tuple, dynamic proof, and path", () => {
-  const plan = withdrawalPlan("mutual");
-  const destination = "0x2222222222222222222222222222222222222222";
-  const encoded = wallet.encodeWithdrawal(plan, "mutual", destination, plan.public_inputs.contract_address);
-  assert.ok(encoded.startsWith(`0x${wallet.ABI.mutualClose}`));
-  assert.equal(encoded.length, 2 + 8 + (56 * 64));
-  assert.equal(encoded.slice(10 + (14 * 64), 10 + (15 * 64)), wallet.abiWord(1_504n));
-  assert.equal(encoded.slice(10 + (47 * 64), 10 + (48 * 64)), wallet.abiWord(256n));
-  assert.equal(encoded.slice(-64), Buffer.from(Array.from({ length: 32 }, (_, index) => index + 224)).toString("hex"));
+function mutualPlan(changes = {}) {
+  return {
+    mode: "mutual",
+    public_inputs: {
+      protocol_version: 2,
+      chain_id: 1,
+      contract_address: "0x4386fdbda35d995beb3bf8625118ec5982ec81fe",
+      active_root: "0x11",
+      state_signing_key_x: "0x12",
+      state_signing_key_y: "0x13",
+      clearance_signing_key_x: "0x14",
+      clearance_signing_key_y: "0x15",
+      note_id: 7,
+      final_balance: 1_850_000,
+      destination: "0x5615deb798bb3e4dfa0139dfa1b3d433cc23b72f",
+      withdrawal_nullifier: "0x16",
+      kind: 1,
+      next_nullifier: "0x0",
+      conceded: 0,
+      valid_until: "18446744073709551615",
+      ...changes,
+    },
+    proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") },
+  };
+}
+
+const ESCAPE_DESTINATION = "0x2222222222222222222222222222222222222222";
+const MUTUAL_DESTINATION = "0x5615deb798bb3e4dfa0139dfa1b3d433cc23b72f";
+
+test("every vault selector and event topic is the keccak of its signature", () => {
+  const W = wallet.WITHDRAWAL_TUPLE;
+  const Q = wallet.REQUEST_TUPLE;
+  assert.equal(W, "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)");
+  assert.equal(Q, "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)");
+  const selectors = {
+    initiateEscapeWithdrawal: [`initiateEscapeWithdrawal(${W},bytes)`, "a38d62aa"],
+    mutualClose: [`mutualClose(${W},bytes)`, "72cd2e44"],
+    finalizeEscapeWithdrawal: ["finalizeEscapeWithdrawal(uint32)", "ff8f5585"],
+    raiseEscapeConcession: [`raiseEscapeConcession(uint32,${Q},bytes,uint128)`, "dd0064ba"],
+    challengeEscapeWithdrawal: [`challengeEscapeWithdrawal(uint32,${Q},bytes)`, "da0ce43d"],
+    pendingWithdrawals: ["pendingWithdrawals(uint32)", "a2f9f1ce"],
+    pendingConcessions: ["pendingConcessions(uint32)", "f8ffe6e0"],
+    challengedNullifiers: ["challengedNullifiers(uint256)", "6cda756a"],
+    usedNullifiers: ["usedNullifiers(uint256)", "aad24061"],
+    effectiveExpiry: ["effectiveExpiry(uint32)", "7cb4a03c"],
+    currentRoot: ["currentRoot()", "fdab463d"],
+    challengePeriod: ["challengePeriod()", "f3f480d9"],
+    notes: ["notes(uint32)", "9f18e4ed"],
+    CONCESSION_ESCAPE_VERSION: ["CONCESSION_ESCAPE_VERSION()", "5e00b426"],
+    maxPauseDuration: ["maxPauseDuration()", "64433d27"],
+    ROOT_HISTORY_WINDOW: ["ROOT_HISTORY_WINDOW()", "1fe72de0"],
+    noteTtl: ["noteTtl()", "225af2e7"],
+    proofAdapter: ["proofAdapter()", "efc91e58"],
+    stateSigningKeyX: ["stateSigningKeyX()", "15fa2a9a"],
+    stateSigningKeyY: ["stateSigningKeyY()", "230e2a24"],
+    clearanceSigningKeyX: ["clearanceSigningKeyX()", "dc41d636"],
+    clearanceSigningKeyY: ["clearanceSigningKeyY()", "112cd6bc"],
+    CIRCUIT_ID_HASH: ["CIRCUIT_ID_HASH()", "da0e8385"],
+    REQUEST_VK_HASH: ["REQUEST_VK_HASH()", "fe351488"],
+    WITHDRAWAL_VK_HASH: ["WITHDRAWAL_VK_HASH()", "7fcd0926"],
+    claimEscapePayout: ["claimEscapePayout(address)", "88c10aee"],
+    escapePayoutCredits: ["escapePayoutCredits(address)", "91f6e93a"],
+  };
+  for (const [name, [signature, pinned]] of Object.entries(selectors)) {
+    assert.equal(selector(signature), pinned, signature);
+    assert.equal(wallet.ABI[name], pinned, name);
+  }
+  const topics = {
+    escapeInitiatedEvent: ["EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)",
+      "0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf"],
+    escapeChallengedEvent: ["EscapeWithdrawalChallenged(uint32,uint256,uint256)",
+      "0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581"],
+    escapeConcessionRecordedEvent: ["EscapeConcessionRecorded(uint32,uint256,uint128,uint128)",
+      "0x2254ee827bce198564720fe77733ebfab1a49361cd4f050f107445241b560b4d"],
+    escapeConcessionRaisedEvent: ["EscapeConcessionRaised(uint32,uint256,uint128,uint128)",
+      "0x3faf5608f821061643ff6fdfe6dd0f6d7fb074bb565f35e3537a86ac08f0897c"],
+    closedLeafRetiredEvent: ["ClosedLeafRetired(uint32,uint256)",
+      "0x64572cec8ef079a5baa4f2860f8b65efb52a96f64ee679d315fd2a0541ea28b3"],
+    noteDeposited: ["NoteDeposited(uint32,bytes32,uint128,uint64,uint256)",
+      "0x7c83dba8534bea9e30d6444f9ca6462dc906897f9938d220dbbe4358c1f7a063"],
+  };
+  for (const [name, [signature, pinned]] of Object.entries(topics)) {
+    assert.equal(keccak256(signature), pinned, signature);
+    assert.equal(wallet.ABI[name], pinned, name);
+  }
+  // The adapter's CIRCUIT_ID_HASH constant.
+  assert.equal(keccak256("zkapi-v2-concession-v1"),
+    "0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687");
+  // The retired note-bound selectors are gone.
+  assert.equal(Object.values(wallet.ABI).includes("9073639b"), false);
+  assert.equal(Object.values(wallet.ABI).includes("7fca9c82"), false);
 });
 
-test("escape calldata and finalization selector use deployed signatures", () => {
-  const plan = withdrawalPlan("escape");
-  const destination = "0x2222222222222222222222222222222222222222";
-  assert.ok(wallet.encodeWithdrawal(plan, "escape", destination).startsWith(`0x${wallet.ABI.initiateEscapeWithdrawal}`));
+test("escape calldata is the 16-word statement and the proof, byte for byte (836 bytes)", () => {
+  const encoded = wallet.encodeWithdrawal(escapePlan(), "escape", ESCAPE_DESTINATION,
+    "0x590DF9ABBFB21074016DAA486C771AE0AF729EE2", { conceded: 100n });
+  assert.equal(encoded, GOLDEN.initiateEscapeWithdrawal);
+  assert.equal((encoded.length - 2) / 2, 836);
+  assert.equal(wallet.WITHDRAWAL_CALLDATA_BYTES, 836);
+  const word = (index) => encoded.slice(10 + index * 64, 10 + (index + 1) * 64);
+  assert.equal(word(12), wallet.abiWord(0n), "kind");
+  assert.equal(word(14), wallet.abiWord(100n), "conceded");
+  assert.equal(word(15), wallet.abiWord(1_800_010_800n), "valid_until");
+  assert.equal(word(16), wallet.abiWord(0x220n), "bytes offset 17 * 32");
+  assert.equal(word(17), wallet.abiWord(256n), "proof length");
+  assert.equal(encoded.slice(-64), PROOF_BYTES.subarray(224).toString("hex"));
+});
+
+test("mutual-close calldata is the 16-word statement and the proof, byte for byte", () => {
+  const encoded = wallet.encodeWithdrawal(mutualPlan(), "mutual", MUTUAL_DESTINATION);
+  assert.equal(encoded, GOLDEN.mutualClose);
+  assert.equal((encoded.length - 2) / 2, 836);
   assert.equal(wallet.encodeFinalizeEscape(21), `0x${wallet.ABI.finalizeEscapeWithdrawal}${wallet.abiWord(21)}`);
 });
 
-test("withdrawal encoder rejects destination and clearance substitutions", () => {
-  const plan = withdrawalPlan("mutual");
-  assert.throws(() => wallet.encodeWithdrawal(plan, "mutual", "0x3333333333333333333333333333333333333333"), /destination/);
-  plan.public_inputs.has_clearance = false;
-  assert.throws(() => wallet.encodeWithdrawal(plan, "mutual", "0x2222222222222222222222222222222222222222"), /clearance/);
+test("the withdrawal encoder refuses another kind, destination, vault or concession", () => {
+  const encode = (plan, mode = "escape", destination = ESCAPE_DESTINATION, expected = {}) =>
+    wallet.encodeWithdrawal(plan, mode, destination, plan.public_inputs.contract_address, expected);
+  assert.throws(() => encode(escapePlan(), "escape", MUTUAL_DESTINATION), /destination/);
+  assert.throws(() => wallet.encodeWithdrawal(escapePlan(), "escape", ESCAPE_DESTINATION, MUTUAL_DESTINATION), /vault/);
+  assert.throws(() => encode(escapePlan(), "mutual"), /withdrawal mode/);
+  // Kinds: an ownership proof (kind 2) or a close proof is never an escape.
+  for (const kind of [1, 2, 3, "0"]) assert.throws(() => encode(escapePlan({ kind })), /kind-0 escape/);
+  for (const kind of [0, 2]) assert.throws(() => encode(mutualPlan({ kind }), "mutual", MUTUAL_DESTINATION), /kind-1/);
+  // An escape names its successor nullifier; a close names none and concedes nothing.
+  assert.throws(() => encode(escapePlan({ next_nullifier: "0x0" })), /successor nullifier/);
+  assert.throws(() => encode(escapePlan({ next_nullifier: "0x16" })), /successor nullifier/);
+  assert.throws(() => encode(mutualPlan({ next_nullifier: "0x1" }), "mutual", MUTUAL_DESTINATION), /concede nothing/);
+  assert.throws(() => encode(mutualPlan({ conceded: 1 }), "mutual", MUTUAL_DESTINATION), /concede nothing/);
+  assert.throws(() => encode(escapePlan(), "escape", ESCAPE_DESTINATION, { conceded: 99 }), /concedes a different amount/);
+  // Values that would encode another statement are refused, not truncated.
+  assert.throws(() => encode(escapePlan({ valid_until: 0 })), /valid_until/);
+  assert.throws(() => encode(escapePlan({ valid_until: (2n ** 64n).toString() })), /uint64/);
+  assert.throws(() => encode(escapePlan({ final_balance: 2 ** 60 })), /exact unsigned integer/);
+  assert.throws(() => encode(escapePlan({ conceded: -1 })), /uint128/);
+  assert.throws(() => encode(escapePlan({ active_root: "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001" })),
+    /canonical field element/);
+  assert.throws(() => encode(escapePlan({ withdrawal_tag: undefined, has_clearance: false, kind: undefined })), /kind-0/);
+  const short = escapePlan();
+  short.proof.proof = Buffer.alloc(255).toString("base64");
+  assert.throws(() => encode(short), /256 bytes/);
+});
+
+test("pendingWithdrawals and pendingConcessions decode only their exact shapes", () => {
+  const words = (...values) => `0x${values.map((value) => wallet.abiWord(value)).join("")}`;
+  assert.equal(wallet.encodePendingConcessions(21), `0xf8ffe6e0${wallet.abiWord(21n)}`);
+  assert.equal(wallet.encodePendingWithdrawals(21), `0xa2f9f1ce${wallet.abiWord(21n)}`);
+  assert.deepEqual(wallet.decodePendingConcessions(words(0x2an, 1_000n, 40n)),
+    { nextNullifier: 0x2an, stateBalance: 1_000n, conceded: 40n });
+  assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n)), /exactly 3/);
+  assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n, 3n, 4n)), /exactly 3/);
+  assert.throws(() => wallet.decodePendingConcessions(words(1n, 2n ** 128n, 3n)), /128 bits/);
+  assert.deepEqual(wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, MUTUAL_DESTINATION, 1_900_000_000n)), {
+    exists: true, activeRoot: 5n, withdrawalNullifier: 6n, finalBalance: 960n,
+    destination: MUTUAL_DESTINATION, challengeDeadline: 1_900_000_000n,
+  });
+  assert.throws(() => wallet.decodePendingWithdrawals(words(2n, 5n, 6n, 960n, 0n, 1n)), /boolean/);
+  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, 2n ** 160n, 1n)), /160 bits/);
+  assert.throws(() => wallet.decodePendingWithdrawals(words(1n, 5n, 6n, 960n, 0n)), /exactly 6/);
+});
+
+test("vault revision 3 events decode strictly and escape receipts carry their concession", () => {
+  const vault = "0x590df9abbfb21074016daa486c771ae0af729ee2";
+  const topicWord = (value) => `0x${wallet.abiWord(value)}`;
+  const data = (...values) => `0x${values.map((value) => wallet.abiWord(value)).join("")}`;
+  const initiated = { address: vault, topics: [wallet.ABI.escapeInitiatedEvent, topicWord(21n)],
+    data: data(0x16n, 960n, ESCAPE_DESTINATION, 1_900_000_000n, 99n) };
+  const recorded = { address: vault, topics: [wallet.ABI.escapeConcessionRecordedEvent, topicWord(21n)],
+    data: data(0x2an, 1_000n, 40n) };
+  const raised = { address: vault, topics: [wallet.ABI.escapeConcessionRaisedEvent, topicWord(21n)],
+    data: data(0x16n, 70n, 930n) };
+  const retired = { address: vault, topics: [wallet.ABI.closedLeafRetiredEvent, topicWord(4n)], data: data(0x77n) };
+  assert.deepEqual(wallet.decodeVaultEvent(recorded, vault),
+    { event: "EscapeConcessionRecorded", noteId: 21n, nextNullifier: 0x2an, stateBalance: 1_000n, conceded: 40n });
+  assert.deepEqual(wallet.decodeVaultEvent(raised, vault),
+    { event: "EscapeConcessionRaised", noteId: 21n, nullifier: 0x16n, conceded: 70n, finalBalance: 930n });
+  assert.deepEqual(wallet.decodeVaultEvent(retired, vault), { event: "ClosedLeafRetired", noteId: 4n, newRoot: 0x77n });
+  assert.deepEqual(wallet.decodeVaultEvent(initiated, vault), { event: "EscapeWithdrawalInitiated", noteId: 21n,
+    nullifier: 0x16n, finalBalance: 960n, destination: ESCAPE_DESTINATION, challengeDeadline: 1_900_000_000n, root: 99n });
+  // Other contracts, removed logs and other events are not vault events.
+  assert.equal(wallet.decodeVaultEvent({ ...recorded, address: MUTUAL_DESTINATION }, vault), null);
+  assert.equal(wallet.decodeVaultEvent({ ...recorded, removed: true }, vault), null);
+  assert.equal(wallet.decodeVaultEvent({ ...recorded, topics: [wallet.ABI.escapePayoutClaimedEvent, topicWord(1n)] }, vault), null);
+  // A known event with another shape is an ABI mismatch.
+  assert.throws(() => wallet.decodeVaultEvent({ ...recorded, data: data(0x2an, 1_000n) }, vault), /exactly 3/);
+  assert.throws(() => wallet.decodeVaultEvent({ ...recorded, topics: recorded.topics.slice(0, 1) }, vault), /topics/);
+  assert.throws(() => wallet.decodeVaultEvent({ ...recorded, data: data(0x2an, 2n ** 128n, 0n) }, vault), /128 bits/);
+
+  const receipt = { logs: [initiated, recorded] };
+  assert.deepEqual(wallet.parseWithdrawalReceipt(receipt, vault, "escape"), {
+    noteId: 21n, finalBalance: 960n, destination: ESCAPE_DESTINATION, challengeDeadline: 1_900_000_000n,
+    concession: { nextNullifier: 0x2an, stateBalance: 1_000n, conceded: 40n },
+  });
+  assert.deepEqual(wallet.escapeConcessionRecorded(receipt, vault, 22), null);
+  assert.deepEqual(wallet.escapeConcessionRaises({ logs: [raised, recorded, raised] }, vault, 21n),
+    [{ nullifier: 0x16n, conceded: 70n, finalBalance: 930n }, { nullifier: 0x16n, conceded: 70n, finalBalance: 930n }]);
+});
+
+test("raise and defeat calldata decode to their request evidence", () => {
+  const raise = wallet.decodeRaiseEscapeConcession(GOLDEN.raiseEscapeConcession);
+  const expectedInputs = {
+    protocol_version: 2, chain_id: 11_155_111, contract_address: "0x590df9abbfb21074016daa486c771ae0af729ee2",
+    active_root: `0x${wallet.abiWord(0x11n)}`, state_signing_key_x: `0x${wallet.abiWord(0x12n)}`,
+    state_signing_key_y: `0x${wallet.abiWord(0x13n)}`, request_time: 1_800_000_000, solvency_bound: 6_000_000,
+    request_nullifier: `0x${wallet.abiWord(0x16n)}`, authorization_tag: `0x${wallet.abiWord(0x17n)}`,
+    anonymous_commitment_x: `0x${wallet.abiWord(0x18n)}`, anonymous_commitment_y: `0x${wallet.abiWord(0x19n)}`,
+  };
+  assert.deepEqual(raise, { noteId: 21, publicInputs: expectedInputs,
+    proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") }, amount: 5_000_000n });
+  const defeat = wallet.decodeChallengeEscapeWithdrawal(GOLDEN.challengeEscapeWithdrawal);
+  assert.deepEqual(defeat, { noteId: 21, publicInputs: { ...expectedInputs, request_nullifier: SUCCESSOR },
+    proof: { backend: "groth16_bn254", proof: PROOF_BYTES.toString("base64") } });
+  assert.equal((GOLDEN.raiseEscapeConcession.length - 2) / 2, 772);
+  assert.equal((GOLDEN.challengeEscapeWithdrawal.length - 2) / 2, 740);
+  assert.throws(() => wallet.decodeRaiseEscapeConcession(GOLDEN.challengeEscapeWithdrawal), /exactly/);
+  assert.throws(() => wallet.decodeChallengeEscapeWithdrawal(GOLDEN.raiseEscapeConcession), /exactly/);
+  assert.throws(() => wallet.decodeChallengeEscapeWithdrawal(`0xdd0064ba${GOLDEN.challengeEscapeWithdrawal.slice(10)}`),
+    /another selector/);
 });
 
 test("withdrawal events expose note, destination, balance, and escape deadline", () => {

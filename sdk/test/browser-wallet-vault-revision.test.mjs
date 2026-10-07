@@ -6,6 +6,7 @@ import {
     DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, HttpError, createHarness, memoryIndexedDb, noteState, nullifierFor,
     selectorOf, word
 } from './helpers/request-archive-harness.mjs';
+import { deployedProfile } from './helpers/deployed-profile.mjs';
 
 globalThis.indexedDB = memoryIndexedDb();
 globalThis.window = Object.assign(new EventTarget(), { location: { hostname: 'localhost' } });
@@ -67,7 +68,7 @@ test('the hardened interface check reads ROOT_HISTORY_WINDOW once and fails clos
 });
 
 async function hardenedProfileOnVault(t, rootHistoryWindow) {
-    const config = JSON.parse(await readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+    const config = deployedProfile();
     const trusted = { ...config.trusted_deployment, ...funding, rpc_url: funding.demo_rpc_url,
         billing_token_address: null, vault_revision: 2, clearance_ownership_proof: 'required' };
     const manifest = { ...trusted, protocol_version: 2, proof_backend: 'groth16_bn254',

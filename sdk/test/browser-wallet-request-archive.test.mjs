@@ -7,6 +7,7 @@ import {
     DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, VAULT, HttpError,
     createHarness, keccak256Hex, memoryIndexedDb, noteState, nullifierFor, word
 } from './helpers/request-archive-harness.mjs';
+import { deployedProfile } from './helpers/deployed-profile.mjs';
 
 // Real store and runtime over a transactional IndexedDB; only the protocol
 // server, the pinned vault RPC and the proof worker are observed fakes.
@@ -1926,7 +1927,7 @@ test('restored challenged escape records evidence; a repeat escape needs the ser
         signature: { r: '0x1', s: '0x2' } });
     const mutual = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
     assert.equal(mutual.mode, 'mutual', 'evidence never blocks a mutual close the server reports unknown');
-    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance')[0].body.ownership_proof.public_inputs.has_clearance, false);
+    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance')[0].body.ownership_proof.public_inputs.kind, 2);
     await store.writeBrowserWallet({ ...(await store.readBrowserWallet()), preparedWithdrawal: null });
     await h.runtime.reload();
 
@@ -2085,7 +2086,7 @@ test('capabilities come only from the build-pinned trust anchor', async () => {
         assert.equal(runtime.unsettledRequestEscapeGraceMs(), expected * 1_000);
     }
 
-    const config = JSON.parse(await readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+    const config = deployedProfile();
     const funding = nativeFunding();
     const trusted = { ...config.trusted_deployment, ...funding, rpc_url: funding.demo_rpc_url, billing_token_address: null };
     const manifest = { ...trusted, protocol_version: 2, proof_backend: 'groth16_bn254',

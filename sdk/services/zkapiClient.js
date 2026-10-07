@@ -2193,10 +2193,9 @@ class ZkapiClient extends EventTarget {
         let submittedHash = prepared?.transaction_hash || null;
         let submission = null;
         let submissionMetadata = null;
-        // A vault with root history accepts a recent proof root but checks the
-        // calldata siblings against its live root. The first root rejection
-        // refreshes siblings only; a repeated rejection or UnknownRoot()
-        // re-proves. Older vaults re-prove whenever the root moved.
+        // The vault accepts any root it ever held and exits carry no Merkle
+        // path, so a saved proof is reused until its valid_until. A repeated
+        // root rejection or UnknownRoot() re-proves from a fresh path.
         const withdrawalAttempts = 4;
         let reprove = false;
         let rootRejections = 0;

@@ -303,6 +303,11 @@ export function createHarness(BrowserWalletRuntime, {
             if (operation === 'prepareRequest') {
                 const { state, args, config } = payload;
                 const nullifier = nullifierFor(state.current_anchor);
+                // C2, as the WebAssembly enforces it: one bound per state.
+                const bound = Number(state.bound_at_state || 0);
+                if (bound && bound !== Number(config.request_charge_cap)) {
+                    throw new Error(`bound_fixed_at_state: request proofs at this state use the bound ${bound}`);
+                }
                 worker.proofs += 1;
                 const request = {
                     client_request_id: args.client_request_id,
@@ -319,6 +324,7 @@ export function createHarness(BrowserWalletRuntime, {
                 };
                 return {
                     request: structuredClone(request),
+                    state: { ...structuredClone(state), bound_at_state: Number(config.request_charge_cap) },
                     journal: {
                         exists: true,
                         client_request_id: args.client_request_id,
@@ -342,16 +348,22 @@ export function createHarness(BrowserWalletRuntime, {
                     throw new Error('invalid charge or next anchor');
                 }
                 if (response.next_state_signature !== 'valid-state-signature') {
-                    throw new Error('invalid next-state signature');
+                    throw new Error('successor_signature_invalid: the successor is not signed by the pinned state key');
+                }
+                if (state.bound_at_state && (BigInt(response.charge_applied) > BigInt(state.bound_at_state)
+                    || BigInt(journal.prepared_request.public_inputs.solvency_bound) !== BigInt(state.bound_at_state))) {
+                    throw new Error('invalid_successor: S3: charge or journal bound differs from the state bound');
                 }
                 return { ...state, current_balance: state.current_balance - Number(response.charge_applied),
-                    current_anchor: response.next_anchor, is_genesis: false, state_signature: 'signed' };
+                    current_anchor: response.next_anchor, is_genesis: false, state_signature: 'signed',
+                    prev_anchor: state.current_anchor, bound_at_state: 0 };
             }
             if (operation === 'prepareWithdrawal') {
                 const { state, args } = payload;
                 if (worker.failWithdrawal) throw worker.failWithdrawal;
                 const nullifier = nullifierFor(state.current_anchor);
-                if (args.mode === 'escape' && args.clearance) throw new Error('escape withdrawal must not include clearance');
+                if (args.mode !== 'mutual' && args.clearance) throw new Error(`invalid_withdrawal_args: a ${args.mode} proof takes no clearance`);
+                if (!args.valid_until) throw new Error('invalid_withdrawal_args: valid_until must be set');
                 if (args.mode === 'mutual' && (!args.clearance?.signature
                     || BigInt(args.clearance.withdrawal_nullifier) !== BigInt(nullifier))) {
                     throw new Error('mutual withdrawal requires server clearance');
@@ -365,11 +377,14 @@ export function createHarness(BrowserWalletRuntime, {
                         state_signing_key_x: KEYS.state_signing_key.x, state_signing_key_y: KEYS.state_signing_key.y,
                         clearance_signing_key_x: KEYS.clearance_signing_key.x,
                         clearance_signing_key_y: KEYS.clearance_signing_key.y,
-                        note_id: state.note_id, final_balance: state.current_balance,
-                        destination: destinationBytes(args.destination), withdrawal_nullifier: nullifier,
-                        has_clearance: args.mode === 'mutual', withdrawal_tag: '0x99'
+                        note_id: state.note_id, final_balance: state.current_balance - Number(args.conceded || 0),
+                        destination: args.mode === 'ownership' ? Array(20).fill(0) : destinationBytes(args.destination),
+                        withdrawal_nullifier: nullifier,
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[args.mode],
+                        next_nullifier: args.mode === 'escape' ? `0x5${BigInt(nullifier).toString(16)}` : '0x0',
+                        conceded: Number(args.conceded || 0),
+                        valid_until: args.valid_until
                     },
-                    siblings: args.merkle_siblings,
                     proof: { backend: 'groth16_bn254', proof: Buffer.from(`${args.mode}-proof-${worker.proofs}`).toString('base64') }
                 };
                 worker.mutate?.(plan, payload);

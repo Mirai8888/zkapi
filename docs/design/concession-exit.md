@@ -1451,6 +1451,8 @@ The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.
 - **The legacy point release (§10.7 D).** zkapi-clientd 0.1.7 exists only as local commits on `release/v2-note-bound` (deposits closed, an in-product fresh-state escape and finalize, and `docs/LEGACY_ESCAPE.md`). It is not pushed, tagged or packaged. The new clientd's `scripts/assemble-release.py` refuses to assemble a release until `packaging/releases/clientd-0.1.7.json` records the published point release, so the legacy release must ship first.
 - **Acceptance (§11 WP-F).** The wallet driver (`examples/v2_acceptance_wallet.rs`) is ported to this circuit and built by default. The Anvil lifecycle scenario of `scripts/v2-acceptance.mjs` still drives the legacy circuit and is being ported. The scripted Sepolia drills of §10.7 B (`--network sepolia-drill`) do not exist yet; the drill list there is the checklist for running them by hand with an `adversary` build.
 
+- **Runbook (§11 WP-F docs).** The operator runbook is `docs/migration-concession-vault.md`; `docs/migration-hardened-vault.md` now only points to it, and its full text stays on `release/v2-note-bound` for the legacy stack. The legacy line has no `--admission closed` switch (§10.7 E step 2): stopping legacy admission at `X` needs a legacy serverd point release, and until then the retirement bound still holds through note expiry.
+
 ### Open items
 
 - G-SETUP and the mainnet gates of §11.

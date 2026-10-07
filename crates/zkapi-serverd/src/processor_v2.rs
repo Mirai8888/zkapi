@@ -95,6 +95,14 @@ const OWNERSHIP_PROOF_MAX_VALIDITY_SECONDS: u64 = 3_600;
 /// one stays published (its events are permanent) and is cached for good.
 const PUBLICATION_CACHE_TTL_SECONDS: u64 = 5;
 const PUBLICATION_CACHE_CAPACITY: usize = 4096;
+/// Without the indexer's published-nullifier table (unreadable, or no
+/// indexer configured), the vault's `EscapeConcessionRecorded` logs are
+/// scanned from this long before a request was reserved
+/// (`RequestProcessor::read_publication`).
+const PUBLICATION_SCAN_SLACK_SECONDS: u64 = 3_600;
+/// The longest such scan, in blocks (about a week of 12-second blocks): an
+/// older reservation fails closed.
+const PUBLICATION_SCAN_MAX_BLOCKS: u64 = 50_000;
 
 /// Latency bounds of the settler. Every settlement step persists its phase
 /// before its external side effect, so cancelling an attempt is safe.
@@ -3641,8 +3649,19 @@ impl RequestProcessor {
                 .and_then(|lease| self.pending_settlement_deadline(&lease, current_timestamp()));
         }
         // §5.2: a published nullifier's request data is no longer served.
+        // Recovery falls back to the vault's logs when the indexer's table
+        // cannot be read.
+        let reserved_at = record
+            .request_inputs_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<RequestPublicInputsV2>(json).ok())
+            .map_or(record.created_at, |inputs| {
+                inputs.request_time.min(record.created_at)
+            });
         if (recovery.request_response.is_some() || recovery.settlement_deadline.is_some())
-            && self.nullifier_published(&record.nullifier).await?
+            && self
+                .nullifier_published(&record.nullifier, Some(reserved_at))
+                .await?
         {
             recovery.request_response = None;
             recovery.settlement_deadline = None;
@@ -3653,9 +3672,16 @@ impl RequestProcessor {
     /// Whether `nullifier` is published: consumed (`usedNullifiers`) or
     /// challenged (`challengedNullifiers`) on chain at latest, or named as a
     /// withdrawal or next nullifier in a vault event (the indexer's
-    /// published-nullifier table, `GET /v1/nullifiers/{N}/published`). A
-    /// failed read is a retriable error: the answer fails closed.
-    pub async fn nullifier_published(&self, nullifier: &Felt252) -> Result<bool, ServerError> {
+    /// published-nullifier table, `GET /v1/nullifiers/{N}/published`).
+    /// With `reserved_at`, the time its request was reserved, the vault's
+    /// logs stand in for that table when it cannot be read or no indexer is
+    /// configured (see `read_publication`). A failed read is a retriable
+    /// error: the answer fails closed.
+    pub async fn nullifier_published(
+        &self,
+        nullifier: &Felt252,
+        reserved_at: Option<u64>,
+    ) -> Result<bool, ServerError> {
         let now = current_timestamp();
         if let Some(cached) = self
             .publication
@@ -3665,14 +3691,55 @@ impl RequestProcessor {
         {
             return Ok(cached);
         }
-        let published = self.read_publication(nullifier).await?;
+        let published = self.read_publication(nullifier, reserved_at).await?;
         if let Ok(mut cache) = self.publication.lock() {
             cache.record(*nullifier, published, now);
         }
         Ok(published)
     }
 
-    async fn read_publication(&self, nullifier: &Felt252) -> Result<bool, ServerError> {
+    /// The flags, then the indexer's table. Without that table, and given
+    /// `reserved_at`, the vault's `EscapeConcessionRecorded` logs from
+    /// `reserved_at - PUBLICATION_SCAN_SLACK_SECONDS` on decide: every other
+    /// event's nullifier stays consumed or challenged, so only an escape's
+    /// `nextNullifier` needs a log, and only once that escape was defeated
+    /// (which clears `usedNullifiers` for it). A request is reserved only
+    /// while its nullifier is unconsumed, so an escape naming it before the
+    /// reservation was defeated before it, with a request proof at it the
+    /// server had not reserved: one only the note's owner can make (L1).
+    /// The scan therefore misses only a nullifier its owner published.
+    async fn read_publication(
+        &self,
+        nullifier: &Felt252,
+        reserved_at: Option<u64>,
+    ) -> Result<bool, ServerError> {
+        if self.nullifier_flagged(nullifier).await? {
+            return Ok(true);
+        }
+        let indexed = match self.config.indexer_url.as_deref() {
+            Some(indexer_url) => self.indexer_published(indexer_url, nullifier).await,
+            None => Err(ServerError::ChainReadUnavailable(
+                "no indexer is configured".into(),
+            )),
+        };
+        match (indexed, reserved_at) {
+            (Ok(published), _) => Ok(published),
+            (Err(error), None) => Err(error),
+            (Err(error), Some(reserved_at)) => {
+                if self.config.indexer_url.is_some() {
+                    tracing::warn!(error = %error, "published-nullifier table unavailable; scanning the vault's logs");
+                }
+                self.escape_named_next_nullifier(
+                    nullifier,
+                    reserved_at.saturating_sub(PUBLICATION_SCAN_SLACK_SECONDS),
+                )
+                .await
+            }
+        }
+    }
+
+    /// `usedNullifiers(N) || challengedNullifiers(N)` at latest.
+    async fn nullifier_flagged(&self, nullifier: &Felt252) -> Result<bool, ServerError> {
         let unavailable = |error: ServerError| ServerError::ChainReadUnavailable(error.to_string());
         #[cfg(test)]
         if let Some(chain) = &self.test_chain {
@@ -3683,11 +3750,9 @@ impl RequestProcessor {
                     "test chain unavailable".into(),
                 ));
             }
-            return Ok(chain.used.contains(nullifier)
-                || chain.challenged.contains(nullifier)
-                || chain.events.contains(nullifier));
+            return Ok(chain.used.contains(nullifier) || chain.challenged.contains(nullifier));
         }
-        if self
+        Ok(self
             .native_oracle
             .nullifier_flag(crate::native_billing::USED_NULLIFIERS_SELECTOR, nullifier)
             .await
@@ -3699,16 +3764,56 @@ impl RequestProcessor {
                     nullifier,
                 )
                 .await
-                .map_err(unavailable)?
-        {
-            return Ok(true);
+                .map_err(unavailable)?)
+    }
+
+    /// The indexer's published-nullifier table.
+    async fn indexer_published(
+        &self,
+        indexer_url: &str,
+        nullifier: &Felt252,
+    ) -> Result<bool, ServerError> {
+        #[cfg(test)]
+        if let Some(chain) = &self.test_chain {
+            let chain = chain.lock().unwrap();
+            if chain.indexer_unavailable {
+                return Err(ServerError::ChainReadUnavailable(
+                    "test indexer unavailable".into(),
+                ));
+            }
+            return Ok(chain.events.contains(nullifier));
         }
-        match self.config.indexer_url.as_deref() {
-            Some(indexer_url) => fetch_indexer_published(indexer_url, nullifier)
-                .await
-                .map_err(|error| ServerError::ChainReadUnavailable(error.to_string())),
-            None => Ok(false),
+        fetch_indexer_published(indexer_url, nullifier)
+            .await
+            .map_err(|error| ServerError::ChainReadUnavailable(error.to_string()))
+    }
+
+    /// Whether a vault `EscapeConcessionRecorded` log at or after `since`
+    /// names `nullifier`.
+    async fn escape_named_next_nullifier(
+        &self,
+        nullifier: &Felt252,
+        since: u64,
+    ) -> Result<bool, ServerError> {
+        #[cfg(test)]
+        if let Some(chain) = &self.test_chain {
+            let mut chain = chain.lock().unwrap();
+            if chain.unavailable {
+                return Err(ServerError::ChainReadUnavailable(
+                    "test chain unavailable".into(),
+                ));
+            }
+            chain.scans.push(since);
+            return Ok(chain.events.contains(nullifier)
+                && chain
+                    .event_times
+                    .get(nullifier)
+                    .is_none_or(|time| *time >= since));
         }
+        self.native_oracle
+            .escape_named_next_nullifier(nullifier, since, PUBLICATION_SCAN_MAX_BLOCKS)
+            .await
+            .map_err(|error| ServerError::ChainReadUnavailable(error.to_string()))
     }
 
     /// `GET /v2/nullifiers/{N}/evidence` (§5.2, the clients' stale-device
@@ -3723,7 +3828,14 @@ impl RequestProcessor {
         let Some(evidence) = self.store.earliest_reserve_evidence(nullifier)? else {
             return Ok(None);
         };
-        if self.nullifier_published(nullifier).await? {
+        // Strict: a configured indexer that cannot answer fails the read.
+        // Without one, the vault's logs from the reservation decide.
+        let reserved_at = self
+            .config
+            .indexer_url
+            .is_none()
+            .then(|| evidence.created_at.min(evidence.public_inputs.request_time));
+        if self.nullifier_published(nullifier, reserved_at).await? {
             return Err(ServerError::Published);
         }
         Ok(Some(RequestEvidenceResponse {
@@ -3937,9 +4049,17 @@ fn current_timestamp_ms() -> u64 {
 pub(crate) struct TestChain {
     pub(crate) used: std::collections::HashSet<Felt252>,
     pub(crate) challenged: std::collections::HashSet<Felt252>,
+    /// Nullifiers named in vault events: the indexer's table, and the logs
+    /// a scan reads (at `event_times`, or any time when absent).
     pub(crate) events: std::collections::HashSet<Felt252>,
+    pub(crate) event_times: std::collections::HashMap<Felt252, u64>,
+    /// The RPC cannot be read (flags and logs).
     pub(crate) unavailable: bool,
+    /// The indexer's table cannot be read.
+    pub(crate) indexer_unavailable: bool,
     pub(crate) reads: usize,
+    /// The `since` of every log scan.
+    pub(crate) scans: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -7054,6 +7174,85 @@ mod tests {
         assert!(by_nullifier.request_response.is_none());
         // Publication cannot be read: no response is served.
         processor.test_chain().events.clear();
+        processor.test_chain().unavailable = true;
+        assert!(matches!(
+            processor.recover_now(&request.client_request_id),
+            Err(ServerError::ChainReadUnavailable(_))
+        ));
+    }
+
+    /// Review regression: while the indexer's published-nullifier table
+    /// cannot be read, recovery reads the vault's EscapeConcessionRecorded
+    /// logs from an hour before the reservation instead of failing: the
+    /// response is served unless such a log names the nullifier (the
+    /// successor nullifier of a defeated escape, whose flags are clear). An
+    /// unreadable chain still fails closed, and the evidence endpoint stays
+    /// strict.
+    #[test]
+    fn recovery_reads_the_vaults_logs_while_the_indexer_is_unavailable() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.indexer_url = Some("http://127.0.0.1:9".into());
+        let request = reserved_request(&processor);
+        processor
+            .settle_request_for_test(
+                &request,
+                SettlementResult {
+                    status_code: 200,
+                    payload: "{}".into(),
+                    charge_applied: 3,
+                    usage: None,
+                    billing_label: "test".into(),
+                },
+            )
+            .unwrap();
+        processor.sign_settled(&request).unwrap();
+        let nullifier = request.public_inputs.request_nullifier;
+        let record = processor
+            .store
+            .try_lookup_by_nullifier(&nullifier)
+            .unwrap()
+            .unwrap();
+        let since = request.public_inputs.request_time.min(record.created_at)
+            - PUBLICATION_SCAN_SLACK_SECONDS;
+        processor.test_chain().indexer_unavailable = true;
+        let recovery = processor.recover_now(&request.client_request_id).unwrap();
+        assert!(recovery.request_response.is_some());
+        assert_eq!(processor.test_chain().scans, [since]);
+        // A defeated escape named it as its successor nullifier: no flag is
+        // set, and the log decides.
+        processor.test_chain().events.insert(nullifier);
+        processor.test_chain().event_times.insert(nullifier, since);
+        let recovery = processor.recover_now(&request.client_request_id).unwrap();
+        assert_eq!(recovery.nullifier_status, "finalized");
+        assert!(recovery.request_response.is_none());
+        // With the indexer back, its table answers and nothing is scanned.
+        processor.test_chain().indexer_unavailable = false;
+        processor.test_chain().scans.clear();
+        assert!(processor
+            .recover_now(&request.client_request_id)
+            .unwrap()
+            .request_response
+            .is_none());
+        assert!(processor.test_chain().scans.is_empty());
+        // The evidence endpoint never falls back while an indexer is
+        // configured.
+        processor.test_chain().events.clear();
+        processor.test_chain().indexer_unavailable = true;
+        assert!(matches!(
+            futures_util::FutureExt::now_or_never(processor.request_evidence(&nullifier)).unwrap(),
+            Err(ServerError::ChainReadUnavailable(_))
+        ));
+        assert!(processor.test_chain().scans.is_empty());
+        // Without one, the vault's logs from the reservation decide.
+        processor.config.indexer_url = None;
+        assert!(
+            futures_util::FutureExt::now_or_never(processor.request_evidence(&nullifier))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(processor.test_chain().scans.len(), 1);
+        // Neither the flags nor the logs can be read: fail closed.
         processor.test_chain().unavailable = true;
         assert!(matches!(
             processor.recover_now(&request.client_request_id),

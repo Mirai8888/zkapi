@@ -280,8 +280,8 @@ with "run `zkapi db init` first". See
 ## Starting the deployment
 
 Start in this order: the indexer, `zkapi db init` (the one-shot `db-init`
-service), the challenger, then the API. The challenger must be healthy before
-the first deposit.
+service), the challenger, the API, then the gateway that publishes it. The
+challenger must be healthy before the first deposit.
 
 ```sh
 sudo docker compose -f docker/aws/compose.yml --profile challenge config --quiet
@@ -289,8 +289,13 @@ sudo docker compose -f docker/aws/compose.yml up -d --wait indexer
 sudo docker compose -f docker/aws/compose.yml run --rm db-init
 sudo docker compose -f docker/aws/compose.yml --profile challenge up -d --wait challenger
 sudo docker compose -f docker/aws/compose.yml up -d --wait server
+sudo docker compose -f docker/aws/compose.yml up -d --wait gateway
 sudo docker compose -f docker/aws/compose.yml --profile challenge ps
 ```
+
+`up` starts the services it names and the ones they depend on, never the ones
+that depend on them: nothing else starts the gateway, the only service that
+publishes `ZKAPI_HTTP_PORT`, so the acceptance checks below need its line.
 
 `db-init` is idempotent for the same deployment and refuses a database bound to
 anything else; `server` and `challenger` also wait for it to complete.
@@ -299,8 +304,9 @@ anything else; `server` and `challenger` also wait for it to complete.
 full replay from `DEPLOY_BLOCK`; it turns healthy as soon as the replay verifies.
 
 The challenge profile is explicit so image building and local startup checks
-can run before a signer is available. Omitting it starts only the API, indexer
-and gateway; such a deployment does not have escape-challenge protection. The
+can run before a signer is available. Without it, `up` never starts the
+challenger or the signer; such a deployment does not have escape-challenge
+protection. The
 challenger requires RPC `eth_sendTransaction`; an ordinary public RPC
 cannot act as its signer. The included restricted signer sidecar requires an explicit supported chain
 (1 or 11155111) and accepts only the challenger's defeat, raise and

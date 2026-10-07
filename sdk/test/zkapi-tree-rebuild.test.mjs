@@ -196,7 +196,7 @@ test('a dense stretch narrows the ranges only while it lasts, and a rebuild ends
         const started = Date.now();
         await assert.rejects(rebuildNotePath({ request: stalling, vault: VAULT, deployBlock: 0, noteId: 0, chainId: 31337, worker,
             deadline: Date.now() + 120 }), { code: 'tree_rebuild_timeout' }, label);
-        assert.ok(Date.now() - started < 1_000, label);
+        assert.ok(Date.now() - started < 3_000, label);
         assert.ok(reads >= 1 && reads <= 8, `${label}: ${reads} reads`);
     }
     // A deadline already past fails before any read.

@@ -2,11 +2,12 @@
 //
 // A proved request leaves the device the moment it is POSTed. Its write-ahead
 // journal may later be discarded from the selected runtime slot (a corroborated
-// stale root, an unaccepted quote, a clearance reservation, or an explicit
-// escape override), but the knowledge that this note state was transmitted
-// must never be. These typed records live in the existing IndexedDB 'archives'
-// object store beside note archives. They never contain a note state, secret,
-// ownership proof or clearance, and older builds ignore them.
+// stale root, an unaccepted quote, a clearance reservation, or an escape from
+// a state with an unsettled request), but the knowledge that this note state
+// was transmitted must never be. These typed records live in the existing
+// IndexedDB 'archives' object store beside note archives. They never contain a
+// note state, secret, ownership proof or clearance, and older builds ignore
+// them. The exit rules classify them (zkapiExitPolicy.mjs, design §6.4).
 
 export const REQUEST_ARCHIVE_SCHEMA = 1;
 export const REQUEST_JOURNAL_TYPE = 'request_journal';
@@ -38,11 +39,20 @@ export const REQUEST_ARCHIVE_LIMITS = Object.freeze({
 export const REQUEST_ACCEPTANCE_WINDOW_SECONDS = 300;
 export const REQUEST_EVICTION_SKEW_SECONDS = 900;
 
-export const TERMINAL_DISPOSITIONS = new Set(['installed', 'superseded']);
+// installed and superseded records can never install again. A signed
+// successor that failed S3, S4 or S5 is archived as invalid_successor: the
+// client treats it exactly like a withheld successor (design §6.1), and it
+// never installs either. All three are compacted.
+export const TERMINAL_DISPOSITIONS = new Set(['installed', 'superseded', 'invalid_successor']);
 // Not terminal: an evicted record keeps its full journal, still marks its
 // state as transmitted and still installs a later receipt, until the state
 // advances or the note closes.
 export const EVICTED_DISPOSITION = 'evicted';
+// A valid successor that arrived after an exit proof from its state was
+// released (design §6.4 E4.6). It keeps its journal and response so that it
+// installs once the exit lock is released (E6); it is never compacted before.
+export const LATE_SUCCESSOR_DISPOSITION = 'late_successor';
+export const INVALID_SUCCESSOR_DISPOSITION = 'invalid_successor';
 const DISCARDED_DISPOSITIONS = new Set([
     'discarded_stale_root',
     'discarded_expired_unaccepted',
@@ -58,20 +68,28 @@ const JOURNAL_DISPOSITION_RANK = new Map([
     ['pending', 0],
     ...[...DISCARDED_DISPOSITIONS].map(disposition => [disposition, 1]),
     [EVICTED_DISPOSITION, 2],
+    [LATE_SUCCESSOR_DISPOSITION, 2.5],
     ['installed', 3],
-    ['superseded', 3]
+    ['superseded', 3],
+    [INVALID_SUCCESSOR_DISPOSITION, 3]
 ]);
 const EVIDENCE_DISPOSITION_RANK = new Map([['evidence', 0], ['superseded', 2]]);
 // GET /v2/nullifiers readings of the state's nullifier. 'unavailable' is a
 // failed read. 'unaccepted' is POST .../expire answering expired_unaccepted
 // or superseded_unaccepted for one request; it only echoes values this wallet
 // sent, so it is never a nullifier reading.
-const NULLIFIER_READINGS = new Set(['unknown', 'reserved', 'finalized', 'clearance_reserved']);
+// exit_deferred and exited_unsigned (design §5.2) are the server's readings
+// of a reserved nullifier that an exit consumed on chain: it signs a
+// successor only if that exit is defeated.
+const NULLIFIER_READINGS = new Set(['unknown', 'reserved', 'finalized', 'clearance_reserved', 'exit_deferred',
+    'exited_unsigned']);
 // The readings that say the nullifier is not finalized, so they contradict an
 // earlier receipt claim.
 const CONTRADICTING_READINGS = new Set(['unknown', 'clearance_reserved']);
 const OBSERVATION_STATUSES = new Set([...NULLIFIER_READINGS, 'unavailable', 'unaccepted']);
-const OBSERVATION_CONTEXTS = new Set(['stale_root', 'recovery', 'escape', 'clearance', 'override']);
+// 'exit' is a bounded E1 recovery pass; 'override' is only kept so records an
+// older build saved still load.
+const OBSERVATION_CONTEXTS = new Set(['stale_root', 'recovery', 'escape', 'clearance', 'override', 'exit']);
 const JOURNAL_SOURCES = new Set(['prepared', 'migrated_runtime_journal']);
 const EVIDENCE_SOURCES = new Set(['escape_challenged']);
 const IDENTITY_FIELDS = ['type', 'deploymentId', 'noteId', 'anchor', 'nullifier', 'clientRequestId'];
@@ -344,8 +362,9 @@ export function buildRequestEvidenceRecord({
 export function compactRequestArchiveRecord(record) {
     if (!record?.journal) return { ...record };
     const journal = record.journal;
+    const { lateResponse: _lateResponse, ...kept } = record;
     return {
-        ...record,
+        ...kept,
         compacted: true,
         journal: {
             client_request_id: journalClientRequestId(journal),
@@ -469,6 +488,16 @@ export function mergeRequestArchiveRecord(previous, update, now = Date.now()) {
             if (update[field] != null) next[field] = update[field];
         }
     }
+    if (next.disposition === LATE_SUCCESSOR_DISPOSITION && previous.disposition !== LATE_SUCCESSOR_DISPOSITION
+        && update.lateResponse) {
+        next.lateResponse = structuredClone(update.lateResponse);
+        next.lateAt = Number(update.lateAt || now);
+    }
+    if (next.disposition === INVALID_SUCCESSOR_DISPOSITION && previous.disposition !== INVALID_SUCCESSOR_DISPOSITION) {
+        for (const field of ['invalidCheck', 'invalidReason', 'chargeApplied', 'invalidAt']) {
+            if (update[field] != null) next[field] = update[field];
+        }
+    }
     const changed = JSON.stringify(next) !== JSON.stringify(previous);
     if (!changed) return previous;
     next.updatedAt = Number(now);
@@ -546,69 +575,4 @@ export function terminalRequestArchiveToPrune(records, deploymentId) {
         .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
         .slice(REQUEST_ARCHIVE_LIMITS.terminalPerDeployment)
         .map(record => record.archiveId);
-}
-
-/**
- * The escape/clearance policy at an anchor whose request proof left this
- * device. `hardened` is true only for a vault whose challenge is
- * non-destructive (deployment capability vault_revision >= 2).
- * `journalMissingAcknowledged` is true only when the user overrode after the
- * receipt_journal_missing warning itself, not the general one.
- * `journalMissingClaimed` is true when a receipt claim saved earlier at this
- * state still stands (standingReceiptClaim of the records before `observed`
- * was saved). Only a contradicting reading, which is corroborated below, or a
- * receipt that installs ends it.
- */
-export function transmittedAnchorDecision({
-    entries,
-    observed = null,
-    purpose,
-    hardened = false,
-    override = false,
-    overrideReady = false,
-    journalMissingAcknowledged = false,
-    journalMissingClaimed = false,
-    selected = true
-}) {
-    if (!entries?.length) return { allowed: true, reason: 'untransmitted' };
-    const status = observed?.status || 'unavailable';
-    const corroborated = status === 'unknown' || status === 'clearance_reserved';
-    const refusal = () => ({
-        allowed: false,
-        code: status === 'reserved'
-            ? 'request_settlement_pending'
-            : status === 'finalized'
-                ? (!observed?.response ? 'receipt_response_missing'
-                    : selected ? 'receipt_journal_missing' : 'receipt_pending_install')
-                : 'transmitted_anchor_unconfirmed'
-    });
-    if (purpose === 'clearance') {
-        // The server arbitrates its own clearance and a mutual close cannot
-        // be challenged, so challenge evidence never blocks it.
-        return corroborated ? { allowed: true, reason: 'corroborated' } : refusal();
-    }
-    if (purpose !== 'escape') throw archiveError('Unknown transmitted-anchor purpose.');
-    // A vault that burns a challenged nullifier gives no safe escape here.
-    if (!hardened) return { allowed: false, code: 'transmitted_anchor_escape_unsafe' };
-    // A finalized challenge forbids re-escaping this nullifier; the user exits
-    // from the signed successor state instead.
-    if (entries.some(entry => entry.type === REQUEST_EVIDENCE_TYPE)) {
-        return { allowed: false, code: 'anchor_challenged' };
-    }
-    if (corroborated) return { allowed: true, reason: 'corroborated' };
-    // The time-gated override applies to every refusal here, including
-    // receipt_journal_missing. The caller installs any receipt that verifies
-    // before deciding, and only such a receipt may veto the override: a lying
-    // server or gateway can claim 'finalized' with a receipt this wallet
-    // cannot apply. A genuine claim of that kind makes the escape's challenge
-    // certain, so there the override needs that case's own acknowledgement,
-    // also when this reading failed or did not repeat a claim that stands.
-    if (override && overrideReady) {
-        const refused = refusal();
-        if ((refused.code === 'receipt_journal_missing' || journalMissingClaimed) && !journalMissingAcknowledged) {
-            return { allowed: false, code: 'receipt_journal_missing' };
-        }
-        return { allowed: true, reason: 'overridden' };
-    }
-    return refusal();
 }

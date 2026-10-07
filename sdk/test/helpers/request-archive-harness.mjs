@@ -165,8 +165,13 @@ export const KEYS = Object.freeze({
 });
 export const GENESIS_ANCHOR = '0x1234';
 export const nullifierFor = anchor => `0x${(BigInt(anchor) + 0x5000n).toString(16)}`;
+// N⁺ of a state, as the fake escape proof publishes it.
+export const successorFor = anchor => `0x5${BigInt(nullifierFor(anchor)).toString(16)}`;
 export const destinationBytes = address => [...Buffer.from(address.slice(2), 'hex')];
 export const word = value => `0x${BigInt(value).toString(16).padStart(64, '0')}`;
+
+/** The harness's next_anchor(N). */
+export const derivedAnchor = nullifier => `0x${(BigInt(nullifier) + 0x9000n).toString(16)}`;
 
 export function noteState(changes = {}) {
     return {
@@ -181,6 +186,35 @@ export function noteState(changes = {}) {
         is_genesis: true,
         ...changes
     };
+}
+
+// The fields of the WebAssembly's BrowserNoteState (zkapi-browser lib.rs).
+// Serde drops every other field of a state that passes through it, so the
+// fake worker returns only these: host-side fields such as deposit_path
+// survive only where the runtime carries them over itself.
+export const BROWSER_NOTE_STATE_FIELDS = Object.freeze(['protocol_version', 'chain_id', 'contract_address', 'note_id',
+    'secret_s', 'deposit_amount', 'expiry_ts', 'current_balance', 'balance_blinding', 'current_commitment_x',
+    'current_commitment_y', 'current_anchor', 'is_genesis', 'state_signature', 'prev_anchor', 'bound_at_state']);
+
+/** A note state as the WebAssembly returns it. */
+export function wasmNoteState(state) {
+    return Object.fromEntries(BROWSER_NOTE_STATE_FIELDS.filter(field => state?.[field] !== undefined)
+        .map(field => [field, structuredClone(state[field])]));
+}
+
+/** The deposit-time path a note saves (Amendment A1). */
+export const depositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
+
+/**
+ * `promise`, or a failed assertion once `ms` passes: a property broken into
+ * a hang fails its test instead of stalling the suite.
+ */
+export function within(ms, promise, label) {
+    let timer;
+    const deadline = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new assert.AssertionError({ message: `${label} did not end within ${ms} ms` })), ms);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 export class HttpError extends Error {
@@ -209,9 +243,14 @@ export function createHarness(BrowserWalletRuntime, {
         effectiveExpiry: 2_000_000_000n,
         challengePeriod: 86_400n,
         reads: [],
-        failRoot: false
+        failRoot: false,
+        // E6 reads: the note's status and the finalized block's timestamp.
+        noteStatus: 'active',
+        finalizedTimestamp: null
     };
-    const worker = { calls: [], completions: [], proofs: 0, failWithdrawal: null, mutate: null };
+    const worker = { calls: [], completions: [], proofs: 0, failWithdrawal: null, mutate: null,
+        // The stale-device pre-check's verifier: true for a proof that verifies.
+        verify: () => false };
     const server = {
         calls: [],
         leasePost: () => { throw new HttpError('Lease issuance is not configured.', 500, 'internal_error'); },
@@ -219,7 +258,9 @@ export function createHarness(BrowserWalletRuntime, {
         nullifier: () => ({ status: 'not_found', nullifier_status: 'unknown' }),
         requests: () => { throw new HttpError('Not found', 404, 'not_found'); },
         clearance: () => { throw new HttpError('Clearance is not configured.', 500, 'internal_error'); },
-        expire: () => { throw new HttpError('The request may still be accepted.', 409, 'lease_pending'); }
+        expire: () => { throw new HttpError('The request may still be accepted.', 409, 'lease_pending'); },
+        // GET /v2/nullifiers/{N⁺}/evidence (design §5.2): none by default.
+        evidence: () => { throw new HttpError('No evidence.', 404, 'not_found'); }
     };
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: DEPLOYMENT };
@@ -248,6 +289,8 @@ export function createHarness(BrowserWalletRuntime, {
     };
     runtime.ownerId = 'this-tab';
     runtime.init = async () => {};
+    runtime.exitChainStatus = async () => ({ noteStatus: chain.noteStatus,
+        finalizedTimestamp: chain.finalizedTimestamp ?? Math.floor(Date.now() / 1000) });
     runtime.scheduleSettlement = () => {};
     runtime.nativeBillingQuote = async () => quote;
     runtime.verifyLease = async () => {};
@@ -281,6 +324,9 @@ export function createHarness(BrowserWalletRuntime, {
         if (method === 'GET' && path.startsWith('/v2/openrouter/leases/')) {
             return server.leaseStatus(decodeURIComponent(path.split('/').pop()));
         }
+        if (method === 'GET' && /^\/v2\/nullifiers\/[^/]+\/evidence$/.test(path)) {
+            return server.evidence(decodeURIComponent(path.split('/')[3]));
+        }
         if (method === 'GET' && path.startsWith('/v2/nullifiers/')) {
             return server.nullifier(decodeURIComponent(path.split('/').pop()));
         }
@@ -300,9 +346,41 @@ export function createHarness(BrowserWalletRuntime, {
                         current_balance: payload.state.current_balance } : null };
             }
             if (operation === 'withdrawalNullifier') return nullifierFor(payload.state.current_anchor);
+            if (operation === 'successorNullifier') return successorFor(payload.state.current_anchor);
+            if (operation === 'verifyRequest') return worker.verify(payload);
+            if (operation === 'notePathMatches') return worker.pathMatches ? worker.pathMatches(payload) : true;
+            if (operation === 'rebuildTreePath') {
+                // The rebuilt path at the last event's root (per-event checks
+                // run in the real worker: zkapi-tree-rebuild tests).
+                worker.rebuilds = (worker.rebuilds || 0) + 1;
+                const root = payload.events.at(-1).root;
+                return { active_root: root, note_id: payload.noteId,
+                    siblings: Array.from({ length: 32 }, (_, index) => `${root}${index.toString(16)}`) };
+            }
+            if (operation === 'checkUnrecoverableResponse') {
+                // S1, S2, S4 and S6 as the WebAssembly checks them, in the
+                // harness's terms: this state's nullifier, a signed response
+                // at the derived anchor.
+                const { state, response } = payload;
+                if (BigInt(response.request_nullifier) !== BigInt(nullifierFor(state.current_anchor))) {
+                    throw new Error('response_identity_mismatch: another nullifier');
+                }
+                if (response.next_state_signature !== 'valid-state-signature') {
+                    throw new Error('successor_signature_invalid: unsigned');
+                }
+                if (BigInt(response.next_anchor) !== BigInt(derivedAnchor(nullifierFor(state.current_anchor)))) {
+                    throw new Error('invalid_successor: S4: not the derived anchor');
+                }
+                return { charge_applied: Number(response.charge_applied), next_anchor: response.next_anchor };
+            }
             if (operation === 'prepareRequest') {
                 const { state, args, config } = payload;
                 const nullifier = nullifierFor(state.current_anchor);
+                // C2, as the WebAssembly enforces it: one bound per state.
+                const bound = Number(state.bound_at_state || 0);
+                if (bound && bound !== Number(config.request_charge_cap)) {
+                    throw new Error(`bound_fixed_at_state: request proofs at this state use the bound ${bound}`);
+                }
                 worker.proofs += 1;
                 const request = {
                     client_request_id: args.client_request_id,
@@ -319,6 +397,7 @@ export function createHarness(BrowserWalletRuntime, {
                 };
                 return {
                     request: structuredClone(request),
+                    state: { ...wasmNoteState(state), bound_at_state: Number(config.request_charge_cap) },
                     journal: {
                         exists: true,
                         client_request_id: args.client_request_id,
@@ -341,17 +420,26 @@ export function createHarness(BrowserWalletRuntime, {
                     || BigInt(response.next_anchor) === 0n || !journal.user_rerandomization) {
                     throw new Error('invalid charge or next anchor');
                 }
-                if (response.next_state_signature !== 'valid-state-signature') {
-                    throw new Error('invalid next-state signature');
+                if (worker.deriveAnchors && BigInt(response.next_anchor) !== BigInt(derivedAnchor(journal.nullifier))) {
+                    throw new Error('invalid_successor: S4: the successor is not at the derived anchor next_anchor(N)');
                 }
-                return { ...state, current_balance: state.current_balance - Number(response.charge_applied),
-                    current_anchor: response.next_anchor, is_genesis: false, state_signature: 'signed' };
+                if (response.next_state_signature !== 'valid-state-signature') {
+                    throw new Error('successor_signature_invalid: the successor is not signed by the pinned state key');
+                }
+                if (state.bound_at_state && (BigInt(response.charge_applied) > BigInt(state.bound_at_state)
+                    || BigInt(journal.prepared_request.public_inputs.solvency_bound) !== BigInt(state.bound_at_state))) {
+                    throw new Error('invalid_successor: S3: charge or journal bound differs from the state bound');
+                }
+                return { ...wasmNoteState(state), current_balance: state.current_balance - Number(response.charge_applied),
+                    current_anchor: response.next_anchor, is_genesis: false, state_signature: 'signed',
+                    prev_anchor: state.current_anchor, bound_at_state: 0 };
             }
             if (operation === 'prepareWithdrawal') {
                 const { state, args } = payload;
                 if (worker.failWithdrawal) throw worker.failWithdrawal;
                 const nullifier = nullifierFor(state.current_anchor);
-                if (args.mode === 'escape' && args.clearance) throw new Error('escape withdrawal must not include clearance');
+                if (args.mode !== 'mutual' && args.clearance) throw new Error(`invalid_withdrawal_args: a ${args.mode} proof takes no clearance`);
+                if (!args.valid_until) throw new Error('invalid_withdrawal_args: valid_until must be set');
                 if (args.mode === 'mutual' && (!args.clearance?.signature
                     || BigInt(args.clearance.withdrawal_nullifier) !== BigInt(nullifier))) {
                     throw new Error('mutual withdrawal requires server clearance');
@@ -365,11 +453,14 @@ export function createHarness(BrowserWalletRuntime, {
                         state_signing_key_x: KEYS.state_signing_key.x, state_signing_key_y: KEYS.state_signing_key.y,
                         clearance_signing_key_x: KEYS.clearance_signing_key.x,
                         clearance_signing_key_y: KEYS.clearance_signing_key.y,
-                        note_id: state.note_id, final_balance: state.current_balance,
-                        destination: destinationBytes(args.destination), withdrawal_nullifier: nullifier,
-                        has_clearance: args.mode === 'mutual', withdrawal_tag: '0x99'
+                        note_id: state.note_id, final_balance: state.current_balance - Number(args.conceded || 0),
+                        destination: args.mode === 'ownership' ? Array(20).fill(0) : destinationBytes(args.destination),
+                        withdrawal_nullifier: nullifier,
+                        kind: { escape: 0, mutual: 1, ownership: 2 }[args.mode],
+                        next_nullifier: args.mode === 'escape' ? `0x5${BigInt(nullifier).toString(16)}` : '0x0',
+                        conceded: Number(args.conceded || 0),
+                        valid_until: args.valid_until
                     },
-                    siblings: args.merkle_siblings,
                     proof: { backend: 'groth16_bn254', proof: Buffer.from(`${args.mode}-proof-${worker.proofs}`).toString('base64') }
                 };
                 worker.mutate?.(plan, payload);

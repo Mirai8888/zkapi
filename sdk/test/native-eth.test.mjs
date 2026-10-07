@@ -8,6 +8,7 @@ import { assertExternalTransaction } from '../services/zkapiExternalTransactions
 import { validateNativeQuote, readNativeQuote, nativeUnitsForUsd, nativeUsdMicros,
     nativeDepositValue, parseUnits, formatUnits } from '../services/zkapiNativeEth.mjs';
 import codec from '../wallet.js';
+import { deployedProfile } from './helpers/deployed-profile.mjs';
 
 const FROM = `0x${'11'.repeat(20)}`;
 const VAULT = `0x${'22'.repeat(20)}`;
@@ -155,7 +156,14 @@ test('native deposit preflights and submits payable value once, without token mi
     const plan = { commitment: '0x1', secret: 'local-secret', amount: 3333334, zero_path: Array(32).fill('0x0') };
     const { default: runtime } = await import('../services/browserWalletRuntime.js');
     t.mock.method(runtime, 'pendingDeposit', async () => null);
-    t.mock.method(runtime, 'prepareDeposit', async amount => { assert.equal(amount, 3333334); return plan; });
+    // The deployment pins and canary caps are checked before any deposit (zkapi-deployment tests).
+    const verified = [];
+    t.mock.method(runtime, 'verifyDeploymentForDeposit', async args => { verified.push(args); return { ok: true }; });
+    t.mock.method(runtime, 'prepareDeposit', async amount => {
+        assert.equal(amount, 3333334);
+        assert.equal(verified.length, 1, 'the deployment is verified before the note is prepared');
+        return plan;
+    });
     t.mock.method(runtime, 'refreshPendingDeposit', async () => plan);
     t.mock.method(runtime, 'claimPendingDepositSubmission', async () => ({ operationId: 'native-deposit', plan }));
     t.mock.method(runtime, 'rememberPendingDepositSubmissionMetadata', async () => {});
@@ -185,7 +193,7 @@ test('native external recovery matches exact wei while zero-value legacy and wit
 });
 
 test('native manifest trust pins asset, denomination, feed, freshness and RPC without changing legacy assets', async () => {
-    const config = JSON.parse(await readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+    const config = deployedProfile();
     const trusted = { ...config.trusted_deployment, ...funding, rpc_url: funding.demo_rpc_url, billing_token_address: null };
     const manifest = { ...trusted, protocol_version: 2, proof_backend: 'groth16_bn254',
         proof_setup: { circuit_id: trusted.circuit_id, request_proving_key_sha256: trusted.request_proving_key_sha256,
@@ -213,7 +221,7 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: 'native-tier-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 } };
     const q = quote();
     runtime.nativeBillingQuote = async () => q;
     runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
@@ -223,9 +231,11 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
         proof = inputs;
         const request = { client_request_id: inputs.args.client_request_id, payload: inputs.args.payload,
             public_inputs: { request_nullifier: '0x42', solvency_bound: inputs.config.request_charge_cap } };
-        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request } };
+        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request },
+            state: { ...inputs.state, bound_at_state: inputs.config.request_charge_cap } };
     } };
     const result = await runtime.prepareLeaseRequest(undefined, null, 4.5);
+    assert.equal(runtime.runtime.state.bound_at_state, 1_500_000, 'the bound is committed with the journal');
     assert.equal(result.public_inputs.solvency_bound, 1_500_000);
     assert.deepEqual(JSON.parse(proof.args.payload), { mode: 'openrouter_ephemeral_lease', version: 1, billing_quote: q });
     runtime.nativeBillingQuote = async () => assert.fail('Never reprice an unfinished proof');
@@ -243,7 +253,7 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     runtime.manifest = { deployment_id: 'native-checksum-test' };
     runtime.config = { funding: { ...funding, native_price_feed_address: feedAddress },
         wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 } };
     runtime.remoteJson = async url => {
         assert.equal(url, `${funding.protocol_server_url}/v2/billing/quote`);
         return q;
@@ -253,7 +263,8 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     runtime.worker = { call: async (_operation, input) => {
         const request = { client_request_id: input.args.client_request_id, payload: input.args.payload,
             public_inputs: { request_nullifier: '0x42', solvency_bound: input.config.request_charge_cap } };
-        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request } };
+        return { request, journal: { client_request_id: request.client_request_id, nullifier: '0x42', prepared_request: request },
+            state: { ...input.state, bound_at_state: input.config.request_charge_cap } };
     } };
     const request = await runtime.prepareLeaseRequest(undefined, null, 1);
     const authorized = JSON.parse(request.payload).billing_quote;
@@ -363,7 +374,7 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: 'native-reprice-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    const note = { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' };
+    const note = { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 };
     runtime.runtime = { state: note };
     let current = quote();
     let quoteReads = 0;
@@ -374,7 +385,8 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     runtime.worker = { call: async (_operation, input) => {
         const request = { client_request_id: `request-${++proofs}`, payload_hash: `0x${proofs}`,
             payload: input.args.payload, public_inputs: { request_nullifier: '0x42', solvency_bound: input.config.request_charge_cap } };
-        return { request, journal: { nullifier: '0x42', prepared_request: request } };
+        return { request, journal: { nullifier: '0x42', prepared_request: request },
+            state: { ...input.state, bound_at_state: input.config.request_charge_cap } };
     } };
     const original = await runtime.prepareLeaseRequest(undefined, null, 1);
     current = quote({ round_id: '124', answer: '400000000000' });
@@ -392,9 +404,13 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     const fresh = await runtime.prepareLeaseRequest(undefined, null, 1);
     assert.equal(quoteReads, 2);
     assert.equal(proofs, 2);
-    assert.equal(fresh.public_inputs.solvency_bound, 250_000);
+    // C2: the unaccepted request already fixed this state's bound, so the
+    // fresh proof carries the same bound at the new quote; the new price
+    // only applies from the next state.
+    assert.equal(original.public_inputs.solvency_bound, 333_334);
+    assert.equal(fresh.public_inputs.solvency_bound, original.public_inputs.solvency_bound);
     assert.deepEqual(JSON.parse(fresh.payload).billing_quote, current);
-    assert.equal(runtime.runtime.state, note);
+    assert.deepEqual(runtime.runtime.state, { ...note, bound_at_state: 333_334 });
 });
 
 for (const rejection of ['expired', 'superseded']) for (const selectedTier of [1, 4.5]) test(`${rejection} native issuance at selected tier ${selectedTier} attempts once then requests authoritative recovery`, { timeout: 2_000 }, async () => {
@@ -558,6 +574,7 @@ test('provider fee changes rejected before signing release the SDK claim for a s
     t.mock.method(client, 'connectWallet', async () => FROM);
     t.mock.method(client, 'refresh', async () => {});
     t.mock.method(runtime, 'pendingDeposit', async () => null);
+    t.mock.method(runtime, 'verifyDeploymentForDeposit', async () => ({ ok: true }));
     t.mock.method(runtime, 'prepareDeposit', async (amount, options) => {
         assert.equal(amount, plan.amount);
         assert.equal(options.preparedOperationId, plan.operationId);

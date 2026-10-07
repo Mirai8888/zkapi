@@ -7,6 +7,7 @@ import {
     DEPLOYMENT, DESTINATION, GENESIS_ANCHOR, VAULT, HttpError,
     createHarness, keccak256Hex, memoryIndexedDb, noteState, nullifierFor, word
 } from './helpers/request-archive-harness.mjs';
+import { deployedProfile } from './helpers/deployed-profile.mjs';
 
 // Real store and runtime over a transactional IndexedDB; only the protocol
 // server, the pinned vault RPC and the proof worker are observed fakes.
@@ -61,26 +62,6 @@ async function discardFirstRequest(h) {
     return record;
 }
 
-// The override warning for receipt_journal_missing: the claim, what a genuine
-// claim costs and what a false one leaves.
-function assertJournalMissingWarning(warning) {
-    assert.match(warning, /^The server claims a finalized receipt for this balance that this wallet cannot apply\./);
-    assert.match(warning, /If that claim is genuine, the escape will be challenged, its gas is lost and the note then needs the operator’s help\./);
-    assert.match(warning, /If it is false, the escape is the only exit\.$/);
-    assert.doesNotMatch(warning, /withdrawable/, 'it never promises that the funds stay withdrawable');
-}
-
-// A refusal offering the override in the receipt_journal_missing case: that
-// case's warning, and the acknowledgement that alone lets the override proceed.
-function assertJournalMissingRefusal(error, overrideAfter) {
-    assert.equal(error.code, 'receipt_journal_missing');
-    assert.equal(error.message, 'The server reports a finalized private request for this balance that this browser cannot apply.');
-    assert.equal(error.data.nullifier_status, 'finalized');
-    assert.equal(error.data.escape_override_after, overrideAfter, 'the override is offered after the grace');
-    assertJournalMissingWarning(error.data.escape_override_warning);
-    assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-}
-
 const withoutRetryDelays = runtime => {
     runtime.recoverStaleRootRequest = (request, error, onProgress, signal) =>
         BrowserWalletRuntime.prototype.recoverStaleRootRequest.call(runtime, request, error, onProgress, signal,
@@ -125,10 +106,17 @@ test('stale_root is not trusted without server corroboration', async () => {
     assert.equal(record.disposition, 'pending');
     assert.deepEqual(archive.lastObservation(record), { ...archive.lastObservation(record), status: 'reserved', context: 'stale_root' });
 
+    // A reserved request leaves the state unresolved (design §6.4 E3): a
+    // mutual request waits for T and asks for no clearance; the lock it set
+    // is released again because nothing was released.
     h.server.leaseStatus = () => ({ status: 'revoking' });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'lease_pending' });
+    await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), error =>
+        error.code === 'request_settlement_pending' && error.data.escape_at > Date.now());
     assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-    assert.ok((await store.readBrowserWallet()).journal);
+    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance').length, 0);
+    const kept = await store.readBrowserWallet();
+    assert.ok(kept.journal);
+    assert.equal(kept.exitLock, null);
 });
 
 test('corroborated stale_root discards the journal but never the archive; honest retry still works', async () => {
@@ -173,75 +161,15 @@ test('a stale_root the pinned vault contradicts keeps the journal and retries th
     assert.equal(lagging.serverCalls('GET', '/v2/nullifiers/').length, 0);
 });
 
-test('escape at a transmitted anchor requires corroboration on a hardened vault', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await discardFirstRequest(h);
-    for (const [reply, code] of [
-        [() => ({ status: 'ok', nullifier_status: 'reserved' }), 'request_settlement_pending'],
-        [() => { throw new Error('network down'); }, 'transmitted_anchor_unconfirmed']
-    ]) {
-        h.server.nullifier = reply;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, code);
-            assert.equal(error.status, 409);
-            assert.equal(error.data.transmitted, true);
-            assert.ok(Number.isSafeInteger(error.data.escape_override_after));
-            assert.match(error.data.escape_override_warning, /challenged/);
-            return true;
-        });
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'no escape proof is generated on refusal');
-    }
-    h.server.nullifier = () => ({ status: 'not_found', nullifier_status: 'unknown' });
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(plan.mode, 'escape');
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 1);
-    assert.ok(h.chain.reads.some(read => read.startsWith('0x6cda756a')), 'the vault challenge flag is consulted');
-    const summary = h.runtime.snapshot().config;
-    assert.equal(summary.vault_revision, 2);
-    assert.match(summary.escape_override.warning, /funds stay withdrawable/);
-    assert.equal(summary.unresolved_requests[0].kind, 'request');
-    assert.equal(summary.unresolved_requests[0].server_status, 'unknown');
-});
-
-test('a Sepolia 401 on the escape gate asks for the password instead of refusing as unconfirmed', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await discardFirstRequest(h);
-    h.server.nullifier = () => {
-        throw Object.assign(new Error('Enter the Sepolia password to continue.'),
-            { code: 'testnet_password_required', status: 401 });
-    };
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'testnet_password_required' });
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-});
-
-test('a challenged nullifier is never escaped again, even when the server reports it unknown', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await discardFirstRequest(h);
-    h.chain.challenged.add(BigInt(nullifierFor(GENESIS_ANCHOR)));
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'nullifier_challenged' });
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-});
-
-test('strict legacy vaults never escape at a transmitted anchor, with or without the override', async () => {
+test('a flagged nullifier read through the RPC only warns: the escape is still proved (E4.5)', async () => {
     const h = await freshWallet();
     await discardFirstRequest(h);
-    h.server.nullifier = () => ({ status: 'not_found', nullifier_status: 'unknown' });
-    for (const options of [{}, { overrideUnsettledRequest: true }]) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, options), error => {
-            assert.equal(error.code, 'transmitted_anchor_escape_unsafe');
-            assert.equal(error.data.escape_override_after, null);
-            assert.equal(error.data.escape_override_warning, undefined);
-            return true;
-        });
-    }
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-    assert.equal(h.runtime.snapshot().config.vault_revision, 1);
-    assert.equal(h.runtime.snapshot().config.escape_override, null, 'no funds-safe override copy on a legacy vault');
-
-    const clean = await freshWallet();
-    const plan = await clean.runtime.prepareWithdrawal('escape', DESTINATION);
-    assert.equal(plan.mode, 'escape');
-    assert.equal(clean.server.calls.length, 0, 'an untransmitted note escapes with no server contact');
+    h.chain.challenged.add(BigInt(nullifierFor(GENESIS_ANCHOR)));
+    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(h.workerOperations('prepareWithdrawal').length, 1, 'an advisory read never blocks');
+    assert.deepEqual(plan.warnings.map(warning => [warning.code, warning.field]), [['nullifier_flagged', 'withdrawal_nullifier']]);
+    // The discarded request is resolved-unreserved: the escape concedes nothing.
+    assert.equal(plan.public_inputs.conceded, 0);
 });
 
 test('clearance_reserved discard is archived and leaves a withdrawal-only marker', async () => {
@@ -290,14 +218,14 @@ test('a later-finalized response completes from the archived rerandomization', a
     assert.deepEqual(h.runtime.snapshot().config.unresolved_requests, []);
 });
 
-test('a receipt without a saved journal reports receipt_journal_missing instead of a replay', async () => {
+test('a receipt without a saved journal reports receipt_unrecoverable instead of a replay', async () => {
     const h = await freshWallet();
     await discardFirstRequest(h);
     const foreign = journalFor(noteState(), 'request-from-another-device');
     h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(foreign) });
     h.server.leasePost = body => h.activeLease(body);
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'receipt_journal_missing',
-        message: 'The server reports a finalized private request for this balance that this browser cannot apply.' });
+    await assert.rejects(h.runtime.issueLease('chat'), { code: 'receipt_unrecoverable',
+        message: /its request journal is gone/ });
     assert.equal(h.workerOperations('prepareRequest').length, 1, 'no new request proof is made at a finalized state');
 });
 
@@ -462,9 +390,9 @@ test('an /expire answer is saved as unaccepted, never as a nullifier reading', a
 // it, while every lease POST is rewritten to native_quote_expired, every
 // /expire echoes the client's own identifiers and every nullifier read says
 // unknown. Eviction must never cost J1 its private rerandomization.
-for (const vaultRevision of [null, 2]) {
-    test(`forged discards past the per-state cap never cost a reserved request its receipt (vault_revision ${vaultRevision ?? 'absent'})`, async t => {
-        const h = await freshWallet(vaultRevision == null ? {} : { vaultRevision });
+{
+    test('forged discards past the per-state cap never cost a reserved request its receipt', async t => {
+        const h = await freshWallet();
         const realNow = Date.now;
         let elapsed = 0;
         t.mock.method(Date, 'now', () => realNow() + elapsed);
@@ -513,10 +441,6 @@ for (const vaultRevision of [null, 2]) {
         await assert.rejects(h.runtime.issueLease('chat'), { code: 'request_archive_limit' });
         assert.equal(h.workerOperations('prepareRequest').length, proofs, 'the ceiling refuses before proving');
         assert.deepEqual(await dispositions(), before, 'nothing is evicted or discarded at the ceiling');
-        if (vaultRevision == null) {
-            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION),
-                { code: 'transmitted_anchor_escape_unsafe' });
-        }
 
         // The rewriter stops; the honest server finalizes J1 and reports it.
         rewriting = false;
@@ -538,25 +462,25 @@ for (const vaultRevision of [null, 2]) {
 }
 
 test('an evicted request still marks its state transmitted and installs its later receipt', async () => {
-    for (const vaultRevision of [null, 2]) {
-        const h = await freshWallet(vaultRevision == null ? {} : { vaultRevision });
-        const state = noteState();
-        const journal = journalFor(state, `evicted-${vaultRevision ?? 'strict'}`);
-        await store.putBrowserRequestArchive([archive.buildRequestJournalRecord({ deploymentId: DEPLOYMENT, state,
-            journal, disposition: 'evicted' })]);
-        await h.runtime.reload();
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION),
-            { code: vaultRevision == null ? 'transmitted_anchor_escape_unsafe' : 'request_settlement_pending' });
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-        assert.deepEqual(h.runtime.snapshot().config.unresolved_requests.map(entry => entry.disposition), ['evicted']);
+    const h = await freshWallet({}, noteState({ bound_at_state: 1_000_000 }));
+    const state = noteState();
+    const journal = journalFor(state, 'evicted');
+    await store.putBrowserRequestArchive([archive.buildRequestJournalRecord({ deploymentId: DEPLOYMENT, state,
+        journal, disposition: 'evicted' })]);
+    await h.runtime.reload();
+    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
+    // Unresolved (E3): a mutual request waits for T.
+    await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), { code: 'request_settlement_pending' });
+    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
+    assert.deepEqual(h.runtime.snapshot().config.unresolved_requests.map(entry => [entry.disposition, entry.class]),
+        [['evicted', 'unresolved']]);
 
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(journal) });
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'), 'the escape is at the signed next state');
-        assert.equal(h.worker.completions[0].journal.user_rerandomization, journal.user_rerandomization);
-        assert.equal((await records())[0].disposition, 'installed');
-    }
+    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(journal) });
+    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'), 'the escape is at the signed next state');
+    assert.equal(plan.public_inputs.conceded, 0, 'the next state is fresh');
+    assert.equal(h.worker.completions[0].journal.user_rerandomization, journal.user_rerandomization);
+    assert.equal((await records())[0].disposition, 'installed');
 });
 
 test('terminal records are compacted and pruned to 256 per deployment without touching note archives', async () => {
@@ -610,547 +534,6 @@ test('repeated evidence and a discarded migrated journal merge as partial patche
     const bounded = archive.mergeRequestArchiveRecord(migrated, { archiveId: migrated.archiveId, serverObservations: observations }, 700);
     assert.equal(bounded.serverObservations.length, 8);
     assert.equal(bounded.serverObservations.at(-1).at, 1_011);
-});
-
-test('the escape override is time-gated and archive-covered', async t => {
-    const h = await freshWallet({ vaultRevision: 2, graceSeconds: 3_600 });
-    await h.runtime.prepareLeaseRequest();
-    const journal = (await store.readBrowserWallet()).journal;
-    h.server.leaseStatus = () => ({ status: 'revoking' });
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'lease_pending' });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assert.equal(error.code, 'request_settlement_pending');
-        assert.equal(error.data.escape_override_after, journal.created_at_ms + 3_600_000);
-        assert.match(error.data.escape_override_warning, /challenged/);
-        return true;
-    });
-    assert.ok((await store.readBrowserWallet()).journal, 'a refused override keeps the journal');
-
-    const realNow = Date.now;
-    t.mock.method(Date, 'now', () => realNow() + 3_700_000);
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true });
-    assert.equal(plan.mode, 'escape');
-    const saved = await store.readBrowserWallet();
-    assert.equal(saved.journal, null);
-    assert.equal(saved.lease, null);
-    const [record] = await records();
-    assert.equal(record.disposition, 'abandoned_for_escape');
-    assert.equal(archive.lastObservation(record).context, 'override');
-    assert.ok(record.journal.user_rerandomization, 'an abandoned request can still install a later receipt');
-});
-
-test('the escape override opens early only when the note would otherwise expire', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await h.runtime.prepareLeaseRequest();
-    h.server.leaseStatus = () => ({ status: 'revoking' });
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
-    h.chain.effectiveExpiry = BigInt(Math.floor(Date.now() / 1000) + 30 * 86_400);
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-        { code: 'request_settlement_pending' });
-    h.chain.effectiveExpiry = BigInt(Math.floor(Date.now() / 1000) + 86_400 + 3_600);
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true });
-    assert.equal(plan.mode, 'escape');
-    assert.ok(h.chain.reads.some(read => read.startsWith('0x7cb4a03c')), 'the pause-aware expiry is read');
-    assert.equal((await records())[0].disposition, 'abandoned_for_escape');
-});
-
-test('a verified finalized receipt installs instead of the escape override', async () => {
-    const h = await freshWallet({ vaultRevision: 2, graceSeconds: 3_600 });
-    await h.runtime.prepareLeaseRequest();
-    const journal = (await store.readBrowserWallet()).journal;
-    h.server.leaseStatus = () => ({ status: 'revoking' });
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(journal) });
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true });
-    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'), 'the escape is at the signed next state');
-    assert.equal(plan.public_inputs.final_balance, 5_000_000 - 25_000);
-    assert.equal((await records())[0].disposition, 'installed');
-});
-
-test('a finalized receipt this browser cannot apply keeps the time-gated override behind its own warning and acknowledgement', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const discarded = await discardFirstRequest(h);
-    const realNow = Date.now;
-    let elapsed = 0;
-    t.mock.method(Date, 'now', () => realNow() + elapsed);
-    const overrideAfter = discarded.journal.created_at_ms + 43_200_000;
-    const otherReadings = [
-        [() => ({ status: 'ok', nullifier_status: 'reserved' }), 'request_settlement_pending'],
-        [() => { throw new Error('network down'); }, 'transmitted_anchor_unconfirmed'],
-        [() => ({ status: 'ok', nullifier_status: 'finalized' }), 'receipt_response_missing']
-    ];
-    // Before any receipt claim, the other override codes keep the existing
-    // warning and the general acknowledgement, in the refusal and in the
-    // snapshot.
-    for (const [reply, code] of otherReadings) {
-        h.server.nullifier = reply;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, code);
-            assert.equal(error.data.escape_override_after, overrideAfter);
-            assert.match(error.data.escape_override_warning, /funds stay withdrawable from the next state/);
-            assert.equal(error.data.escape_override_acknowledgement, true);
-            return true;
-        });
-        assert.match(h.runtime.snapshot().config.escape_override.warning, /funds stay withdrawable from the next state/);
-        assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, true);
-    }
-
-    // The server reports a finalized transcript for a request whose journal
-    // this browser does not have. Genuine or not, only a receipt that
-    // verifies may veto the override.
-    const foreign = journalFor(noteState(), 'request-from-another-device');
-    const finalizedForeign = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(foreign) });
-    h.server.nullifier = finalizedForeign;
-    for (const options of [{}, { overrideUnsettledRequest: true }, { overrideUnsettledRequest: 'receipt_journal_missing' }]) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, options), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            assert.doesNotMatch(error.message, /would be challenged|operator/);
-            return true;
-        });
-    }
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'no escape is proved before the grace');
-    const summary = h.runtime.snapshot().config;
-    assertJournalMissingWarning(summary.escape_override.warning);
-    assert.equal(summary.escape_override.acknowledgement, 'receipt_journal_missing');
-    assert.equal(summary.unresolved_requests[0].escape_override_after, overrideAfter);
-
-    // The claim stands through the same readings: each is refused with its
-    // own code, but the override it offers, like the snapshot, keeps this
-    // case's warning and acknowledgement.
-    for (const [reply, code] of otherReadings) {
-        h.server.nullifier = reply;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, code);
-            assert.equal(error.data.escape_override_after, overrideAfter);
-            assertJournalMissingWarning(error.data.escape_override_warning);
-            assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-            return true;
-        });
-        assertJournalMissingWarning(h.runtime.snapshot().config.escape_override.warning);
-        assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, 'receipt_journal_missing');
-    }
-
-    h.server.nullifier = finalizedForeign;
-    elapsed = 13 * 3_600_000;
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' },
-        'only the explicit override escapes');
-    // The general acknowledgement never escapes in this case, also after the
-    // grace: the refusal carries this case's warning and acknowledgement.
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assertJournalMissingRefusal(error, overrideAfter);
-        return true;
-    });
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: 'receipt_journal_missing' });
-    assert.equal(plan.mode, 'escape');
-    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR), 'the override escapes at the current state');
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 1);
-    assert.equal(h.workerOperations('completeResponse').length, 0, 'the receipt names no journal this browser holds');
-    const [kept] = await records();
-    assert.ok(archive.isUnresolved(kept) && kept.journal.user_rerandomization, 'the archived journal still installs a later receipt');
-
-    // Once ready, every refusal is overridable; a receipt that verifies is
-    // installed by the gate before this decision is ever made. Only
-    // receipt_journal_missing needs its own acknowledgement, which also
-    // covers the general case.
-    const entries = [pendingRecord(noteState(), 'transmitted')];
-    const decide = (observed, {
-        overrideReady = true, journalMissingAcknowledged = false, journalMissingClaimed = false
-    } = {}) => archive.transmittedAnchorDecision({ entries, observed, purpose: 'escape', hardened: true, override: true,
-        overrideReady, journalMissingAcknowledged, journalMissingClaimed });
-    for (const observed of [{ status: 'reserved' }, { status: 'unavailable' }, { status: 'finalized', response: null }]) {
-        assert.deepEqual(decide(observed), { allowed: true, reason: 'overridden' });
-        assert.deepEqual(decide(observed, { journalMissingAcknowledged: true }), { allowed: true, reason: 'overridden' });
-        // A claim saved earlier that this reading does not contradict.
-        assert.deepEqual(decide(observed, { journalMissingClaimed: true }), { allowed: false, code: 'receipt_journal_missing' });
-        assert.deepEqual(decide(observed, { journalMissingClaimed: true, journalMissingAcknowledged: true }),
-            { allowed: true, reason: 'overridden' });
-    }
-    assert.deepEqual(decide({ status: 'unavailable' }, { overrideReady: false, journalMissingClaimed: true }),
-        { allowed: false, code: 'transmitted_anchor_unconfirmed' }, 'before it is ready the code follows the reading');
-    for (const status of ['unknown', 'clearance_reserved']) {
-        assert.deepEqual(decide({ status }, { journalMissingClaimed: true }), { allowed: true, reason: 'corroborated' },
-            'a reading that contradicts the claim is corroborated');
-    }
-    const unapplied = { status: 'finalized', response: h.receiptFor(foreign) };
-    assert.deepEqual(decide(unapplied), { allowed: false, code: 'receipt_journal_missing' });
-    assert.deepEqual(decide(unapplied, { journalMissingAcknowledged: true }), { allowed: true, reason: 'overridden' });
-    assert.deepEqual(decide(unapplied, { overrideReady: false, journalMissingAcknowledged: true }),
-        { allowed: false, code: 'receipt_journal_missing' });
-});
-
-// The refutation of completeness #3: a server or gateway that lies 'finalized'
-// produces the same receipt_journal_missing code. Without the override, the
-// escape would stay refused after the grace and near expiry, and the note
-// would be left to claimExpired.
-for (const variant of ['invented request', 'forged signature']) {
-    test(`a fabricated finalized claim (${variant}) never blocks the escape override after the grace or near expiry`, async t => {
-        const realNow = Date.now;
-        let elapsed = 0;
-        t.mock.method(Date, 'now', () => realNow() + elapsed);
-        for (const trigger of ['grace', 'expiry']) {
-            elapsed = 0;
-            const h = await freshWallet({ vaultRevision: 2 });
-            let own;
-            let fabricated;
-            if (variant === 'invented request') {
-                // A gateway answers the lease POST itself and echoes /expire,
-                // so the honest server never sees a request at this state.
-                h.server.leasePost = () => { throw new HttpError('Quote expired.', 409, 'native_quote_expired'); };
-                h.server.expire = body => ({ status: 'expired_unaccepted', client_request_id: body.client_request_id,
-                    request_nullifier: body.public_inputs.request_nullifier, payload_hash: body.payload_hash });
-                await assert.rejects(h.runtime.issueLease('chat'), { code: 'native_quote_expired' });
-                [own] = await records();
-                assert.equal(own.disposition, 'discarded_expired_unaccepted');
-                fabricated = { status: 'ok', client_request_id: 'invented-by-the-server',
-                    request_nullifier: nullifierFor(GENESIS_ANCHOR), response_payload: 'garbage' };
-            } else {
-                // 'unknown' corroborated this discard: the server never
-                // reserved the nullifier, so a later 'finalized' is false.
-                own = await discardFirstRequest(h);
-                fabricated = { ...h.receiptFor(own.journal), next_state_signature: 'forged-signature' };
-            }
-            h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: fabricated });
-
-            // A host following the refusal shows its warning and passes back
-            // its acknowledgement.
-            let acknowledgement = null;
-            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-                assertJournalMissingRefusal(error, own.journal.created_at_ms + 43_200_000);
-                acknowledgement = error.data.escape_override_acknowledgement;
-                return true;
-            });
-            assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'refused before the grace');
-
-            if (trigger === 'grace') elapsed = 13 * 3_600_000;
-            else h.chain.effectiveExpiry = BigInt(Math.floor(Date.now() / 1_000)) + h.chain.challengePeriod + 3_600n;
-            // Ready now, yet the general acknowledgement still never escapes
-            // here; the refusal says that the override is available now.
-            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-                assert.equal(error.code, 'receipt_journal_missing');
-                assert.ok(error.data.escape_override_after <= Date.now(), `available now (${trigger})`);
-                assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-                return true;
-            });
-            assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-            const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: acknowledgement });
-            assert.equal(plan.mode, 'escape', `the override opens (${trigger})`);
-            assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-            assert.equal(h.workerOperations('completeResponse').length > 0, variant === 'forged signature',
-                'an invented request never reaches completeResponse; a forged signature fails it');
-            assert.equal((await store.readBrowserWallet()).state.current_anchor, GENESIS_ANCHOR, 'nothing was installed');
-        }
-    });
-}
-
-// The same lie while this browser still holds the live journal: the server
-// reports the lease revoking, unknown, or active and then retired with a
-// receipt by request id, and the nullifier 'finalized', always for an invented
-// request. Quiet recovery (initialization, the override) must not fail on it,
-// and the override's own time gate warns about this case.
-for (const leaseStatus of ['revoking', 'not_found', 'active']) {
-    test(`a fabricated finalized claim never blocks initialization or the override of a live journal (lease ${leaseStatus})`, async t => {
-        const h = await freshWallet({ vaultRevision: 2, graceSeconds: 3_600 });
-        await h.runtime.prepareLeaseRequest();
-        const journal = (await store.readBrowserWallet()).journal;
-        h.server.leaseStatus = () => {
-            if (leaseStatus === 'not_found') throw new HttpError('Not found', 404, 'not_found');
-            return { status: leaseStatus };
-        };
-        const invented = { status: 'ok', client_request_id: 'invented-by-the-server',
-            request_nullifier: nullifierFor(GENESIS_ANCHOR), response_payload: 'garbage' };
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: invented });
-        h.server.requests = () => ({ request_response: invented });
-        assert.equal(await h.runtime.recoverPendingLocked({ retireLostKey: true, quiet: true }), false,
-            'the quiet recovery that initialization runs does not fail');
-        // The snapshot follows the reading that this recovery saved.
-        assertJournalMissingWarning(h.runtime.snapshot().config.escape_override.warning);
-        await assert.rejects(h.runtime.recoverPending({ retireLostKey: true }), { code: 'receipt_journal_missing' },
-            'a caller that is not quiet still sees the refusal');
-        assert.ok((await store.readBrowserWallet()).journal);
-
-        const overrideAfter = journal.created_at_ms + 3_600_000;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            assert.equal(error.data.client_request_id, journal.client_request_id);
-            return true;
-        });
-        assert.ok((await store.readBrowserWallet()).journal, 'a refused override keeps the journal');
-        assertJournalMissingWarning(h.runtime.snapshot().config.escape_override.warning);
-
-        const realNow = Date.now;
-        t.mock.method(Date, 'now', () => realNow() + 3_700_000);
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            return true;
-        }, 'the general acknowledgement never abandons the journal in this case');
-        assert.ok((await store.readBrowserWallet()).journal);
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: 'receipt_journal_missing' });
-        assert.equal(plan.mode, 'escape');
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-        assert.equal(h.workerOperations('completeResponse').length, 0);
-        const [record] = await records();
-        assert.equal(record.disposition, 'abandoned_for_escape');
-        assert.ok(record.journal.user_rerandomization, 'the abandoned journal still installs a later receipt');
-    });
-}
-
-// The README's genuine receipt_journal_missing, end to end. An older build
-// discarded J0, which the honest server reserved and later finalized. After
-// the upgrade no archive record exists for that state, so the next chat proves
-// J1 there. The server answers 409 replay (J0 holds the nullifier), keeps no
-// lease for J1 (404) and reports the nullifier finalized with J0's genuine
-// receipt, so an escape at this state will be challenged. No escape may be
-// proved before this case's own warning was offered and acknowledged.
-test('a genuine finalized receipt for a request an older build discarded never escapes without its own acknowledgement', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const j0 = journalFor(noteState(), 'discarded-by-an-older-build',
-        { requestTime: Math.floor(Date.now() / 1000) - 86_400, createdAt: Date.now() - 86_400_000 });
-    h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-    h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(j0) });
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-    const j1 = (await store.readBrowserWallet()).journal;
-    assert.ok(j1, 'the replayed request stays live');
-    const overrideAfter = j1.created_at_ms + 43_200_000;
-
-    const realNow = Date.now;
-    let elapsed = 0;
-    t.mock.method(Date, 'now', () => realNow() + elapsed);
-    for (const hours of [0, 13]) {
-        elapsed = hours * 3_600_000;
-        // A plain escape offers the override with this case's warning, and
-        // the snapshot shows the same from the reading recovery saved.
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            return true;
-        });
-        const summary = h.runtime.snapshot().config;
-        assertJournalMissingWarning(summary.escape_override.warning);
-        assert.equal(summary.escape_override.acknowledgement, 'receipt_journal_missing');
-        assert.equal(summary.unresolved_requests[0].server_status, 'finalized');
-        assert.equal(summary.unresolved_requests[0].escape_override_after, overrideAfter);
-    }
-    // Past the grace, the general acknowledgement is refused again and the
-    // live journal stays where it is.
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assertJournalMissingRefusal(error, overrideAfter);
-        assert.equal(error.data.client_request_id, j1.client_request_id);
-        return true;
-    });
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'no escape before this case is acknowledged');
-    assert.equal((await store.readBrowserWallet()).journal.client_request_id, j1.client_request_id);
-
-    // The user accepted that a genuine claim makes the challenge certain.
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: 'receipt_journal_missing' });
-    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    assert.equal(h.workerOperations('completeResponse').length, 0);
-    const [record] = await records();
-    assert.equal(record.disposition, 'abandoned_for_escape');
-    assert.ok(record.journal.user_rerandomization, 'the abandoned journal still installs a later receipt');
-});
-
-// The first 'finalized' reading can arrive inside an override past the grace,
-// after the snapshot or an earlier refusal offered only the general warning.
-for (const earlier of ['unknown', 'reserved']) {
-    test(`a finalized claim first read inside the override is refused with its own warning (earlier reading ${earlier})`, async t => {
-        const h = await freshWallet({ vaultRevision: 2 });
-        const discarded = await discardFirstRequest(h);
-        const overrideAfter = discarded.journal.created_at_ms + 43_200_000;
-        if (earlier === 'reserved') {
-            h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
-            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-                assert.equal(error.code, 'request_settlement_pending');
-                assert.match(error.data.escape_override_warning, /funds stay withdrawable/);
-                assert.equal(error.data.escape_override_acknowledgement, true);
-                return true;
-            });
-        }
-        const realNow = Date.now;
-        t.mock.method(Date, 'now', () => realNow() + 13 * 3_600_000);
-        const shown = h.runtime.snapshot().config.escape_override;
-        assert.match(shown.warning, /funds stay withdrawable/);
-        assert.equal(shown.acknowledgement, true);
-
-        // The server's answer changes before the user overrides with the
-        // general acknowledgement that was offered.
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-            request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement }),
-            error => {
-                assertJournalMissingRefusal(error, overrideAfter);
-                return true;
-            });
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'no escape on the first finalized reading');
-        const updated = h.runtime.snapshot().config.escape_override;
-        assertJournalMissingWarning(updated.warning);
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: updated.acknowledgement });
-        assert.equal(plan.mode, 'escape');
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    });
-}
-
-// Round-2 review: once a reading saved the claim, a later read that fails,
-// says 'reserved' or says 'finalized' without a receipt must neither offer the
-// general warning nor let `true` escape. Each variant runs with the request
-// archived (a corroborated discard) and with the journal still live (the
-// README's older-build path).
-const LATER_READINGS = [
-    ['a failed read', () => { throw new HttpError('Service unavailable', 503, 'service_unavailable'); },
-        'unavailable', 'transmitted_anchor_unconfirmed'],
-    ['reserved', () => ({ status: 'ok', nullifier_status: 'reserved' }), 'reserved', 'request_settlement_pending'],
-    ['finalized without a receipt', () => ({ status: 'ok', nullifier_status: 'finalized' }),
-        'finalized', 'receipt_response_missing']
-];
-
-// The override refused as receipt_journal_missing on a claim an earlier read
-// saved: ready, so available now, and this case's own acknowledgement.
-function assertSavedClaimRefusal(error, nullifierStatus) {
-    assert.equal(error.code, 'receipt_journal_missing');
-    assert.equal(error.message, 'The server earlier reported a finalized private request for this balance that this browser cannot apply.');
-    assert.equal(error.data.nullifier_status, nullifierStatus, 'the data reports this read');
-    assert.ok(error.data.escape_override_after <= Date.now(), 'available now');
-    assertJournalMissingWarning(error.data.escape_override_warning);
-    assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-}
-
-for (const [later, reply, nullifierStatus, code] of LATER_READINGS) {
-    test(`a saved receipt_journal_missing claim keeps its own acknowledgement after ${later} (archived request)`, async t => {
-        const h = await freshWallet({ vaultRevision: 2 });
-        const discarded = await discardFirstRequest(h);
-        const overrideAfter = discarded.journal.created_at_ms + 43_200_000;
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-            request_response: h.receiptFor(journalFor(noteState(), 'discarded-by-an-older-build')) });
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            return true;
-        });
-
-        const realNow = Date.now;
-        t.mock.method(Date, 'now', () => realNow() + 13 * 3_600_000);
-        h.server.nullifier = reply;
-        // The plain escape is refused for this read and offers the override
-        // with the claim's warning and acknowledgement, as the snapshot does.
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, code);
-            assert.equal(error.data.nullifier_status, nullifierStatus);
-            assert.equal(error.data.escape_override_after, overrideAfter);
-            assertJournalMissingWarning(error.data.escape_override_warning);
-            assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-            return true;
-        });
-        const shown = h.runtime.snapshot().config.escape_override;
-        assertJournalMissingWarning(shown.warning);
-        assert.equal(shown.acknowledgement, 'receipt_journal_missing');
-
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-            error => {
-                assertSavedClaimRefusal(error, nullifierStatus);
-                return true;
-            });
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0, 'the general acknowledgement never escapes here');
-        // The claim never vetoes: its own acknowledgement escapes.
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
-        assert.equal(plan.mode, 'escape');
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 1);
-    });
-
-    test(`a saved receipt_journal_missing claim keeps its own acknowledgement after ${later} (live journal)`, async t => {
-        const h = await freshWallet({ vaultRevision: 2 });
-        h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-        h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-            request_response: h.receiptFor(journalFor(noteState(), 'discarded-by-an-older-build')) });
-        await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-        const j1 = (await store.readBrowserWallet()).journal;
-        const overrideAfter = j1.created_at_ms + 43_200_000;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assertJournalMissingRefusal(error, overrideAfter);
-            return true;
-        });
-
-        const realNow = Date.now;
-        let elapsed = 3_600_000;
-        t.mock.method(Date, 'now', () => realNow() + elapsed);
-        h.server.nullifier = reply;
-        // Before the grace the override waits like any other, and already
-        // shows this case's warning and acknowledgement.
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-            error => {
-                assert.equal(error.code, 'request_settlement_pending');
-                assert.equal(error.data.nullifier_status, nullifierStatus);
-                assert.equal(error.data.escape_override_after, overrideAfter);
-                assertJournalMissingWarning(error.data.escape_override_warning);
-                assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-                return true;
-            });
-
-        elapsed = 13 * 3_600_000;
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-            error => {
-                assertSavedClaimRefusal(error, nullifierStatus);
-                assert.equal(error.data.client_request_id, j1.client_request_id);
-                return true;
-            });
-        assert.equal((await store.readBrowserWallet()).journal.client_request_id, j1.client_request_id,
-            'the general acknowledgement never abandons the journal here');
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-        const shown = h.runtime.snapshot().config.escape_override;
-        assertJournalMissingWarning(shown.warning);
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-        const [record] = await records();
-        assert.equal(record.disposition, 'abandoned_for_escape');
-        assert.ok(record.journal.user_rerandomization, 'the abandoned journal still installs a later receipt');
-    });
-}
-
-test('a standing receipt claim survives repeated failed reads, and a reading that contradicts it ends it', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await discardFirstRequest(h);
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-        request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' });
-    const realNow = Date.now;
-    t.mock.method(Date, 'now', () => realNow() + 13 * 3_600_000);
-    h.server.nullifier = () => { throw new Error('network down'); };
-    // Each attempt saves two failed reads (the sweep and the gate), well past
-    // the newest eight observations a record keeps.
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, 'transmitted_anchor_unconfirmed');
-            assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-            return true;
-        });
-    }
-    const [record] = await records();
-    assert.equal(record.serverObservations.length, archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord + 1);
-    assert.ok(archive.isReceiptClaim(record.serverObservations[0]), 'the standing claim is kept ahead of the newest eight');
-    assert.ok(record.serverObservations.slice(1).every(observation => observation.status === 'unavailable'));
-    assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, 'receipt_journal_missing');
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assertSavedClaimRefusal(error, 'unavailable');
-        return true;
-    });
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-
-    // The server now reports the nullifier unknown: the claim no longer
-    // stands, so the general warning applies again, even after a failed read.
-    h.server.nullifier = () => ({ status: 'not_found', nullifier_status: 'unknown' });
-    assert.equal(await h.runtime.recoverPending({ retireLostKey: true, sweep: true }), false);
-    assert.match(h.runtime.snapshot().config.escape_override.warning, /funds stay withdrawable from the next state/);
-    assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, true);
-    h.server.nullifier = () => { throw new Error('network down'); };
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-        assert.equal(error.code, 'transmitted_anchor_unconfirmed');
-        assert.match(error.data.escape_override_warning, /funds stay withdrawable from the next state/);
-        assert.equal(error.data.escape_override_acknowledgement, true);
-        return true;
-    });
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true });
-    assert.equal(plan.mode, 'escape');
 });
 
 test('a receipt claim stands until a later unknown or clearance_reserved reading, and is never trimmed', () => {
@@ -1550,307 +933,6 @@ test('the store stamps every saved observation in save order, across records and
     assert.equal(archive.standingReceiptClaim(saved), null);
 });
 
-// Round-3 and round-4 reviews: a contradicting reading saved while the device
-// clock ran fast must neither hide a later claim nor outlast it in trimming.
-for (const [label, skew] of [['10 minutes', 10 * 60_000], ['3 days', 3 * 86_400_000]]) {
-    test(`a receipt claim saved after the clock stepped back ${label} stands at once and through later failed reads`, async t => {
-        const realNow = Date.now();
-        let clock = realNow + skew;
-        t.mock.method(Date, 'now', () => clock);
-        // The clock runs fast while a chat is discarded on a corroborated 'unknown'.
-        const h = await freshWallet({ vaultRevision: 2 });
-        await discardFirstRequest(h);
-        // The clock is corrected. The server then claims a finalized receipt
-        // this browser cannot apply.
-        clock = realNow;
-        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-            request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' });
-        const [record] = await records();
-        const claim = record.serverObservations.findLast(archive.isReceiptClaim);
-        assert.equal(record.serverObservations[0].status, 'unknown');
-        assert.ok(claim.at < record.serverObservations[0].at, 'the claim carries the earlier clock');
-        assert.ok(claim.seq > record.serverObservations[0].seq, 'and the later save');
-        // The claim stands at once.
-        assert.deepEqual(archive.standingReceiptClaim(await records()), claim);
-        let shown = h.runtime.snapshot().config.escape_override;
-        assertJournalMissingWarning(shown.warning);
-        assert.equal(shown.acknowledgement, 'receipt_journal_missing');
-
-        // Real time passes the grace and the fast clock's reading; the server
-        // is unreachable. Each attempt saves two failed reads.
-        clock = realNow + skew + 13 * 3_600_000;
-        h.server.nullifier = () => { throw new HttpError('Service unavailable', 503, 'service_unavailable'); };
-        for (let attempt = 0; attempt < 6; attempt += 1) {
-            await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-                assert.equal(error.code, 'transmitted_anchor_unconfirmed');
-                assertJournalMissingWarning(error.data.escape_override_warning);
-                assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-                return true;
-            });
-        }
-        const [kept] = await records();
-        assert.equal(kept.serverObservations.length, archive.REQUEST_ARCHIVE_LIMITS.observationsPerRecord + 1);
-        assert.deepEqual(kept.serverObservations[0], claim, 'the claim, not the fast-dated reading, is kept');
-        assert.ok(kept.serverObservations.slice(1).every(observation => observation.status === 'unavailable'));
-        shown = h.runtime.snapshot().config.escape_override;
-        assertJournalMissingWarning(shown.warning);
-        assert.equal(shown.acknowledgement, 'receipt_journal_missing');
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-            assertSavedClaimRefusal(error, 'unavailable');
-            return true;
-        });
-        assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
-        // A false claim still cannot veto the override: its own acknowledgement escapes.
-        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
-        assert.equal(plan.mode, 'escape');
-        assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    });
-}
-
-test('an unknown reading saved on the live journal alone keeps a receipt claim ended through later failed reads', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const discarded = await discardFirstRequest(h);
-    // A second chat is refused with 'replay' and its journal stays live.
-    h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-    h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-    const live = (await store.readBrowserWallet()).journal;
-    const overrideAfter = live.created_at_ms + 43_200_000;
-    // One lying answer: recovery saves the claim on both records.
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-        request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' });
-    assert.ok((await records()).every(record => record.serverObservations.some(archive.isReceiptClaim)));
-    assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, 'receipt_journal_missing');
-
-    const realNow = Date.now;
-    let elapsed = 3_600_000;
-    t.mock.method(Date, 'now', () => realNow() + elapsed);
-    // The server reports the nullifier unknown while its lease status fails:
-    // the override's refusal before the grace saves that on the live record only.
-    h.server.leaseStatus = () => { throw new HttpError('Service unavailable', 503, 'service_unavailable'); };
-    h.server.nullifier = () => ({ status: 'not_found', nullifier_status: 'unknown' });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assert.equal(error.code, 'request_settlement_pending');
-        assert.equal(error.data.nullifier_status, 'unknown');
-        assert.equal(error.data.escape_override_acknowledgement, true);
-        return true;
-    });
-    const byId = async id => (await records()).find(record => record.clientRequestId === id);
-    assert.ok(!(await byId(discarded.clientRequestId)).serverObservations.some(observation => observation.context === 'override'),
-        'the archived record never received that reading');
-    assert.equal(archive.standingReceiptClaim(await records()), null);
-
-    // Eight more attempts before the grace while the server is unreachable.
-    h.server.nullifier = () => { throw new HttpError('Service unavailable', 503, 'service_unavailable'); };
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-            error => {
-                assert.equal(error.code, 'request_settlement_pending');
-                assert.equal(error.data.nullifier_status, 'unavailable');
-                assert.equal(error.data.escape_override_after, overrideAfter);
-                assert.match(error.data.escape_override_warning, /funds stay withdrawable from the next state/);
-                assert.equal(error.data.escape_override_acknowledgement, true);
-                return true;
-            });
-    }
-    const liveRecord = await byId(live.client_request_id);
-    assert.equal(liveRecord.serverObservations[0].status, 'unknown', 'the reading that ended the claim is kept');
-    assert.ok(liveRecord.serverObservations.slice(1).every(observation => observation.status === 'unavailable'));
-    assert.ok(archive.isReceiptClaim(archive.lastDefinitiveObservation(await byId(discarded.clientRequestId))),
-        'the archived record still holds the claim as its newest reading');
-    assert.equal(archive.standingReceiptClaim(await records()), null);
-    const shown = h.runtime.snapshot().config.escape_override;
-    assert.match(shown.warning, /funds stay withdrawable from the next state/);
-    assert.equal(shown.acknowledgement, true);
-
-    // Past the grace the general acknowledgement escapes.
-    elapsed = 13 * 3_600_000;
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
-    assert.equal(plan.mode, 'escape');
-    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 1);
-    assert.equal((await byId(live.client_request_id)).disposition, 'abandoned_for_escape');
-});
-
-test('a clearance_reserved discard of the live journal keeps a receipt claim ended through later failed reads', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const discarded = await discardFirstRequest(h);
-    h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-    h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-    const live = (await store.readBrowserWallet()).journal;
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-        request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), { code: 'receipt_journal_missing' });
-    assert.ok((await records()).every(record => record.serverObservations.some(archive.isReceiptClaim)));
-
-    const realNow = Date.now;
-    let elapsed = 3_600_000;
-    t.mock.method(Date, 'now', () => realNow() + elapsed);
-    // Operator remediation: recovery reads 'clearance_reserved' once and
-    // discards the live journal, saving that reading on its record only.
-    // Then the server is unreachable.
-    let answers = 0;
-    h.server.nullifier = () => {
-        answers += 1;
-        if (answers === 1) return { status: 'ok', nullifier_status: 'clearance_reserved' };
-        throw new HttpError('Service unavailable', 503, 'service_unavailable');
-    };
-    assert.equal(await h.runtime.recoverPending({ retireLostKey: true }), true);
-    const byId = async id => (await records()).find(record => record.clientRequestId === id);
-    assert.equal((await byId(live.client_request_id)).disposition, 'discarded_clearance_reserved');
-    assert.ok(!(await byId(discarded.clientRequestId)).serverObservations.some(observation =>
-        observation.status === 'clearance_reserved'), 'the archived record never received that reading');
-    assert.equal(archive.standingReceiptClaim(await records()), null);
-
-    // Each attempt saves two failed reads on both records (the sweep and the gate).
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-            assert.equal(error.code, 'transmitted_anchor_unconfirmed');
-            assert.match(error.data.escape_override_warning, /funds stay withdrawable from the next state/);
-            assert.equal(error.data.escape_override_acknowledgement, true);
-            return true;
-        });
-    }
-    assert.equal((await byId(live.client_request_id)).serverObservations[0].status, 'clearance_reserved',
-        'the reading that ended the claim is kept');
-    assert.equal(archive.standingReceiptClaim(await records()), null);
-    const shown = h.runtime.snapshot().config.escape_override;
-    assert.match(shown.warning, /funds stay withdrawable from the next state/);
-    assert.equal(shown.acknowledgement, true);
-
-    elapsed = 13 * 3_600_000;
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: shown.acknowledgement });
-    assert.equal(plan.mode, 'escape');
-    assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    assert.equal(h.workerOperations('prepareWithdrawal').length, 1);
-});
-
-test('near expiry, a live request’s receipt_journal_missing refusal offers the override now', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    await h.runtime.prepareLeaseRequest();
-    const journal = (await store.readBrowserWallet()).journal;
-    h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-        request_response: h.receiptFor(journalFor(noteState(), 'not-held-by-this-browser')) });
-    // Well before the grace; only the note's expiry makes the override ready.
-    h.chain.effectiveExpiry = BigInt(Math.floor(Date.now() / 1_000)) + h.chain.challengePeriod + 3_600n;
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }), error => {
-        assert.equal(error.code, 'receipt_journal_missing');
-        assert.ok(error.data.escape_override_after <= Date.now(), 'available now, not after the grace');
-        assert.ok(journal.created_at_ms + 43_200_000 > Date.now());
-        assertJournalMissingWarning(error.data.escape_override_warning);
-        assert.equal(error.data.escape_override_acknowledgement, 'receipt_journal_missing');
-        return true;
-    });
-    assert.ok((await store.readBrowserWallet()).journal, 'the general acknowledgement keeps the journal');
-    const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: 'receipt_journal_missing' });
-    assert.equal(plan.mode, 'escape');
-    assert.equal((await records())[0].disposition, 'abandoned_for_escape');
-});
-
-test('the snapshot advertises the override time that binds, and none at a challenged state', async t => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const discarded = await discardFirstRequest(h);
-    const realNow = Date.now;
-    t.mock.method(Date, 'now', () => realNow() + 3_600_000);
-    // An hour later a second request at the same state stays live.
-    h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-    const live = (await store.readBrowserWallet()).journal;
-    assert.ok(live.created_at_ms > discarded.journal.created_at_ms);
-    const advertised = () => h.runtime.snapshot().config.unresolved_requests.map(entry => entry.escape_override_after);
-    // The live request's own time gate binds first.
-    assert.deepEqual(advertised(), [live.created_at_ms + 43_200_000, live.created_at_ms + 43_200_000]);
-
-    await store.putBrowserRequestArchive([archive.buildRequestEvidenceRecord({ deploymentId: DEPLOYMENT, noteId: 7,
-        anchor: GENESIS_ANCHOR, nullifier: nullifierFor(GENESIS_ANCHOR) })]);
-    await h.runtime.reload();
-    assert.deepEqual(advertised(), [null, null, null], 'a challenged state is never escaped again');
-});
-
-test('a finalized receipt without a client request id selects the same warning in the snapshot and the refusal', async () => {
-    const h = await freshWallet({ vaultRevision: 2 });
-    const discarded = await discardFirstRequest(h);
-    const { client_request_id: _unnamed, ...receipt } = h.receiptFor(journalFor(noteState(), 'unnamed'));
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: receipt });
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION), error => {
-        assertJournalMissingRefusal(error, discarded.journal.created_at_ms + 43_200_000);
-        return true;
-    });
-    const observed = archive.lastDefinitiveObservation((await records())[0]);
-    assert.deepEqual({ status: observed.status, receipt: observed.receipt, named: 'clientRequestId' in observed },
-        { status: 'finalized', receipt: true, named: false });
-    assertJournalMissingWarning(h.runtime.snapshot().config.escape_override.warning);
-    assert.equal(h.runtime.snapshot().config.escape_override.acknowledgement, 'receipt_journal_missing');
-    // A finalized reading without any receipt stays receipt_response_missing.
-    assert.deepEqual(archive.requestObservation('finalized', 'escape', 1, { receipt: false }),
-        { status: 'finalized', context: 'escape', at: 1 });
-    assert.deepEqual(archive.requestObservation('reserved', 'escape', 1, { receipt: true, clientRequestId: 'x' }),
-        { status: 'reserved', context: 'escape', at: 1 }, 'only a finalized reading carries a receipt');
-});
-
-test('client.withdraw offers the override for a plain escape and passes each acknowledgement through', async t => {
-    // The genuine older-build case above, through the client's own settle step.
-    const h = await freshWallet({ vaultRevision: 2 });
-    h.server.leasePost = () => { throw new HttpError('This request replays an earlier one.', 409, 'replay'); };
-    h.server.leaseStatus = () => { throw new HttpError('Not found', 404, 'not_found'); };
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized',
-        request_response: h.receiptFor(journalFor(noteState(), 'discarded-by-an-older-build')) });
-    await assert.rejects(h.runtime.issueLease('chat'), { code: 'replay' });
-    const j1 = (await store.readBrowserWallet()).journal;
-
-    const client = new ZkapiClient();
-    client.config = { funding: { chain_id: 11155111, contract_address: VAULT } };
-    client.wallet = { has_note: true, note: { note_id: 7, current_balance: 5_000_000 } };
-    t.mock.method(client, 'assertBalanceNotClaimed', async () => {});
-    t.mock.method(client, 'settleActiveLease', async () => h.runtime.settleActiveLease());
-    t.mock.method(sharedRuntime, 'withEscapeOverrideData', error => h.runtime.withEscapeOverrideData(error));
-    await assert.rejects(client.withdraw('escape', () => {}, { destination: DESTINATION }), error => {
-        assertJournalMissingRefusal(error, j1.created_at_ms + 43_200_000);
-        assert.match(error.shortMessage, /read its warning before using it/);
-        return true;
-    });
-
-    // Only `true` and 'receipt_journal_missing' request the override, and
-    // each reaches the runtime unchanged.
-    t.mock.method(client, 'settleActiveLease', async () => {});
-    t.mock.method(client, 'connectWallet', async () => DESTINATION);
-    t.mock.method(client, 'readContractUint', async () => 1n);
-    t.mock.method(client, 'recoverFailedWithdrawalSubmission', async () => null);
-    t.mock.method(sharedRuntime, 'currentPreparedWithdrawal', async () => null);
-    const seen = [];
-    t.mock.method(sharedRuntime, 'prepareWithdrawal', async (_mode, _destination, options) => {
-        seen.push(options.overrideUnsettledRequest);
-        throw Object.assign(new Error('refused'), { code: 'request_settlement_pending' });
-    });
-    for (const value of ['receipt_journal_missing', true, 'yes', false]) {
-        await assert.rejects(client.withdraw('escape', () => {}, { destination: DESTINATION, overrideUnsettledRequest: value }),
-            { code: 'request_settlement_pending' });
-    }
-    assert.deepEqual(seen, ['receipt_journal_missing', true, undefined, undefined]);
-});
-
-test('an escape override never abandons another tab’s live key', async t => {
-    const h = await freshWallet({ vaultRevision: 2, graceSeconds: 3_600 });
-    await h.runtime.prepareLeaseRequest();
-    const saved = await store.readBrowserWallet();
-    const realNow = Date.now;
-    const future = realNow() + 3_700_000;
-    await store.writeBrowserWallet({ ...saved, lease: { ownerId: 'other-tab', sessionId: 'chat',
-        client_request_id: saved.journal.client_request_id, expires_at: Math.floor(future / 1000) + 300,
-        settle_after: Math.floor(future / 1000) + 600 } });
-    h.server.leaseStatus = () => ({ status: 'active' });
-    h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'reserved' });
-    t.mock.method(Date, 'now', () => future);
-    await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, { overrideUnsettledRequest: true }),
-        { code: 'lease_tab_conflict' });
-    assert.ok((await store.readBrowserWallet()).journal);
-    assert.equal((await records())[0].disposition, 'pending');
-});
-
 test('worst-case and clamped receipts install with their proof-bound quote after a manifest pin change', async () => {
     for (const basis of ['worst_case', 'clamped']) {
         const h = await freshWallet();
@@ -1896,8 +978,8 @@ test('a journaled request made under older price pins settles unused instead of 
     assert.equal(h.runtime.activeLease.client_request_id, lease.client_request_id);
 });
 
-test('restored challenged escape records evidence; a repeat escape needs the server receipt', async () => {
-    const h = await freshWallet({ vaultRevision: 2, clearanceOwnershipProof: 'required' });
+test('restored defeated escape records evidence: this device is not the newest until a receipt moves it on', async () => {
+    const h = await freshWallet();
     const first = (await discardFirstRequest(h)).journal;
     const state = (await store.readBrowserWallet()).state;
     const nullifier = nullifierFor(state.current_anchor);
@@ -1917,24 +999,22 @@ test('restored challenged escape records evidence; a repeat escape needs the ser
 
     await h.runtime.reload();
     h.server.nullifier = () => ({ status: 'not_found', nullifier_status: 'unknown' });
-    for (const options of [{}, { overrideUnsettledRequest: true }]) {
-        await assert.rejects(h.runtime.prepareWithdrawal('escape', DESTINATION, options), { code: 'anchor_challenged' });
+    // A defeat needs a request from this state's successor: another device
+    // spent it (design §6.4 E5). Neither exit is attempted from here.
+    for (const mode of ['escape', 'mutual']) {
+        await assert.rejects(h.runtime.prepareWithdrawal(mode, DESTINATION), { code: 'device_not_newest' });
     }
     assert.equal(h.workerOperations('prepareWithdrawal').length, 0);
+    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance').length, 0);
+    assert.equal(h.runtime.snapshot().config.exit.device_not_newest, true);
 
-    h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier,
-        signature: { r: '0x1', s: '0x2' } });
-    const mutual = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
-    assert.equal(mutual.mode, 'mutual', 'evidence never blocks a mutual close the server reports unknown');
-    assert.equal(h.serverCalls('POST', '/v2/withdraw/clearance')[0].body.ownership_proof.public_inputs.has_clearance, false);
-    await store.writeBrowserWallet({ ...(await store.readBrowserWallet()), preparedWithdrawal: null });
+    // This device's own earlier request settles: E1 installs its receipt and
+    // the escape is made from the signed next state.
+    await store.writeBrowserWallet({ ...(await store.readBrowserWallet()), exitLock: null });
     await h.runtime.reload();
-
-    h.server.calls.length = 0;
     h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(first) });
     const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION);
     assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'));
-    assert.equal(h.serverCalls('GET', '/v2/nullifiers/').length, 1, 'the next state escapes without a server gate');
     assert.equal((await records()).find(record => record.type === 'request_evidence').disposition, 'superseded');
 });
 
@@ -2068,24 +1148,14 @@ test('a failing automatic settlement backs off instead of polling every two seco
     t.mock.timers.tick(60_000);
 });
 
-test('capabilities come only from the build-pinned trust anchor', async () => {
+test('capabilities come only from the build-pinned trust anchor: vault revision 3, required ownership proofs', async () => {
     const runtime = new BrowserWalletRuntime();
-    runtime.manifest = { vault_revision: 2, clearance_ownership_proof: 'required' };
+    runtime.manifest = { vault_revision: 2, clearance_ownership_proof: 'optional' };
     runtime.browserConfig = { trusted_deployment: {} };
-    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 1, hardenedVault: false,
-        clearanceOwnershipProof: null, sendOwnershipProof: false });
-    runtime.browserConfig = { trusted_deployment: { vault_revision: 2 } };
-    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 2, hardenedVault: true,
-        clearanceOwnershipProof: null, sendOwnershipProof: true });
-    runtime.browserConfig = { trusted_deployment: { clearance_ownership_proof: 'optional' } };
-    assert.equal(runtime.vaultCapabilities().hardenedVault, false);
-    assert.equal(runtime.vaultCapabilities().sendOwnershipProof, true);
-    for (const [seconds, expected] of [[undefined, 43_200], [60, 3_600], [10_000_000, 604_800], [7_200, 7_200], ['7200', 43_200]]) {
-        runtime.browserConfig = { unsettled_request_escape_after_seconds: seconds };
-        assert.equal(runtime.unsettledRequestEscapeGraceMs(), expected * 1_000);
-    }
+    assert.deepEqual(runtime.vaultCapabilities(), { vaultRevision: 3, exitConcession: true, payoutCredits: true,
+        sendOwnershipProof: true });
 
-    const config = JSON.parse(await readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+    const config = deployedProfile();
     const funding = nativeFunding();
     const trusted = { ...config.trusted_deployment, ...funding, rpc_url: funding.demo_rpc_url, billing_token_address: null };
     const manifest = { ...trusted, protocol_version: 2, proof_backend: 'groth16_bn254',
@@ -2094,11 +1164,11 @@ test('capabilities come only from the build-pinned trust anchor', async () => {
         privacy_mode: { openrouter_inference_base: trusted.openrouter_inference_base, verifier_url: trusted.verifier_url } };
     runtime.browserConfig = { ...config, trusted_deployment: trusted };
     assert.doesNotThrow(() => runtime.validateManifestTrust(manifest));
-    for (const change of [{ vault_revision: 0 }, { vault_revision: '2' }, { vault_revision: 1.5 },
-        { clearance_ownership_proof: 'always' }]) {
+    // A served manifest cannot change them: only the pinned profile counts.
+    assert.doesNotThrow(() => runtime.validateManifestTrust({ ...manifest, vault_revision: 2, clearance_ownership_proof: 'optional' }));
+    for (const change of [{ vault_revision: 0 }, { vault_revision: '3' }, { vault_revision: 2 },
+        { clearance_ownership_proof: 'always' }, { clearance_ownership_proof: 'optional' }]) {
         runtime.browserConfig = { ...config, trusted_deployment: { ...trusted, ...change } };
-        assert.throws(() => runtime.validateManifestTrust(manifest), /invalid trusted/);
+        assert.throws(() => runtime.validateManifestTrust(manifest), /invalid trusted/, JSON.stringify(change));
     }
-    runtime.browserConfig = { ...config, trusted_deployment: { ...trusted, vault_revision: 2, clearance_ownership_proof: 'required' } };
-    assert.doesNotThrow(() => runtime.validateManifestTrust(manifest));
 });

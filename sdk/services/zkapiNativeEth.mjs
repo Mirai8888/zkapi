@@ -116,13 +116,27 @@ export function nativeDepositValue(amount, funding) {
     return units * NATIVE_WEI_PER_UNIT;
 }
 
+/**
+ * `promise`, or a rejection once `signal` aborts: an RPC call ends at its
+ * timeout even through a host transport that ignores the signal (E0).
+ */
+function untilAborted(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+    return new Promise((resolve, reject) => {
+        const aborted = () => reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+        signal.addEventListener('abort', aborted, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+    });
+}
+
 async function rpc(funding, method, params, signal) {
-    const response = await browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
+    const response = await untilAborted(browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit',
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal, cache: 'no-store'
-    }, { preferProxy: true });
+    }, { preferProxy: true }), signal);
     if (!response.ok) throw new Error('The ETH price RPC is unavailable. Please check again.');
-    const body = await response.json();
+    const body = await untilAborted(response.json(), signal);
     if (body.error || body.result == null) {
         const error = new Error('The ETH price RPC could not return a verified quote.');
         // The call itself reverted (code 3 on anvil and current geth; older
@@ -165,37 +179,60 @@ export async function readVaultWord(funding, data, {
     return BigInt(word);
 }
 
-/** Whether a failed vault read says the vault lacks that view (a revert or no word), not that the RPC failed. */
-export function vaultViewMissing(error) {
-    return error?.code === 'rpc_call_reverted' || error?.code === 'vault_value_invalid';
+/**
+ * An EIP-1193-style `request({ method, params })` over the build-pinned RPC,
+ * each call bounded by `timeoutMs`. Exit-mode reads (deployment pins, note
+ * status, finality, the tree rebuild) use it or the user's exit RPC.
+ */
+export function pinnedRpcRequest(funding, { timeoutMs = 20_000, signal = null } = {}) {
+    validateNativeFunding(funding);
+    return ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        return rpc(funding, method, params, signal ? AbortSignal.any([signal, timeout]) : timeout);
+    };
 }
-
-/** The configuration error of a vault_revision 2 profile whose vault lacks the hardened interface. */
-export function vaultRevisionMismatch() {
-    return Object.assign(new Error('browser-config.json declares trusted_deployment.vault_revision 2, but the pinned vault does not implement the hardened vault interface. The host must correct its trusted deployment profile before this wallet can be used.'), {
-        code: 'vault_revision_mismatch'
-    });
-}
-
-// ROOT_HISTORY_WINDOW(), a constant only the hardened (vault_revision 2) vault has.
-const ROOT_HISTORY_WINDOW_SELECTOR = '0x1fe72de0';
-const HARDENED_ROOT_HISTORY_WINDOW_SECONDS = 86_400n;
 
 /**
- * Before a vault_revision 2 profile enables hardened behaviour, read one view
- * only the hardened vault has: ROOT_HISTORY_WINDOW() must be one day. A
- * revert, no word or another value is vault_revision_mismatch; a failed read
- * is thrown unchanged, as the denomination check does.
+ * The same over a user-configured exit RPC URL (design §6.4 E0, §6.6). It is
+ * the user's own endpoint, so it is called directly, never through the host's
+ * proxy, and without credentials.
  */
-export async function assertHardenedVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {
-    let window;
+export function urlRpcRequest(url, { timeoutMs = 20_000, signal = null, fetchImpl = null } = {}) {
+    const target = exitRpcUrl(url);
+    return async ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        const response = await untilAborted((fetchImpl || globalThis.fetch)(target, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit', cache: 'no-store',
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            signal: callSignal
+        }), callSignal);
+        if (!response.ok) throw new Error(`The exit RPC answered HTTP ${response.status}.`);
+        const body = await untilAborted(response.json(), callSignal);
+        if (body.error) {
+            throw Object.assign(new Error(body.error.message || 'The exit RPC returned an error.'), {
+                code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code
+            });
+        }
+        return body.result;
+    };
+}
+
+/** A validated exit RPC URL: HTTPS, or HTTP on loopback; no credentials. */
+export function exitRpcUrl(value) {
+    let url;
     try {
-        window = await readVaultWord(funding, ROOT_HISTORY_WINDOW_SELECTOR, { signal });
-    } catch (error) {
-        if (vaultViewMissing(error)) throw vaultRevisionMismatch();
-        throw error;
+        url = new URL(String(value));
+    } catch {
+        throw Object.assign(new Error('The exit RPC URL is invalid.'), { code: 'exit_rpc_invalid' });
     }
-    if (window !== HARDENED_ROOT_HISTORY_WINDOW_SECONDS) throw vaultRevisionMismatch();
+    if (url.username || url.password || (url.protocol !== 'https:'
+        && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))) {
+        throw Object.assign(new Error('The exit RPC must be an HTTPS (or loopback) URL without credentials.'), {
+            code: 'exit_rpc_invalid'
+        });
+    }
+    return url.href;
 }
 
 export async function assertNativeVault(funding, { signal = AbortSignal.timeout(20_000) } = {}) {

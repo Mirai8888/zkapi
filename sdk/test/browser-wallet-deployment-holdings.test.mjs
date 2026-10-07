@@ -14,8 +14,10 @@ const { BrowserWalletRuntime } = await import('../services/browserWalletRuntime.
 // DEPLOYMENT plays the legacy deployment; the host then pins a hardened one.
 const LEGACY = DEPLOYMENT;
 const HARDENED = 'hardened-deployment';
+// A close whose clearance the server granted: the only kind a user can set aside.
 const reserving = () => ({ phase: 'reserving', mode: 'mutual', operationId: 'close', noteId: 7, destination: DESTINATION,
-    withdrawalNullifier: nullifierFor(GENESIS_ANCHOR), clearanceReserved: true, createdAt: 1 });
+    withdrawalNullifier: nullifierFor(GENESIS_ANCHOR), clearanceReserved: true, createdAt: 1, clearanceOutcome: 'granted',
+    clearance: { withdrawal_nullifier: nullifierFor(GENESIS_ANCHOR), signature: { r: '0x1', s: '0x2' } } });
 
 async function legacyWallet(runtimeValue = {}) {
     indexedDB.clear();

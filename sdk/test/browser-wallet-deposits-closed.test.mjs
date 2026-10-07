@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { nativeFunding } from './helpers/native-fixtures.mjs';
 import { DEPLOYMENT, VAULT, createHarness, memoryIndexedDb } from './helpers/request-archive-harness.mjs';
+import { deployedProfile } from './helpers/deployed-profile.mjs';
 
 globalThis.indexedDB = memoryIndexedDb();
 globalThis.window = Object.assign(new EventTarget(), { location: { hostname: 'localhost' } });
@@ -127,7 +128,7 @@ test('the client refuses a new deposit and its USD quote before reading the chai
 });
 
 test('the trusted deposits setting is validated with the rest of the profile', async () => {
-    const config = JSON.parse(await readFile(new URL('../assets/config/sepolia.json', import.meta.url), 'utf8'));
+    const config = deployedProfile();
     const funding = nativeFunding();
     const trusted = { ...config.trusted_deployment, ...funding, rpc_url: funding.demo_rpc_url, billing_token_address: null };
     const manifest = { ...trusted, protocol_version: 2, proof_backend: 'groth16_bn254',

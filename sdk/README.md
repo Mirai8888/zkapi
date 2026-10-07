@@ -15,8 +15,8 @@ import { configureBrowserSdk } from '@openanonymity/zkapi-browser-sdk';
 import client from '@openanonymity/zkapi-browser-sdk/client';
 
 configureBrowserSdk({
-  configUrl: '/zkapi/browser-config.json',
-  workerUrl: '/zkapi/assets/zkapiWasmWorker.js',
+  configUrl: '/zkapi/v2c/browser-config.json',
+  workerUrl: '/zkapi/v2c/assets/zkapiWasmWorker.js',
   // Optional: the host may preserve its explicit opt-in privacy proxy policy.
   transport: (url, init, hints) => hostTransport.fetch(url, init, hints)
 });
@@ -40,6 +40,27 @@ must preserve that credential policy. Chat account cookies must never accompany
 private proof or key issuance requests.
 Never include note secrets, key values, proof bodies, or wallet transactions
 in host logs.
+
+### Exit-only mode
+
+Initialization never waits on the operator or on the pinned RPC, because every
+exit starts with it:
+
+- The wallet configures itself from the build-pinned `trusted_deployment`. The
+  operator's deployment manifest is fetched with a 20-second limit and must
+  equal those pins. When it is missing, slow, untrusted or different, the
+  wallet runs in exit-only mode: withdrawals work, and deposits and new chats
+  fail with the codes below until the manifest matches again. Each deposit or
+  chat attempt fetches the manifest once more.
+- The pinned RPC's native-vault and deployment checks run in the background.
+  Deposits and chats wait for them; exits do not.
+- A request journal left by a closed tab is recovered after initialization,
+  within 120 seconds. A withdrawal started in the same tab stops that recovery
+  and any private key still being issued.
+- A failed initialization is not kept: the next `init()` starts again.
+
+`snapshot().config.service` reports the mode: `{ available, exits: true, code,
+message, detail }`. Show `message` while `available` is false.
 
 ## Sepolia shared password
 
@@ -75,10 +96,18 @@ endpoints and provider inference never receive this password. A 401 clears
 the rejected credential without replaying a protocol operation; recovery
 journals remain authoritative. Mainnet does no password discovery or prompting.
 
-This SDK requires `proof_setup.circuit_id: "zkapi-v2-note-bound-v1"` in the
+This SDK requires `proof_setup.circuit_id: "zkapi-v2-concession-v1"` in the
 deployment manifest and matching `trusted_deployment.circuit_id` in the host
-config. The vault's immutable verifier, proving keys, and signing-key pins must
-match this circuit. Configuration mismatches are rejected before funding.
+config, a vault with the concession exit (`trusted_deployment.exit_concession:
+1`, vault revision 3), and a `trusted_deployment.setup_id` equal to the setup
+the bundled WebAssembly is built for (`browser_setup_id()`, also
+`setupId` in `sdk/assets/manifest.json`). The vault's immutable verifier,
+proving keys, and signing-key pins must match this circuit. Configuration
+mismatches are rejected before funding; a profile with
+`deployment_status: "not_deployed"` is a placeholder and is refused with
+`deployment_not_deployed`. Notes in a `zkapi-v2-note-bound-v1` vault exit
+through the legacy build of this SDK, served at its own path
+([Two builds on one origin](#two-builds-on-one-origin)).
 
 ## External wallets and manual signing
 
@@ -100,19 +129,17 @@ for reads, and display the exact `eth_sendTransaction` payload for submission
 with the user's own wallet. The connected address funds deposits and pays
 withdrawal gas. By default it is also the destination of a newly prepared
 withdrawal. To choose an independent payout address, call
-`client.withdraw(mode, onStatus, { destination })`, where `mode` is `mutual` or
-`escape`. The destination must be a nonzero Ethereum address, distinct from the
-configured vault. An escape's destination cannot change after initiation. On a
-vault with `vault_revision` 2, finalization pushes the payout with at most
-100,000 gas; a destination that rejects it or needs more gas is only credited
-in the vault (`escapePayoutCredits`, `EscapePayoutDeferred`) until someone calls
-`claimEscapePayout(destination)`. The SDK then reports that escape as credited,
-not returned, and offers the claim (see
-[Credited escape payouts](#credited-escape-payouts)). On an older vault an
-escape to a destination that rejects ETH cannot finalize, so the SDK refuses
-to start one unless the caller overrides that check. Steer users to a
+`client.withdraw(mode, onStatus, { destination })`. [Exits](#exits) describes
+`mode` and the `concede` option. The destination must be a nonzero Ethereum
+address, distinct from the configured vault. An escape's destination cannot
+change after initiation. Finalization pushes the payout with at most 100,000
+gas. A destination that rejects it or needs more gas is only credited in the
+vault (`escapePayoutCredits`, `EscapePayoutDeferred`) until someone calls
+`claimEscapePayout(destination)`. The SDK then reports that escape as
+credited, not returned, and offers the claim (see
+[Credited escape payouts](#credited-escape-payouts)). Steer users to a
 destination that accepts a plain ETH transfer within 100,000 gas, such as an
-ordinary account; `client.checkEscapeDestination(destination)` simulates the
+ordinary account. `client.checkEscapeDestination(destination)` simulates the
 vault's push to it. The host must confirm the intended address
 and network with the user. The SDK binds it into the durable proof; an explicit
 different destination on a later call is rejected. Omitting the option when
@@ -163,268 +190,451 @@ import { build } from 'esbuild';
 import { buildBrowserSdkAssets } from '@openanonymity/zkapi-browser-sdk/build';
 
 await buildBrowserSdkAssets({
-  outDir: 'dist/zkapi',
-  publicPath: '/zkapi/',
+  outDir: 'dist/zkapi/v2c',
+  publicPath: '/zkapi/v2c/', // the default
   network: 'sepolia', // or 'mainnet'
   build
 });
 ```
 
 The helper emits `browser-config.json`, `assets/zkapiWasmWorker.js`,
-`wasm/zkapi_browser_bg.wasm`, `proofs/request.pk`, `proofs/withdrawal.pk`, and
-`sdk-assets.json`. It verifies all source artifact hashes and both proving-key
-pins before returning. The host supplies its esbuild implementation, controls
-its CSP/rewrites, and hashes these emitted assets in its deployment manifest.
-Proof downloads are verified again inside the worker. No private credentials
-are required to build either network.
+`wasm/zkapi_browser_bg.wasm`, `proofs/request.pk`, `proofs/withdrawal.pk`,
+`proofs/request.vk`, and `sdk-assets.json` (schema 2: `circuitId`, `setupId`,
+`sourceRevision`, `publicPath` and the emitted hashes). It verifies all source
+artifact hashes, the WebAssembly's own circuit and setup, and the profile's
+proving- and verifying-key pins before writing anything. It refuses a
+placeholder profile (`deployment_not_deployed`), a profile of another circuit
+(`incompatible_proof_circuit`) or setup (`setup_mismatch`), a profile without
+`exit_concession: 1` (`exit_concession_required`), and a mainnet profile on
+any setup but the ceremony's `mpc-1` (`development_setup_on_mainnet`). Both
+shipped profiles are `not_deployed` placeholders until their vaults exist.
+The default `publicPath` is `/zkapi/v2c/`: proving keys are fetched with
+`cache: 'force-cache'`, so new keys need URLs the legacy build never used.
+The host supplies its esbuild implementation, controls its CSP/rewrites, and
+hashes these emitted assets in its deployment manifest. Proof downloads are
+verified again inside the worker; every key download must carry its SHA-256
+pin. No private credentials are required to build either network.
+
+### Building and checking the WebAssembly
+
+Maintainers build the bundle with `scripts/build-browser-client.sh --setup
+dev|mpc-1`. `mpc-1` is the production bundle, which loads only the ceremony
+keys pinned in `zkapi-proof`; `dev` loads only the development keys of
+`protocol/setup/v2-concession-dev` (CI, tests and the drill vault). The script
+copies the setup's `request.pk`, `withdrawal.pk` and `request.vk` into
+`sdk/assets/proofs/` and rewrites `sdk/assets/manifest.json` with the hashes,
+the setup's VK keccak256 values and `sourceRevision`, the commit the bundle
+was built from (the WebAssembly sources must be committed first). The build is
+reproducible: `rust-toolchain.toml` pins rustc 1.99.0, the script requires
+wasm-bindgen-cli 0.2.117, uses `Cargo.lock` as is, and remaps every absolute
+build path. `npm run verify:wasm` rebuilds into a temporary directory and
+fails unless every `sdk/wasm/` file matches the manifest byte for byte;
+`npm run verify:assets` checks the committed hashes without Rust.
 
 The SDK uses IndexedDB, local/session storage, Web Locks, BroadcastChannel,
 revision checks, and signed receipt validation to manage wallet state. Hosting
 the same SDK on a different origin does not transfer browser wallet data. A model adapter must select one of
 `CHAT_SPENDING_TIER_USD` (`1`, `2`, `3`, `4.5`, `6`) without disclosing the user's
 exact balance. The SDK settles/rekeys when a selected cap changes; only actual
-usage is charged. Requests stop at the note's original expiry. On a
-`vault_revision` 2 vault the treasury can claim the note only after
-`effectiveExpiry(noteId)`, which paused time and a challenge can extend; the
-SDK reads that view only for the escape override below.
+usage is charged. No new chat starts once a note is close to its expiry
+(`note_near_expiry`; see [Exits](#exits)). The balance is then withdrawn.
 
 Run `npm run test:sdk` in this checkout. For an installed package, run
 `node --test node_modules/@openanonymity/zkapi-browser-sdk/sdk/test/*.test.mjs`
 from a host that provides esbuild as a development dependency. The tests use
 local fixtures and do not connect a wallet or broadcast transactions.
 
-## Transmitted requests and safe withdrawals
+## Transmitted requests
 
-A proved request leaves the device when it is sent, and every request and
+A proved request leaves the device when it is sent. Every request and
 withdrawal at one note state shares that state's nullifier. The SDK therefore
 keeps an append-only archive of transmitted requests in the existing IndexedDB
-`archives` store (records `request_journal` and `request_evidence`; the database
-version stays 3, so older builds keep opening it). The archive record and the
-write-ahead journal are committed in one transaction before the request is
-sent. A journal leaves the wallet only in the same write that installs a
-verified next state or records its outcome in the archive. A server error string
-alone never discards it. A `stale_root` reply is first checked against the
-pinned vault RPC (the same request is retried while the vault still has the
-proof's root). Only then is the server's own nullifier record consulted.
-An archived request keeps its full journal, including the private
-rerandomization, while its note state is current, so a receipt the server
-finalizes later still installs. A record is resolved only when the next state
-is installed or the note closes. Resolved records are compacted (no proof,
-payload or rerandomization) and pruned to the newest 256 per deployment. No
-host action is needed. In-flight journals from older builds migrate on the
-first read.
+`archives` store, as records `request_journal` and `request_evidence`. The
+database version stays 3, so older builds keep opening it. The archive record
+and the write-ahead journal are committed in one transaction before the
+request is sent. A journal leaves the wallet only in the same write that
+installs a verified next state or records its outcome in the archive. A server
+error string alone never discards it.
 
-Each note state is bounded. At most 16 of its unresolved requests count toward
-a per-state cap. Past the cap, the oldest discarded requests whose nullifier
-read `unknown` or `clearance_reserved` at least 20 minutes after their request
-time are evicted. Eviction only takes a record out of the cap: an `evicted`
-record keeps its journal, still marks its state as transmitted for the gates
-below, and still installs a later receipt. A state keeps at most 64 unresolved
-records, evicted ones included. Beyond that, a new chat fails with
-`request_archive_limit` before proving, and nothing is evicted or discarded.
-Chats at that state resume only if the server settles one of its requests: the
-receipt still installs and resolves every record there. A request the server
-never accepted (for example, a quote that expired before acceptance) never
-settles, so waiting does not help and the balance has to be withdrawn: by
-mutual close, which needs the server's clearance, or on a `vault_revision` 2
-vault also by escape. A strict vault never escapes at a transmitted state, so
-there mutual close is the only exit from that note, and it needs a clearance
-the server grants without an ownership proof (below); otherwise only the
-operator can help. Reaching the ceiling takes at least 64 failed chats at one
-state, spread over at least an hour.
+A `stale_root` reply is first checked against the pinned vault RPC: the same
+request is retried while the vault still has the proof's root. Only then is
+the server's own nullifier record consulted. An archived request keeps its
+full journal, including the private rerandomization, while its note state is
+current, so a receipt the server finalizes later still installs. A record is
+resolved only when the next state is installed or the note closes. Resolved
+records are compacted (no proof, payload or rerandomization) and pruned to the
+newest 256 per deployment. No host action is needed. In-flight journals from
+older builds migrate on the first read.
+
+Each note state is bounded:
+
+- At most 16 of its unresolved requests count toward a per-state cap.
+- Past the cap, the oldest discarded requests are evicted, if their nullifier
+  read `unknown` or `clearance_reserved` at least 20 minutes after their
+  request time.
+- Eviction only takes a record out of the cap. An `evicted` record keeps its
+  journal, still keeps its state unresolved for the exit rules below, and
+  still installs a later receipt.
+- A state keeps at most 64 unresolved records, evicted ones included. Beyond
+  that, a new chat fails with `request_archive_limit` before proving, and
+  nothing is evicted or discarded.
+
+At that ceiling, chats at the state resume only if the server settles one of
+its requests: the receipt still installs and resolves every record there. A
+request the server never accepted never settles (for example, a quote that
+expired before acceptance). Waiting does not help, so the balance has to be
+withdrawn. An escape from that state concedes at most that state's request
+bound ([Exits](#exits)). Reaching the ceiling takes at least 64 failed chats at
+one state, spread over at least an hour.
 
 Each record keeps its newest eight server observations. Of its older ones it
 keeps at most one: the newest that is a receipt claim or a reading that ends
 one (both below). Trimming therefore never changes whether a claim stands.
+
 "Newest" and "after" mean save order, never the device clock. The store stamps
 every observation it saves with a sequence number (`seq`) inside its write
 transaction, above every one already saved. A clock that ran fast or stepped
 back therefore cannot make an older reading outrank one saved after it. Each
-observation's `at` is the device time of its save; it only decides eviction
-(above). Observations saved by an older build have no `seq`. They order before
-every stamped one, by `at` among themselves. An older build open in another tab
-drops the stamps of each record it writes.
-`unknown`, `reserved`, `finalized` and `clearance_reserved` are readings of the
-state's nullifier from
-`GET /v2/nullifiers/{nullifier}`; `unavailable` is a failed read. A `finalized`
-reading that carried a receipt is marked `receipt` and names the receipt's
-`client_request_id` when it has one. A receipt that `GET /v2/requests/{id}`
-returns and this browser cannot apply is saved as such a `finalized`
-observation too. A receipt that installs resolves every record at its state,
-so such an observation at the current state is a receipt claim: the server
-says the nullifier was finalized with a receipt this browser could not apply.
-The claim stands until a reading saved after it reports the nullifier `unknown`
-or `clearance_reserved`, also when that reading was saved with another request
-at the same state. A failed read, `reserved`, or `finalized` without a
-receipt leaves it standing. `unaccepted` records that
-`POST /v2/openrouter/leases/{id}/expire` answered `expired_unaccepted` or
-`superseded_unaccepted` for that one request. That
+observation's `at` is the device time of its save, and it only decides
+eviction (above). Observations saved by an older build have no `seq`. They
+order before every stamped one, by `at` among themselves. An older build open
+in another tab drops the stamps of each record it writes.
+
+`GET /v2/nullifiers/{nullifier}` reads the state's nullifier as one of:
+
+- `unknown`, `reserved`, `finalized` or `clearance_reserved`;
+- `exit_deferred` or `exited_unsigned`: an exit consumed the reserved
+  nullifier on chain, and the server signs a successor only if that exit is
+  defeated.
+
+`unavailable` records a failed read. A `finalized` reading that carried a
+receipt is marked `receipt`, and it names the receipt's `client_request_id`
+when it has one. A receipt that `GET /v2/requests/{id}` returns and this
+browser cannot apply is saved as such a `finalized` observation too.
+
+A receipt that installs resolves every record at its state. Such an
+observation at the current state is therefore a receipt claim: the server says
+the nullifier was finalized with a receipt this browser could not apply. The
+claim stands until a reading saved after it reports the nullifier `unknown` or
+`clearance_reserved`, also when that reading was saved with another request at
+the same state. A failed read, `reserved`, or `finalized` without a receipt
+leaves it standing.
+
+`unaccepted` records that `POST /v2/openrouter/leases/{id}/expire` answered
+`expired_unaccepted` or `superseded_unaccepted` for that one request. That
 answer only echoes identifiers the wallet sent, so it is never treated as a
-nullifier reading: it never makes a record evictable and never corroborates a
-discard. The escape and clearance gates decide on a fresh nullifier reading,
-and a saved observation never allows a withdrawal. A standing receipt claim
-only makes the escape override require that claim's own acknowledgement
-(below).
+nullifier reading. It never makes a record evictable and never corroborates a
+discard. The exit rules decide on fresh readings, so a saved observation never
+allows a withdrawal by itself.
 
-Escape and clearance behavior depends on two optional keys in
-`browser-config.json`'s `trusted_deployment`, read only from that build-pinned
-trust anchor and never from the served manifest:
+Two dispositions end a request without installing its successor:
 
-- `vault_revision` (integer; absent means `1`, the deployed vaults). With `2`
-  (a vault whose challenge is non-destructive and that keeps recent roots), an
-  escape at a transmitted state is allowed when the server reports the
-  nullifier `unknown` or `clearance_reserved` and no challenge was observed.
-  Withdrawal proofs are reused with refreshed Merkle siblings when only the
-  vault root moved. Without it (strict mode) an escape at a transmitted state is
-  always refused (`transmitted_anchor_escape_unsafe`), and a moved root always
-  re-proves. A declared `2` is checked on chain before it takes effect:
-  initialization reads the vault's `ROOT_HISTORY_WINDOW()`, a view only that
-  vault has, and refuses with `vault_revision_mismatch` if the read reverts,
-  returns no word or is not 86400. Later, a hardened-only view that reverts
-  (`challengedNullifiers` or `effectiveExpiry`) is the same configuration
-  error, never read as "not challenged" or "not about to expire".
-- `clearance_ownership_proof` (`"required"` or `"optional"`). Mutual close
-  then sends an escape-form ownership proof (a second withdrawal proof, to the
-  user's real destination and current balance) with
-  `POST /v2/withdraw/clearance`. This also happens when `vault_revision` is 2 or
-  more. Otherwise the request is sent without a proof first. A server with
-  legacy clearance on may reserve on it, so the note is marked withdrawal-only
-  before it is sent. If the server answers `400 clearance_ownership_required`,
-  or `503 legacy_clearance_capacity` (an upgraded server whose shared
-  proof-less budget is spent), nothing was reserved: the wallet restores its
-  previous withdrawal state, generates the ownership proof, and only then marks
-  the note withdrawal-only again and sends the request once more with the
-  proof. A proving failure or a refused transmitted-state check (below) leaves
-  that previous state, so a note that was usable for chat stays usable. After
-  any other failure of the proof-less request the note stays withdrawal-only,
-  because the server may have reserved it. The ownership proof is never
-  persisted. The returned clearance is persisted with the plan and reused
-  while the state's nullifier is unchanged.
+- `invalid_successor`: the server returned a signed successor at the state
+  that fails this wallet's checks (nullifier, payload hash, next anchor or
+  signature). It is terminal. The state stays where it is, and no new chat
+  starts from it (`invalid_successor`). Only an exit remains, conceding at most
+  `min(reported charge, bound_at_state)`.
+- `late_successor`: a verified successor that arrived after an exit proof at
+  its state was released. It is held, with its journal, until the exit lock is
+  released (below), and then installs.
 
-Clearance retries: a gateway's `429 gateway_rate_limited` (the request never
-reached the API) is retried with the same body after its `retry_after_seconds`,
-and so are `409 stale_root` and `503 capacity_exhausted` for a request with a
-proof (the server sends neither for a proof-less one). All waits share one
-budget of 15 seconds, and a wait that does not fit ends the retries. A 429 that
-outlasts them fails the close with `gateway_rate_limited`; trying again later
-completes it. From an honest gateway it reserved nothing, but it is unsigned,
-and whoever sent it may have read the body. So the wallet restores its previous
-withdrawal state only when the request carried no ownership proof, or when
-`vault_revision` is 2. After a request with an ownership proof on any other
-vault, the note stays withdrawal-only and the error carries
-`error.data.withdrawal_only: true`. That proof is an escape at the state's
-nullifier, and a request proof from the same state could challenge it, which
-on such a vault burns the nullifier, so the wallet never makes one from that
-state. Closing again or escaping still works. The wallet does not re-prove on
-its own: a `stale_root` that outlasts the budget fails the close, and the next
-attempt proves at the then-current root.
+## Exits
 
-An ownership proof is itself a valid escape at the state's nullifier. On a
-`vault_revision` 2 vault it is generated for a transmitted state only when the
-server reports that nullifier `unknown` or `clearance_reserved`. On any other
-vault a challenge burns the nullifier, and whoever holds a request proof sent
-from that state (for example a gateway that withheld it) could submit the
-ownership proof as an escape and challenge it. There the wallet never generates
-one for a transmitted state, whatever `clearance_ownership_proof` says: after
-the same server reading, mutual close sends only the proof-less request. If the
-server answers it with `400 clearance_ownership_required` or
-`503 legacy_clearance_capacity`, the wallet restores its previous withdrawal
-state and refuses with `409 transmitted_anchor_ownership_unsafe`
-(`error.data.clearance_error_code` names the server's answer). The note stays
-usable for chat: a request that settles moves it to a new state, which closes
-normally with a proof. A state that never left the device is unaffected.
+This SDK runs only against a concession vault. The build-pinned
+`trusted_deployment` must declare:
 
-On a revision-2 vault, `client.withdraw('escape', onStatus, { destination,
-overrideUnsettledRequest: true })` is an explicit, separately keyed escape
-override for a request the server never settles. It is available once
-`browser-config.json`'s `unsettled_request_escape_after_seconds` has elapsed
-since this device sent the request (default 43200, clamped to 3600–604800;
-keep it above the server's settlement deadline), or earlier when the note's
-`effectiveExpiry` is within a challenge period plus a margin. A receipt the
-server finalized installs instead, and only a receipt that verifies vetoes the
-override. The override never abandons another tab's live key, and the archived
-journal still installs a later receipt. Before the user overrides, show the
-override's warning, then pass the acknowledgement that goes with it as
-`overrideUnsettledRequest`. Both come from a refusal that offers the override
-(`error.data.escape_override_warning` and
-`error.data.escape_override_acknowledgement`) or from
-`snapshot().config.escape_override` (`warning` and `acknowledgement`). The
-acknowledgement is `true` for the general warning and
-`'receipt_journal_missing'` for that code's own warning (see below), which also
-covers the general case. While the server's claim of a finalized receipt this
-browser cannot apply stands (the fresh reading, or a receipt claim saved
-earlier that the fresh reading does not contradict), the override never
-proceeds with `true`, also after the grace period. It is refused with
-`receipt_journal_missing`, that code's warning and its acknowledgement. When
-that refusal rests on a saved claim, its message says that the server earlier
-reported it, and `error.data.nullifier_status` is the fresh reading (for
-example `unavailable`). The other refusals that offer the override keep the
-code of their fresh reading and carry the same warning and acknowledgement as
-the snapshot. A claim first read during an override can still change the
-warning to show. `snapshot().config.escape_override` is `null` on
-strict vaults, where no override exists. Escape gates contact the server only
-for a transmitted state; on Sepolia that read may prompt for the password.
+- `vault_revision: 3`;
+- `exit_concession: 1`;
+- `clearance_ownership_proof: "required"`: the server takes an ownership
+  proof with every mutual-close clearance.
 
-New 409 codes: `request_settlement_pending`, `transmitted_anchor_unconfirmed`,
-`transmitted_anchor_escape_unsafe`, `transmitted_anchor_ownership_unsafe`,
-`anchor_challenged`, `nullifier_challenged`,
-`receipt_journal_missing`, `receipt_response_missing`, `receipt_pending_install`,
-`request_archive_limit` and `withdrawal_submission_pending`. Vault reverts map to
-`unknown_root`, `challenged_nullifier`, `invalid_destination` and
-`vault_paused`. A refusal that offers the override carries
-`error.data.escape_override_after` (milliseconds; no later than now once the
-override is ready and only its acknowledgement was missing),
-`error.data.escape_override_warning` and
-`error.data.escape_override_acknowledgement`: the escape gate's refusals, the
-override's own refusals, and a plain escape's `receipt_journal_missing`.
-`snapshot().config` adds `vault_revision`, `escape_override` (`grace_seconds`,
-`warning`, `acknowledgement`), `unresolved_requests` (per request at the
-selected state: `client_request_id`, `kind`, `disposition` (including
-`evicted`), `created_at`, `server_status` (the newest observation),
-`server_status_at`, `escape_override_after` (when the override opens absent an
-imminent expiry: the grace after the live request's transmission while one
-exists, else after the earliest archived one; `null` on strict vaults and at a
-challenged state); no proofs) and `last_settlement`
-(`charge_applied`, `charge_basis`, `settlement_reason`). Receipts are installed
-against the proof-bound billing quote, never re-validated against changed
-manifest price pins. A worst-case charge equal to the proven bound is valid.
+Initialization refuses any other profile. An escape names the note's current
+state and its successor state. It concedes an amount `c` of at most
+`bound_at_state`, the budget of the requests sent from that state, and the
+vault pays `B − c`. While the escape is pending, the operator can:
 
-Challenge evidence is recorded only from a finalized
-`EscapeWithdrawalChallenged` log for the note and nullifier. A server reply such
-as `nullifier_used` is advisory. A challenged state is never escaped again; the
-wallet installs the server-signed successor (from the archived journal) and
-withdraws from that next state.
+- raise the concession, up to that bound, by proving a request it settled at
+  the state (`EscapeConcessionRaised`);
+- defeat the escape, but only with a request at the successor state. That
+  proves a newer device holds the note.
 
-`receipt_journal_missing` means the server reports a finalized request at the
-current state with a receipt this browser cannot apply. Either the browser
-holds no journal for its `client_request_id` (for example, one an older SDK
-build discarded), or the receipt does not verify. A lying server or gateway
-can send the same answer, for example `finalized` for an invented
-`client_request_id` at a state whose nullifier the honest server never
-reserved. Only a receipt that verifies vetoes the escape override, so on a
-revision-2 vault the override is offered for this code on the same schedule as
-for the others, with its own warning and its own acknowledgement,
-`overrideUnsettledRequest: 'receipt_journal_missing'`. A plain escape refused
-with this code offers both wherever the override applies (never at a challenged
-state), also when the receipt surfaced while recovering a live request. If the
-claim is genuine, the server holds the finalized transcript, so the escape will
-be challenged, its gas is lost and the note then needs the operator's help. If
-the claim is false, the escape is the only exit. Mutual close is refused at that
-state on every vault, and strict
-vaults have no override, so there only the operator can help. For a genuine
-claim, the operator can, for example, mark that state's nullifier
-`ClearanceReserved` and sign its mutual-close clearance (forgoing that
-request's charge), after which `withdraw('mutual')` withdraws the current
-balance. On a strict vault the wallet asks for that clearance without an
-ownership proof (above), so the server must grant it proof-less, which needs
-its legacy clearance on; ownership is then verified outside the protocol. On a
-revision-2 vault this also works after a challenged escape, because a
-challenge does not burn the nullifier.
+Two optional keys tune the timing:
+
+- `settlement_window_seconds` (`W`, default 21905): the server's settlement
+  window.
+- `unsettled_request_escape_after_seconds`: a cap on how long an unresolved
+  request delays an escape.
+
+### Request rules
+
+- One bound per state. The first request at a state writes `bound_at_state` in
+  the same transaction as its journal, and later requests there use it.
+- No request at a state from which an exit or ownership proof was released
+  (`exit_locked`).
+- No request once `now + W + 4500` seconds passes `must_initiate_by`
+  (`note_near_expiry`). `must_initiate_by` is 12 hours before the note's local
+  `expiry_ts`, or before a later `effectiveExpiry` when the exit RPC and the
+  pinned RPC both report one. Withdraw such a note instead.
+- A settled request's successor installs only after its nullifier, payload
+  hash, next anchor and server signature are checked.
+
+### Withdrawing
+
+`client.withdraw(mode, onStatus, { destination, concede })` takes:
+
+- `mode`: `'mutual'` asks for a cooperative close where the rules allow one,
+  and the rules may turn it into an escape. `'escape'` exits unilaterally now.
+- `concede`: `'zero'` (the default) or `'bound'`. It applies only to an escape
+  forced before the state's settlement time `T` (below).
+
+Every operator call made during an exit is limited to 20 seconds. A timeout, a
+5xx, a 401 or a 429 counts as unreachable, and `Retry-After` is ignored. Every
+other operator call ends after 90 seconds, so no call holds the wallet lock,
+and an exit queued behind it in another tab, for longer. A
+recovery pass re-reads every unresolved request and the state's nullifier,
+installs a verified successor, and lasts at most 120 seconds. Nothing in an
+exit waits past `must_initiate_by`. The decision then depends on the state:
+
+1. **Fresh state** (no unresolved request): a mutual close. The wallet sends a
+   kind-2 ownership proof with `POST /v2/withdraw/clearance`, then submits the
+   kind-1 close.
+   - `nullifier_used` makes the state unresolved (2). The answer is kept with
+     the exit lock and the withdrawal-only marker, so a retry, also after a
+     cancel, decides the same way and sends no second ownership proof.
+   - Any other refusal, or an unreachable server, escapes with `c = 0`. A
+     retry after such an answer escapes too: a lock sends one ownership proof.
+   - `withdraw('escape')`, or a fresh state within an hour of
+     `must_initiate_by`, also escapes with `c = 0`.
+2. **Unresolved state**: take the newest unresolved request, with `created`
+   its creation time. Then `T = min(min(settlement_deadline, created + W) +
+   900, created + unsettled_request_escape_after_seconds, must_initiate_by)`.
+   - Before `T`, `withdraw('mutual')` refuses with `request_settlement_pending`
+     and `error.data.escape_at` (milliseconds).
+   - Before `T`, `withdraw('escape')` escapes with `c = 0`, or with
+     `c = bound_at_state` when called with `concede: 'bound'`.
+   - At or after `T`, an escape concedes `bound_at_state`.
+3. **Lost response**: the server finalized a request at the state with a
+   signed response this browser cannot install (`receipt_unrecoverable`,
+   `invalid_successor`). The escape then concedes
+   `min(charge, bound_at_state)` at once.
+
+Before proving an escape, the wallet does the following:
+
+1. It takes the Merkle path from the first source that works:
+   - the deposit, saved at deposit time and checked against the
+     `NoteDeposited` root, which the vault accepts for good;
+   - the indexer, checked against the vault's current root;
+   - a rebuild from the vault's logs, in adaptively sized chunks with every
+     event's root checked. Ranges halve on an RPC limit and double again after
+     four accepted ranges. The whole rebuild ends within 5 minutes
+     (`tree_rebuild_timeout`).
+
+   The vault's root and logs are read through the user's exit RPC
+   (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it)
+   when one is set. Its first answer in each exit is `eth_chainId`: an exit
+   RPC on another chain than the vault's is never read further, and the
+   snapshot flags it (`exit_rpc_wrong_chain`). When no exit RPC is set, or
+   it is on another chain or fails, they are read through the wallet
+   provider, when it is on the vault's chain (each call bounded by the
+   20-second call limit), and then through the pinned RPC.
+
+   After the wallet's simulation refuses a proof's root (`unknown_root`), the
+   proof is made again from the indexer or the rebuild, at any root except
+   the refused one. If neither gives a path, the existing proof is submitted
+   anyway, as for any other simulation refusal.
+2. It asks the server for a request proof at the successor state
+   (`GET /v2/nullifiers/{successor}/evidence`). A proof that verifies locally
+   refuses the escape with `device_not_newest`: another device is newer. Any
+   other answer, or none, is ignored.
+3. It runs a last recovery pass. Advisory warnings never block the escape,
+   for example when the RPC reports either nullifier as already challenged.
+4. It records the proof in the exit lock before the proof is broadcast.
+5. Just before the wallet sees the transaction, it runs one more recovery
+   pass. A successor that arrives now is kept as `late_successor`.
+
+The wallet provider's simulation (`eth_estimateGas`) of an escape or a close
+only warns. When it refuses, the exit RPC's estimate is used if one is set
+and on the vault's chain, otherwise a fixed limit of 1,000,000 gas, and the status message explains the
+refusal; the wallet still asks the user to confirm. A refusal that a new proof
+can cure (`proof_expired`, `unknown_root`) re-proves once first.
+
+The **exit lock** starts with the first exit decision at a state and freezes
+that state:
+
+- No request proofs are made there. Only proofs of the lock's mode at the
+  lock's state are allowed (`exit_lock_mode`, `exit_lock_state`).
+- A prepared or cancelled exit keeps the lock until every kind-0 and kind-1
+  proof it released is past its `valid_until` plus 900 seconds, both on this
+  device's clock and at a finalized block, and none landed. Only then can
+  chats resume, and a held `late_successor` installs. The note's status and
+  the finalized block are read from the first of these that answers: the
+  exit RPC when one is set and on the vault's chain; the wallet provider,
+  during a withdrawal or a cancel, when it is on the vault's chain; the
+  pinned RPC. A `Closed` reading releases the lock earlier only when it comes
+  from the exit RPC. The wallet provider is read before the pinned RPC, so a
+  pinned RPC that fails or misreports cannot keep a dead lock on its own.
+- Every withdrawal first releases a lock whose proofs are all dead. A held
+  `late_successor` then installs, and the decision starts again at the
+  newest state, so an escape that never landed does not force another escape
+  from the old state.
+- When such a lock cannot be released yet while a `late_successor` waits
+  (no RPC answered, the note reads as pending, or finality lags this
+  device's clock), a withdrawal refuses with `exit_release_pending` instead
+  of exiting from the older state, which would concede up to its last
+  request's budget. `error.data` has `reason`, `status_source`,
+  `releasable_after` and `must_initiate_by` (seconds). From
+  `must_initiate_by` on, the exit goes ahead from the older state.
+- Escape and close proofs are valid for 3 hours. Ownership proofs are valid
+  for 55 minutes: the server accepts at most an hour, and the margin absorbs a
+  client clock up to five minutes fast. The SDK proves again after
+  `proof_expired` or `unknown_root`.
+
+### Setting a balance aside
+
+`client.parkPreparedWithdrawal()` sets a withdrawal-only balance aside so the
+user can fund another one. Only a mutual close whose clearance the server
+granted can be set aside: `snapshot().config.prepared_withdrawal.clearance_granted`
+says so. Any other withdrawal-only balance (an ownership proof answered with
+`nullifier_used`, a refusal or no answer, or a released escape proof) is
+refused with `park_requires_clearance`. It must be withdrawn first, by the
+exit rules above, so that it never depends on the operator once set aside.
+
+`client.withdrawBackground(recordId)` later closes a set-aside balance with its
+kept clearance. The close proof takes the deposit-time path first, then the
+indexer at the vault's current root, then the vault's logs, and it re-proves
+at another root after `unknown_root` like any exit. Each set-aside record in
+`snapshot().withdrawals` carries `expiry` and `must_initiate_by` (milliseconds,
+from the note's own `expiry_ts`) and `exit_deadline_near`, which is true within
+7 days of `must_initiate_by`. Show it: a set-aside close that is not finished
+before expiry is claimed by the treasury.
+
+### Raised concessions and the payout
+
+While an escape is pending, the operator may raise its concession
+(`EscapeConcessionRaised`), and the status message reports a raise. A
+challenge with a request at the successor state defeats the escape
+(`device_not_newest`); the user should restore the newest backup or exit kit.
+
+The withdrawal record carries `stateBalance`, `concededAtInit`,
+`boundAtState`, `concededCurrent` (the vault's `pendingConcessions`) and
+`validUntil`. Every finalization is checked: `finalizeEscape`, the background
+sync, and a finalization by a third party. The payout must equal
+`stateBalance − max(concededAtInit, raises)` and be at most
+`stateBalance − concededAtInit`. The record then gets `concededFinal`.
+
+- A payout below `stateBalance − boundAtState` sets
+  `payoutAlert: "concession_exceeded_bound"`. Show it: the vault's accounting
+  is final.
+- When the raise logs cannot be read, a payout within those bounds is
+  accepted.
+- A credited payout reaches `closed` through the claim
+  ([Credited escape payouts](#credited-escape-payouts)).
+
+### Exit kit
+
+`await client.exportExitKit(passphrase)` returns a JSON string with
+`format: "zkapi-exit-kit-v1"`. It holds:
+
+- the trusted deployment pins;
+- the note's current state and secret;
+- `bound_at_state` and `state_seq`;
+- the deposit-time Merkle path.
+
+The kit is encrypted with AES-256-GCM under a PBKDF2-SHA256 key (600,000
+iterations, 16-byte salt). The passphrase needs at least 10 characters
+(`exit_kit_passphrase_weak`). Offer the kit for download after every deposit,
+and whenever `snapshot().config.exit.exit_kit.out_of_date` is true. A kit of an
+older state stops working once a newer state exists: a request at that older
+state's successor defeats its escape.
+
+`openExitKit(kit, passphrase)` from
+`@openanonymity/zkapi-browser-sdk/exit-kit` decrypts a kit
+(`exit_kit_invalid`, `exit_kit_passphrase`). The companion's `exit-kit`
+subcommand exits from a kit without this host.
+`configureBrowserSdk({ provingKeysBaseUrlOverride })` lets an exit fetch the
+withdrawal key from another origin when the host is gone. The URL must end
+with `/`, and the build-pinned SHA-256 still applies.
+
+### Deposit checks
+
+Before every deposit, the SDK checks the deployment against
+`trusted_deployment` twice: through the wallet provider that will sign, and
+through the pinned RPC. It checks:
+
+- the `keccak256` of the vault's, adapter's and Poseidon library's code
+  (`vault_runtime_codehash`, `adapter_runtime_codehash`,
+  `poseidon_runtime_codehash`);
+- the vault's `proofAdapter()`;
+- the signing keys;
+- `challengePeriod`, `noteTtl` and `maxPauseDuration`;
+- `CONCESSION_ESCAPE_VERSION` (1) and `ROOT_HISTORY_WINDOW` (86400);
+- the adapter's `CIRCUIT_ID_HASH` and verifying-key hashes.
+
+A mismatch refuses the deposit with `deployment_mismatch`, and
+`error.data.mismatches` lists each `{ field, expected, actual, source }`. A
+profile without these pins refuses deposits too (`deployment_unverifiable`).
+Exits never depend on this check.
+
+During a launch period, `trusted_deployment.canary` (`per_note_max_wei`,
+`aggregate_max_wei`, `until`) caps deposits. A deposit over a cap fails with
+`canary_cap_exceeded`, or with `canary_cap_unverified` when the vault balance
+cannot be read.
+
+### Snapshot and error codes
+
+`snapshot().config` adds:
+
+- `service` ([Exit-only mode](#exit-only-mode));
+- `vault_revision` (3);
+- `exit`, with times in milliseconds:
+  - `must_initiate_by`, `near_expiry`, `bound_at_state`, `state_fresh`,
+    `escape_at` and `device_not_newest`;
+  - `lock` (`mode`, `since`, `released`, `exit_proofs_released`,
+    `releasable_after`);
+  - `exit_kit` (`state_seq`, `exported_seq`, `out_of_date`);
+  - `exit_cost_warning`: `{ floor, cost, gas_price_wei }` (gwei ledger units)
+    when the payout floor `current_balance − bound_at_state` is below three
+    times an escape's estimated fee (620,000 gas at the last gas price the
+    wallet provider reported), else `null`. The SDK reads the gas price after
+    each deposit and at the start of each withdrawal, and both flows report
+    the warning in a status message. It never blocks anything: the read ends
+    within the 20-second call limit, a deposit waits for it at most that
+    long, and a withdrawal does not wait for it at all (the warning appears
+    when the read completes);
+  - `deposit_path_saved`, `exit_rpc_url`, `exit_rpc_wrong_chain` and
+    `exit_rpc_recommended`. `exit_rpc_wrong_chain` is true once the saved
+    exit RPC answered on another chain than the vault's; exits then ignore
+    it, so ask the user to correct it. `exit_rpc_recommended` is true when
+    no deposit-time path is saved and no exit RPC is set: an escape's path
+    would then come from the operator's indexer or the pinned RPC's logs, so
+    ask the user to set an exit RPC or keep an exit kit from the depositing
+    device;
+- `unresolved_requests`, one entry per request at the selected state, with no
+  proofs: `client_request_id`, `kind`, `disposition`, `class` (`terminal`,
+  `resolved_unreserved`, `unresolved`), `created_at`, `server_status`,
+  `server_status_at` and `escape_at`;
+- `last_settlement` (`client_request_id`, `charge_applied`, `charge_basis`,
+  `settlement_reason`, `installed_at`).
+
+Receipts are installed against the proof-bound billing quote, never
+re-validated against changed manifest price pins. A worst-case charge equal
+to the proven bound is valid.
+
+Each of these errors carries a `shortMessage` for display.
+
+| Group | Codes |
+| --- | --- |
+| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `exit_release_pending`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance` |
+| Deposits | `deployment_mismatch`, `deployment_unverifiable`, `canary_cap_exceeded`, `canary_cap_unverified` |
+| Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
+| Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
+| Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
+| Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `tree_rebuild_timeout`, `tree_root_refused`, `wrong_network` (each with `error.data.exit_path_unavailable`) |
+| Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
 
 ## Credited escape payouts
 
-On a `vault_revision` 2 vault, `finalizeEscapeWithdrawal` closes the note and
-pays the treasury even when its push to the destination fails. The balance is
+`finalizeEscapeWithdrawal` closes the note and pays the treasury even when its push to the destination fails. The balance is
 then added to `escapePayoutCredits(destination)`, and the receipt carries
 `EscapePayoutDeferred(noteId, destination, amount)` before
 `EscapeWithdrawalFinalized`. `EscapeWithdrawalFinalized` alone therefore does
@@ -440,7 +650,7 @@ it, and `finalizeEscape` also returns `payoutCredited: true`. Show such a
 withdrawal as credited, never as returned. The fields survive finality, when
 the record's recovery material is removed. An escape that another device or a
 third party finalized has no receipt in this browser, and a receipt can also be
-unreadable for a while. On a `vault_revision` 2 vault the SDK then reads
+unreadable for a while. The SDK then reads
 `escapePayoutCredits(destination)` at the block where the note reads Closed. A
 nonzero credit marks the record credited, with
 `payoutCreditEvidence: "vault_credit"` and `creditedAmount: null`, because that
@@ -485,23 +695,16 @@ accepts it, and the next `claimEscapePayout` checks it.
 `client.readEscapePayoutCredit(destination)` reads the credit directly.
 
 Before proving a new escape, the SDK simulates the vault's push: a plain
-transfer of one vault unit from the vault to the destination. On a
-`vault_revision` 2 vault the call gets the payout gas (21,000 intrinsic gas,
-100,000, and the 2,300 call stipend); on older vaults it gets all gas. A
-revert or another EVM halt (for example geth's `out of gas` or anvil's
-`EVM error OutOfGas`) counts as a failed transfer. On a `vault_revision` 2
-vault the escape then still proceeds, because the payout is credited, but
-`onStatus` shows a warning first and the result carries `destinationWarning`.
-On an older vault such an escape could never be finalized: the note would
-stay pending, and expiry cannot claim it either. `withdraw("escape")` therefore
-refuses before proving, with error code `escape_destination_unpayable` and
-`error.data.override_option: "overrideDestinationCheck"`. Only after the user
-has confirmed that address anyway, call `client.withdraw("escape", onStatus,
-{ destination, overrideDestinationCheck: true })`; the warning is still shown.
-A host can run the same check before the user confirms the address:
+transfer of one vault unit from the vault to the destination. The call gets
+the payout gas: 21,000 intrinsic gas, 100,000, and the 2,300 call stipend. A
+revert or another EVM halt counts as a failed transfer (for example, geth's
+`out of gas` or anvil's `EVM error OutOfGas`). The escape still proceeds,
+because the payout is credited, but `onStatus` shows a warning first and the
+result carries `destinationWarning`. A host can run the same check before the
+user confirms the address:
 `client.checkEscapeDestination(destination, { finalBalance })` returns
-`{ destination, accepts, warning }`, where `accepts` is `null` when the RPC
-cannot tell. Such an unknown result never refuses an escape.
+`{ destination, accepts, warning }`. `accepts` is `null` when the RPC cannot
+tell, and such an unknown result never refuses an escape.
 
 Withdrawal records written by earlier builds have no `payoutCredited` field and
 keep their meaning. SDK builds before this one report a credited escape as
@@ -565,6 +768,23 @@ the runtime slot holds no other deployment's state. Anyone can also call
 `claimEscapePayout(destination)` on that vault directly; the SDK recognises
 that delivery from the zero credit the next time that profile's claim action
 runs.
+
+### Two builds on one origin
+
+Notes in a `zkapi-v2-note-bound-v1` vault stay with the legacy build of this
+SDK. A host serves it beside this one on the same origin:
+
+- the legacy build at its existing `publicPath` (`/zkapi/`);
+- this build at `/zkapi/v2c/`.
+
+Both share IndexedDB `zkapi-browser-wallet-v1` (version 3) and its lock.
+Neither rewrites the other deployment's records, and each runtime refuses a
+runtime slot that holds the other's note. The host lists two package entries
+(`zkapi-sdk-legacy` and `zkapi-sdk`), and each resolves its own WebAssembly,
+keys and worker. A small loader calls `readBrowserWalletHoldings()` and
+`import()`s the legacy entry while a legacy runtime holds an open note, and
+this one otherwise. [`examples/sample-host`](../examples/sample-host) builds
+both and holds that loader.
 
 ## Native ETH deployments
 
@@ -685,18 +905,18 @@ current USD value independently of a running key's frozen conversion.
 
 ## Default deployments
 
-The packaged mainnet and Sepolia configurations use
+The packaged mainnet and Sepolia profiles name
 `https://zkapi-mainnet.openanonymity.ai` and
-`https://zkapi-sepolia.openanonymity.ai`. Each profile pins its native ETH vault,
-signing keys, proof artifacts, and circuit hashes. Hosts may supply reviewed
-explicit profiles as described above. The packaged profiles declare neither
-`vault_revision` nor `clearance_ownership_proof`: they run in strict mode and
-send clearance requests without a proof first, adding one when the server
-answers `400 clearance_ownership_required` or `503 legacy_clearance_capacity`.
-Once a deployment's server is upgraded, its profile must declare
-`"clearance_ownership_proof": "optional"` in `trusted_deployment`, because
-proof-less requests share a legacy budget that anyone can exhaust (see the
-[migration guide](../docs/migration-hardened-vault.md#phase-2-publish-clients)).
+`https://zkapi-sepolia.openanonymity.ai`. They stay `not_deployed`
+placeholders until their concession vaults exist, and `buildBrowserSdkAssets`
+refuses them with `deployment_not_deployed`. A deployed profile pins:
+
+- its native ETH vault, signing keys, proof artifacts, circuit and setup;
+- `vault_revision: 3`, `exit_concession: 1` and
+  `clearance_ownership_proof: "required"`;
+- the deployment pins of [Deposit checks](#deposit-checks).
+
+Hosts may supply reviewed explicit profiles as described above.
 
 The runtime checks that active notes, pending deposits, leases, and unfinished
 recovery state match the selected deployment. Preserve wallet state and recovery

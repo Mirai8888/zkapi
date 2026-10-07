@@ -71,6 +71,7 @@ async function scenario({ state = noteState(), liveRequest = false } = {}) {
                 return wallet.estimate(params[0], wallet.estimates.length);
             }
             if (method === 'eth_getTransactionCount') return '0x5';
+            if (method === 'eth_gasPrice' && wallet.gasPrice != null) return `0x${BigInt(wallet.gasPrice).toString(16)}`;
             if (method === 'eth_sendTransaction') {
                 wallet.sent.push({ ...params[0], atSend: await wallet.atSend?.() });
                 throw SEND_REFUSED;
@@ -210,5 +211,20 @@ test('E4.1: after UnknownRoot the vault logs replace a missing indexer, the inde
             assert.equal(wallet.sent[0].gas, FIXED_EXIT_GAS, `${label}: the refusal only warns`);
         }
         assert.equal(wallet.sent.length, 1, `${label}: the escape reached the wallet`);
+    }
+});
+
+test('G1: a withdrawal warns first when the balance returns less than three escape fees', async () => {
+    for (const [gasPrice, warned] of [[10_000_000_000n, true], [1_000_000_000n, false], [null, false]]) {
+        const { wallet, statuses, withdraw } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+        wallet.gasPrice = gasPrice;
+        await assert.rejects(withdraw('escape'), refusedInWallet);
+        const index = statuses.findIndex(message => /less than three times the estimated network fee of an escape/.test(message));
+        assert.equal(index >= 0, warned, `gas price ${gasPrice}`);
+        if (warned) {
+            assert.match(statuses[index], /as little as 0\.005 ETH.*\(0\.0062 ETH/);
+            assert.ok(index < statuses.findIndex(message => /Confirm the escape-hatch start/.test(message)), 'before the wallet prompt');
+        }
+        assert.equal(wallet.sent.length, 1, 'the warning never blocks the exit');
     }
 });

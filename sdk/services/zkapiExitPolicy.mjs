@@ -471,6 +471,17 @@ export function matchEscapePayout({ stateBalance, concededAtInit, boundAtState =
     };
 }
 
+// An escape's gas (§1.5: about 0.55–0.62M), for the G1 exit-cost warning.
+export const ESCAPE_GAS_ESTIMATE = 620_000n;
+
+/** An escape's estimated network fee in ledger units at `gasPriceWei`, rounded up. */
+export function escapeCostUnits({ gasPriceWei, weiPerUnit }) {
+    const price = amount(gasPriceWei, 'gas price');
+    const scale = amount(weiPerUnit, 'wei per unit');
+    if (scale === 0n) throw exitError('The ledger unit must be positive.', 'exit_input_invalid');
+    return (ESCAPE_GAS_ESTIMATE * price + scale - 1n) / scale;
+}
+
 /** The G1 warning of §2.3: the payout floor B − b is below three exit costs. */
 export function exitCostWarning({ stateBalance, boundAtState, exitCostUnits }) {
     const B = amount(stateBalance, 'state balance');

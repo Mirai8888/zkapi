@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    EXIT_TIMING, RECORD_CLASS, afterClearanceFailure, chooseExit, escapeAt, exitCostWarning, exitLockRefusal,
+    ESCAPE_GAS_ESTIMATE, EXIT_TIMING, RECORD_CLASS, afterClearanceFailure, chooseExit, escapeAt, escapeCostUnits, exitCostWarning, exitLockRefusal,
     exitLockDeadAfter, exitLockReleasable, exitRecordClass, lowExpiry, matchEscapePayout, mustInitiateBy, nearExpiry, newExitLock,
     ownershipOutcome, recordClearanceOutcome, recordReleasedProof, recordReleasedTransaction, releasedExitProofs, requestRecordsAtState, stateExitStatus,
     switchExitLock, unsettledEscapeAfterSeconds
@@ -258,4 +258,9 @@ test('E5: payouts match B − c_final after raises, bounded by the state bound',
     // The G1 exit-cost warning: B − b below three escape costs.
     assert.deepEqual(exitCostWarning({ stateBalance: 1_000, boundAtState: 300, exitCostUnits: 250 }), { floor: 700n, cost: 250n });
     assert.equal(exitCostWarning({ stateBalance: 1_000, boundAtState: 300, exitCostUnits: 233 }), null);
+    // An escape's fee in gwei ledger units, rounded up.
+    assert.equal(ESCAPE_GAS_ESTIMATE, 620_000n);
+    assert.equal(escapeCostUnits({ gasPriceWei: 10_000_000_000n, weiPerUnit: '1000000000' }), 6_200_000n);
+    assert.equal(escapeCostUnits({ gasPriceWei: 1n, weiPerUnit: 1_000_000_000 }), 1n);
+    assert.throws(() => escapeCostUnits({ gasPriceWei: 1n, weiPerUnit: 0 }), { code: 'exit_input_invalid' });
 });

@@ -299,6 +299,30 @@ for (const recovery of [false, true]) {
     });
 }
 
+test('a confirmed deposit whose balance is below three escape fees ends with the G1 warning', async t => {
+    seedRuntime({ pendingDeposit: plan() });
+    const runtime = makeRuntime();
+    const client = confirmationClient(t, runtime);
+    t.mock.method(singleton, 'refreshExitCost', runtime.refreshExitCost.bind(runtime));
+    const previous = globalThis.ethereum;
+    globalThis.ethereum = { request: async ({ method }) => {
+        if (method === 'eth_chainId') return `0x${Number(runtime.config.funding.chain_id).toString(16)}`;
+        if (method === 'eth_gasPrice') return '0x3b9aca00';
+        throw new Error(`unexpected wallet RPC ${method}`);
+    } };
+    try {
+        const statuses = [];
+        const { vault, receipt } = depositReceipt();
+        const result = await client.confirmBrowserDepositReceipt(plan(), receipt, vault, message => statuses.push(message));
+        assert.equal(result.status, 'confirmed');
+        assert.match(statuses.at(-1), /as little as 0\.000000123 ETH, less than three times the estimated network fee of an escape \(0\.00062 ETH/);
+        assert.deepEqual(runtime.snapshot().config.exit.exit_cost_warning,
+            { floor: '123', cost: '620000', gas_price_wei: '1000000000' });
+    } finally {
+        globalThis.ethereum = previous;
+    }
+});
+
 for (const failure of ['worker', 'storage', 'indexer', 'old-note']) {
     test(`a ${failure} failure before this deposit commit is never classified as confirmed`, async t => {
         seedRuntime({ pendingDeposit: plan(), ...(failure === 'old-note' ? { state: state(6) } : {}) });

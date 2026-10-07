@@ -19,7 +19,8 @@ import {
     unresolvedRequestArchiveAt
 } from './zkapiRequestArchive.mjs';
 import {
-    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, exitLockDeadAfter, exitLockRefusal,
+    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, escapeCostUnits, exitCostWarning,
+    exitLockDeadAfter, exitLockRefusal,
     exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, ownershipOutcome,
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
@@ -1276,6 +1277,7 @@ class BrowserWalletRuntime extends EventTarget {
             } : null,
             exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
             deposit_path_saved: Boolean(state.deposit_path),
+            exit_cost_warning: this.exitCostWarningAt(state),
             exit_rpc_url: exitRpcUrlValue,
             // Without a saved deposit path an escape's path comes from the
             // operator's indexer or a log rebuild; the user's own exit RPC
@@ -1283,6 +1285,50 @@ class BrowserWalletRuntime extends EventTarget {
             // dependence on the operator.
             exit_rpc_recommended: !state.deposit_path && !exitRpcUrlValue
         };
+    }
+
+    /**
+     * G1 (§2.3): `{ floor, cost, gas_price_wei }` when the state's payout
+     * floor B − bound_at_state is below three times an escape's estimated
+     * network fee at the last gas price the wallet provider reported, else
+     * null (also while no gas price was read). Amounts are ledger units.
+     */
+    exitCostWarningAt(state = this.runtime?.state) {
+        const price = this.exitGasPrice?.wei;
+        if (!state || price == null) return null;
+        try {
+            const cost = escapeCostUnits({ gasPriceWei: price,
+                weiPerUnit: this.config?.funding?.native_asset_wei_per_unit ?? 1_000_000_000 });
+            const warning = exitCostWarning({ stateBalance: state.current_balance, boundAtState: state.bound_at_state || 0,
+                exitCostUnits: cost });
+            return warning ? { floor: String(warning.floor), cost: String(warning.cost), gas_price_wei: String(price) } : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Read the gas price through the user's wallet provider (on the vault's
+     * chain only) for the G1 exit-cost warning. Best effort: a failed read
+     * keeps the last price. Returns the selected state's warning, or null.
+     */
+    async refreshExitCost({ request } = {}) {
+        if (typeof request === 'function' && this.config?.funding?.chain_id != null) {
+            try {
+                const chain = await request({ method: 'eth_chainId', params: [] });
+                if (BigInt(chain) === BigInt(this.config.funding.chain_id)) {
+                    const price = BigInt(await request({ method: 'eth_gasPrice', params: [] }));
+                    if (price > 0n) {
+                        const changed = this.exitGasPrice?.wei !== price;
+                        this.exitGasPrice = { wei: price, at: Date.now() };
+                        if (changed) this.dispatchEvent(new Event('change'));
+                    }
+                }
+            } catch {
+                // The warning is advisory; the last price stays.
+            }
+        }
+        return this.exitCostWarningAt();
     }
 
     archiveKey(state = this.runtime?.state) {

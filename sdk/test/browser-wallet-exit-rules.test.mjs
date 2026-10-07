@@ -987,6 +987,33 @@ test('the deposit-time path is saved only when it leads to the root the deposit 
     }
 });
 
+test('G1: the snapshot warns when B − bound_at_state is below three escape fees at the wallet\'s gas price', async () => {
+    const h = await walletWithLiveRequest();
+    const exit = () => h.runtime.snapshot().config.exit;
+    assert.equal(exit().exit_cost_warning, null, 'no gas price read yet');
+    const wallet = (chainId, gasPrice, calls = []) => async ({ method }) => {
+        calls.push(method);
+        if (method === 'eth_chainId') return `0x${chainId.toString(16)}`;
+        assert.equal(method, 'eth_gasPrice');
+        return `0x${BigInt(gasPrice).toString(16)}`;
+    };
+    // At 10 gwei an escape costs 620,000 × 10 gwei = 6,200,000 gwei: the
+    // floor B − b = 5,000,000 − 1,000,000 is below three of them.
+    const warning = await h.runtime.refreshExitCost({ request: wallet(11155111, 10_000_000_000n) });
+    assert.deepEqual(warning, { floor: '4000000', cost: '6200000', gas_price_wei: '10000000000' });
+    assert.deepEqual(exit().exit_cost_warning, warning);
+    // A wallet on another chain is not read.
+    const calls = [];
+    await h.runtime.refreshExitCost({ request: wallet(1, 1n, calls) });
+    assert.deepEqual(calls, ['eth_chainId']);
+    assert.deepEqual(exit().exit_cost_warning, warning, 'the last price stays');
+    // At 1 gwei three escapes cost 1,860,000 gwei: no warning.
+    assert.equal(await h.runtime.refreshExitCost({ request: wallet(11155111, 1_000_000_000n) }), null);
+    assert.equal(exit().exit_cost_warning, null);
+    // A failing provider keeps the last price.
+    assert.equal(await h.runtime.refreshExitCost({ request: async () => { throw new Error('offline'); } }), null);
+});
+
 test('E7: the exit kit holds the state an escape needs and goes out of date after an install', async () => {
     const h = await walletWithLiveRequest({}, noteState({ secret_s: '0x5ec', deposit_path: depositPath('0x51') }));
     h.runtime.browserConfig.trusted_deployment = { ...h.runtime.browserConfig.trusted_deployment, deployment_id: 'kit-test' };

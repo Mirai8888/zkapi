@@ -290,6 +290,11 @@ function startFinalBalance(record) {
 // the vault does not know the proof's root (E4.1).
 const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
 
+/** The G1 warning (design §2.3) as a status message; amounts are gwei ledger units. */
+function exitCostMessage({ floor, cost }) {
+    return `This balance can return as little as ${formatUnits(floor, 9)} ETH, less than three times the estimated network fee of an escape (${formatUnits(cost, 9)} ETH at the current gas price). Exiting by escape may cost more than it returns.`;
+}
+
 class ZkapiClient extends EventTarget {
     constructor() {
         super();
@@ -1628,6 +1633,10 @@ class ZkapiClient extends EventTarget {
         onStatus(balanceRefreshPending
             ? 'Deposit confirmed and saved. The balance display will refresh when available.'
             : 'Private balance is ready.');
+        // G1: a balance smaller than three escape fees is worth less than
+        // its unilateral exit.
+        const costWarning = await browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) });
+        if (costWarning) onStatus(exitCostMessage(costWarning));
         return {
             status: 'confirmed',
             balanceRefreshPending,
@@ -2198,6 +2207,9 @@ class ZkapiClient extends EventTarget {
 
         onStatus('Connecting to MetaMask…');
         const from = await this.connectWallet();
+        // G1: warn when this balance returns less than three escape fees.
+        const costWarning = await browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) });
+        if (costWarning) onStatus(exitCostMessage(costWarning));
         // MetaMask connection can outlive a cross-tab update. Re-read the
         // durable plan under the wallet lock instead of trusting the UI/config
         // snapshot that existed before the prompt opened.

@@ -559,6 +559,12 @@ cannot be read.
   - `lock` (`mode`, `since`, `released`, `exit_proofs_released`,
     `releasable_after`);
   - `exit_kit` (`state_seq`, `exported_seq`, `out_of_date`);
+  - `exit_cost_warning`: `{ floor, cost, gas_price_wei }` (gwei ledger units)
+    when the payout floor `current_balance − bound_at_state` is below three
+    times an escape's estimated fee (620,000 gas at the last gas price the
+    wallet provider reported), else `null`. The SDK reads the gas price after
+    each deposit and at the start of each withdrawal, and both flows report
+    the warning in a status message. It never blocks anything;
   - `deposit_path_saved`, `exit_rpc_url` and `exit_rpc_recommended`. The
     last is true when no deposit-time path is saved and no exit RPC is set:
     an escape's path would then come from the operator's indexer or the

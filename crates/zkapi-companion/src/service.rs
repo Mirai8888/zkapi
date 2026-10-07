@@ -4963,8 +4963,9 @@ mod oa_withdrawal_tests {
             .unwrap());
         assert!(verifier.verify(&plan.public_inputs, &plan.proof).unwrap());
         // The mutual plan is saved in the reservation. The ownership proof is
-        // kept only in the exit lock, so a retry resends it instead of
-        // releasing another (it is kind 2: no vault entry point accepts it).
+        // kept only in the exit lock and C5's marker (which keeps it past a
+        // cancelled lock), so a retry resends it instead of releasing
+        // another (it is kind 2: no vault entry point accepts it).
         assert_eq!(
             oa_withdrawal::load(&config).unwrap().unwrap().plan.unwrap(),
             plan
@@ -4979,7 +4980,10 @@ mod oa_withdrawal_tests {
         );
         for entry in std::fs::read_dir(directory.path()).unwrap() {
             let path = entry.unwrap().path();
-            if path.is_file() && !path.ends_with("exit_lock.json") {
+            if path.is_file()
+                && !path.ends_with("exit_lock.json")
+                && !path.ends_with(zkapi_client::wallet::OWNERSHIP_PROOF_MARKER_FILE)
+            {
                 assert!(
                     !std::fs::read_to_string(&path)
                         .unwrap_or_default()

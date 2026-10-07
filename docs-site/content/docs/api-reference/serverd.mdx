@@ -193,7 +193,7 @@ newer state.
 | Method + path | `POST /v2/withdraw/clearance` |
 | Request | `ClearanceRequestV2C { withdrawal_nullifier: Felt252, ownership_proof: { public_inputs: WithdrawalPublicInputsV2C, proof: { backend: "groth16_bn254", proof: base64 } } }` |
 | Response (200) | `ClearanceResponseV2 { status, withdrawal_nullifier, signature: {r_x,r_y,s} }` |
-| Errors | `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `500 internal_error`, `503 capacity_exhausted` |
+| Errors | `400 clearance_ownership_required`, `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`, `409 stale_root`, `409 nullifier_used`, `500 internal_error`, `503 capacity_exhausted` |
 
 Both structures refuse unknown fields. `ownership_proof` is a kind-2
 withdrawal proof for the same nullifier. Its `public_inputs` use the JSON
@@ -213,8 +213,10 @@ of the wallet's deposit-time path is accepted. Otherwise it answers
 `409 stale_root` with the vault's root in `latest_root`; a failed vault read
 returns retriable `500 internal_error`. Groth16 verification failures return
 `400 invalid_proof`. Ownership-proof verification runs under a small
-concurrency limit; saturation returns retriable `503 capacity_exhausted`. The
-server never logs or stores ownership proofs.
+concurrency limit; saturation returns retriable `503 capacity_exhausted`. A
+request without `ownership_proof` returns `400 clearance_ownership_required`,
+which is not retriable, and reserves nothing. The server never logs or stores
+ownership proofs.
 
 A successful request reserves the nullifier permanently
 (`clearance_reserved`); repeating it with a valid proof signs the clearance
@@ -270,7 +272,7 @@ reference gateway does not expose them.
 Protocol errors include `error_code`, `error_message`, and `retriable`, plus
 optional `latest_root`, `server_time_ms`, and `retry_after_seconds`. Examples
 include `400 invalid_proof`, `400 invalid_request`, `400 protocol_mismatch`,
-`400 request_limit_exceeded`, `404 lease_record_unreadable` (not retriable),
+`400 clearance_ownership_required`, `400 request_limit_exceeded`, `404 lease_record_unreadable` (not retriable),
 `409 stale_root`, `409 replay`, `409 nullifier_used`, `410 note_expired`,
 `410 published`, `500 database_error` (retriable), `503 capacity_exhausted`,
 `503 root_unavailable` and `503 chain_read_unavailable` (both retriable).

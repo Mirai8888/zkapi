@@ -164,9 +164,15 @@ Every profile, the server stack's `deployment.json`, the SDK and clientd
 profiles, takes its pins and `deploy_block` from the finalized manifest only,
 never from `.pending` or `deployBlockLowerBound`; serverd, `zkapi db init`, the
 companion, the SDK build and clientd refuse a `pending` or `simulated` status.
-The profile is the snake_case `trusted_deployment` form of those fields; the
+`node scripts/deployment-profile.mjs --finalized "$OUTPUT_PATH" ...` writes
+each of them: the snake_case `trusted_deployment` form (`--format trusted`, the
+default), the SDK config (`--format sdk`) and clientd's packaged profile under
+its own field names (`--format clientd`). It checks the setup directory's
+verifying keys against the manifest, refuses a legacy `deployment_id`, and
+writes the signing-key coordinates, decimal strings in the manifest, as the
+`0x` hex every consumer parses. The
 [migration runbook](migration-concession-vault.md#b2-production-sepolia), step
-5, maps them.
+5, gives the commands.
 
 The owner controls an emergency pause and the treasury address. Use a multisig,
 ideally behind a timelock, never a single deployer key:

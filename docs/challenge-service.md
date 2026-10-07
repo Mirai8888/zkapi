@@ -468,10 +468,19 @@ the bundled signer bounds what a compromised daemon host could spend on it:
 One missed defeat takes one unit, plus one for each re-send after a root race.
 Retirement gas is therefore at most the budget x the signer's maximum gas x
 its fee cap per day, whether the retirements succeed or revert. The daemon
-reports every signer refusal as `signer_refused`, critical at once: raise the
-budget in `signer.env` and recreate the signer when repeated root races spent
-it. Alert on `challenge_refused` audit lines with reason `retirement_in_flight`
-or `retirement_not_after_escape`: the daemon misbehaves. `zkapi_signerStatus`
+reports every signer refusal as `signer_refused`, critical at once. The
+reason is on the signer's `challenge_refused` audit line, and each has its
+own fix:
+
+| Reason | Cause | Fix |
+| --- | --- | --- |
+| `retirement_budget_exhausted` | The rolling day's budget is spent, usually by re-sends after root races | Raise `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` in `signer.env` and recreate the signer |
+| `retirement_not_after_escape` | No `EscapeWithdrawalFinalized` of the note within the lookback. After an outage longer than the lookback (about seven days) the restarted challenger meets this for an escape that finalized while it was down | Raise `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` past the escape's finalization and recreate the signer. For a note no escape closed (a mutual close or an expiry claim), the daemon misbehaves |
+| `retirement_in_flight` | A retirement of the note on a new nonce while an earlier counted nonce may still mine | The daemon misbehaves, or a lagging upstream answered the nonce count; it clears once the earlier nonce mines |
+| `retirement_disabled` | `ZKAPI_CHALLENGE_RETIRE_ON_MISS` differs between `deployment.env` and `signer.env` | Set the same value in both and recreate the signer |
+
+Until the retirement mines, the loss bound of a missed defeat (design §7.4,
+service from the owner's newest state) keeps running. `zkapi_signerStatus`
 and the signer's `/health` report `max_retirements_per_day`,
 `retirements_last_24h` (nonces), `retirement_refusals` and
 `last_retirement_refusal_at`. The window is kept in memory, so a signer

@@ -223,8 +223,11 @@ during an exit has a 20-second limit, and none can delay the exit past
   `c = bound_at_state`. An honest operator delivers the successor before `T`;
   a dishonest one could raise to that bound anyway. The owner may escape
   earlier with `c = 0`, and the operator then raises it to the actual charge.
-- **A lost response** (the server finalized a request whose successor the
-  wallet cannot install): an escape with `c = min(charge, bound_at_state)`.
+- **A lost response** (the server finalized a request whose successor passes
+  the wallet's identity, hash, anchor and signature checks but cannot be
+  installed, for example after the wallet lost its blinding): an escape with
+  `c = min(charge, bound_at_state)`. A successor at the wrong anchor counts
+  as withheld.
 
 Merkle paths come from the deposit-time path, the indexer, or a rebuild from
 the vault's logs, read through the user's own exit RPC when one is set. Just

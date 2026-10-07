@@ -160,9 +160,13 @@ twice, then the escape stops with an error naming the exit RPC, and you
 retry later or configure another one. So a pinned RPC that is down or
 answers falsely can neither block an escape nor end one, nor choose the
 nonce, gas limit or Merkle root an escape is signed with. `config
---exit-rpc-url none` clears it; escapes then use the pinned RPC. The
-companion takes the same setting from `--exit-rpc-url` or
-`ZKAPI_EXIT_RPC_URL`.
+--exit-rpc-url none` clears it; escapes then use the pinned RPC, and every
+open escape's status warns about it: the pinned RPC then decides when the
+escape's exit lock is released and reports whether it landed or was
+defeated. Even so, no lock is released before this machine's clock says the
+released proof is dead, and a defeat it reports is read again on every run.
+Set an exit RPC before you escape. The companion takes the same setting from
+`--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
@@ -335,8 +339,8 @@ proof from that note state, only the withdrawal's own proofs, and the chat
 API answers 409 `exit_locked`. The lock is released when the note closes,
 when you cancel a withdrawal that released no escape or close proof
 (`withdraw --escape --cancel`), or once every released proof is dead (its
-`valid_until` plus 15 minutes is before the finalized block and the note is
-still active). A decision that releases nothing (showing the escape's terms,
+`valid_until` plus 15 minutes is before both the finalized block and this
+machine's clock, and the note is still active). A decision that releases nothing (showing the escape's terms,
 waiting for a sent request to settle, or a refusal before any proof) leaves
 no lock behind, so chats continue.
 
@@ -438,6 +442,17 @@ zkapi-clientd withdraw --escape --cancel                              # drop an 
 decision was shown, or it waits for a request to settle); chats resume. Once
 the escape proof was released it cannot be cancelled: the exit lock stays
 until the proof is dead or the note closes.
+
+An escape defeated on chain (`device_not_newest`: another device or backup
+spent the escaped state) shows phase `defeated`. A defeat counts only from
+the vault's `EscapeWithdrawalChallenged` log in a finalized block, and it is
+never final on one reading: every `withdraw --escape --to` reads the chain
+again (through your exit RPC once one is set), follows the escape if it shows
+pending after all, and decides again if your exit RPC shows the escape never
+landed. Exit from the newest state instead (restore the newest backup, or
+`zkapi-walletd exit-kit escape` with the newest kit). `--escape --cancel`
+clears a defeated escape once the chain shows it neither pending nor closed
+and its exit lock was released (its proof is dead).
 
 The first run shows what the escape concedes (in gwei), why, and what it
 pays; nothing is signed. `--conceded` repeats the concession you reviewed

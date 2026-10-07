@@ -349,26 +349,62 @@ The drill vault tests the adversarial cases with short timings. It uses the
    profile only). Finalize the manifest as in
    [B2, step 3](#b2-production-sepolia).
 2. Build drill binaries that load the `dev` keys, the server with the
-   adversary modes:
+   adversary modes, into their own target directory, as
+   `scripts/run-v2-acceptance.sh` does, so that they never replace a release
+   build in `target/release`:
 
    ```sh
-   cargo build --release -p zkapi-cli --features adversary,zkapi-proof/dev-setup
-   cargo build --release -p zkapi-serverd --bin zkapi-challenged --features zkapi-proof/dev-setup
-   cargo build --release -p zkapi-companion --bin zkapi-walletd --features zkapi-proof/dev-setup
-   bash scripts/build-browser-client.sh --setup dev
+   cargo build --locked --release --target-dir target/drill \
+     --features zkapi-cli/adversary,zkapi-proof/dev-setup \
+     -p zkapi-cli --bin zkapi -p zkapi-serverd --bin zkapi-challenged \
+     -p zkapi-indexerd --bin zkapi-indexerd -p zkapi-companion --bin zkapi-walletd
    ```
 
-   Point their proof setup at `protocol/setup/v2-concession-dev`. Never ship
-   these builds: release binaries and the Docker image load only the ceremony
-   keys and reject `--adversary`. The server's mode is chosen at start,
-   `zkapi --adversary <mode> serverd ...`: `withhold` (settles every request
-   but never signs its successor), `born-spent` (signs successors at anchor 1),
-   `reuse-anchor`, `random-anchor`, `overcharge` (one unit above the bound),
-   `lie-expired` (answers every expiry check `expired_unaccepted`) and `hang`
-   (holds every connection, drips a byte every 5 seconds for up to 600
-   seconds, then answers 429 or 503 with `Retry-After: 86400`). Clients give
-   up on each call after 20 seconds, so under `hang` an escape must still land
-   before `must_initiate_by`.
+   Build the drill browser client in a worktree of its own: the build writes
+   the tracked `sdk/wasm`, `sdk/assets/proofs` and `sdk/assets/manifest.json`,
+   which in the release checkout hold the `mpc-1` bundle of Phase A, step 4.
+   Pin the drill vault in that worktree's Sepolia profile, then build:
+
+   ```sh
+   git worktree add --detach ../zkapi-drill HEAD && cd ../zkapi-drill
+   node scripts/deployment-profile.mjs --finalized "$DRILL_MANIFEST" \
+     --deployment-id zkapi-native-eth-sepolia-concession-drill-1 \
+     --protocol-server-url https://DRILL_API_HOST --indexer-url https://DRILL_API_HOST \
+     --verifier-url https://OA_VERIFIER_HOST --format sdk \
+     --base sdk/assets/config/sepolia.json --out sdk/assets/config/sepolia.json
+   bash scripts/build-browser-client.sh --setup dev   # the dev WebAssembly and keys
+   npm run build:browser                              # dist/sdk-sepolia
+   ```
+
+   Never commit these builds or ship them: release binaries and the Docker
+   image load only the ceremony keys and reject `--adversary`. The server's
+   mode is chosen at start, `zkapi --adversary <mode> serverd ...`:
+   `withhold` (settles every request but never signs its successor),
+   `born-spent` (signs successors at anchor 1), `reuse-anchor`,
+   `random-anchor`, `overcharge` (one unit above the bound), `lie-expired`
+   (answers every expiry check `expired_unaccepted`) and `hang` (holds every
+   connection, drips a byte every 5 seconds for up to 600 seconds, then
+   answers 429 or 503 with `Retry-After: 86400`). Clients give up on each call
+   after 20 seconds, so under `hang` an escape must still land before
+   `must_initiate_by`.
+
+   **Running the drill stack.** The Docker image refuses the `dev` keys, so
+   run the drill binaries directly, each with
+   `--proof-setup-dir protocol/setup/v2-concession-dev` (`ZKAPI_PROOF_SETUP_DIR`
+   for `zkapi-walletd`) and the drill profile from
+   `scripts/deployment-profile.mjs` (`--deployment`), in the production order:
+   `zkapi-indexerd` from a fresh checkpoint at the drill vault's
+   `deployBlock`; `zkapi --proof-setup-dir ... db init --deployment ... --db ...`
+   on a fresh database; the signer sidecar
+   (`node docker/aws/signer/server.mjs` with the variables of
+   `docker/aws/signer.env.example`, its own key and
+   `ZKAPI_CHALLENGE_VAULT` set to the drill vault); `zkapi-challenged` with
+   `--deployment`, `--settlement-window-seconds 2105` and
+   `--raise-lead-seconds 1800`; then `zkapi [--adversary <mode>] serverd`
+   with `--deployment` and the drill lease timings. Restart serverd to change
+   its mode. `scripts/v2-acceptance.mjs` starts exactly this stack on Anvil:
+   read its `serverArgs`, `challengerArgs`, `indexerArgs` and signer
+   environment for every flag.
 3. Run the drills of design §10.7 B on it, each asserting the client's final
    state as well as balances: the honest flow; a withholding server
    (`--adversary withhold`) and the concession at `T`; `hang`, with the
@@ -385,9 +421,9 @@ The drill vault tests the adversarial cases with short timings. It uses the
    refusing deposits; and a missed defeat (challenger stopped) followed by
    `retireClosedLeaf`. There is no scripted Sepolia drill harness yet: run
    them with the drill binaries and record each result. The local acceptance
-   ([`npm run test:e2e:v2`](v2-acceptance.md)) rehearses them on Anvil,
-   except `hang`, the late successor and the switch, and the rebuild from
-   logs (with the indexer down it proves from the deposit-time path). A drill
+   ([`npm run test:e2e:v2`](v2-acceptance.md)) rehearses every one of them
+   on Anvil, with the SDK, the companion or the wallet core as the client
+   ([its scenario table](v2-acceptance.md#scenarios) names which). A drill
    that retires leaves more than twice a day needs
    `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` raised in `signer.env`.
 
@@ -472,24 +508,42 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    expected values.
 5. **Profiles.** Every consumer takes its pins and `deploy_block` from the
    finalized manifest only, never from `.pending` or `deployBlockLowerBound`.
-   Write the `trusted_deployment` profile from it: `chain_id` (`chainId`),
-   `contract_address` (`vault`), `deploy_block` (`deployBlock`), `circuit_id`,
-   `setup_id`, `request_vk_keccak256`, `withdrawal_vk_keccak256`,
-   `vault_runtime_codehash`, `proof_adapter_address` (`proofAdapter`),
-   `adapter_runtime_codehash`, `poseidon_library_address` (`poseidonLibrary`),
-   `poseidon_runtime_codehash`, `challenge_period`, `note_ttl`,
-   `max_pause_duration`, `state_signing_key` and `clearance_signing_key`
-   (`{x, y}`, from the decimal key coordinates), `request_charge_cap`,
-   `vault_revision: 3`, `exit_concession: 1`,
-   `clearance_ownership_proof: "required"`, `settlement_window_seconds`
-   (lease TTL + grace + settlement deadline), the proving- and verifying-key
-   SHA-256 pins of the setup, the endpoints, and
-   `deployment_status: "deployed"`. The same profile is the server stack's
-   `/etc/zkapi/deployment.json`; the SDK profile
-   (`sdk/assets/config/sepolia.json`) adds the browser fields, and clientd's
-   `deployments/sepolia.json` carries the same pins under its own names
-   (`challenge_period_seconds`, `deployment_evidence.*_runtime_keccak256`,
-   `proof_setup`).
+   Generate them with `scripts/deployment-profile.mjs`, which refuses a
+   pending or simulated manifest, checks that the setup directory's
+   verifying keys are the vault's, and writes the four signing-key
+   coordinates as `0x` hex (the manifest holds decimal strings, and
+   serverd, `zkapi db init` and clientd parse hex only):
+
+   ```sh
+   PROFILE_ARGS=(--finalized "$OUTPUT_PATH" --deployment-id zkapi-native-eth-sepolia-concession-v1
+     --protocol-server-url https://API_HOST --indexer-url https://API_HOST
+     --verifier-url https://OA_VERIFIER_HOST)
+   node scripts/deployment-profile.mjs "${PROFILE_ARGS[@]}" --rpc-url "$PINNED_RPC_URL" \
+     --price-feed 0x694AA1769357215DE4FAC081bf1f309aDC325306 --settlement-window-seconds 14705 \
+     --out deployment.json
+   node scripts/deployment-profile.mjs "${PROFILE_ARGS[@]}" --format sdk \
+     --base sdk/assets/config/sepolia.json --out sdk/assets/config/sepolia.json
+   node scripts/deployment-profile.mjs "${PROFILE_ARGS[@]}" --format clientd \
+     --base zkapi-clientd/internal/zkapi/deployments/sepolia.json \
+     --out zkapi-clientd/internal/zkapi/deployments/sepolia.json
+   ```
+
+   - `deployment.json` is `{"trusted_deployment": ...}`, the server stack's
+     `/etc/zkapi/deployment.json`.
+   - The SDK profile keeps its browser fields and takes the RPC, price feed
+     and settlement window of the file it replaces.
+   - clientd's file keeps its own names: `challenge_period_seconds`,
+     `note_ttl_seconds`, `max_pause_duration_seconds`,
+     `settlement_window_seconds`, `deployment_evidence.{vault,adapter,poseidon}_runtime_keccak256`,
+     `proof_setup.*` and `privacy_mode.verifier_url`.
+   - `deployment_id` must be new: never a legacy ID (they contain
+     `note-bound`, and the script refuses them). Both browser builds keep
+     their wallets in one store keyed by it.
+   - On mainnet, add the canary with `--canary '{"per_note_max_wei": ..., "aggregate_max_wei": ..., "until": ...}'`.
+
+   Review the three diffs. Write a profile by hand only with the script's
+   rules: decimal coordinates written as `0x` hex (`cast to-hex`), a new
+   `deployment_id`, and clientd's names above.
 6. **Stack.** Configure it from [the Docker guide](../docker/aws/README.md)
    with the Sepolia values of
    [`deployment.env.example`](../docker/aws/deployment.env.example): the new
@@ -503,13 +557,16 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    retirements: at 100 gwei, about 0.06 ETH per defeat and 0.72 ETH per
    retirement.
 7. **Start in this order:** the indexer from `DEPLOY_BLOCK`, `zkapi db init`
-   (the `db-init` service), the challenger, then the API server.
+   (the `db-init` service), the challenger, the API server, then the
+   gateway that publishes it (`up` never starts the services that depend on
+   the ones it names, so the gateway needs its own line).
 
    ```sh
    dc up -d --wait indexer
    dc run --rm db-init
    dc up -d --wait challenger
    dc up -d --wait server
+   dc up -d --wait gateway
    ```
 
    `zkapi db init` creates the schema, the append-only `request_evidence`
@@ -635,14 +692,39 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
    checkout, build the legacy gateway under a new legacy `ZKAPI_IMAGE_TAG`,
    and recreate it. Never pause the legacy vault to stop deposits; anyone can
    still deposit directly, and such notes drain like any other.
-2. **From `X`.** The design closes legacy admission at `X`
-   (`--admission closed`, refusing new requests with `deployment_retiring`),
-   but the legacy line has no such switch yet: it needs a legacy point
-   release of serverd. Until one ships, the legacy stack keeps admitting
-   requests from legacy notes; the retirement bound below holds either way,
-   because requests end at each note's expiry. In-flight leases still settle,
-   clearances for fresh nullifiers stay available, and the legacy challenger
-   keeps running.
+2. **From `X`: close legacy admission at the gateway.** The design closes
+   legacy admission at `X` (`--admission closed`, refusing new requests with
+   `deployment_retiring`). The legacy serverd has no such switch, so the
+   legacy gateway refuses new requests instead. `POST /v2/openrouter/leases`
+   is the only route that admits a request; in the `nginx.conf` of the legacy
+   checkout, replace its `location = /v2/openrouter/leases` block with:
+
+   ```nginx
+   # From X: no new request is admitted. Lease status, retirement and expiry
+   # (/v2/openrouter/leases/{id}...), recovery and clearance stay open.
+   location = /v2/openrouter/leases {
+       default_type application/json;
+       add_header Cache-Control "no-store" always;
+       add_header Access-Control-Allow-Origin "*" always;
+       return 410 '{"status":"error","client_request_id":"","error_code":"deployment_retiring","error_message":"This zkAPI deployment no longer admits requests. Withdraw the balance.","retriable":false}';
+   }
+   ```
+
+   Build the legacy gateway under a new legacy `ZKAPI_IMAGE_TAG` and
+   recreate it, as for the deposit cutoff of step 1. Check that
+   `curl -s -o /dev/null -w '%{http_code}\n' -X POST "$API_URL/v2/openrouter/leases" -H 'content-type: application/json' -d '{}'`
+   prints 410 while `curl -fsS "$API_URL/health"` still answers. The legacy
+   serverd publishes no port of its own: the gateway is its only entrance.
+
+   **Do not skip this step.** Deposits stay permissionless (step 1), so
+   notes are still created after `X`. A note deposited at `X + k` could
+   otherwise buy service until its own expiry, `X + k + noteTtl`, after the
+   retirement bound of step 6. Once the legacy challenger stops, its owner
+   could escape from the genesis state, which nothing then defeats, and be
+   paid the whole deposit after consuming service. If admission closed later
+   than `X`, count step 6's bound from the moment it closed. In-flight leases
+   still settle, clearances for fresh nullifiers stay available, and the
+   legacy challenger keeps running.
 3. **Drain monitoring.** Track the legacy notes daily (Before you start, items
    1 and 2): notes by status, pending escapes, `nextNoteId()` for late direct
    deposits, and whether the treasury still accepts ETH. Anyone can finalize
@@ -687,9 +769,11 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
 6. **Retire the legacy stack** when every legacy note deposited before `X` is
    `Closed` or past its `effectiveExpiry`, and the last challenge deadline
    has passed: at most `X` + `noteTtl` + pauses + post-challenge grace +
-   `challengePeriod`. Notes deposited after `X` hold only their genesis state,
-   so they need no challenger; they exit at their deposit by escape (the
-   legacy build or 0.1.7) or are swept at expiry, as announced. An escape
+   `challengePeriod`, with `X` the moment admission closed (step 2). Notes
+   deposited after that moment hold only their genesis state, because the
+   gateway admitted no request for them, so they need no challenger; they
+   exit at their deposit by escape (the legacy build or 0.1.7) or are swept
+   at expiry, as announced. An escape
    stuck on a destination that rejects ETH (step 3) does not block retirement
    once its deadline has passed. Then, with the legacy deployment's `dc`:
    stop the challenger and signer and move the sender's balance; stop the
@@ -848,11 +932,23 @@ root, refuses every later proof built on that note. The obligation shows
 `retiring_leaf` until the retirement mines; it needs the indexer's path at
 the live root, about 7.2M gas, and the signer's retirement budget
 (`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`, default 2 per rolling day, counted
-per nonce). A refusal shows as `signer_refused`; raise the budget in
-`signer.env` and recreate the signer if repeated root races spent it. A miss
-means the challenger was down, blocked or out of funds through a whole
-window: find the cause before the next deadline (see
-[challenge operation](challenge-service.md)).
+per nonce). A refusal shows as `signer_refused`, and the signer's
+`challenge_refused` line names its reason:
+
+- `retirement_budget_exhausted`: raise `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`
+  in `signer.env` and recreate the signer (repeated root races spent it);
+- `retirement_not_after_escape` after an outage longer than
+  `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` (about seven days): raise the
+  lookback past the escape's finalization and recreate the signer;
+- `retirement_in_flight`: an earlier retirement of the note may still mine;
+  if it persists, the daemon or its upstream misbehaves;
+- `retirement_disabled`: set `ZKAPI_CHALLENGE_RETIRE_ON_MISS` to the same
+  value in both files.
+
+The operator's loss keeps growing until the retirement mines. A miss means
+the challenger was down, blocked or out of funds through a whole window: find
+the cause before the next deadline (see
+[the signer's refusals](challenge-service.md#the-signers-retirement-budget)).
 
 ### Settlement reviews
 
@@ -917,8 +1013,8 @@ the [fee-spike runbook](../docker/aws/signer/README.md#fee-spike-runbook) and
 | --- | --- |
 | Phase 0 | Roll forward where possible. The previous image tags bring back the defects the hardening fixed: the previous signer needs `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` and refuses the new challenger's fee fields; the previous challenger treats reserved leases as evidence, which burns nullifiers on a legacy vault; the previous server restores the seed fallback and proof-less clearance; the previous indexer needs `indexer.cursor` moved aside and replays from `DEPLOY_BLOCK` (never restore a `.v1-*.bak`). Never restore an older database over newer wallet activity. |
 | Before Phase C, step 4 | Do not publish; the contracts stay unused. An unannounced deployment can be abandoned before anyone deposits. |
-| After new deposits; a client or server bug | Fix forward. Exits never depend on server or client cooperation. Optionally set the new profiles to `"deposits": "closed"`. |
-| After new deposits; a vault or circuit bug that leaves exits sound | Close deposits on the new profiles. Reopen the legacy profiles only while the legacy stack runs, before `X`. Keep the new stack running until the new vault drains. Deploy a corrected vault with a new circuit ID if needed. |
+| After new deposits; a client or server bug | Fix forward. Exits never depend on server or client cooperation. Optionally close deposits as in the next row. |
+| After new deposits; a vault or circuit bug that leaves exits sound | Close deposits: set the new SDK profiles to `"deposits": "closed"`, and have the new stack's gateway answer 410 on its two deposit-only routes, `/v1/tree/next-note-id` and `/v1/tree/notes/{id}/zero-path` (the snippet of [Phase E, step 1](#phase-e-drain-and-retire-the-legacy-vault), in this checkout's `nginx.conf`, under a new `ZKAPI_IMAGE_TAG`). The profile flag reaches only the SDK: clientd's profile is compiled in and has no deposits switch, but its companion takes every deposit path from those two routes, so the gateway stops clientd deposits at once. Then ship a clientd release that refuses deposits. Reopen the legacy profiles only while the legacy stack runs, before `X`. Keep the new stack running until the new vault drains. Deploy a corrected vault with a new circuit ID if needed. |
 | An exit-soundness bug (forgery) | Pausing stops only new escapes and closes, and only for up to `maxPauseDuration`. Pending escapes finalize at their deadlines unless defeated or raised, and the challenger must act in each window; a forged escape with no successor evidence cannot be defeated. Decide in advance: pause, publish, keep the challengers running, and let honest users exit when exits reopen. The vault has no upgrade path. The canary caps bound honest SDK users' exposure, and the server's lease ceiling bounds per-request service. |
 | The server signs non-derived anchors (a bug) | Clients reject such successors (S4), and the request circuit makes them unspendable. Fix the server; nothing on chain changes. |
 | A clientd release | The new line never reads or changes the legacy wallet and payment files, so reinstalling 0.1.7 finds them as it left them. Each line withdraws only its own vault's notes. |
@@ -983,9 +1079,15 @@ refuses them everywhere.
 - **An exit RPC that is down.** With `--exit-rpc-url` set, clientd and the
   companion stop an escape with an error rather than fall back to the pinned
   RPC; the owner retries or changes the setting. Without an exit RPC, the
-  pinned RPC is trusted for escape liveness. The SDK's chat path still
-  releases a dead exit lock on the pinned RPC's reading when no exit RPC is
-  set.
+  pinned RPC is trusted for escape liveness: it decides when a dead exit lock
+  is released and whether an escape landed or was defeated. No client
+  releases a lock before its own clock says the released proof is dead, and
+  clientd reads a reported defeat again on every run instead of recording it
+  for good: a lying pinned RPC can delay an exit, but it cannot release a
+  lock while the escape proof can still land, nor make a defeat permanent.
+  clientd warns on every open escape while no exit RPC is set. The
+  SDK's chat path still releases a dead exit lock on the pinned RPC's reading
+  when no exit RPC is set.
 - **Deployment manifests.** Finalizing needs forge's broadcast log, and owner
   and treasury are checked only when it runs.
 
@@ -1004,5 +1106,7 @@ refuses them everywhere.
   siblings.
 - **The legacy clearance budget** is one shared pool while legacy clearance
   is on.
-- **No admission switch.** The legacy line cannot stop new requests at `X`
-  until a legacy serverd point release adds one (Phase E, step 2).
+- **Admission closes at the gateway.** The legacy serverd has no admission
+  switch; from `X` the legacy gateway refuses new leases (Phase E, step 2).
+  The retirement bound depends on it: a note that could still buy service
+  after `X` would need the legacy challenger until its own expiry.

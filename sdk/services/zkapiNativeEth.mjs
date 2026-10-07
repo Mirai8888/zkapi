@@ -165,6 +165,61 @@ export async function readVaultWord(funding, data, {
     return BigInt(word);
 }
 
+/**
+ * An EIP-1193-style `request({ method, params })` over the build-pinned RPC,
+ * each call bounded by `timeoutMs`. Exit-mode reads (deployment pins, note
+ * status, finality, the tree rebuild) use it or the user's exit RPC.
+ */
+export function pinnedRpcRequest(funding, { timeoutMs = 20_000, signal = null } = {}) {
+    validateNativeFunding(funding);
+    return ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        return rpc(funding, method, params, signal ? AbortSignal.any([signal, timeout]) : timeout);
+    };
+}
+
+/**
+ * The same over a user-configured exit RPC URL (design §6.4 E0, §6.6). It is
+ * the user's own endpoint, so it is called directly, never through the host's
+ * proxy, and without credentials.
+ */
+export function urlRpcRequest(url, { timeoutMs = 20_000, signal = null, fetchImpl = null } = {}) {
+    const target = exitRpcUrl(url);
+    return async ({ method, params = [] }) => {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        const response = await (fetchImpl || globalThis.fetch)(target, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit', cache: 'no-store',
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+        });
+        if (!response.ok) throw new Error(`The exit RPC answered HTTP ${response.status}.`);
+        const body = await response.json();
+        if (body.error) {
+            throw Object.assign(new Error(body.error.message || 'The exit RPC returned an error.'), {
+                code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code
+            });
+        }
+        return body.result;
+    };
+}
+
+/** A validated exit RPC URL: HTTPS, or HTTP on loopback; no credentials. */
+export function exitRpcUrl(value) {
+    let url;
+    try {
+        url = new URL(String(value));
+    } catch {
+        throw Object.assign(new Error('The exit RPC URL is invalid.'), { code: 'exit_rpc_invalid' });
+    }
+    if (url.username || url.password || (url.protocol !== 'https:'
+        && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))) {
+        throw Object.assign(new Error('The exit RPC must be an HTTPS (or loopback) URL without credentials.'), {
+            code: 'exit_rpc_invalid'
+        });
+    }
+    return url.href;
+}
+
 /** Whether a failed vault read says the vault lacks that view (a revert or no word), not that the RPC failed. */
 export function vaultViewMissing(error) {
     return error?.code === 'rpc_call_reverted' || error?.code === 'vault_value_invalid';

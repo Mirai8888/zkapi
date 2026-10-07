@@ -3,31 +3,47 @@ const CONTRACT_ERRORS = Object.freeze({
         code: 'invalid_proof',
         message: 'The vault rejected the withdrawal proof. Refresh the page and prepare the withdrawal again.'
     },
-    // StaleRoot(): on a vault with root history the proof's root is still
-    // known and only the Merkle siblings are stale against the live root.
+    // StaleRoot(): a deposit's (or retirement's) siblings no longer match
+    // the live root. Exits do no Merkle work on vault revision 3.
     '0x607447de': {
         code: 'stale_root',
-        message: 'The vault changed while the withdrawal was being prepared. The Merkle path (and, on older vaults, the proof) must be refreshed.'
+        message: 'The vault changed while the deposit was being prepared. Its Merkle path must be refreshed.'
     },
-    // UnknownRoot(): the proof's root left the vault's recent-root window.
+    // UnknownRoot(): the vault never held the proof's root.
     '0x8c520116': {
         code: 'unknown_root',
-        message: 'The vault no longer accepts this withdrawal proof’s Merkle root. The proof must be generated again.'
+        message: 'The vault does not know this withdrawal proof’s Merkle root. The proof must be generated again.'
     },
-    // ChallengedNullifier(): an escape at this state was already challenged.
+    // ChallengedNullifier(): an escape from this state was defeated by
+    // successor evidence: another device spent the next state.
     '0x2845df70': {
         code: 'challenged_nullifier',
-        message: 'An escape at this balance state was already challenged, so it cannot escape again. Withdraw from the server-signed next state instead.'
+        message: 'An escape from this balance state was already defeated: another device spent its next state. Restore the newest backup or exit kit.'
+    },
+    // SupersededState(): an escape from the next state was defeated.
+    '0x4e8225b5': {
+        code: 'superseded_state',
+        message: 'An escape from this balance’s next state was already defeated: another device holds a newer state.'
+    },
+    // ProofExpired(): the block is past the proof's valid_until.
+    '0xb67a7713': {
+        code: 'proof_expired',
+        message: 'The withdrawal proof expired before it was included. It must be generated again.'
+    },
+    // WrongWithdrawalKind(): an ownership proof, or a close sent as an escape.
+    '0x06868d53': {
+        code: 'wrong_withdrawal_kind',
+        message: 'The vault refused this kind of withdrawal proof.'
     },
     // InvalidDestination(): a zero payout address.
     '0xac6b05f5': {
         code: 'invalid_destination',
         message: 'The vault rejected the withdrawal address.'
     },
-    // Paused(): the owner paused the vault.
+    // Paused(): the owner paused the vault (exits reopen after maxPauseDuration).
     '0x9e87fac8': {
         code: 'vault_paused',
-        message: 'The vault is paused by its owner. Withdrawals resume when it is unpaused.'
+        message: 'The vault is paused by its owner. Escapes and closes reopen at the latest when its pause limit ends.'
     },
     '0x947e59c5': {
         code: 'replayed_nullifier',

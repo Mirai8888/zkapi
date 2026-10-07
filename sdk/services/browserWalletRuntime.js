@@ -1,25 +1,31 @@
 import { browserSdkOptions, beginBrowserSdkInitialization, browserSdkTransport } from '../configure.js';
-import { assertHardenedVault, assertNativeVault, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote, vaultRevisionMismatch, vaultViewMissing } from './zkapiNativeEth.mjs';
+import { assertNativeVault, exitRpcUrl, pinnedRpcRequest, urlRpcRequest, validateNativeFunding, validateNativeQuote, validateProofBoundQuote, readNativeQuote, readVaultWord, nativeUnitsForUsd, nativeUsdMicros, sameNativeQuote, requestBillingQuote } from './zkapiNativeEth.mjs';
 import { CHAT_SPENDING_TIER_USD } from './zkapiRequestCompat.mjs';
 import { TestnetPasswordAuth, testnetPasswordRequired } from './testnetPasswordAuth.mjs';
 import { sameFelt, waitForExpectedActiveRoot } from './zkapiWithdrawalRoot.mjs';
 import { isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import {
+    INVALID_SUCCESSOR_DISPOSITION,
+    LATE_SUCCESSOR_DISPOSITION,
     REQUEST_EVIDENCE_TYPE,
     REQUEST_JOURNAL_TYPE,
     anchorArchiveCapacity,
     buildRequestJournalRecord,
-    earliestLocalTransmission,
     feltKey,
-    isReceiptClaim,
     journalClientRequestId,
     lastDefinitiveObservation,
     lastObservation,
     requestObservation,
-    standingReceiptClaim,
-    transmittedAnchorDecision,
     unresolvedRequestArchiveAt
 } from './zkapiRequestArchive.mjs';
+import {
+    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, exitLockRefusal,
+    exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, recordReleasedProof,
+    releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
+} from './zkapiExitPolicy.mjs';
+import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
+import { buildExitKitPayload, sealExitKit } from './zkapiExitKit.mjs';
+import { canaryLimits, canaryRefusal, deploymentMismatchError, verifyDeployment } from './zkapiDeploymentCheck.mjs';
 import {
     archiveBrowserWallet,
     assertBrowserBackgroundWithdrawalAvailable,
@@ -63,41 +69,17 @@ import {
     writeBrowserWallet
 } from './browserWalletStore.js';
 
-// Escape override for an unsettled transmitted request (hardened vaults only):
-// the default grace must exceed the server's maximum settlement deadline, so
-// an honest operator has finalized (and an honest watcher challenged) first.
-const UNSETTLED_REQUEST_ESCAPE_AFTER_SECONDS = Object.freeze({
-    default: 43_200,
-    minimum: 3_600,
-    maximum: 604_800
-});
-// Allow the override early when waiting for the grace could let the note
-// expire: a challenged escape still needs a full challenge period plus margin.
-const ESCAPE_OVERRIDE_EXPIRY_MARGIN_SECONDS = 6 * 3_600;
-const ESCAPE_OVERRIDE_WARNING = 'An escape while a private request is unsettled can be challenged if the server later finalizes that request. On this vault a challenge only costs the escape gas and delay: the note becomes active again and the wallet applies the finalized receipt, so the funds stay withdrawable from the next state.';
-// receipt_journal_missing keeps the override: only a receipt that verifies may
-// veto it, because a lying server or gateway can claim 'finalized' with a
-// receipt this wallet cannot apply. A genuine claim makes the challenge
-// certain, so that case has its own warning, and the override proceeds there
-// only with that case's own acknowledgement (overrideUnsettledRequest:
-// 'receipt_journal_missing'), never with the general `true`. A saved claim
-// stands until the server reports the nullifier unknown or clearance_reserved,
-// so a failed or different later read never brings back the general case.
-const RECEIPT_JOURNAL_MISSING_OVERRIDE_WARNING = 'The server claims a finalized receipt for this balance that this wallet cannot apply. If that claim is genuine, the escape will be challenged, its gas is lost and the note then needs the operator’s help. If it is false, the escape is the only exit.';
-const RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT = 'receipt_journal_missing';
-const RECEIPT_JOURNAL_MISSING_MESSAGE = 'The server reports a finalized private request for this balance that this browser cannot apply.';
-// The same refusal when it rests on a claim that an earlier read saved.
-const RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE = 'The server earlier reported a finalized private request for this balance that this browser cannot apply.';
+// The build-pinned settlement window W when a profile predates it (mainnet's).
+const DEFAULT_SETTLEMENT_WINDOW_SECONDS = 21_905;
+const EXIT_RPC_STORAGE_KEY = 'zkapi-exit-rpc-url';
+const RECEIPT_UNRECOVERABLE_MESSAGE = 'The server reports a finalized private request for this balance that this browser cannot apply: its request journal is gone. Only withdrawing remains, conceding at most the request’s bound.';
+const DEVICE_NOT_NEWEST_MESSAGE = 'Another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit before withdrawing.';
+const EXIT_LOCKED_MESSAGE = 'A withdrawal of this balance is in progress, so no new private chat can start from it. Finish the withdrawal, or cancel it; a released exit proof keeps the balance frozen until it expires.';
+const NOTE_NEAR_EXPIRY_MESSAGE = 'This balance is too close to its expiry for a new private chat: a chat now could still be settling when the balance must be withdrawn. Withdraw it instead.';
+const INVALID_SUCCESSOR_MESSAGE = 'The server settled a private request for this balance with a successor that fails this wallet’s checks. It is treated as withheld: the balance can only be withdrawn, conceding at most that request’s bound.';
 const DEPOSITS_CLOSED_MESSAGE = 'This deployment no longer accepts new deposits. Existing balances and deposits already started can still be completed, recovered and withdrawn.';
 const REQUEST_ARCHIVE_LIMIT_MESSAGE = 'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.';
 const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
-const CLEARANCE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000]);
-// The reference gateway's own 429: the request never reached the API.
-const CLEARANCE_GATEWAY_THROTTLED = 'gateway_rate_limited';
-// Server refusals of a proof-less clearance that reserved nothing.
-const CLEARANCE_NOTHING_RESERVED = new Set(['clearance_ownership_required', 'legacy_clearance_capacity']);
-const CLEARANCE_THROTTLED_WITHDRAWAL_ONLY_MESSAGE = 'The service is receiving too many requests and did not grant this mutual close. Its ownership proof was already sent, and on this vault a private request from this balance could let that proof burn the balance, so the balance stays withdrawal-only. Try the withdrawal again in a moment, or escape.';
-const TRANSMITTED_OWNERSHIP_MESSAGE = 'This balance’s current state was already sent with a private request, and this vault can permanently burn a challenged escape. The server asks for an ownership proof, which works as such an escape, so this wallet does not send one from this state. A private chat that settles moves the balance to a new state that can be withdrawn; otherwise wait for the pending request to settle or ask the operator.';
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
 const SETTLEMENT_RETRY_MAX_MS = 60_000;
 const VAULT_SELECTORS = Object.freeze({
@@ -112,45 +94,6 @@ const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'solvency_bound', 'request_time'
 ]);
 
-/** The warning that goes with an escape override offered for a refusal code. */
-function escapeOverrideWarning(code) {
-    return code === 'receipt_journal_missing' ? RECEIPT_JOURNAL_MISSING_OVERRIDE_WARNING : ESCAPE_OVERRIDE_WARNING;
-}
-
-/** The overrideUnsettledRequest value that acknowledges that code's warning. */
-function escapeOverrideAcknowledgement(code) {
-    return code === 'receipt_journal_missing' ? RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT : true;
-}
-
-/** The escape override fields of a refusal that offers it. */
-function escapeOverrideData(code, overrideAfter) {
-    return {
-        escape_override_after: overrideAfter,
-        escape_override_warning: escapeOverrideWarning(code),
-        escape_override_acknowledgement: escapeOverrideAcknowledgement(code)
-    };
-}
-
-/**
- * The override code of a nullifier reading, fresh ({ status, response }) or
- * saved ({ status, receipt, clientRequestId }), taken after the receipt it
- * carried was offered for install. 'finalized' with a receipt that did not
- * install, so the note state is still current, is receipt_journal_missing.
- */
-function readingOverrideCode(observed) {
-    return isReceiptClaim(observed) ? 'receipt_journal_missing' : null;
-}
-
-/**
- * Whether the receipt_journal_missing case applies after a fresh reading: the
- * reading is such a claim, or a claim saved before it stands and the reading
- * does not contradict it ('unknown' or 'clearance_reserved').
- */
-function journalMissingAfter(observed, savedClaim) {
-    return readingOverrideCode(observed) === 'receipt_journal_missing'
-        || (Boolean(savedClaim) && !['unknown', 'clearance_reserved'].includes(observed?.status));
-}
-
 /** A saved observation of a nullifier reading, marking and naming the receipt it carried. */
 function readingObservation(observed, context) {
     return requestObservation(observed.status, context, Date.now(), {
@@ -162,21 +105,25 @@ function readingObservation(observed, context) {
 
 /**
  * A GET /v2/nullifiers answer as a reading: only 'unknown', 'reserved',
- * 'finalized' (with its response) and 'clearance_reserved' are readings;
- * anything else is 'unavailable'.
+ * 'finalized' (with its response), 'clearance_reserved', 'exit_deferred' and
+ * 'exited_unsigned' are readings; anything else is 'unavailable'. A reported
+ * settlement deadline (seconds) is kept for E3.
  */
 function nullifierReading(recovery) {
+    const deadline = Number(recovery?.settlement_deadline);
+    const settlementDeadline = Number.isSafeInteger(deadline) && deadline > 0 ? deadline : null;
     if (recovery?.status === 'not_found' && recovery.nullifier_status === 'unknown' && !recovery.request_response) {
-        return { status: 'unknown', response: null };
+        return { status: 'unknown', response: null, settlementDeadline };
     }
     if (recovery?.status === 'ok'
-        && ['reserved', 'finalized', 'clearance_reserved'].includes(recovery.nullifier_status)) {
+        && ['reserved', 'finalized', 'clearance_reserved', 'exit_deferred', 'exited_unsigned'].includes(recovery.nullifier_status)) {
         return {
             status: recovery.nullifier_status,
-            response: recovery.nullifier_status === 'finalized' ? recovery.request_response || null : null
+            response: recovery.nullifier_status === 'finalized' ? recovery.request_response || null : null,
+            settlementDeadline
         };
     }
-    return { status: 'unavailable', response: null };
+    return { status: 'unavailable', response: null, settlementDeadline: null };
 }
 
 function browserConfigUrl() {
@@ -188,13 +135,12 @@ const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
 // Setups a bundle can be built for; the build-pinned profile names one, and
 // the proof worker must run a bundle of exactly that setup.
 const BUNDLE_SETUP_IDS = Object.freeze(['dev', 'mpc-1']);
-// valid_until of kind 0 and 1 proofs (checked by the vault) and of kind 2
-// ownership proofs (checked by the server), design §6.4 E0.
-const WITHDRAWAL_PROOF_VALIDITY_SECONDS = 10_800;
-const OWNERSHIP_PROOF_VALIDITY_SECONDS = 3_600;
 // A saved withdrawal proof is reused only while this much of its validity
-// remains, so a reused proof can still be signed and included in time.
+// remains, so a reused proof can still be signed and included in time (E4.7).
 const WITHDRAWAL_PROOF_REUSE_MARGIN_SECONDS = 1_800;
+// installRecoveredResponse's answer for a valid successor that arrived after
+// an exit proof was released: archived as late_successor, not installed (E4.6).
+const LATE_SUCCESSOR = Symbol('late-successor');
 const MAX_RECOVERY_WAIT_MS = 45_000;
 // OA may briefly throttle child-key creation. Keep retrying the same durable,
 // idempotent lease request long enough to cross a one-minute limiter without
@@ -235,34 +181,6 @@ function retryAfterMilliseconds(error) {
     return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1_000) : 0;
 }
 
-/**
- * The refusal of a mutual close at a transmitted state of a vault without
- * non-destructive challenges, when the server will not grant a proof-less
- * clearance: `error` is that answer (null when refused before asking).
- */
-function transmittedOwnershipRefusal(error) {
-    return new BrowserWalletHttpError(TRANSMITTED_OWNERSHIP_MESSAGE, 409, 'transmitted_anchor_ownership_unsafe', {
-        transmitted: true,
-        clearance_error_code: error?.code || null
-    });
-}
-
-/**
- * A gateway 429 that outlasted the retries of a clearance carrying an
- * ownership proof, on a vault whose challenge burns the nullifier: the same
- * code and retry hint, with `withdrawal_only` because the note keeps its
- * withdrawal-only marker.
- */
-function clearanceThrottledAfterOwnershipProof(error) {
-    const throttled = new BrowserWalletHttpError(CLEARANCE_THROTTLED_WITHDRAWAL_ONLY_MESSAGE,
-        error?.status ?? 429, CLEARANCE_GATEWAY_THROTTLED, {
-            ...(error?.data && typeof error.data === 'object' ? error.data : {}),
-            withdrawal_only: true
-        });
-    throttled.cause = error;
-    return throttled;
-}
-
 class WorkerBridge {
     constructor() {
         this.worker = new Worker(browserSdkOptions().workerUrl || new URL('./zkapiWasmWorker.js', import.meta.url), { type: 'module' });
@@ -300,6 +218,20 @@ function throwIfAborted(signal) {
     const error = new DOMException('The operation was aborted.', 'AbortError');
     error.isCancelled = true;
     throw error;
+}
+
+/**
+ * `promise`, or a rejection as soon as `signal` aborts: an exit-mode call must
+ * end at its timeout even when the transport ignores the signal (E0).
+ */
+function abortable(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+    return new Promise((resolve, reject) => {
+        const aborted = () => reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+        signal.addEventListener('abort', aborted, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+    });
 }
 
 function exactTrustedUrl(supplied, expected, label) {
@@ -471,6 +403,13 @@ function sameStateExceptBound(next, current) {
     return STATE_IDENTITY_FIELDS.every(field => JSON.stringify(next[field] ?? null) === JSON.stringify(current[field] ?? null));
 }
 
+/** A note state from the WebAssembly, with the deposit-time path the previous one saved. */
+function withDepositPath(next, previous) {
+    return previous?.deposit_path && next && Number(next.note_id) === Number(previous.note_id)
+        ? { ...next, deposit_path: previous.deposit_path }
+        : next;
+}
+
 function nowSeconds() {
     return Math.floor(Date.now() / 1000);
 }
@@ -562,10 +501,13 @@ class BrowserWalletRuntime extends EventTarget {
             requestPassword: browserSdkOptions().requestTestnetPassword
         });
         await assertNativeVault(this.config.funding);
-        // A build-pinned vault_revision 2 enables the escape override and
-        // proof reuse, which are safe only on a vault whose challenge does not
-        // burn the nullifier. Require the hardened interface on chain first.
-        if (this.vaultCapabilities().hardenedVault) await assertHardenedVault(this.config.funding);
+        // Design §6.5: the pinned RPC's view of the deployment pins, checked
+        // again through the wallet provider before every deposit. A mismatch
+        // only refuses deposits; exits never depend on it.
+        this.deploymentVerification = await verifyDeployment({ request: this.pinnedRpc(),
+            trusted: this.browserConfig.trusted_deployment, chainId: Number(this.config.funding.chain_id),
+            source: 'pinned_rpc' }).then(result => ({ checkedAt: Date.now(), ok: result.ok, results: [result] }),
+            error => ({ checkedAt: Date.now(), ok: false, error: error?.code || error?.message || String(error) }));
         this.worker = new WorkerBridge();
         await this.assertWorkerBundle();
         // Initialization participates in the same global lock as every later
@@ -746,16 +688,17 @@ class BrowserWalletRuntime extends EventTarget {
             'OA verifier',
             normalizedUrl
         );
-        // Escape and clearance capabilities come only from the build-pinned
-        // trust anchor, never from the served manifest: a server claiming a
-        // hardened vault must not unlock the escape override on an old one.
-        if (trusted.vault_revision != null
-            && (!Number.isSafeInteger(trusted.vault_revision) || trusted.vault_revision < 1)) {
-            throw new Error('browser-config.json contains an invalid trusted vault_revision.');
+        // Capabilities come only from the build-pinned trust anchor, never
+        // from the served manifest. This build supports vault revision 3 only.
+        if (trusted.vault_revision !== 3) {
+            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 3).');
         }
-        if (trusted.clearance_ownership_proof != null
-            && !['required', 'optional'].includes(trusted.clearance_ownership_proof)) {
-            throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof.');
+        if (trusted.clearance_ownership_proof !== 'required') {
+            throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof (this build needs "required").');
+        }
+        if (trusted.settlement_window_seconds != null
+            && (!Number.isSafeInteger(trusted.settlement_window_seconds) || trusted.settlement_window_seconds <= 0)) {
+            throw new Error('browser-config.json contains an invalid trusted settlement_window_seconds.');
         }
         // The deposit cutoff of a deployment being drained, also from the
         // build-pinned profile only.
@@ -790,33 +733,13 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * Deployment capabilities from the trusted (build-pinned) deployment.
-     * vault_revision >= 2 is the hardened vault whose challenge is
-     * non-destructive; absent means the currently deployed vaults (strict).
+     * Deployment capabilities. This build supports only vault revision 3
+     * (capability exit_concession 1): escape payouts that the destination
+     * rejects are credited, and every clearance carries a kind-2 ownership
+     * proof.
      */
     vaultCapabilities() {
-        const trusted = this.browserConfig?.trusted_deployment || {};
-        const vaultRevision = Number.isSafeInteger(trusted.vault_revision) && trusted.vault_revision >= 1
-            ? trusted.vault_revision
-            : 1;
-        const clearanceOwnershipProof = ['required', 'optional'].includes(trusted.clearance_ownership_proof)
-            ? trusted.clearance_ownership_proof
-            : null;
-        return {
-            vaultRevision,
-            hardenedVault: vaultRevision >= 2,
-            clearanceOwnershipProof,
-            sendOwnershipProof: clearanceOwnershipProof != null || vaultRevision >= 2
-        };
-    }
-
-    unsettledRequestEscapeGraceMs() {
-        const configured = this.browserConfig?.unsettled_request_escape_after_seconds;
-        const seconds = Number.isSafeInteger(configured)
-            ? Math.min(Math.max(configured, UNSETTLED_REQUEST_ESCAPE_AFTER_SECONDS.minimum),
-                UNSETTLED_REQUEST_ESCAPE_AFTER_SECONDS.maximum)
-            : UNSETTLED_REQUEST_ESCAPE_AFTER_SECONDS.default;
-        return seconds * 1_000;
+        return { vaultRevision: 3, exitConcession: true, payoutCredits: true, sendOwnershipProof: true };
     }
 
     /**
@@ -1036,40 +959,31 @@ class BrowserWalletRuntime extends EventTarget {
         };
     }
 
-    /** Public, proof-free view of transmitted requests at the selected note state. */
+    /** Public, proof-free view of transmitted requests and the exit rules at the selected note state. */
     requestArchiveSummary() {
-        const { vaultRevision, hardenedVault } = this.vaultCapabilities();
-        const graceMs = this.unsettledRequestEscapeGraceMs();
-        const entries = this.archivedRequestsAt(this.runtime?.state);
-        const overrideAfter = this.escapeOverrideAfter(this.runtime?.state, entries);
-        // The warning and its acknowledgement follow the state's standing
-        // receipt claim, as every refusal that offers the override does.
-        const claimCode = standingReceiptClaim(entries) ? 'receipt_journal_missing' : null;
+        const state = this.runtime?.state;
+        const entries = this.archivedRequestsAt(state);
+        const exit = this.exitSummary(state);
         const installed = (this.requestArchive || [])
             .filter(record => record.type === REQUEST_JOURNAL_TYPE && record.disposition === 'installed'
                 && record.deploymentId === this.manifest?.deployment_id
-                && Number(record.noteId) === Number(this.runtime?.state?.note_id))
+                && Number(record.noteId) === Number(state?.note_id))
             .sort((left, right) => Number(right.installedAt || right.updatedAt || 0)
                 - Number(left.installedAt || left.updatedAt || 0))[0];
         return {
-            vault_revision: vaultRevision,
-            escape_override: hardenedVault
-                ? {
-                    grace_seconds: graceMs / 1_000,
-                    warning: escapeOverrideWarning(claimCode),
-                    acknowledgement: escapeOverrideAcknowledgement(claimCode)
-                }
-                : null,
+            vault_revision: this.vaultCapabilities().vaultRevision,
+            exit,
             unresolved_requests: entries.map(entry => {
                 const observed = lastObservation(entry);
                 return {
                     client_request_id: entry.clientRequestId || null,
                     kind: entry.type === REQUEST_JOURNAL_TYPE ? 'request' : 'evidence',
                     disposition: entry.disposition,
+                    class: exitRecordClass(entry),
                     created_at: Number(entry.createdAt) || null,
                     server_status: observed?.status || null,
                     server_status_at: observed?.at || null,
-                    escape_override_after: overrideAfter
+                    escape_at: exit?.escape_at ?? null
                 };
             }),
             last_settlement: installed ? {
@@ -1079,6 +993,55 @@ class BrowserWalletRuntime extends EventTarget {
                 settlement_reason: installed.settlementReason ?? null,
                 installed_at: installed.installedAt ?? installed.updatedAt ?? null
             } : null
+        };
+    }
+
+    /**
+     * The exit rules at a state from local data only (design §6.4): when an
+     * exit must start, whether the state is fresh (E2), when an escape
+     * concedes the bound (T, E3), the exit lock and the exit kit's age.
+     * Times are in milliseconds.
+     */
+    exitSummary(state = this.runtime?.state) {
+        if (!state) return null;
+        const now = nowSeconds();
+        let deadline = null;
+        try {
+            deadline = mustInitiateBy(lowExpiry(state.expiry_ts));
+        } catch {
+            deadline = null;
+        }
+        const status = stateExitStatus({ boundAtState: state.bound_at_state || 0, records: this.exitRecordsAt(state) });
+        const T = status.fresh || status.newestCreatedAt == null || deadline == null ? null : escapeAt({
+            createdAt: status.newestCreatedAt,
+            settlementWindowSeconds: this.settlementWindowSeconds(),
+            unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds,
+            mustInitiateBy: deadline
+        });
+        const lock = this.runtime?.exitLock;
+        const exits = releasedExitProofs(lock);
+        const stateSeq = Number(this.runtime?.stateSeq || 0);
+        const exported = this.runtime?.exitKitExportedSeq;
+        return {
+            must_initiate_by: deadline == null ? null : deadline * 1_000,
+            near_expiry: deadline != null && nearExpiry({ now, settlementWindowSeconds: this.settlementWindowSeconds(),
+                mustInitiateBy: deadline }),
+            bound_at_state: String(status.boundAtState),
+            state_fresh: status.fresh,
+            escape_at: T == null ? null : T * 1_000,
+            device_not_newest: status.challenged,
+            lock: lock ? {
+                mode: lock.mode,
+                since: Number(lock.since) * 1_000,
+                released: (lock.released || []).length,
+                exit_proofs_released: exits.length,
+                releasable_after: exits.length
+                    ? (Math.max(...exits.map(entry => Number(entry.valid_until))) + EXIT_TIMING.lockReleaseMarginSeconds) * 1_000
+                    : null
+            } : null,
+            exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
+            deposit_path_saved: Boolean(state.deposit_path),
+            exit_rpc_url: this.getExitRpcUrl()
         };
     }
 
@@ -1092,21 +1055,6 @@ class BrowserWalletRuntime extends EventTarget {
     archivedRequestsAt(state = this.runtime?.state) {
         const key = this.archiveKey(state);
         return key ? unresolvedRequestArchiveAt(this.requestArchive, key) : [];
-    }
-
-    /**
-     * When the escape override opens at a transmitted state on a hardened
-     * vault, absent an imminent expiry: the grace after the live request's
-     * transmission while one exists (its own time gate binds first), else
-     * after the earliest archived one. Null where no override applies.
-     */
-    escapeOverrideAfter(state = this.runtime?.state, entries = this.archivedRequestsAt(state)) {
-        if (!this.vaultCapabilities().hardenedVault
-            || entries.some(entry => entry.type === REQUEST_EVIDENCE_TYPE)) return null;
-        const earliest = earliestLocalTransmission(entries);
-        if (earliest == null) return null;
-        const live = state && state === this.runtime?.state ? Number(this.runtime?.journal?.created_at_ms) : NaN;
-        return (Number.isSafeInteger(live) && live > earliest ? live : earliest) + this.unsettledRequestEscapeGraceMs();
     }
 
     /** A complete archive record for a journal at a state, or null when incomplete. */
@@ -2042,7 +1990,7 @@ class BrowserWalletRuntime extends EventTarget {
                 || (args.commitment && !sameFelt(pending.commitment, args.commitment))) {
                 throw new Error('The deposit secret does not match this browser’s durable pending deposit.');
             }
-            const state = await this.worker.call('confirmDeposit', {
+            let state = await this.worker.call('confirmDeposit', {
                 config: this.config.wallet_core,
                 args: {
                     secret: args.secret,
@@ -2051,9 +1999,17 @@ class BrowserWalletRuntime extends EventTarget {
                     expiry_ts: Number(args.expiry_ts)
                 }
             });
+            // Amendment A1: the path the deposit used, at the root it set (the
+            // NoteDeposited newRoot), proves exits for the note's whole life:
+            // the vault accepts any root it ever held. Kept only if it leads
+            // from this note's leaf to that root.
+            const depositPath = await this.verifiedDepositPath(state, args.deposit_root, pending.zero_path);
+            if (depositPath) state = { ...state, deposit_path: depositPath };
             await this.commit({
                 ...this.runtime,
                 state,
+                stateSeq: 1,
+                exitLock: null,
                 journal: null,
                 pendingDeposit: null,
                 preparedWithdrawal: null
@@ -2080,6 +2036,23 @@ class BrowserWalletRuntime extends EventTarget {
                 transactionHash: args.transactionHash || null
             };
         });
+    }
+
+    /** The deposit-time Merkle path, when it leads from the note's leaf to `root`. */
+    async verifiedDepositPath(state, root, siblings) {
+        if (root == null || !Array.isArray(siblings) || siblings.length !== 32) return null;
+        let activeRoot;
+        try {
+            activeRoot = `0x${BigInt(root).toString(16).padStart(64, '0')}`;
+        } catch {
+            return null;
+        }
+        const path = { active_root: activeRoot, siblings: siblings.map(String) };
+        try {
+            return await this.worker.call('notePathMatches', { state, path }) === true ? path : null;
+        } catch {
+            return null;
+        }
     }
 
     async nativeBillingQuote(signal) {
@@ -2121,7 +2094,24 @@ class BrowserWalletRuntime extends EventTarget {
             );
         }
         if (this.runtime.journal) return this.runtime.journal.prepared_request;
+        // C3: no request proof while the exit lock is held. A lock whose
+        // released proofs are all dead is released here (E6); one never
+        // released needs the user's cancel.
+        if (this.runtime.exitLock) {
+            const release = await this.releaseExitLockLocked();
+            if (!release.released) throw this.exitLockedError(this.runtime.exitLock, release);
+            if (release.installed || !this.runtime.state) {
+                throw new BrowserWalletHttpError('The balance changed when its withdrawal ended. Send the message again.',
+                    409, 'lease_pending');
+            }
+        }
         if (this.runtime.preparedWithdrawal) throw new Error('Finish the prepared withdrawal before sending another message.');
+        // C4: a request whose settlement could run past the latest time to
+        // start an exit is refused (from the note's own expiry_ts).
+        if (nearExpiry({ now: nowSeconds(), settlementWindowSeconds: this.settlementWindowSeconds(),
+            mustInitiateBy: mustInitiateBy(lowExpiry(this.runtime.state.expiry_ts)) })) {
+            throw new BrowserWalletHttpError(NOTE_NEAR_EXPIRY_MESSAGE, 409, 'note_near_expiry');
+        }
         // Fail closed before proving: every transmitted request needs an
         // archive identity, is never sent at a state the server is already
         // settling, and keeps the archive bounded.
@@ -2172,12 +2162,20 @@ class BrowserWalletRuntime extends EventTarget {
         // The state with its bound, the journal and its append-only archive
         // record land in ONE durable write before any POST can carry the
         // proof off this device (design §6.2).
-        await this.commit({ ...this.runtime, state: prepared.state, journal: prepared.journal },
-            { requestArchive: [record] });
+        await this.commit({ ...this.runtime, state: withDepositPath(prepared.state, this.runtime.state),
+            journal: prepared.journal }, { requestArchive: [record] });
         return prepared.request;
     }
 
     assertAnchorAcceptsRequest(state) {
+        const key = this.archiveKey(state);
+        // A signed successor archived as invalid (or held back by an exit
+        // lock) means the server finalized this state's nullifier: a new
+        // request would only replay it. Only withdrawing remains.
+        if (key && requestRecordsAtState(this.requestArchive, key).some(entry =>
+            [INVALID_SUCCESSOR_DISPOSITION, LATE_SUCCESSOR_DISPOSITION].includes(entry.disposition))) {
+            throw new BrowserWalletHttpError(INVALID_SUCCESSOR_MESSAGE, 409, 'invalid_successor');
+        }
         const journals = this.archivedRequestsAt(state)
             .filter(entry => entry.type === REQUEST_JOURNAL_TYPE);
         const finalized = journals.map(lastDefinitiveObservation)
@@ -2187,8 +2185,8 @@ class BrowserWalletRuntime extends EventTarget {
                 && entry.journal?.user_rerandomization != null && entry.journal?.prepared_request);
             throw new BrowserWalletHttpError(installable
                 ? 'A settled private request receipt must be applied to this balance first. Try again in a moment.'
-                : RECEIPT_JOURNAL_MISSING_MESSAGE,
-            409, installable ? 'receipt_pending_install' : 'receipt_journal_missing',
+                : RECEIPT_UNRECOVERABLE_MESSAGE,
+            409, installable ? 'receipt_pending_install' : 'receipt_unrecoverable',
             { nullifier_status: 'finalized' });
         }
         // Every request at one state shares its nullifier, so a new proof would
@@ -2201,7 +2199,6 @@ class BrowserWalletRuntime extends EventTarget {
                 { nullifier_status: 'reserved' }
             );
         }
-        const key = this.archiveKey(state);
         if (key && !anchorArchiveCapacity(this.requestArchive, key).available) {
             throw new BrowserWalletHttpError(REQUEST_ARCHIVE_LIMIT_MESSAGE, 409, 'request_archive_limit');
         }
@@ -2867,11 +2864,15 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Install a finalized, signed receipt. The response selects its journal:
      * the live one, or an archived one at this state that still holds its
-     * private rerandomization (a discarded, evicted or abandoned request the
-     * server finalized later). completeResponse verifies the commitment
-     * algebra, the charge bound (a worst-case charge equal to the proven
-     * solvency bound is valid) and the state signature before the ONE commit
-     * that installs it.
+     * private rerandomization (a discarded, evicted, abandoned or late request
+     * the server finalized later). completeResponse checks S1–S6 (design
+     * §6.1) before the ONE commit that installs it. A correctly signed
+     * successor that fails S3, S4 or S5 is archived as invalid_successor and
+     * treated as withheld. While an exit proof released from this state can
+     * still land, a valid successor is archived as late_successor instead and
+     * installs when the exit lock is released (E4.6, E6); this returns
+     * LATE_SUCCESSOR then. An install moves an exit lock that released no
+     * exit proof to the new state.
      */
     async installRecoveredResponse(clientRequestId, onProgress = () => {}, { response = null } = {}) {
         onProgress('applying', 'Updating your private balance…');
@@ -2903,7 +2904,7 @@ class BrowserWalletRuntime extends EventTarget {
                 await this.saveRequestObservations(this.archivedRequestsAt(state),
                     { status: 'finalized', response: receipt }, 'recovery');
             }
-            throw new BrowserWalletHttpError(RECEIPT_JOURNAL_MISSING_MESSAGE, 409, 'receipt_journal_missing',
+            throw new BrowserWalletHttpError(RECEIPT_UNRECOVERABLE_MESSAGE, 409, 'receipt_unrecoverable',
                 { nullifier_status: 'finalized' });
         }
         // The quote was validated against the pins when the proof was made; a
@@ -2913,29 +2914,91 @@ class BrowserWalletRuntime extends EventTarget {
         let payload;
         try { payload = JSON.parse(receipt.response_payload); } catch { /* Reject below. */ }
         if (!sameNativeQuote(payload?.billing_quote, quote)) throw new Error('The settlement receipt changed the authorized ETH/USD quote.');
+        const lock = this.runtime.exitLock;
+        const lockHere = Boolean(lock && state && Number(lock.noteId) === Number(state.note_id)
+            && sameFelt(lock.anchor, state.current_anchor));
+        const exitProofLive = lockHere && releasedExitProofs(lock).length > 0;
         const prepared = this.runtime.preparedWithdrawal;
-        if (preparedWithdrawalHasSubmission(prepared)
-            || (state && unresolvedLateWithdrawalForNote(this.runtime, state.note_id))) {
+        if (!exitProofLive && (preparedWithdrawalHasSubmission(prepared)
+            || (state && unresolvedLateWithdrawalForNote(this.runtime, state.note_id)))) {
             throw new BrowserWalletHttpError(
                 'A withdrawal transaction for this balance is still unresolved. Check it before applying a settled private request.',
                 409,
                 'withdrawal_submission_pending'
             );
         }
-        const next = await this.worker.call('completeResponse', {
-            config: this.config.wallet_core,
-            args: {
-                state,
-                journal,
-                response: receipt
-            }
-        });
+        let next;
+        try {
+            next = await this.worker.call('completeResponse', {
+                config: this.config.wallet_core,
+                args: {
+                    state,
+                    journal,
+                    response: receipt
+                }
+            });
+        } catch (error) {
+            throw await this.successorRefusal(error, { state, journal, current, receipt });
+        }
+        const live = Boolean(current) && journalClientRequestId(current) === journalClientRequestId(journal);
+        if (exitProofLive) {
+            // C3: while a released exit proof can land, the client never
+            // spends this state's successor. It installs after E6.
+            const record = this.tryRequestJournalRecord(journal, state, { disposition: LATE_SUCCESSOR_DISPOSITION });
+            if (!record) throw new Error('The late private request journal is incomplete.');
+            await this.commit({ ...this.runtime, ...(live ? { journal: null, lease: null } : {}) },
+                { requestArchive: [{ ...record, lateResponse: receipt, lateAt: Date.now() }] });
+            return LATE_SUCCESSOR;
+        }
         // An unsubmitted withdrawal plan or clearance marker was bound to the
-        // consumed state's nullifier; the next state starts clean.
-        await this.commit({ ...this.runtime, state: next, journal: null, lease: null, preparedWithdrawal: null }, {
+        // consumed state's nullifier; the next state starts clean. A lock that
+        // released no exit proof moves with the note (E3.2, E4.3).
+        const exitLock = lockHere
+            ? { ...lock, anchor: next.current_anchor, since: nowSeconds(), released: [] }
+            : lock || null;
+        await this.commit({
+            ...this.runtime,
+            state: withDepositPath(next, state),
+            stateSeq: Number(this.runtime.stateSeq || 0) + 1,
+            exitLock,
+            journal: null,
+            lease: null,
+            preparedWithdrawal: null
+        }, {
             requestArchive: this.installArchiveUpdates({ state, journal, current, next, receipt, payload })
         });
         return true;
+    }
+
+    /**
+     * The refusal of a successor that failed S1–S6. One that fails S3, S4 or
+     * S5 although signed is archived as invalid_successor and treated as
+     * withheld (design §6.1); an unsigned one is no operator answer at all.
+     */
+    async successorRefusal(error, { state, journal, current, receipt }) {
+        const message = String(error?.message || error || '');
+        if (message.startsWith('invalid_successor')) {
+            const check = /^invalid_successor: (S[345])/.exec(message)?.[1] || null;
+            const record = this.tryRequestJournalRecord(journal, state, { disposition: INVALID_SUCCESSOR_DISPOSITION });
+            const live = Boolean(current) && journalClientRequestId(current) === journalClientRequestId(journal);
+            if (record) {
+                try {
+                    await this.commit({ ...this.runtime, ...(live ? { journal: null, lease: null } : {}) }, {
+                        requestArchive: [{ ...record, invalidCheck: check, invalidReason: message.slice(0, 300),
+                            chargeApplied: Number.isSafeInteger(Number(receipt?.charge_applied)) ? Number(receipt.charge_applied) : null,
+                            invalidAt: Date.now() }]
+                    });
+                } catch (commitError) {
+                    console.warn('Unable to archive an invalid successor.', commitError);
+                }
+            }
+            return new BrowserWalletHttpError(INVALID_SUCCESSOR_MESSAGE, 409, 'invalid_successor', { check });
+        }
+        if (message.startsWith('successor_signature_invalid')) {
+            return new BrowserWalletHttpError('The settlement receipt is not signed by this deployment’s state key.',
+                409, 'successor_signature_invalid');
+        }
+        return error;
     }
 
     installArchiveUpdates({ state, journal, current, next, receipt, payload }) {
@@ -3206,132 +3269,476 @@ class BrowserWalletRuntime extends EventTarget {
         };
     }
 
-    async prepareWithdrawal(mode, destination, {
-        expectedActiveRoot = null,
-        reprove = false,
-        overrideUnsettledRequest = false
-    } = {}) {
-        await this.init();
-        // The override exists only where a wrongly challenged escape is
-        // non-destructive (hardened vault). Strict mode ignores it entirely.
-        // `true` acknowledges the general warning; 'receipt_journal_missing'
-        // acknowledges that case's own warning, and covers the general one.
-        const override = (overrideUnsettledRequest === true
-            || overrideUnsettledRequest === RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT)
-            && mode === 'escape' && this.vaultCapabilities().hardenedVault;
-        const journalMissingAcknowledged = override
-            && overrideUnsettledRequest === RECEIPT_JOURNAL_MISSING_ACKNOWLEDGEMENT;
+    // ---- Exits (design §6.3 C1–C5 and §6.4 E0–E7) ----
+    //
+    // Every exit decision runs under the one Web Lock (C1) and holds the
+    // durable exit lock (runtime.exitLock) from before E1 until the note
+    // closes or every released exit proof is dead (E6). While the exit lock
+    // is held the wallet makes no request proof (C3). Operator calls in exit
+    // mode have a hard timeout, count 5xx, 429 and timeouts as unreachable
+    // and ignore Retry-After (E0); nothing waits past must_initiate_by.
+
+    /** E0 timing, overridable per instance (tests shorten the budgets). */
+    exitTiming() {
+        return { ...EXIT_TIMING, ...(this.exitTimingOverrides || {}) };
+    }
+
+    /** The build-pinned settlement window W (E0, C4). */
+    settlementWindowSeconds() {
+        const value = Number(this.browserConfig?.trusted_deployment?.settlement_window_seconds);
+        return Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_SETTLEMENT_WINDOW_SECONDS;
+    }
+
+    /** The build-pinned RPC as an EIP-1193-style request function. */
+    pinnedRpc() {
+        return pinnedRpcRequest(this.config.funding, { timeoutMs: this.exitTiming().callTimeoutMs });
+    }
+
+    /** The user's exit RPC (persisted per origin), or null. */
+    exitRpc() {
+        const url = this.getExitRpcUrl();
+        return url ? urlRpcRequest(url, { timeoutMs: this.exitTiming().callTimeoutMs }) : null;
+    }
+
+    getExitRpcUrl() {
         try {
+            const value = localStorage.getItem(EXIT_RPC_STORAGE_KEY);
+            return value ? exitRpcUrl(value) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Set (or clear with null) the user's exit RPC for this origin. */
+    setExitRpcUrl(value) {
+        const url = value == null || value === '' ? null : exitRpcUrl(value);
+        try {
+            if (url) localStorage.setItem(EXIT_RPC_STORAGE_KEY, url);
+            else localStorage.removeItem(EXIT_RPC_STORAGE_KEY);
+        } catch {
+            throw new BrowserWalletHttpError('This browser cannot save the exit RPC setting.', 409, 'exit_rpc_unsaved');
+        }
+        this.dispatchEvent(new Event('change'));
+        return url;
+    }
+
+    /**
+     * E_low: the note's own expiry_ts, raised only when the user's exit RPC and
+     * the pinned RPC both report a later effectiveExpiry (E0).
+     */
+    async exitLowExpiry(state) {
+        const exit = this.exitRpc();
+        if (!exit) return lowExpiry(state.expiry_ts);
+        const read = async request => {
             try {
-                await this.settleActiveLease();
-            } catch (error) {
-                // An unsettleable lease must not block the escape hatch forever; the
-                // override below archives its journal under the same time gate.
-                if (!override || error?.code === 'lease_requests_in_flight' || isAbortError(error)
-                    || error?.code === 'testnet_password_required') throw error;
+                const word = await request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+                    data: `${VAULT_SELECTORS.effectiveExpiry}${abiWordHex(state.note_id)}` }, 'latest'] });
+                return /^0x[0-9a-fA-F]{64}$/.test(word || '') ? Number(BigInt(word)) : null;
+            } catch {
+                return null;
             }
-            return await withBrowserWalletLock(this.manifest.deployment_id, async () => {
-                // A verified receipt install advances the note to an untransmitted
-                // state, after which preparation restarts from a fresh reload.
-                for (let pass = 0; pass < 3; pass += 1) {
-                    const plan = await this.prepareWithdrawalLocked(mode, destination, {
-                        expectedActiveRoot, reprove, override, journalMissingAcknowledged
-                    });
-                    if (plan !== WITHDRAWAL_RESTART) return plan;
-                }
-                throw new Error('The private balance changed repeatedly while the withdrawal was being prepared. Try again.');
-            });
+        };
+        const [exitRpcExpiry, pinnedRpcExpiry] = await Promise.all([read(exit), read(this.pinnedRpc())]);
+        return lowExpiry(state.expiry_ts, { exitRpcExpiry, pinnedRpcExpiry });
+    }
+
+    /**
+     * One operator call in exit mode: at most CALL_TIMEOUT (and within
+     * `deadline`, ms), no retries. Returns { reachable, ok, status, code, body };
+     * a timeout, network failure, 5xx, 429 or 401 is { reachable: false }.
+     */
+    async exitCall(url, { method = 'GET', body = null, deadline = null, signal = null } = {}) {
+        const limit = this.exitTiming().callTimeoutMs;
+        const remaining = deadline == null ? limit : Math.min(limit, deadline - Date.now());
+        if (remaining <= 0) return { reachable: false, reason: 'budget' };
+        const timeout = AbortSignal.timeout(remaining);
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        try {
+            const payload = await abortable(this.remoteJson(url, {
+                method,
+                signal: callSignal,
+                ...(body == null ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+            }), callSignal);
+            return { reachable: true, ok: true, status: 200, body: payload };
         } catch (error) {
-            throw mode === 'escape' ? this.withEscapeOverrideData(error) : error;
+            if (signal?.aborted) throw error;
+            const status = Number(error?.status);
+            if (!Number.isInteger(status) || status >= 500 || status === 429 || status === 401) {
+                return { reachable: false, status: Number.isInteger(status) ? status : null, reason: error?.code || 'unreachable' };
+            }
+            return { reachable: true, ok: false, status, code: error.code || null, body: error.data || null };
+        }
+    }
+
+    /** Request journal records and challenge evidence at one note state, for exit decisions. */
+    exitRecordsAt(state = this.runtime?.state) {
+        const key = this.archiveKey(state);
+        if (!key) return [];
+        return [
+            ...requestRecordsAtState(this.requestArchive, key),
+            ...unresolvedRequestArchiveAt(this.requestArchive, key).filter(entry => entry.type === REQUEST_EVIDENCE_TYPE)
+        ];
+    }
+
+    /**
+     * E1: one bounded recovery pass. Reads the pending journal's request and
+     * the nullifier of every unresolved record at the current state, installs
+     * a response that passes S1–S6, and repeats once from the new state.
+     * Returns { installed, lateSuccessor, reading, response, installError }.
+     */
+    async exitRecoveryPassLocked({ signal = null, onProgress = () => {} } = {}) {
+        const deadline = Date.now() + this.exitTiming().recoveryBudgetMs;
+        const result = { installed: false, lateSuccessor: false, reading: null, response: null, installError: null };
+        const server = this.config.funding.protocol_server_url;
+        for (let round = 0; round < 2; round += 1) {
+            const state = this.runtime?.state;
+            if (!state) return result;
+            // Every record that can still install (the archive's unresolved
+            // records: pending, discarded, evicted, abandoned, late).
+            const records = this.archivedRequestsAt(state).filter(entry => entry.type === REQUEST_JOURNAL_TYPE);
+            const journal = this.runtime.journal;
+            if (!journal && !records.length) return result;
+            let response = null;
+            if (journal) {
+                const id = journalClientRequestId(journal);
+                const answer = await this.exitCall(`${server}/v2/requests/${encodeURIComponent(id)}`, { deadline, signal });
+                if (answer.ok && answer.body?.request_response) response = answer.body.request_response;
+            }
+            if (!response) {
+                const nullifier = journal?.nullifier ?? records[0]?.nullifier;
+                const answer = await this.exitCall(`${server}/v2/nullifiers/${encodeURIComponent(nullifier)}`, { deadline, signal });
+                const reading = answer.ok ? nullifierReading(answer.body) : { status: 'unavailable', response: null };
+                result.reading = reading;
+                await this.saveRequestObservations(this.archivedRequestsAt(state), reading, 'exit');
+                response = reading.response;
+            }
+            if (!response) return result;
+            result.response = response;
+            let installed;
+            try {
+                installed = await this.installRecoveredResponse(response.client_request_id || journalClientRequestId(journal),
+                    onProgress, { response });
+            } catch (error) {
+                if (isAbortError(error, signal)) throw error;
+                result.installError = error?.code || String(error?.message || error);
+                return result;
+            }
+            if (installed === LATE_SUCCESSOR) {
+                result.lateSuccessor = true;
+                return result;
+            }
+            if (!installed) return result;
+            result.installed = true;
+        }
+        return result;
+    }
+
+    /**
+     * Lost ε (E3): a finalized response at this state that did not install
+     * but passes S1, S2, S4 and S6. Its charge may lower the concession to
+     * min(charge, bound_at_state).
+     */
+    async lostEpsilonCharge(state, recovery) {
+        const response = recovery?.response;
+        if (!response || recovery.installed || recovery.lateSuccessor) return null;
+        try {
+            const checked = await this.worker.call('checkUnrecoverableResponse', { config: this.config.wallet_core, state, response });
+            return checked?.charge_applied ?? null;
+        } catch {
+            return null;
         }
     }
 
     /**
-     * A plain escape that recovery refused with receipt_journal_missing (a
-     * finalized receipt for a live request that this browser cannot apply)
-     * offers the override like the escape gate does. Strict vaults and
-     * challenged states offer none.
+     * E4.1: a path at a root the vault holds. The deposit-time path first
+     * (Amendment A1), then the operator's indexer with its root checked
+     * against the vault's currentRoot, then the vault's own logs (§6.6).
      */
-    withEscapeOverrideData(error) {
-        if (error?.code !== 'receipt_journal_missing' || error.data?.escape_override_warning) return error;
-        const overrideAfter = this.escapeOverrideAfter(this.runtime?.state);
-        if (overrideAfter == null) return error;
-        error.data = {
-            ...(error.data || {}),
-            nullifier_status: 'finalized',
-            transmitted: true,
-            ...escapeOverrideData('receipt_journal_missing', overrideAfter)
-        };
-        return error;
+    async exitPathLocked(state, { signal = null } = {}) {
+        const saved = state?.deposit_path;
+        if (saved?.active_root != null && Array.isArray(saved.siblings) && saved.siblings.length === 32) {
+            return { active_root: saved.active_root, note_id: Number(state.note_id), siblings: saved.siblings, source: 'deposit' };
+        }
+        const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        try {
+            const root = await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
+            const path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+            if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
+        } catch (error) {
+            if (signal?.aborted) throw error;
+        }
+        const trusted = this.browserConfig?.trusted_deployment || {};
+        const rebuilt = await rebuildNotePath({
+            request: this.exitRpc() || this.pinnedRpc(),
+            vault: this.config.funding.contract_address,
+            deployBlock: trusted.deploy_block,
+            noteId: Number(state.note_id),
+            chainId: Number(this.config.funding.chain_id),
+            worker: this.worker,
+            signal
+        });
+        return { active_root: rebuilt.active_root, note_id: rebuilt.note_id, siblings: rebuilt.siblings, source: 'rebuild' };
     }
 
-    async prepareWithdrawalLocked(mode, destination, { expectedActiveRoot, reprove, override, journalMissingAcknowledged = false }) {
+    /**
+     * E4.2: the stale-device pre-check. Evidence the operator holds at N⁺
+     * that verifies under the pinned request VK means another device spent
+     * this state's successor: refuse with device_not_newest. Errors and
+     * unverifiable answers are ignored, so a lying server cannot block exits.
+     */
+    async staleDeviceCheckLocked(state, { signal = null } = {}) {
+        const successor = await this.worker.call('successorNullifier', { state });
+        const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/nullifiers/${encodeURIComponent(successor)}/evidence`,
+            { signal });
+        const evidence = answer.ok ? answer.body : null;
+        if (!evidence?.public_inputs || !evidence.proof
+            || !sameFelt(evidence.public_inputs.request_nullifier, successor)) return { checked: answer.reachable, successor };
+        let verified = false;
+        try {
+            verified = await this.worker.call('verifyRequest', {
+                publicInputs: evidence.public_inputs,
+                proof: typeof evidence.proof === 'string' ? evidence.proof : evidence.proof?.proof,
+                verifyingKey: this.config.verifying_keys?.request
+            }) === true;
+        } catch {
+            verified = false;
+        }
+        if (verified) {
+            throw new BrowserWalletHttpError(DEVICE_NOT_NEWEST_MESSAGE, 409, 'device_not_newest', { successor_nullifier: successor });
+        }
+        return { checked: true, successor };
+    }
+
+    /** E4.5: advisory reads; a disagreement only warns. */
+    async exitAdvisoryWarnings(nullifier, successor, { signal = null } = {}) {
+        const warnings = [];
+        for (const [label, value] of [['withdrawal_nullifier', nullifier], ['next_nullifier', successor]]) {
+            try {
+                if (await this.vaultWord(`${VAULT_SELECTORS.challengedNullifiers}${abiWordHex(value)}`, signal) !== 0n) {
+                    warnings.push({ code: 'nullifier_flagged', field: label,
+                        message: 'The RPC reports this balance state as already defeated; the escape may revert.' });
+                }
+            } catch (error) {
+                if (isAbortError(error, signal)) throw error;
+            }
+        }
+        return warnings;
+    }
+
+    /** A request refused while the note is frozen by its exit lock (C3). */
+    exitLockedError(lock, verdict = null) {
+        return new BrowserWalletHttpError(EXIT_LOCKED_MESSAGE, 409, 'exit_locked', {
+            mode: lock?.mode || null,
+            released: (lock?.released || []).length,
+            releasable_after: verdict?.releasableAfter ?? null,
+            reason: verdict?.reason || null
+        });
+    }
+
+    /**
+     * The note's chain status and the finalized block's timestamp, read at
+     * the finalized block through the pinned RPC (for E6).
+     */
+    async exitChainStatus(noteId) {
+        const request = this.pinnedRpc();
+        const block = await request({ method: 'eth_getBlockByNumber', params: ['finalized', false] });
+        if (!/^0x[0-9a-fA-F]+$/.test(String(block?.number || '')) || !/^0x[0-9a-fA-F]+$/.test(String(block?.timestamp || ''))) {
+            throw new Error('The pinned RPC returned no finalized block.');
+        }
+        const encoded = await request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+            data: `0x9f18e4ed${abiWordHex(noteId)}` }, block.number] });
+        const words = String(encoded || '').replace(/^0x/, '').match(/.{64}/g) || [];
+        if (words.length < 4) throw new Error('The vault returned a truncated note record.');
+        const status = Number(BigInt(`0x${words[3]}`));
+        return {
+            noteStatus: status === 1 ? 'active' : status === 2 ? 'pending_withdrawal' : status === 3 ? 'closed' : 'unknown',
+            finalizedTimestamp: Number(BigInt(block.timestamp))
+        };
+    }
+
+    /**
+     * E6: release the exit lock if the note closed, if no kind-0 or kind-1
+     * proof was released and the user cancels, or once every released one is
+     * dead at a finalized block. A sent ownership proof keeps the state
+     * withdrawal-only (C5). Successors archived as late_successor install
+     * afterwards, after S1–S6 again. Call under the wallet lock.
+     */
+    async releaseExitLockLocked({ cancel = false } = {}) {
+        const lock = this.runtime?.exitLock;
+        if (!lock) return { released: true, reason: 'no_lock' };
+        let chain = {};
+        if (releasedExitProofs(lock).length) {
+            try {
+                chain = await this.exitChainStatus(lock.noteId);
+            } catch {
+                chain = {};
+            }
+        }
+        const verdict = exitLockReleasable(lock, { noteStatus: chain.noteStatus ?? null,
+            finalizedTimestamp: chain.finalizedTimestamp ?? null, cancel });
+        if (!verdict.releasable) return { released: false, ...verdict };
+        const prepared = this.runtime.preparedWithdrawal;
+        const ownershipSent = (lock.released || []).some(entry => Number(entry.kind) === WITHDRAWAL_KIND.ownership)
+            || prepared?.clearanceReserved === true;
+        let nextPrepared = preparedWithdrawalHasSubmission(prepared) ? prepared : null;
+        if (!nextPrepared && ownershipSent && this.runtime.state) {
+            nextPrepared = {
+                phase: 'reserving', mode: 'mutual', operationId: prepared?.operationId || uuid(),
+                noteId: Number(this.runtime.state.note_id), destination: prepared?.destination || null,
+                withdrawalNullifier: prepared?.withdrawalNullifier || null, clearanceReserved: true,
+                ...(prepared?.clearance?.signature ? { clearance: prepared.clearance } : {}),
+                createdAt: Number(prepared?.createdAt || Date.now())
+            };
+        }
+        await this.commit({ ...this.runtime, exitLock: null, preparedWithdrawal: nextPrepared });
+        const installed = await this.installLateSuccessorsLocked(lock);
+        return { released: true, reason: verdict.reason, installed };
+    }
+
+    /** Install, after S1–S6 again, a successor archived while the lock was held. */
+    async installLateSuccessorsLocked(lock) {
+        const key = this.archiveKey(this.runtime?.state);
+        if (!key || Number(key.noteId) !== Number(lock.noteId) || !sameFelt(key.anchor, lock.anchor)) return false;
+        const late = requestRecordsAtState(this.requestArchive, key)
+            .filter(entry => entry.disposition === LATE_SUCCESSOR_DISPOSITION && entry.lateResponse);
+        for (const entry of late) {
+            try {
+                if (await this.installRecoveredResponse(entry.clientRequestId, () => {}, { response: entry.lateResponse }) === true) {
+                    return true;
+                }
+            } catch {
+                // A late successor that no longer passes S1–S6 stays archived.
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Cancel an exit: release the exit lock now if no escape or close proof
+     * was released, otherwise once every released proof is dead (E6).
+     */
+    async cancelExit() {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const prepared = this.runtime.preparedWithdrawal;
+            if (preparedWithdrawalHasSubmission(prepared) || prepared?.submissionId) {
+                throw new BrowserWalletHttpError('A withdrawal transaction for this balance is still unresolved. Check its status first.',
+                    409, 'withdrawal_submission_pending');
+            }
+            const result = await this.releaseExitLockLocked({ cancel: true });
+            if (!result.released) throw this.exitLockedError(this.runtime.exitLock, result);
+            return result;
+        });
+    }
+
+    /**
+     * E4.6: rerun E1 once more just before a released exit proof is
+     * broadcast. A successor that arrives now is archived as late_successor
+     * and the lock is kept; it installs when the lock is released.
+     */
+    async exitBeforeBroadcast({ signal = null } = {}) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const state = this.runtime.state;
+            const lock = this.runtime.exitLock;
+            if (!state || !lock || !releasedExitProofs(lock).length) return { checked: false };
+            if (nowSeconds() >= mustInitiateBy(await this.exitLowExpiry(state))) {
+                return { checked: false, reason: 'past_must_initiate_by' };
+            }
+            const recovery = await this.exitRecoveryPassLocked({ signal });
+            return { checked: true, lateSuccessor: recovery.lateSuccessor };
+        });
+    }
+
+    /**
+     * Prepare the exit the rules choose for `mode`: 'mutual' (withdraw,
+     * cooperatively when the state allows) or 'escape' (unilateral exit now).
+     * The returned plan's `mode` is the exit actually prepared: a mutual
+     * request becomes an escape when the state, the deadline or the server
+     * calls for one (E2, E3). `earlyConcession` ('zero' or 'bound') is the
+     * user's choice for an escape forced before T (E3). Throws
+     * request_settlement_pending (with escape_at) when a mutual request must
+     * wait for T, and device_not_newest when another device spent this state.
+     */
+    async prepareWithdrawal(mode, destination, {
+        expectedActiveRoot = null,
+        reprove = false,
+        earlyConcession = 'zero',
+        signal = null,
+        onProgress = () => {}
+    } = {}) {
+        await this.init();
+        if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
+        if (!['zero', 'bound'].includes(earlyConcession)) {
+            throw new BrowserWalletHttpError('Choose zero or bound for a forced escape.', 400, 'invalid_concession_choice');
+        }
+        if (this.activeLease?.inFlight > 0) {
+            throw new BrowserWalletHttpError('Wait for the active model requests to finish before withdrawing.',
+                409, 'lease_requests_in_flight');
+        }
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const lockBefore = this.runtime.exitLock;
+            try {
+                // A verified install moves the note to a new state, and
+                // preparation restarts there (E1, E3.2, E4.3).
+                for (let pass = 0; pass < 3; pass += 1) {
+                    const plan = await this.prepareExitLocked(mode, destination, {
+                        expectedActiveRoot, reprove, earlyConcession, signal, onProgress
+                    });
+                    if (plan !== WITHDRAWAL_RESTART) return plan;
+                }
+                throw new Error('The private balance changed repeatedly while the withdrawal was being prepared. Try again.');
+            } catch (error) {
+                // An attempt that failed before releasing any proof leaves the
+                // note as it was: the lock it set is released (E6, cancel).
+                await this.reload().catch(() => null);
+                const lock = this.runtime?.exitLock;
+                if (!lockBefore && lock && !(lock.released || []).length) {
+                    await this.commit({ ...this.runtime, exitLock: null }).catch(() => null);
+                }
+                throw error;
+            }
+        });
+    }
+
+    /** A saved plan that already releases this decision's proof at this state. */
+    reusablePlan(existing, { mode, destination, state, nullifier, conceded }) {
+        const inputs = existing?.public_inputs;
+        return Boolean(existing?.proof && inputs && existing.mode === mode
+            && existing.destination?.toLowerCase() === destination.toLowerCase()
+            && Number(inputs.kind) === WITHDRAWAL_KIND[mode]
+            && Number(inputs.note_id) === Number(state.note_id)
+            && sameFelt(inputs.withdrawal_nullifier, nullifier)
+            && BigInt(inputs.final_balance) + BigInt(inputs.conceded ?? 0) === BigInt(state.current_balance)
+            && BigInt(inputs.conceded ?? 0) === BigInt(conceded)
+            && withdrawalProofStillValid(inputs));
+    }
+
+    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, signal, onProgress }) {
         await this.reload();
-        if (!this.runtime.state) throw new Error('There is no active private note to withdraw.');
-        if (unresolvedLateWithdrawalForNote(this.runtime, this.runtime.state.note_id)) {
+        const state = this.runtime.state;
+        if (!state) throw new Error('There is no active private note to withdraw.');
+        if (unresolvedLateWithdrawalForNote(this.runtime, state.note_id)) {
             throw new BrowserWalletHttpError(
                 'A withdrawal from another tab may already be on-chain. Check its status before starting another withdrawal.',
                 409,
                 'late_withdrawal_pending'
             );
         }
-        const validateExisting = (prepared) => {
-            if (!prepared) return;
-            if (Number(prepared.noteId ?? prepared.note_id ?? prepared.public_inputs?.note_id)
-                !== Number(this.runtime.state.note_id)) {
-                throw new Error('The prepared withdrawal belongs to a different private balance.');
-            }
-            const existingDestination = prepared.destination?.toLowerCase();
-            const existingHashes = Array.isArray(prepared.transactionHashes)
-                ? prepared.transactionHashes
-                : prepared.transactionHash ? [prepared.transactionHash] : [];
-            const hasSubmission = Boolean(prepared.submissionId || existingHashes.length);
-            const safeModeSwitch = !hasSubmission && (
-                (prepared.mode === 'mutual' && mode === 'escape')
-                || (prepared.mode === 'escape' && mode === 'mutual'
-                    && prepared.clearanceReserved === true)
-            );
-            if (existingDestination
-                && (prepared.mode !== mode || existingDestination !== destination.toLowerCase())
-                && !(safeModeSwitch && existingDestination === destination.toLowerCase())) {
-                throw new Error('A different withdrawal is already prepared in this browser.');
-            }
-        };
         let existing = this.runtime.preparedWithdrawal;
-        validateExisting(existing);
-        await this.recoverPendingLocked({ retireLostKey: true, quiet: override, sweep: true });
-        await this.reload();
-        if (!this.runtime.state) throw new Error('There is no active private note to withdraw.');
-        // Recovery can discover that a pre-crash request nullifier was
-        // already reserved for mutual close. Re-read that marker before
-        // choosing whether this note is still usable.
-        existing = this.runtime.preparedWithdrawal;
-        validateExisting(existing);
-        if (this.runtime.journal || this.runtime.lease) {
-            if (!override) {
-                throw new BrowserWalletHttpError(
-                    'A private chat started in another tab while withdrawal was opening. Finish that chat and try again.',
-                    409,
-                    'lease_pending'
-                );
-            }
-            if (await this.abandonUnsettledRequestLocked({ journalMissingAcknowledged }) === WITHDRAWAL_RESTART) {
-                return WITHDRAWAL_RESTART;
-            }
-            existing = this.runtime.preparedWithdrawal;
-        }
-        const existingHashes = Array.isArray(existing?.transactionHashes)
-            ? existing.transactionHashes
-            : existing?.transactionHash ? [existing.transactionHash] : [];
+        this.validateExistingWithdrawal(existing, requested, destination, state);
+        const existingHashes = preparedWithdrawalHashes(existing);
         if (existing?.submissionId && !existingHashes.length) {
             throw new BrowserWalletHttpError(
                 existing.phase === 'ambiguous'
                     ? 'MetaMask did not return a transaction ID. Check the chain, then explicitly retry if this balance is still active.'
                     : 'This withdrawal is awaiting MetaMask in this or another tab.',
                 409,
-                existing.phase === 'ambiguous'
-                    ? 'withdrawal_submission_ambiguous'
-                    : 'withdrawal_wallet_pending'
+                existing.phase === 'ambiguous' ? 'withdrawal_submission_ambiguous' : 'withdrawal_wallet_pending'
             );
         }
         if (existingHashes.length) {
@@ -3341,337 +3748,337 @@ class BrowserWalletRuntime extends EventTarget {
             }
             return existing;
         }
-        const state = this.runtime.state;
-        // Always derive the nullifier from the current state. A plan or marker
-        // left over from an older state must not steer the gate, clearance or
-        // proof reuse.
-        const withdrawalNullifier = await this.worker.call('withdrawalNullifier', { state });
-        const savedNullifier = preparedWithdrawalNullifier(existing);
-        if (existing && savedNullifier != null && !sameFelt(savedNullifier, withdrawalNullifier)) {
-            existing = null;
+        const now = nowSeconds();
+        const deadline = mustInitiateBy(await this.exitLowExpiry(state));
+        const nullifier = await this.worker.call('withdrawalNullifier', { state });
+        if (existing && preparedWithdrawalNullifier(existing) != null
+            && !sameFelt(preparedWithdrawalNullifier(existing), nullifier)) existing = null;
+
+        // C3, E2.1, E3.2: the exit lock is held at this state before E1.
+        let lock = this.runtime.exitLock;
+        if (lock && (Number(lock.noteId) !== Number(state.note_id) || !sameFelt(lock.anchor, state.current_anchor))) {
+            if (releasedExitProofs(lock).length) {
+                throw new BrowserWalletHttpError('An exit proof of another balance state may still land. Check its status first.',
+                    409, 'exit_lock_state');
+            }
+            lock = null;
         }
-        const path = await this.treePath(state.note_id, true, expectedActiveRoot);
-        const persistedClearance = validClearance(existing, withdrawalNullifier) ? existing.clearance : null;
-        if (mode === 'escape') {
-            const gate = await this.transmittedAnchorGate({
-                state, nullifier: withdrawalNullifier, purpose: 'escape', override, journalMissingAcknowledged
-            });
-            if (gate.advanced) return WITHDRAWAL_RESTART;
+        const lockSetHere = !lock;
+        if (!lock) {
+            lock = newExitLock({ noteId: state.note_id, anchor: state.current_anchor, mode: requested, now });
+            await this.commit({ ...this.runtime, exitLock: lock });
         }
-        const provenForState = existing?.mode === mode
-            && existing.destination?.toLowerCase() === destination.toLowerCase()
-            && existing.proof && existing.public_inputs
-            && Number(existing.public_inputs.kind) === (mode === 'escape' ? 0 : 1)
-            && Number(existing.public_inputs.note_id) === Number(state.note_id)
-            && sameFelt(existing.public_inputs.withdrawal_nullifier, withdrawalNullifier)
-            && sameFelt(existing.public_inputs.final_balance, state.current_balance)
-            && Number(existing.public_inputs.conceded) === 0
-            && withdrawalProofStillValid(existing.public_inputs);
-        // The vault accepts any root it ever held and exits do no Merkle
-        // work, so a durable plan stays usable until its valid_until. An
-        // UnknownRoot() or a repeated rejection asks for a fresh proof.
-        if (!reprove && provenForState) return existing;
-        const clearanceReserved = existing?.clearanceReserved === true
-            || existing?.mode === 'mutual';
-        let clearance = persistedClearance;
-        if (mode === 'mutual' && !clearance) {
-            const replacedMarker = this.runtime.preparedWithdrawal ?? null;
-            clearance = await this.obtainClearance({
-                state,
-                destination,
-                nullifier: withdrawalNullifier,
-                path,
-                selected: true,
-                // The server's mutual-close clearance reservation is
-                // deliberately irreversible for this note state. Persist the
-                // intent before crossing that boundary so closing the tab can
-                // never leave an apparently usable but server-rejected note.
-                commitMarker: () => this.commit({
-                    ...this.runtime,
-                    preparedWithdrawal: {
-                        phase: 'reserving',
-                        mode,
-                        operationId: existing?.operationId || uuid(),
-                        noteId: Number(state.note_id),
-                        destination,
-                        withdrawalNullifier,
-                        clearanceReserved: true,
-                        createdAt: Number(existing?.createdAt || Date.now())
-                    }
-                }),
-                // A refusal that reserved nothing restores exactly what this
-                // attempt replaced: an earlier attempt's marker may still
-                // stand for a reservation, so it is never dropped.
-                rollbackMarker: () => this.commit({ ...this.runtime, preparedWithdrawal: replacedMarker })
-            });
-            if (clearance === WITHDRAWAL_RESTART) return WITHDRAWAL_RESTART;
+        // A released escape keeps the note on escapes until it is dead.
+        const request = lock.mode === 'escape' && releasedExitProofs(lock).length ? 'escape' : requested;
+
+        // An active key of this tab is closed first, in one bounded call, so
+        // that a finished chat settles into a fresh state (E2).
+        await this.exitRetireLeaseLocked({ signal });
+
+        // E1, bounded, and skipped once must_initiate_by has passed.
+        let recovery = { installed: false, lateSuccessor: false, reading: null, response: null };
+        if (now < deadline) {
+            onProgress('recovering', 'Checking for a settled private request…');
+            recovery = await this.exitRecoveryPassLocked({ signal, onProgress });
+            if (recovery.installed) return WITHDRAWAL_RESTART;
         }
-        const plan = await this.worker.call('prepareWithdrawal', {
-            config: this.config.wallet_core,
-            state,
-            args: {
-                mode,
-                destination,
-                // Nothing is conceded here: an escape at a fresh state, or the
-                // override, pays the whole balance (design §6.4 E2, E3).
-                ...(mode === 'escape' ? { conceded: 0 } : {}),
-                valid_until: nowSeconds() + WITHDRAWAL_PROOF_VALIDITY_SECONDS,
-                active_root: path.active_root,
-                merkle_siblings: path.siblings,
-                // The WASM rejects any clearance on an escape.
-                clearance: mode === 'mutual' ? clearance : null
-            },
-            provingKey: this.config.proving_keys.withdrawal
-        });
-        if (Number(plan?.public_inputs?.kind) !== (mode === 'escape' ? 0 : 1)) {
-            throw new Error('The generated withdrawal proof is of another kind.');
+        await this.reload();
+        const records = this.exitRecordsAt(state);
+        const status = stateExitStatus({ boundAtState: state.bound_at_state || 0, records });
+        if (status.challenged) {
+            throw new BrowserWalletHttpError(DEVICE_NOT_NEWEST_MESSAGE, 409, 'device_not_newest', { reason: 'defeated' });
         }
-        plan.destination = destination;
-        plan.phase = 'prepared';
-        plan.operationId = existing?.operationId || uuid();
-        plan.noteId = Number(state.note_id);
-        plan.withdrawalNullifier = withdrawalNullifier
-            || plan.public_inputs?.withdrawal_nullifier
-            || null;
-        plan.clearanceReserved = mode === 'mutual' || clearanceReserved;
-        plan.createdAt = Number(existing?.createdAt || Date.now());
-        // Persist the server clearance with the plan: re-proving at a new
-        // root (or switching back from an escape) needs no second request.
-        const carriedClearance = clearance || persistedClearance;
-        if (carriedClearance?.signature) plan.clearance = carriedClearance;
-        await this.commit({ ...this.runtime, preparedWithdrawal: plan });
-        return plan;
+        // E4.7: a released close proof of this state stays the exit until
+        // its valid_until; a successor that arrived meanwhile waits (E6).
+        if (request === 'mutual' && !reprove
+            && this.reusablePlan(existing, { mode: 'mutual', destination, state, nullifier, conceded: 0n })) {
+            return existing;
+        }
+        const timing = { settlementWindowSeconds: this.settlementWindowSeconds(),
+            unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds, mustInitiateBy: deadline };
+        const escapeAtFor = createdAt => createdAt == null ? null : escapeAt({ createdAt,
+            settlementDeadline: recovery.reading?.settlementDeadline ?? null, ...timing });
+        const lostEpsilonCharge = status.fresh ? null : await this.lostEpsilonCharge(state, recovery);
+        let decision = chooseExit({ request, now, mustInitiateBy: deadline, status,
+            escapeAtSeconds: escapeAtFor(status.newestCreatedAt), lostEpsilonCharge, earlyConcession });
+        if (decision.action === 'wait') {
+            if (lockSetHere && !(this.runtime.exitLock?.released || []).length) {
+                await this.commit({ ...this.runtime, exitLock: null });
+            }
+            throw this.settlementPendingError(decision, status, deadline);
+        }
+        if (decision.action === 'mutual') {
+            if (!reprove && this.reusablePlan(existing, { mode: 'mutual', destination, state, nullifier, conceded: 0n })) {
+                return existing;
+            }
+            if (this.runtime.exitLock.mode !== 'mutual') {
+                // Nothing was released yet (else the request is an escape).
+                await this.commit({ ...this.runtime, exitLock: switchExitLock(this.runtime.exitLock, 'mutual') });
+            }
+            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, signal });
+            if (outcome === WITHDRAWAL_RESTART) return outcome;
+            if (outcome.plan) return outcome.plan;
+            const next = afterClearanceFailure(outcome.error);
+            if (next.action === 'reconsider') {
+                // E2.4: the server claims a reservation; decide as at an
+                // unresolved state, from the newest released record.
+                decision = chooseExit({ request: 'mutual', now, mustInitiateBy: deadline,
+                    status: { ...status, fresh: false }, escapeAtSeconds: escapeAtFor(status.newestCreatedAt) ?? now,
+                    lostEpsilonCharge });
+                if (decision.action === 'wait') throw this.settlementPendingError(decision, status, deadline, outcome.error);
+            } else {
+                decision = { ...next, clearanceError: outcome.error?.code || null };
+            }
+        }
+        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, onProgress });
+    }
+
+    /** The refusal of a mutual request that waits for T (E3). */
+    settlementPendingError(decision, status, deadline, clearanceError = null) {
+        return new BrowserWalletHttpError(
+            'The server may still settle a private request sent from this balance. A mutual close waits for it; an escape is available now (conceding nothing by default) and concedes at most the request’s bound from the time shown.',
+            409,
+            'request_settlement_pending',
+            {
+                escape_at: decision.escapeAt == null ? null : decision.escapeAt * 1_000,
+                must_initiate_by: deadline * 1_000,
+                bound_at_state: String(status.boundAtState),
+                forced_escape: { zero: '0', bound: String(status.boundAtState) },
+                ...(clearanceError?.code ? { clearance_error_code: clearanceError.code } : {})
+            }
+        );
     }
 
     /**
-     * Explicit, time-gated escape override for an unsettled transmitted
-     * request (hardened vault only). The journal leaves the runtime only into
-     * the archive ('abandoned_for_escape'), so a later-finalized receipt still
-     * installs from its saved rerandomization. A finalized claim whose receipt
-     * does not install is the receipt_journal_missing case: abandoned only
-     * with that case's own acknowledgement, also when the claim was saved by
-     * an earlier read and this one failed or did not repeat it.
+     * Close this tab's active key in one bounded call before an exit decision,
+     * so a finished chat can settle into a fresh state. Failures are ignored:
+     * E1 and E3 decide without the operator.
      */
-    async abandonUnsettledRequestLocked({ onProgress = () => {}, signal = null, journalMissingAcknowledged = false } = {}) {
-        if (this.activeLease?.inFlight > 0) {
-            throw new BrowserWalletHttpError(
-                'Wait for the active model requests to finish before overriding the private key settlement.',
-                409,
-                'lease_requests_in_flight'
-            );
-        }
-        const nowMs = Date.now();
-        const lease = this.runtime.lease;
-        if (lease && lease.ownerId !== this.ownerId
-            && Number(lease.settle_after || lease.expires_at) * 1_000 > nowMs) {
-            throw new BrowserWalletHttpError(
-                `Another browser tab owns the current private key until ${new Date(Number(lease.settle_after || lease.expires_at) * 1000).toLocaleTimeString()}.`,
-                409,
-                'lease_tab_conflict'
-            );
-        }
+    async exitRetireLeaseLocked({ signal = null } = {}) {
         const journal = this.runtime.journal;
-        const state = this.runtime.state;
-        const dropActiveLease = () => {
+        const lease = this.runtime.lease;
+        if (!journal?.prepared_request || !lease || lease.client_request_id !== journal.prepared_request.client_request_id) return;
+        if (lease.ownerId !== this.ownerId && Number(lease.settle_after || lease.expires_at) > nowSeconds()) return;
+        const request = journal.prepared_request;
+        await this.exitCall(`${this.config.funding.protocol_server_url}/v2/openrouter/leases/${encodeURIComponent(request.client_request_id)}`,
+            { method: 'POST', body: request, signal });
+        if (this.activeLease?.client_request_id === request.client_request_id) {
+            this.activeLease.retired = true;
             this.activeLease = null;
             if (this.settlementTimer) clearTimeout(this.settlementTimer);
             this.settlementTimer = null;
-        };
-        if (!journal) {
-            // A lease row without a request journal carries no transmitted proof.
-            await this.commit({ ...this.runtime, lease: null });
-            dropActiveLease();
-            return 'abandoned';
-        }
-        const record = this.tryRequestJournalRecord(journal, state);
-        if (!record) throw new Error('The unsettled private request journal is incomplete.');
-        // Saved before this read; only a contradicting reading or an installed
-        // receipt ends it.
-        const savedClaim = standingReceiptClaim(this.archivedRequestsAt(state));
-        const observed = await this.nullifierServerStatus(journal.nullifier, signal, { propagateAuth: true });
-        if (observed.status === 'finalized' && observed.response) {
-            try {
-                if (await this.installRecoveredResponse(
-                    observed.response.client_request_id || journalClientRequestId(journal),
-                    onProgress,
-                    { response: observed.response }
-                )) return WITHDRAWAL_RESTART;
-            } catch (error) {
-                // Only a receipt that verifies can veto the override.
-                if (isAbortError(error, signal)) throw error;
-            }
-        }
-        const overrideAfter = Number(record.createdAt) + this.unsettledRequestEscapeGraceMs();
-        // A finalized receipt that did not install above, or a claim saved
-        // earlier that this reading does not contradict.
-        const freshClaim = readingOverrideCode(observed) === 'receipt_journal_missing';
-        const journalMissing = journalMissingAfter(observed, savedClaim);
-        const ready = nowMs >= overrideAfter || await this.escapeExpiryImminent(state, signal);
-        if (!ready || (journalMissing && !journalMissingAcknowledged)) {
-            await putBrowserRequestArchive([{
-                ...record,
-                serverObservations: [readingObservation(observed, 'override')]
-            }], { deploymentId: this.manifest.deployment_id }).then(records => {
-                this.requestArchive = records;
-            }, error => console.warn('Unable to save a private request status observation.', error));
-            // The code follows this reading, except that a ready override
-            // missing only this case's acknowledgement is refused as this case.
-            const code = freshClaim || (journalMissing && ready) ? 'receipt_journal_missing' : 'request_settlement_pending';
-            throw new BrowserWalletHttpError(
-                code === 'request_settlement_pending'
-                    ? 'The server may still settle this private request. The escape override becomes available after its safety window.'
-                    : freshClaim ? RECEIPT_JOURNAL_MISSING_MESSAGE : RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE,
-                409,
-                code,
-                {
-                    client_request_id: record.clientRequestId,
-                    nullifier_status: observed.status,
-                    created_at: record.createdAt,
-                    // Ready but unacknowledged (also near expiry): available now.
-                    ...escapeOverrideData(journalMissing ? 'receipt_journal_missing' : null,
-                        ready ? Math.min(overrideAfter, nowMs) : overrideAfter)
-                }
-            );
-        }
-        await this.commit({ ...this.runtime, journal: null, lease: null }, { requestArchive: [{
-            ...record,
-            disposition: 'abandoned_for_escape',
-            serverObservations: [readingObservation(observed, 'override')]
-        }] });
-        dropActiveLease();
-        return 'abandoned';
-    }
-
-    /** now + challenge period + margin >= the vault's pause-aware expiry. */
-    async escapeExpiryImminent(state, signal = null) {
-        try {
-            const [expiry, period] = await Promise.all([
-                this.vaultWord(`${VAULT_SELECTORS.effectiveExpiry}${abiWordHex(state.note_id)}`, signal),
-                this.vaultWord(VAULT_SELECTORS.challengePeriod, signal)
-            ]);
-            if (expiry <= 0n) return false;
-            return BigInt(Math.floor(Date.now() / 1_000)) + period
-                + BigInt(ESCAPE_OVERRIDE_EXPIRY_MARGIN_SECONDS) >= expiry;
-        } catch (error) {
-            if (isAbortError(error, signal)) throw error;
-            this.assertHardenedViewRead(error);
-            // An unreadable expiry only waits for the grace.
-            return false;
-        }
-    }
-
-    async vaultNullifierChallenged(nullifier, signal = null) {
-        try {
-            return await this.vaultWord(`${VAULT_SELECTORS.challengedNullifiers}${abiWordHex(nullifier)}`, signal) !== 0n;
-        } catch (error) {
-            if (isAbortError(error, signal)) throw error;
-            this.assertHardenedViewRead(error);
-            // The gas estimate still reverts ChallengedNullifier() if it was.
-            return false;
         }
     }
 
     /**
-     * Under a vault_revision 2 profile, a hardened-only view that reverts (or
-     * returns no word) means the pinned vault is not hardened: a configuration
-     * error, never a "false" that would open the escape override.
+     * E2: a mutual close at a fresh state: the kind-2 ownership proof (at most
+     * one per lock, journaled before it leaves), the server clearance, then
+     * the kind-1 close proof, journaled with its plan. Returns { plan },
+     * WITHDRAWAL_RESTART, or { error } when the clearance failed.
      */
-    assertHardenedViewRead(error) {
-        if (this.vaultCapabilities().hardenedVault && vaultViewMissing(error)) throw vaultRevisionMismatch();
-    }
-
-    /**
-     * Escape/clearance gate for a state whose request proof may have left this
-     * device. Untransmitted states pass without any server contact, so the
-     * escape hatch stays operator-independent in the normal case.
-     */
-    async transmittedAnchorGate({
-        state, nullifier, purpose, override = false, journalMissingAcknowledged = false, selected = true, signal = null
-    }) {
-        const entries = this.archivedRequestsAt(state);
-        if (!entries.length) return { allowed: true, transmitted: false };
-        const { hardenedVault } = this.vaultCapabilities();
-        const graceMs = this.unsettledRequestEscapeGraceMs();
-        const transmittedAt = earliestLocalTransmission(entries);
-        // A receipt claim saved before this gate's own read.
-        const savedClaim = standingReceiptClaim(entries);
-        // `ready`: the override was requested and is available now (by the
-        // grace or an imminent expiry); only its acknowledgement was missing.
-        const refuse = (decision, observed, ready = false) => {
-            const messages = {
-                transmitted_anchor_escape_unsafe: 'This balance’s current private state was already sent with a private request. This vault can permanently burn a challenged escape, so the escape hatch stays closed until the server settles that request. Wait for settlement, or withdraw by mutual close.',
-                request_settlement_pending: 'The server is still settling a private request for this balance. Try again after it settles.',
-                transmitted_anchor_unconfirmed: 'This balance’s current state was sent with a private request, and the server’s status could not be confirmed. Try again shortly.',
-                anchor_challenged: 'An escape at this balance state was already challenged on-chain. Withdraw from the server-signed next state instead.',
-                receipt_journal_missing: RECEIPT_JOURNAL_MISSING_MESSAGE,
-                receipt_response_missing: 'The server reports this private request as finalized but returned no receipt. Try again shortly.',
-                receipt_pending_install: 'A finalized private request receipt must be applied to this balance before it can be withdrawn.'
-            };
-            const escapeOverride = purpose === 'escape' && hardenedVault
-                && ['request_settlement_pending', 'transmitted_anchor_unconfirmed', 'receipt_journal_missing', 'receipt_response_missing'].includes(decision.code);
-            // The override's warning and acknowledgement follow the claim that
-            // stands after this reading, as the snapshot's do.
-            const overrideCode = journalMissingAfter(observed, savedClaim) ? 'receipt_journal_missing' : decision.code;
-            const message = decision.code === 'receipt_journal_missing' && !readingOverrideCode(observed)
-                ? RECEIPT_JOURNAL_MISSING_EARLIER_MESSAGE
-                : messages[decision.code] || 'This withdrawal is not safe at the current balance state.';
-            return new BrowserWalletHttpError(message, 409, decision.code, {
-                nullifier_status: observed?.status || null,
-                transmitted: true,
-                escape_override_after: escapeOverride && transmittedAt != null
-                    ? (ready ? Math.min(transmittedAt + graceMs, Date.now()) : transmittedAt + graceMs)
-                    : null,
-                ...(escapeOverride ? {
-                    escape_override_warning: escapeOverrideWarning(overrideCode),
-                    escape_override_acknowledgement: escapeOverrideAcknowledgement(overrideCode)
-                } : {})
-            });
-        };
-        // STRICT (no hardened vault): never escape at a transmitted state, and
-        // never let a server answer decide otherwise.
-        if (purpose === 'escape' && !hardenedVault) {
-            throw refuse({ code: 'transmitted_anchor_escape_unsafe' }, null);
+    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, signal }) {
+        let clearance = validClearance(existing, nullifier) ? existing.clearance : null;
+        let path;
+        try {
+            const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+            const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+            const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
+            path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+        } catch (error) {
+            if (signal?.aborted) throw error;
+            return { error: { code: 'indexer_unavailable', message: error?.message || null } };
         }
-        const observed = await this.nullifierServerStatus(nullifier ?? entries[0].nullifier, signal, { propagateAuth: true });
-        await this.saveRequestObservations(entries, observed, override ? 'override' : purpose);
-        if (observed.status === 'finalized' && observed.response && selected) {
-            try {
-                if (await this.installRecoveredResponse(observed.response.client_request_id, () => {},
-                    { response: observed.response })) return { advanced: true };
-            } catch (error) {
-                // An unverifiable "finalized" claim neither installs nor vetoes.
-                if (isAbortError(error, signal)) throw error;
-            }
+        if (!clearance) {
+            const result = await this.requestClearanceLocked({ state, destination, nullifier, path, existing, signal });
+            if (result === WITHDRAWAL_RESTART || result.error) return result;
+            clearance = result.clearance;
         }
-        let overrideReady = false;
-        if (purpose === 'escape' && override) {
-            overrideReady = (transmittedAt != null && Date.now() >= transmittedAt + graceMs)
-                || await this.escapeExpiryImminent(state, signal);
-        }
-        // Past the grace, a receipt_journal_missing reading, or such a claim
-        // saved earlier that this reading does not contradict, is refused
-        // again without its own acknowledgement, with that code's warning.
-        const decision = transmittedAnchorDecision({
-            entries, observed, purpose, hardened: hardenedVault, override, overrideReady,
-            journalMissingAcknowledged, journalMissingClaimed: Boolean(savedClaim), selected
+        const lock = this.runtime.exitLock;
+        const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'mutual' });
+        if (refusal) throw new BrowserWalletHttpError('This balance is exiting by escape.', 409, refusal);
+        const validUntil = nowSeconds() + this.exitTiming().exitProofValiditySeconds;
+        const plan = await this.worker.call('prepareWithdrawal', {
+            config: this.config.wallet_core,
+            state,
+            args: { mode: 'mutual', destination, valid_until: validUntil, active_root: path.active_root,
+                merkle_siblings: path.siblings, clearance },
+            provingKey: this.withdrawalProvingKey()
         });
-        if (!decision.allowed) throw refuse(decision, observed, overrideReady);
-        if (purpose === 'escape' && await this.vaultNullifierChallenged(nullifier, signal)) {
-            throw new BrowserWalletHttpError(
-                'The vault already challenged an escape at this balance state, so it cannot escape again. Withdraw from the server-signed next state instead.',
-                409,
-                'nullifier_challenged',
-                { nullifier_status: observed.status, transmitted: true }
-            );
+        if (Number(plan?.public_inputs?.kind) !== WITHDRAWAL_KIND.mutual || Number(plan.public_inputs.conceded) !== 0) {
+            throw new Error('The generated withdrawal proof is of another kind.');
         }
-        return { allowed: true, transmitted: true, reason: decision.reason };
+        const decorated = this.decoratePlan(plan, { mode: 'mutual', destination, state, nullifier, existing,
+            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, pathSource: 'indexer' });
+        await this.commit({ ...this.runtime, preparedWithdrawal: decorated,
+            exitLock: recordReleasedProof(this.runtime.exitLock, { kind: WITHDRAWAL_KIND.mutual, validUntil, nullifier, at: nowSeconds() }) });
+        return { plan: decorated };
     }
 
     /**
-     * Assert that a locally generated ownership proof is a kind-2 withdrawal
-     * proof for exactly this state, vault, keys, root and balance: no
-     * destination, no concession, no successor nullifier, and a fresh
-     * valid_until. The vault rejects kind 2 at every entry point, so it can
+     * The clearance of a mutual close (G6): one kind-2 ownership proof at the
+     * current root, journaled in the exit lock and the withdrawal-only marker
+     * before it is sent (C5), then one bounded POST.
+     */
+    async requestClearanceLocked({ state, destination, nullifier, path, existing, signal }) {
+        const lock = this.runtime.exitLock;
+        const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'ownership' });
+        if (refusal) return { error: { code: refusal } };
+        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
+        await this.commit({
+            ...this.runtime,
+            exitLock: recordReleasedProof(lock, { kind: WITHDRAWAL_KIND.ownership,
+                validUntil: ownership.public_inputs.valid_until, nullifier, at: nowSeconds() }),
+            // C5: never request from this state after its ownership proof.
+            preparedWithdrawal: {
+                phase: 'reserving', mode: 'mutual', operationId: existing?.operationId || uuid(),
+                noteId: Number(state.note_id), destination, withdrawalNullifier: nullifier, clearanceReserved: true,
+                createdAt: Number(existing?.createdAt || Date.now())
+            }
+        });
+        const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
+            method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
+        });
+        if (!answer.reachable) return { error: { code: 'unreachable', status: answer.status ?? null } };
+        if (!answer.ok) return { error: { code: answer.code, status: answer.status } };
+        const clearance = answer.body;
+        if (!clearance?.signature || clearance.withdrawal_nullifier == null || !sameFelt(clearance.withdrawal_nullifier, nullifier)) {
+            return { error: { code: 'clearance_invalid' } };
+        }
+        // Keep the clearance with the withdrawal-only marker: a close proof
+        // re-proved later needs no second ownership proof.
+        await this.commit({ ...this.runtime, preparedWithdrawal: { ...this.runtime.preparedWithdrawal, clearance } });
+        return { clearance };
+    }
+
+    /**
+     * E4: an escape conceding `decision.conceded` (at most bound_at_state):
+     * a path at a known root, the stale-device pre-check, E1 again, advisory
+     * reads, then the kind-0 proof, journaled in the exit lock with its plan
+     * before the plan leaves this function. A live request journal moves to
+     * the archive (abandoned_for_escape), where a later receipt can still
+     * install once the lock is released.
+     */
+    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, onProgress }) {
+        let lock = this.runtime.exitLock;
+        if (lock.mode !== 'escape') {
+            lock = switchExitLock(lock, 'escape');
+            await this.commit({ ...this.runtime, exitLock: lock });
+        }
+        const conceded = BigInt(decision.conceded);
+        const bound = BigInt(state.bound_at_state || 0);
+        const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'escape',
+            conceded, boundAtState: bound });
+        if (refusal) throw new BrowserWalletHttpError('This escape is not allowed at this balance state.', 409, refusal);
+        if (!reprove && this.reusablePlan(existing, { mode: 'escape', destination, state, nullifier, conceded })) return existing;
+        onProgress('path', 'Finding this balance’s Merkle path…');
+        const path = await this.exitPathLocked(state, { signal });
+        onProgress('checking', 'Checking that this device holds the newest balance state…');
+        const { successor } = await this.staleDeviceCheckLocked(state, { signal });
+        if (nowSeconds() < deadline) {
+            const again = await this.exitRecoveryPassLocked({ signal, onProgress });
+            if (again.installed) return WITHDRAWAL_RESTART;
+        }
+        const warnings = await this.exitAdvisoryWarnings(nullifier, successor, { signal });
+        const validUntil = nowSeconds() + this.exitTiming().exitProofValiditySeconds;
+        onProgress('proving', 'Generating the escape proof locally…');
+        if (conceded > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('The conceded amount exceeds the safe ledger range.');
+        const plan = await this.worker.call('prepareWithdrawal', {
+            config: this.config.wallet_core,
+            state,
+            args: { mode: 'escape', destination, conceded: Number(conceded), valid_until: validUntil,
+                active_root: path.active_root, merkle_siblings: path.siblings },
+            provingKey: this.withdrawalProvingKey()
+        });
+        const inputs = plan?.public_inputs;
+        if (Number(inputs?.kind) !== WITHDRAWAL_KIND.escape || BigInt(inputs.conceded ?? 0) !== conceded
+            || BigInt(inputs.final_balance) + conceded !== BigInt(state.current_balance)) {
+            throw new Error('The generated escape proof does not match its decision.');
+        }
+        await this.reload();
+        // The withdrawal-only marker of a clearance attempt (E2.5) may be newer
+        // than the plan read at the start.
+        const marker = this.runtime.preparedWithdrawal;
+        const base = marker && sameFelt(preparedWithdrawalNullifier(marker) ?? nullifier, nullifier) ? marker : existing;
+        const decorated = this.decoratePlan(plan, { mode: 'escape', destination, state, nullifier, existing: base, decision,
+            validUntil, pathSource: path.source, warnings });
+        const journal = this.runtime.journal;
+        const abandoned = journal ? this.tryRequestJournalRecord(journal, state, { disposition: 'abandoned_for_escape' }) : null;
+        if (journal && !abandoned) throw new Error('The unsettled private request journal is incomplete.');
+        await this.commit({
+            ...this.runtime,
+            journal: null,
+            lease: null,
+            preparedWithdrawal: decorated,
+            exitLock: recordReleasedProof(this.runtime.exitLock, { kind: WITHDRAWAL_KIND.escape, validUntil,
+                conceded, nullifier, at: nowSeconds() })
+        }, abandoned ? { requestArchive: [abandoned] } : {});
+        if (this.activeLease) {
+            this.activeLease = null;
+            if (this.settlementTimer) clearTimeout(this.settlementTimer);
+            this.settlementTimer = null;
+        }
+        return decorated;
+    }
+
+    /**
+     * The withdrawal key descriptor. A host's provingKeysBaseUrlOverride
+     * (design §6.4 E7) moves only its URL: the build-pinned SHA-256 stays.
+     */
+    withdrawalProvingKey() {
+        const pinned = this.config.proving_keys.withdrawal;
+        const override = browserSdkOptions().provingKeysBaseUrlOverride;
+        return override ? { ...pinned, url: new URL('withdrawal.pk', override).href } : pinned;
+    }
+
+    /** A proof plan with the record fields the payout matchers need (E5). */
+    decoratePlan(plan, { mode, destination, state, nullifier, existing, decision, clearance = null, validUntil,
+        pathSource = null, warnings = [] }) {
+        const conceded = BigInt(decision.conceded ?? 0);
+        const decorated = {
+            ...plan,
+            mode,
+            destination,
+            phase: 'prepared',
+            operationId: existing?.operationId || uuid(),
+            noteId: Number(state.note_id),
+            withdrawalNullifier: nullifier,
+            clearanceReserved: mode === 'mutual' || existing?.clearanceReserved === true,
+            createdAt: Number(existing?.createdAt || Date.now()),
+            decision: { rule: decision.rule, conceded: conceded.toString(),
+                ...(decision.clearanceError ? { clearance_error_code: decision.clearanceError } : {}) },
+            stateBalance: String(state.current_balance),
+            concededAtInit: conceded.toString(),
+            boundAtState: String(state.bound_at_state || 0),
+            validUntil,
+            ...(pathSource ? { pathSource } : {}),
+            ...(warnings.length ? { warnings } : {})
+        };
+        const carried = clearance || (validClearance(existing, nullifier) ? existing.clearance : null);
+        if (carried?.signature) decorated.clearance = carried;
+        return decorated;
+    }
+
+    validateExistingWithdrawal(prepared, mode, destination, state) {
+        if (!prepared) return;
+        if (Number(prepared.noteId ?? prepared.note_id ?? prepared.public_inputs?.note_id) !== Number(state.note_id)) {
+            throw new Error('The prepared withdrawal belongs to a different private balance.');
+        }
+        const existingDestination = prepared.destination?.toLowerCase();
+        const hasSubmission = Boolean(prepared.submissionId || preparedWithdrawalHashes(prepared).length);
+        // Before a submission, a mutual plan may become an escape (E2.5) and
+        // back; the destination never changes.
+        if (existingDestination && existingDestination !== destination.toLowerCase()) {
+            throw new Error('A different withdrawal is already prepared in this browser.');
+        }
+        if (hasSubmission && prepared.mode && prepared.mode !== mode && !(prepared.mode === 'escape' && mode === 'mutual')) {
+            throw new Error('A different withdrawal is already prepared in this browser.');
+        }
+    }
+
+    /**
+     * A kind-2 ownership proof of exactly this state, vault, keys, root and
+     * balance: no destination, no concession, no successor nullifier, and a
+     * fresh valid_until. Every vault entry point rejects kind 2, so it can
      * never be submitted as an exit. Never a request proof.
      */
     assertOwnershipProof(plan, { state, nullifier, activeRoot }) {
@@ -3687,7 +4094,7 @@ class BrowserWalletRuntime extends EventTarget {
             && Number(inputs.conceded) === 0
             && sameFelt(inputs.next_nullifier, 0)
             && Number.isSafeInteger(validUntil) && validUntil > nowSeconds()
-            && validUntil <= nowSeconds() + OWNERSHIP_PROOF_VALIDITY_SECONDS
+            && validUntil <= nowSeconds() + this.exitTiming().ownershipProofValiditySeconds
             && Number(inputs.protocol_version) === 2
             && Number(inputs.chain_id) === Number(funding.chain_id)
             && sameFelt(inputs.contract_address, funding.contract_address)
@@ -3705,23 +4112,16 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async generateOwnershipProof({ state, nullifier, path }) {
-        // A kind-2 ownership proof at the current balance: it names no
-        // destination and no successor nullifier, and every vault entry point
-        // rejects it, so the server cannot submit it as an exit. It is valid
-        // for one hour (the server's freshness window).
-        if (!this.vaultCapabilities().hardenedVault && this.archivedRequestsAt(state).length) {
-            throw transmittedOwnershipRefusal(null);
-        }
         const ownership = await this.worker.call('prepareWithdrawal', {
             config: this.config.wallet_core,
             state,
             args: {
                 mode: 'ownership',
-                valid_until: nowSeconds() + OWNERSHIP_PROOF_VALIDITY_SECONDS,
+                valid_until: nowSeconds() + this.exitTiming().ownershipProofValiditySeconds,
                 active_root: path.active_root,
                 merkle_siblings: path.siblings
             },
-            provingKey: this.config.proving_keys.withdrawal
+            provingKey: this.withdrawalProvingKey()
         });
         this.assertOwnershipProof(ownership, { state, nullifier, activeRoot: path.active_root });
         // Only the public inputs and proof travel; nothing is persisted.
@@ -3729,125 +4129,77 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * POST one clearance body, retrying the same bytes only for answers that
-     * reserved nothing and may pass on their own: the gateway's 429
-     * gateway_rate_limited (the request never reached the API; its
-     * retry_after_seconds is honoured), and for a proof the server's
-     * stale_root (its root lags the vault) or capacity_exhausted (proof
-     * verification is saturated). The server sends neither of the last two
-     * for a proof-less request. All waits share one backoff budget; a wait the
-     * budget cannot hold ends the retries. The caller does not re-prove: a
-     * stale_root that outlasts the budget fails the close, which a retry
-     * prepares again at the then-current root.
+     * The clearance of a set-aside (background) mutual close: one ownership
+     * proof and one bounded POST. Its record is withdrawal-only already.
      */
-    async postClearance(body, nullifier, signal = null, {
-        delays = CLEARANCE_RETRY_DELAYS_MS,
-        sleep = delay
-    } = {}) {
-        const serialized = JSON.stringify(body);
-        const budget = delays.reduce((total, value) => total + value, 0);
-        let waited = 0;
-        for (let attempt = 0; ; attempt += 1) {
-            try {
-                const clearance = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: serialized,
-                    signal
-                });
-                // The WASM verifies the signature; here only the identity.
-                if (clearance?.withdrawal_nullifier != null && !sameFelt(clearance.withdrawal_nullifier, nullifier)) {
-                    throw new Error('The server returned a clearance for a different private balance state.');
-                }
-                return clearance;
-            } catch (error) {
-                const throttled = error?.code === CLEARANCE_GATEWAY_THROTTLED;
-                const retriable = throttled || (Boolean(body.ownership_proof)
-                    && ['stale_root', 'capacity_exhausted'].includes(error?.code));
-                if (!retriable || attempt >= delays.length) throw error;
-                const wait = Math.max(delays[attempt], throttled ? retryAfterMilliseconds(error) : 0);
-                if (waited + wait > budget) throw error;
-                waited += wait;
-                await sleep(wait, signal);
-            }
+    async backgroundClearance({ state, nullifier, path, signal = null }) {
+        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
+        const answer = await this.exitCall(`${this.config.funding.protocol_server_url}/v2/withdraw/clearance`, {
+            method: 'POST', body: { withdrawal_nullifier: nullifier, ownership_proof: ownership }, signal
+        });
+        if (!answer.ok) {
+            throw new BrowserWalletHttpError(answer.reachable
+                ? 'The server refused the mutual close of this set-aside balance.'
+                : 'The server did not answer. The set-aside balance can still be withdrawn later.',
+            answer.status || 503, answer.code || 'clearance_unavailable');
         }
+        const clearance = answer.body;
+        if (!clearance?.signature || clearance.withdrawal_nullifier == null || !sameFelt(clearance.withdrawal_nullifier, nullifier)) {
+            throw new Error('The server returned a clearance for a different private balance state.');
+        }
+        return clearance;
     }
 
     /**
-     * Obtain the server clearance for a mutual close (G6 client half). With a
-     * declared capability the request always carries an escape-form ownership
-     * proof; otherwise it is proof-less first. A refusal that reserved nothing
-     * (400 clearance_ownership_required, or 503 legacy_clearance_capacity from
-     * an upgraded server whose shared proof-less budget is spent) rolls the
-     * withdrawal-only marker back, then the proof is generated and sent once
-     * exactly as with the capability. A gateway 429 that outlasts the retries
-     * fails the close; it rolls the marker back for a proof-less body or on a
-     * hardened vault, but after an ownership proof was sent to a vault that
-     * burns a challenged nullifier the note stays withdrawal-only, since the
-     * 429 is unsigned and its sender may hold that proof. An ownership proof is
-     * never generated for a transmitted state unless the vault is hardened
-     * (vault_revision 2) and the server reports that nullifier unknown or
-     * clearance_reserved. On any other vault such a state, once its gate
-     * passes, gets only the proof-less request; a refusal that asks for a
-     * proof is answered with transmitted_anchor_ownership_unsafe.
+     * E7: an encrypted exit kit of the selected balance (zkapi-exit-kit-v1):
+     * the build-pinned deployment profile, the state an escape needs, its
+     * bound and its deposit-time Merkle path. Returns the kit as JSON for the
+     * host to save; it is never uploaded.
      */
-    async obtainClearance({
-        state, destination, nullifier, path, selected = true, signal = null,
-        commitMarker = null, rollbackMarker = null
-    }) {
-        const { hardenedVault, sendOwnershipProof } = this.vaultCapabilities();
-        // On a vault that burns a challenged nullifier the ownership proof is
-        // a submittable escape at this nullifier, and whoever holds a request
-        // proof sent from this state can challenge it there. Neither a server
-        // reading nor a server refusal is signed, so neither may decide that.
-        const strictTransmitted = !hardenedVault && this.archivedRequestsAt(state).length > 0;
-        const send = async body => {
-            if (commitMarker) await commitMarker();
+    async exportExitKit({ passphrase } = {}) {
+        await this.init();
+        return withBrowserWalletLock(this.manifest.deployment_id, async () => {
+            await this.reload();
+            const state = this.runtime.state;
+            if (!state) throw new Error('There is no private balance to export.');
+            const stateSeq = Number(this.runtime.stateSeq || 0);
+            const payload = buildExitKitPayload({ trustedDeployment: this.browserConfig?.trusted_deployment,
+                state, stateSeq, exportedAt: nowSeconds(), merklePath: state.deposit_path || null });
+            const kit = await sealExitKit(payload, passphrase);
+            await this.commit({ ...this.runtime, exitKitExportedSeq: stateSeq });
+            return JSON.stringify(kit);
+        });
+    }
+
+    /**
+     * Deployment verification before a deposit (design §6.5): codehashes,
+     * adapter and getters through the wallet provider that will sign, and
+     * through the pinned RPC; then the canary caps with the vault balance
+     * read through the wallet provider. Throws deployment_mismatch (or a
+     * canary refusal); exits never depend on it.
+     */
+    async verifyDeploymentForDeposit({ walletRequest, depositWei }) {
+        const trusted = this.browserConfig?.trusted_deployment;
+        const chainId = Number(this.config.funding.chain_id);
+        const results = await Promise.all([
+            verifyDeployment({ request: walletRequest, trusted, chainId, source: 'wallet' }),
+            verifyDeployment({ request: this.pinnedRpc(), trusted, chainId, source: 'pinned_rpc' })
+        ]);
+        this.deploymentVerification = { checkedAt: Date.now(), ok: results.every(result => result.ok), results };
+        if (!this.deploymentVerification.ok) throw deploymentMismatchError(results);
+        const limits = canaryLimits(trusted, nowSeconds());
+        if (limits) {
+            let balance = null;
             try {
-                return await this.postClearance(body, nullifier, signal);
-            } catch (error) {
-                if (error?.code !== CLEARANCE_GATEWAY_THROTTLED) throw error;
-                // An honest gateway answered before the API, so the server
-                // reserved nothing. A proof-less body gave whoever answered
-                // nothing, so the note may be usable again.
-                if (!body.ownership_proof || hardenedVault) {
-                    if (rollbackMarker) await rollbackMarker();
-                    throw error;
-                }
-                // The 429 is unsigned, and whoever answered it now holds an
-                // ownership proof: a submittable escape at this nullifier. On
-                // a vault whose challenge burns the nullifier, a request proof
-                // from this state would let that holder escape and challenge,
-                // so the note stays withdrawal-only (closing again or an
-                // escape still works) and no request proof is ever made here.
-                throw clearanceThrottledAfterOwnershipProof(error);
+                balance = BigInt(await walletRequest({ method: 'eth_getBalance',
+                    params: [this.config.funding.contract_address, 'latest'] }));
+            } catch {
+                balance = null;
             }
-        };
-        if (strictTransmitted) {
-            // Settle, install or refuse as for any transmitted state before
-            // the note is marked withdrawal-only.
-            const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
-            if (gate.advanced) return WITHDRAWAL_RESTART;
+            const refusal = canaryRefusal({ limits, depositWei, vaultBalanceWei: balance });
+            if (refusal) throw refusal;
         }
-        if (!sendOwnershipProof || strictTransmitted) {
-            // A server with legacy clearance on may reserve on this request,
-            // so the marker is committed before it is sent.
-            try {
-                return await send({ withdrawal_nullifier: nullifier });
-            } catch (error) {
-                if (!CLEARANCE_NOTHING_RESERVED.has(error?.code)) throw error;
-                // This request reserved nothing: until the proof is ready, a gate
-                // refusal, a proving failure or a closed tab leaves the note as it was.
-                if (rollbackMarker) await rollbackMarker();
-                if (strictTransmitted) throw transmittedOwnershipRefusal(error);
-            }
-        }
-        const gate = await this.transmittedAnchorGate({ state, nullifier, purpose: 'clearance', selected, signal });
-        if (gate.advanced) return WITHDRAWAL_RESTART;
-        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
-        // Commit the withdrawal-only marker only after local proving, so a
-        // proving failure never makes the note withdrawal-only.
-        return send({ withdrawal_nullifier: nullifier, ownership_proof: ownership });
+        return this.deploymentVerification;
     }
 
     async claimPreparedWithdrawalSubmission() {
@@ -4667,7 +5019,15 @@ class BrowserWalletRuntime extends EventTarget {
             const phase = details.phase === 'challenged_unconfirmed'
                 ? 'challenged_unconfirmed'
                 : 'pending';
+            // E5: what the payout matchers need, from the escape's plan (B, its
+            // initial concession, the state's bound) unless given.
+            const prepared = this.runtime.preparedWithdrawal;
+            const concession = Object.fromEntries(['stateBalance', 'concededAtInit', 'boundAtState', 'validUntil']
+                .map(field => [field, details[field] ?? prepared?.[field] ?? null])
+                .filter(([, value]) => value != null)
+                .map(([field, value]) => [field, field === 'validUntil' ? Number(value) : String(value)]));
             const result = await detachBrowserEscapeWithdrawal({
+                ...concession,
                 recordId: this.withdrawalRecordId(noteId),
                 deploymentId: this.manifest.deployment_id,
                 chainId: Number(this.config.funding.chain_id),
@@ -4779,19 +5139,12 @@ class BrowserWalletRuntime extends EventTarget {
         let clearance = validClearance(record.preparedWithdrawal, nullifier)
             ? record.preparedWithdrawal.clearance
             : null;
-        if (!clearance) {
-            clearance = await this.obtainClearance({
-                state, destination: identity.destination, nullifier, path, selected: false
-            });
-            if (clearance === WITHDRAWAL_RESTART) {
-                throw new Error('The saved balance changed while its withdrawal was being prepared. Try again.');
-            }
-        }
+        if (!clearance) clearance = await this.backgroundClearance({ state, nullifier, path });
         const plan = await this.worker.call('prepareWithdrawal', {
             config: config.wallet_core, state,
             args: { mode: 'mutual', destination: identity.destination,
-                valid_until: nowSeconds() + WITHDRAWAL_PROOF_VALIDITY_SECONDS, active_root: path.active_root,
-                merkle_siblings: path.siblings, clearance }, provingKey: config.proving_keys.withdrawal
+                valid_until: nowSeconds() + this.exitTiming().exitProofValiditySeconds, active_root: path.active_root,
+                merkle_siblings: path.siblings, clearance }, provingKey: this.withdrawalProvingKey()
         });
         const inputs = plan.public_inputs;
         const encodedDestination = Array.isArray(inputs?.destination)

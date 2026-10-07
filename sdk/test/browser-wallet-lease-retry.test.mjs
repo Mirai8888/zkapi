@@ -1062,7 +1062,7 @@ test('selected cap reaches proof inputs and insufficient funds never start provi
     runtime.config.wallet_core = { policy_charge_cap: 50_000 };
     runtime.config.policy_enabled = true;
     runtime.config.proving_keys = { request: {} };
-    runtime.runtime = { state: { note_id: 44, current_balance: 5_000_000, current_anchor: '0x2c' } };
+    runtime.runtime = { state: { note_id: 44, current_balance: 5_000_000, current_anchor: '0x2c', expiry_ts: 2_000_000_000 } };
     runtime.treePath = async () => ({ active_root: 'root', siblings: [] });
     runtime.commit = async next => { runtime.runtime = next; };
     const proofInputs = [];

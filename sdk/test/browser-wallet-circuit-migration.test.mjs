@@ -58,7 +58,9 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
         ...deployment.proof_setup,
         ...deployment.privacy_mode,
         setup_id: 'dev',
-        exit_concession: 1
+        exit_concession: 1,
+        vault_revision: 3,
+        clearance_ownership_proof: 'required'
     } };
     runtime.validateManifestTrust(deployment);
     delete runtime.browserConfig.trusted_deployment.circuit_id;
@@ -124,7 +126,7 @@ test('a placeholder profile, a profile without the concession exit or an unknown
     const runtime = new BrowserWalletRuntime();
     const deployment = manifest();
     const trusted = { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode,
-        setup_id: 'dev', exit_concession: 1 };
+        setup_id: 'dev', exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required' };
     runtime.browserConfig = { trusted_deployment: trusted };
     runtime.validateManifestTrust(deployment);
     runtime.browserConfig = { trusted_deployment: { ...trusted, deployment_status: 'not_deployed' } };
@@ -139,6 +141,12 @@ test('a placeholder profile, a profile without the concession exit or an unknown
     for (const setupId of [undefined, 'rehearsal', 'DEV']) {
         runtime.browserConfig = { trusted_deployment: { ...trusted, setup_id: setupId } };
         assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted setup_id/);
+    }
+    // Only vault revision 3 with required ownership proofs and a positive W.
+    for (const change of [{ vault_revision: 2 }, { vault_revision: undefined }, { clearance_ownership_proof: 'optional' },
+        { clearance_ownership_proof: undefined }, { settlement_window_seconds: 0 }, { settlement_window_seconds: '14705' }]) {
+        runtime.browserConfig = { trusted_deployment: { ...trusted, ...change } };
+        assert.throws(() => runtime.validateManifestTrust(deployment), /invalid trusted/, JSON.stringify(change));
     }
 });
 

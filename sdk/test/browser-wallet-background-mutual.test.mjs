@@ -115,8 +115,16 @@ async function setup(shared = false) {
             assert.equal(note, 7); assert.equal(required, true);
             return { active_root: root, siblings: [] };
         },
+        // Every clearance carries one kind-2 ownership proof (vault revision 3).
+        generateOwnershipProof: async ({ nullifier }) => {
+            assert.equal(nullifier, '0x777');
+            return { public_inputs: { kind: 2, withdrawal_nullifier: nullifier }, proof: { proof: 'ownership' } };
+        },
         remoteJson: async (_url, options) => {
-            assert.deepEqual(JSON.parse(options.body), { withdrawal_nullifier: '0x777' }); return {};
+            const body = JSON.parse(options.body);
+            assert.equal(body.withdrawal_nullifier, '0x777');
+            assert.equal(body.ownership_proof.public_inputs.kind, 2);
+            return { withdrawal_nullifier: '0x777', signature: { r_x: '0x1', r_y: '0x2', s: '0x3' } };
         },
         worker: { async call(method, args) {
             assert.equal(args.state.note_id, 7);

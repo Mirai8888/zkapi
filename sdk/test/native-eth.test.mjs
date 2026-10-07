@@ -156,7 +156,14 @@ test('native deposit preflights and submits payable value once, without token mi
     const plan = { commitment: '0x1', secret: 'local-secret', amount: 3333334, zero_path: Array(32).fill('0x0') };
     const { default: runtime } = await import('../services/browserWalletRuntime.js');
     t.mock.method(runtime, 'pendingDeposit', async () => null);
-    t.mock.method(runtime, 'prepareDeposit', async amount => { assert.equal(amount, 3333334); return plan; });
+    // The deployment pins and canary caps are checked before any deposit (zkapi-deployment tests).
+    const verified = [];
+    t.mock.method(runtime, 'verifyDeploymentForDeposit', async args => { verified.push(args); return { ok: true }; });
+    t.mock.method(runtime, 'prepareDeposit', async amount => {
+        assert.equal(amount, 3333334);
+        assert.equal(verified.length, 1, 'the deployment is verified before the note is prepared');
+        return plan;
+    });
     t.mock.method(runtime, 'refreshPendingDeposit', async () => plan);
     t.mock.method(runtime, 'claimPendingDepositSubmission', async () => ({ operationId: 'native-deposit', plan }));
     t.mock.method(runtime, 'rememberPendingDepositSubmissionMetadata', async () => {});
@@ -214,7 +221,7 @@ test('native lease proves a fixed USD tier with its exact feed quote and keeps p
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: 'native-tier-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 } };
     const q = quote();
     runtime.nativeBillingQuote = async () => q;
     runtime.treePath = async () => ({ active_root: '0x1', siblings: [] });
@@ -246,7 +253,7 @@ test('checksummed feed pins produce a canonical lowercase quote in the actual pr
     runtime.manifest = { deployment_id: 'native-checksum-test' };
     runtime.config = { funding: { ...funding, native_price_feed_address: feedAddress },
         wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' } };
+    runtime.runtime = { state: { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 } };
     runtime.remoteJson = async url => {
         assert.equal(url, `${funding.protocol_server_url}/v2/billing/quote`);
         return q;
@@ -367,7 +374,7 @@ test('a finalized price update cannot reprice a pending proof until exact supers
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: 'native-reprice-test' };
     runtime.config = { funding, wallet_core: {}, request_charge_cap: 1000, proving_keys: { request: {} } };
-    const note = { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1' };
+    const note = { note_id: 1, current_balance: 2_000_000, current_anchor: '0x1', expiry_ts: 2_000_000_000 };
     runtime.runtime = { state: note };
     let current = quote();
     let quoteReads = 0;
@@ -567,6 +574,7 @@ test('provider fee changes rejected before signing release the SDK claim for a s
     t.mock.method(client, 'connectWallet', async () => FROM);
     t.mock.method(client, 'refresh', async () => {});
     t.mock.method(runtime, 'pendingDeposit', async () => null);
+    t.mock.method(runtime, 'verifyDeploymentForDeposit', async () => ({ ok: true }));
     t.mock.method(runtime, 'prepareDeposit', async (amount, options) => {
         assert.equal(amount, plan.amount);
         assert.equal(options.preparedOperationId, plan.operationId);

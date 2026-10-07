@@ -279,18 +279,16 @@ test('an escape finalized elsewhere is reported credited while the hardened vaul
     assert.equal(creditRead.params[0].data, `${SELECTOR.credits}${word(DESTINATION)}`);
     assert.equal(creditRead.params[1], hex(chain.head), 'read at the block that showed the note closed');
 
-    // Without a credit (or on a legacy vault) nothing is claimed either way.
-    for (const hardened of [true, false]) {
-        const other = await scenario({ hardened });
-        other.chain.credits.set(DESTINATION, hardened ? 0 : FINAL_BALANCE);
-        await other.client.syncEscapeWithdrawals(() => {});
-        const closed = await other.record();
-        assert.equal(closed.phase, 'closed_unconfirmed');
-        assert.equal(closed.payoutCredited, undefined);
-        assert.equal(closed.payoutVerified, false);
-        assert.equal(other.chain.calls.some(call => call.method === 'eth_call'
-            && call.params[0].data.startsWith(SELECTOR.credits)), hardened);
-    }
+    // Without a credit nothing is claimed either way.
+    const other = await scenario();
+    other.chain.credits.set(DESTINATION, 0);
+    await other.client.syncEscapeWithdrawals(() => {});
+    const closed = await other.record();
+    assert.equal(closed.phase, 'closed_unconfirmed');
+    assert.equal(closed.payoutCredited, undefined);
+    assert.equal(closed.payoutVerified, false);
+    assert.ok(other.chain.calls.some(call => call.method === 'eth_call'
+        && call.params[0].data.startsWith(SELECTOR.credits)));
 
     // A push an earlier pass proved from its receipt is not re-attributed to
     // a credit the destination holds for another escape.
@@ -761,14 +759,6 @@ test('the escape destination check simulates the vault push with the payout gas'
     assert.equal((await client.checkEscapeDestination(DESTINATION, { finalBalance: 0 })).accepts, true);
     assert.ok(!calls.some(entry => entry.method === 'eth_call'));
 
-    // An older vault forwards all gas, and a rejected push blocks finalization.
-    runtime.browserConfig = { trusted_deployment: {} };
-    calls.length = 0;
-    outcome = { code: 3, message: 'execution reverted' };
-    const legacy = await client.checkEscapeDestination(DESTINATION);
-    assert.equal(legacy.accepts, false);
-    assert.match(legacy.warning, /could never be finalized/);
-    assert.equal(calls.find(entry => entry.method === 'eth_call').params[0].gas, undefined);
     await assert.rejects(client.checkEscapeDestination(VAULT), /vault contract/);
 });
 
@@ -806,72 +796,10 @@ test('an escape warns about its destination before proving, and a mutual close d
         if (mode === 'escape') {
             assert.deepEqual(order, [`eth_call:${DESTINATION}`, 'prove']);
             const warning = statuses.findIndex(message => /100,000-gas payout limit/.test(message));
-            assert.ok(warning >= 0 && warning < statuses.findIndex(message => /Generating/.test(message)));
+            assert.ok(warning >= 0 && warning < statuses.findIndex(message => /Preparing a unilateral escape/.test(message)));
         } else {
             assert.deepEqual(order, ['prove']);
         }
         t.mock.restoreAll();
-    }
-});
-
-test('on a vault without payout credits an escape to a destination that rejects ETH needs an override', async t => {
-    const order = [];
-    let accepts = false;
-    globalThis.ethereum = {
-        async request({ method, params }) {
-            if (method === 'eth_chainId') return hex(CHAIN_ID);
-            if (method === 'eth_call') {
-                order.push(`eth_call:${params[0].to}`);
-                if (!accepts) throw { code: -32603, message: 'EVM error OutOfGas' };
-                return '0x';
-            }
-            throw new Error(`unexpected RPC ${method}`);
-        }
-    };
-    runtime.browserConfig = { trusted_deployment: {} };
-    const client = new ZkapiClient();
-    client.config = { funding: { chain_id: CHAIN_ID, contract_address: VAULT } };
-    client.wallet = { has_note: true, note: { note_id: NOTE_ID, current_balance: 5_000_000 } };
-    for (const name of ['assertBalanceNotClaimed', 'settleActiveLease', 'refresh', 'rememberWithdrawal']) {
-        t.mock.method(client, name, async () => {});
-    }
-    t.mock.method(client, 'connectWallet', async () => FROM);
-    t.mock.method(client, 'readContractUint', async () => 1n);
-    t.mock.method(runtime, 'currentPreparedWithdrawal', async () => null);
-    t.mock.method(runtime, 'prepareWithdrawal', async () => {
-        order.push('prove');
-        throw new Error('stop after proving');
-    });
-
-    // Refused before any proof exists, through the public action too.
-    await assert.rejects(client.withdraw('escape', () => {}, { destination: DESTINATION }), error =>
-        error.code === 'escape_destination_unpayable'
-        && error.data.override_option === 'overrideDestinationCheck'
-        && error.data.destination === DESTINATION
-        && /could never be finalized/.test(error.shortMessage));
-    assert.deepEqual(order, [`eth_call:${DESTINATION}`]);
-
-    // The explicit override proceeds after the warning.
-    order.length = 0;
-    const statuses = [];
-    await assert.rejects(client.withdraw('escape', message => statuses.push(message),
-        { destination: DESTINATION, overrideDestinationCheck: true }), /stop after proving/);
-    assert.deepEqual(order, [`eth_call:${DESTINATION}`, 'prove']);
-    assert.ok(statuses.some(message => /could never be finalized/.test(message)));
-
-    // An accepting destination, or an RPC that cannot tell, is not refused.
-    for (const outcome of ['accepts', 'unknown']) {
-        order.length = 0;
-        accepts = outcome === 'accepts';
-        if (outcome === 'unknown') {
-            globalThis.ethereum.request = async ({ method, params }) => {
-                if (method === 'eth_chainId') return hex(CHAIN_ID);
-                order.push(`eth_call:${params[0].to}`);
-                throw { code: -32000, message: 'header not found' };
-            };
-        }
-        await assert.rejects(client.withdraw('escape', () => {}, { destination: DESTINATION }), /stop after proving/,
-            outcome);
-        assert.deepEqual(order, [`eth_call:${DESTINATION}`, 'prove'], outcome);
     }
 });

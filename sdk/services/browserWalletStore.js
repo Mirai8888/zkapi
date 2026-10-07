@@ -44,6 +44,9 @@ const EMPTY_RUNTIME = Object.freeze({
     pendingDeposit: null,
     depositQuote: null,
     preparedWithdrawal: null,
+    // Design §6.2: { noteId, anchor, mode, since, released: [...] } while an
+    // exit decision or a released exit proof freezes the note (C3, E6).
+    exitLock: null,
     lease: null,
     lateWithdrawalAttempts: [],
     lateDepositAttempts: [],
@@ -404,14 +407,16 @@ export function projectBrowserDeposits(runtime, records, deploymentId, depositCo
 
 /**
  * Whether a stored runtime slot holds durable wallet state: a note, journal,
- * lease, pending deposit, deposit draft, prepared withdrawal or unfinished late
- * attempt. A runtime for another deployment refuses to load over such a slot.
+ * exit lock, lease, pending deposit, deposit draft, prepared withdrawal or
+ * unfinished late attempt. A runtime for another deployment refuses to load
+ * over such a slot.
  */
 export function browserRuntimeHoldsState(runtime) {
     const value = runtime || {};
     return Boolean(
         value.state
         || value.journal
+        || value.exitLock
         || value.pendingDeposit
         || value.depositQuote
         || value.preparedWithdrawal
@@ -829,6 +834,9 @@ export async function detachBrowserEscapeWithdrawal(record) {
         deploymentId: record.deploymentId || current.deploymentId,
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal?.clearanceReserved === true
             || record.clearanceReserved === true,
         withdrawalNullifier: current.preparedWithdrawal?.withdrawalNullifier
@@ -880,6 +888,9 @@ export async function detachBrowserClosedWithdrawal(record) {
         phase: 'closed_unconfirmed',
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal?.clearanceReserved === true
             || current.preparedWithdrawal?.mode === 'mutual'
             || record.clearanceReserved === true,
@@ -1105,6 +1116,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
         noteId: Number(identity.noteId),
         state: existing?.state || current.state,
         preparedWithdrawal,
+        exitLock: existing?.exitLock || (selectedOwns ? current.exitLock || null : null),
         clearanceReserved: existing?.clearanceReserved === true
             || preparedWithdrawal?.clearanceReserved === true
             || preparedWithdrawal?.mode === 'mutual'
@@ -1212,6 +1224,7 @@ export async function transferBrowserLateWithdrawalAttempt(identity, record) {
             state: null,
             journal: null,
             preparedWithdrawal: null,
+            exitLock: null,
             lease: null
         } : {}),
         lateWithdrawalAttempts: [...terminalHistory, ...unresolved],
@@ -2027,6 +2040,9 @@ export async function parkBrowserWithdrawal(record) {
         deploymentId: record.deploymentId || current.deploymentId,
         state: current.state,
         preparedWithdrawal: current.preparedWithdrawal,
+        // The exit lock (design §6.2) stays with the note until it closes or
+        // its released proofs expire (E6).
+        exitLock: current.exitLock || null,
         clearanceReserved: current.preparedWithdrawal.clearanceReserved === true
             || current.preparedWithdrawal.mode === 'mutual',
         withdrawalNullifier: current.preparedWithdrawal.withdrawalNullifier
@@ -2173,6 +2189,9 @@ export async function restoreBrowserWithdrawal(recordId, identity = {}, expected
         deploymentId: record.deploymentId,
         state: record.state,
         preparedWithdrawal,
+        // A defeated escape's proof cannot land again, but the lock is
+        // released only by the E6 rules.
+        exitLock: record.exitLock || null,
         lateWithdrawalAttempts: current.lateWithdrawalAttempts || [],
         lateDepositAttempts: current.lateDepositAttempts || [],
         updatedAt: Date.now()
@@ -2273,6 +2292,7 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         }
         delete next.state;
         delete next.preparedWithdrawal;
+        delete next.exitLock;
         delete next.proof;
         delete next.withdrawalNullifier;
         delete next.finalizeTransactionHash;

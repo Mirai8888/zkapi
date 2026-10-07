@@ -275,17 +275,15 @@ test('a saved withdrawal proof is reused until its valid_until, never refreshed 
     assert.match(client, /`0x\$\{ABI\.currentRoot\}`/);
     // Deposits still re-prove on any stale root.
     assert.match(client, /const attempts = 3/);
-    assert.match(client, /Refreshing the Merkle path and proof/);
+    assert.match(client, /Refreshing the deposit before retrying/);
     // Exits do no Merkle work and the vault accepts any root it ever held:
-    // a proof stays usable until valid_until, and calldata carries no path.
-    const prepare = sourceMethodAt(runtime, 'async prepareWithdrawalLocked(');
-    assert.match(prepare, /withdrawalProofStillValid\(existing\.public_inputs\)/);
-    assert.match(prepare, /if \(!reprove && provenForState\) return existing;/);
-    assert.doesNotMatch(prepare, /siblingsRoot/);
-    assert.match(prepare, /valid_until: nowSeconds\(\) \+ WITHDRAWAL_PROOF_VALIDITY_SECONDS/);
+    // a proof stays usable until valid_until (E4.7) and calldata carries no
+    // path. Behaviour: browser-wallet-exit-rules.test.mjs.
+    const reuse = sourceMethodAt(runtime, 'reusablePlan(');
+    assert.match(reuse, /withdrawalProofStillValid\(inputs\)/);
+    assert.doesNotMatch(runtime, /siblingsRoot/);
     const withdraw = sourceMethodAt(client, 'async performWithdrawal(');
-    assert.match(withdraw, /reprove = error\.code === 'unknown_root' \|\| rootRejections > 1/);
-    assert.match(withdraw, /expectedActiveRoot,\s*reprove,/);
+    assert.match(withdraw, /\['proof_expired', 'unknown_root'\]\.includes\(error\?\.code\)/);
 });
 
 test('withdrawal root synchronization waits for the indexer and fails closed', async () => {

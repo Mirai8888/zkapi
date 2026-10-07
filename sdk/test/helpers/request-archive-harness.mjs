@@ -165,8 +165,13 @@ export const KEYS = Object.freeze({
 });
 export const GENESIS_ANCHOR = '0x1234';
 export const nullifierFor = anchor => `0x${(BigInt(anchor) + 0x5000n).toString(16)}`;
+// N⁺ of a state, as the fake escape proof publishes it.
+export const successorFor = anchor => `0x5${BigInt(nullifierFor(anchor)).toString(16)}`;
 export const destinationBytes = address => [...Buffer.from(address.slice(2), 'hex')];
 export const word = value => `0x${BigInt(value).toString(16).padStart(64, '0')}`;
+
+/** The harness's next_anchor(N). */
+export const derivedAnchor = nullifier => `0x${(BigInt(nullifier) + 0x9000n).toString(16)}`;
 
 export function noteState(changes = {}) {
     return {
@@ -182,6 +187,9 @@ export function noteState(changes = {}) {
         ...changes
     };
 }
+
+/** The deposit-time path a note saves (Amendment A1). */
+export const depositPath = (root = '0x51') => ({ active_root: root, siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) });
 
 export class HttpError extends Error {
     constructor(message, status, code, data = {}) {
@@ -209,9 +217,14 @@ export function createHarness(BrowserWalletRuntime, {
         effectiveExpiry: 2_000_000_000n,
         challengePeriod: 86_400n,
         reads: [],
-        failRoot: false
+        failRoot: false,
+        // E6 reads: the note's status and the finalized block's timestamp.
+        noteStatus: 'active',
+        finalizedTimestamp: null
     };
-    const worker = { calls: [], completions: [], proofs: 0, failWithdrawal: null, mutate: null };
+    const worker = { calls: [], completions: [], proofs: 0, failWithdrawal: null, mutate: null,
+        // The stale-device pre-check's verifier: true for a proof that verifies.
+        verify: () => false };
     const server = {
         calls: [],
         leasePost: () => { throw new HttpError('Lease issuance is not configured.', 500, 'internal_error'); },
@@ -219,7 +232,9 @@ export function createHarness(BrowserWalletRuntime, {
         nullifier: () => ({ status: 'not_found', nullifier_status: 'unknown' }),
         requests: () => { throw new HttpError('Not found', 404, 'not_found'); },
         clearance: () => { throw new HttpError('Clearance is not configured.', 500, 'internal_error'); },
-        expire: () => { throw new HttpError('The request may still be accepted.', 409, 'lease_pending'); }
+        expire: () => { throw new HttpError('The request may still be accepted.', 409, 'lease_pending'); },
+        // GET /v2/nullifiers/{N⁺}/evidence (design §5.2): none by default.
+        evidence: () => { throw new HttpError('No evidence.', 404, 'not_found'); }
     };
     const runtime = new BrowserWalletRuntime();
     runtime.manifest = { deployment_id: DEPLOYMENT };
@@ -248,6 +263,8 @@ export function createHarness(BrowserWalletRuntime, {
     };
     runtime.ownerId = 'this-tab';
     runtime.init = async () => {};
+    runtime.exitChainStatus = async () => ({ noteStatus: chain.noteStatus,
+        finalizedTimestamp: chain.finalizedTimestamp ?? Math.floor(Date.now() / 1000) });
     runtime.scheduleSettlement = () => {};
     runtime.nativeBillingQuote = async () => quote;
     runtime.verifyLease = async () => {};
@@ -281,6 +298,9 @@ export function createHarness(BrowserWalletRuntime, {
         if (method === 'GET' && path.startsWith('/v2/openrouter/leases/')) {
             return server.leaseStatus(decodeURIComponent(path.split('/').pop()));
         }
+        if (method === 'GET' && /^\/v2\/nullifiers\/[^/]+\/evidence$/.test(path)) {
+            return server.evidence(decodeURIComponent(path.split('/')[3]));
+        }
         if (method === 'GET' && path.startsWith('/v2/nullifiers/')) {
             return server.nullifier(decodeURIComponent(path.split('/').pop()));
         }
@@ -300,6 +320,25 @@ export function createHarness(BrowserWalletRuntime, {
                         current_balance: payload.state.current_balance } : null };
             }
             if (operation === 'withdrawalNullifier') return nullifierFor(payload.state.current_anchor);
+            if (operation === 'successorNullifier') return successorFor(payload.state.current_anchor);
+            if (operation === 'verifyRequest') return worker.verify(payload);
+            if (operation === 'notePathMatches') return true;
+            if (operation === 'checkUnrecoverableResponse') {
+                // S1, S2, S4 and S6 as the WebAssembly checks them, in the
+                // harness's terms: this state's nullifier, a signed response
+                // at the derived anchor.
+                const { state, response } = payload;
+                if (BigInt(response.request_nullifier) !== BigInt(nullifierFor(state.current_anchor))) {
+                    throw new Error('response_identity_mismatch: another nullifier');
+                }
+                if (response.next_state_signature !== 'valid-state-signature') {
+                    throw new Error('successor_signature_invalid: unsigned');
+                }
+                if (BigInt(response.next_anchor) !== BigInt(derivedAnchor(nullifierFor(state.current_anchor)))) {
+                    throw new Error('invalid_successor: S4: not the derived anchor');
+                }
+                return { charge_applied: Number(response.charge_applied), next_anchor: response.next_anchor };
+            }
             if (operation === 'prepareRequest') {
                 const { state, args, config } = payload;
                 const nullifier = nullifierFor(state.current_anchor);
@@ -346,6 +385,9 @@ export function createHarness(BrowserWalletRuntime, {
                 if (BigInt(response.charge_applied) > BigInt(journal.prepared_request.public_inputs.solvency_bound)
                     || BigInt(response.next_anchor) === 0n || !journal.user_rerandomization) {
                     throw new Error('invalid charge or next anchor');
+                }
+                if (worker.deriveAnchors && BigInt(response.next_anchor) !== BigInt(derivedAnchor(journal.nullifier))) {
+                    throw new Error('invalid_successor: S4: the successor is not at the derived anchor next_anchor(N)');
                 }
                 if (response.next_state_signature !== 'valid-state-signature') {
                     throw new Error('successor_signature_invalid: the successor is not signed by the pinned state key');

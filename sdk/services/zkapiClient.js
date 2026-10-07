@@ -9,6 +9,7 @@ import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from 
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
 import { externalRecoveryContext, sameAddress, externalTransactionNonce, assertExternalTransaction,
     hasDurableTransactionHash } from './zkapiExternalTransactions.mjs';
+import { matchEscapePayout } from './zkapiExitPolicy.mjs';
 
 const WITHDRAWAL_STORAGE_KEY = 'zkapi-withdrawal-v2';
 // Ethereum's `finalized` block tag is authoritative when the wallet RPC
@@ -26,6 +27,8 @@ const {
     abiWord,
     addressWord,
     callData,
+    decodePendingConcessions,
+    decodeVaultEvent,
     encodeClaimEscapePayout,
     encodeDeposit,
     encodeEscapePayoutCredits,
@@ -51,7 +54,8 @@ const ESCAPE_PAYOUT_STILL_REJECTED_MESSAGE = 'The destination still does not acc
 // the destination the same execution gas as the vault's push.
 const ESCAPE_DESTINATION_CHECK_GAS = 21_000 + ESCAPE_PAYOUT_GAS + 2_300;
 const ESCAPE_DESTINATION_CREDIT_WARNING = 'This address did not accept a plain ETH transfer within the vault’s 100,000-gas payout limit. An escape to it still closes, but the vault would only hold the payout for this address until someone claims it. An escape destination cannot be changed later, so prefer an ordinary account.';
-const ESCAPE_DESTINATION_LOCK_WARNING = 'This address did not accept a plain ETH transfer. On this vault an escape to it could never be finalized, and an escape destination cannot be changed later. Choose an ordinary account.';
+const DEVICE_NOT_NEWEST_MESSAGE = 'The escape was defeated: another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit.';
+const CONCESSION_EXCEEDED_BOUND_MESSAGE = 'The escape paid less than this balance minus its last chat’s budget (concession_exceeded_bound). The vault’s accounting is final; report this to the operator.';
 
 // A failed eth_call whose provider reports an EVM failure (a revert, out of
 // gas or an invalid instruction), as opposed to an RPC, network or account error.
@@ -183,46 +187,37 @@ function isDefinitelyPreBroadcastSendFailure(error) {
 }
 
 // Actionable copy for wallet-gate refusals and vault reverts. error.data keeps
-// the machine-readable details (for example escape_override_after).
+// the machine-readable details (for example escape_at).
 const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
-    request_settlement_pending: 'A private chat payment for this balance is still settling. Try the withdrawal again after it settles.',
-    transmitted_anchor_unconfirmed: 'This balance was used for a private request whose status the server could not confirm. Try again shortly.',
-    transmitted_anchor_escape_unsafe: 'This balance’s current state was already used for a private request, and this vault would burn a challenged escape. Wait for the request to settle, or withdraw by mutual close.',
-    transmitted_anchor_ownership_unsafe: 'This balance’s current state was already used for a private request, and on this vault the ownership proof the server asks for could be used to burn the balance, so it cannot be closed from this state. A private chat that settles moves it to a state that can be withdrawn; otherwise wait for the request to settle or contact the operator.',
-    gateway_rate_limited: 'The service is receiving too many requests right now. Nothing was reserved; try the withdrawal again in a moment.',
-    vault_revision_mismatch: 'This app’s configuration does not match its vault, so withdrawals are paused in this app. Your balance is unchanged; contact the site operator.',
-    anchor_challenged: 'An escape at this balance state was already challenged. Withdraw from the server-signed next state once its receipt is recovered.',
-    nullifier_challenged: 'The vault already challenged an escape at this balance state. Withdraw from the server-signed next state once its receipt is recovered.',
-    challenged_nullifier: 'The vault already challenged an escape at this balance state, so it cannot escape again. Withdraw from the server-signed next state once its receipt is recovered.',
-    receipt_journal_missing: 'The server reports a finalized private request for this balance that this browser cannot apply. Where the escape override is offered, read its warning before using it; otherwise withdrawing needs the operator’s help.',
+    request_settlement_pending: 'A private chat payment for this balance may still settle. A mutual close waits for it; an escape is available now, and from the time shown it concedes at most that chat’s budget.',
+    device_not_newest: 'Another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit before withdrawing.',
+    exit_locked: 'A withdrawal of this balance is in progress. Finish or cancel it before starting a private chat.',
+    exit_lock_mode: 'An escape proof for this balance may still land, so it can only exit by escape until that proof expires.',
+    exit_lock_state: 'An exit proof of another balance state may still land. Check its status first.',
+    note_near_expiry: 'This balance is too close to its expiry for a new private chat. Withdraw it instead.',
+    invalid_successor: 'The server settled a private request with a successor that fails this wallet’s checks. Only withdrawing remains, conceding at most that request’s budget.',
+    deployment_mismatch: 'This vault does not match the deployment this app pins, so deposits are refused. Existing balances can still be withdrawn.',
+    deployment_unverifiable: 'This app cannot verify its vault deployment, so deposits are refused. Existing balances can still be withdrawn.',
+    canary_cap_exceeded: 'During its launch period this vault takes only limited deposits. Choose a smaller amount.',
+    canary_cap_unverified: 'The vault balance could not be read to check its launch-period limit. Try again.',
+    receipt_unrecoverable: 'The server reports a settled private request for this balance that this browser cannot apply. Only withdrawing remains, conceding at most that request’s budget.',
     receipt_response_missing: 'The server reports a finalized private request for this balance but returned no receipt. Try again shortly.',
     receipt_pending_install: 'A settled private request must be applied to this balance first. Select the balance and try again.',
     request_archive_limit: 'Too many unsettled private requests are recorded for this balance, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw the balance.',
     withdrawal_submission_pending: 'A withdrawal transaction for this balance is still unresolved. Check its status first.',
-    unknown_root: 'The vault no longer accepts this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
+    challenged_nullifier: 'The vault already defeated an escape at this balance state: another device spent its next state. Restore the newest backup or exit kit.',
+    superseded_state: 'The vault already defeated an escape from this balance’s next state: another device holds a newer state. Restore the newest backup or exit kit.',
+    proof_expired: 'The withdrawal proof expired before it was included. Prepare the withdrawal again.',
+    unknown_root: 'The vault does not know this withdrawal proof’s Merkle root. Prepare the withdrawal again.',
     invalid_destination: 'The vault rejected the withdrawal address. Choose a valid nonzero address.',
-    escape_destination_unpayable: ESCAPE_DESTINATION_LOCK_WARNING,
-    vault_paused: 'The vault is paused by its owner. Withdrawals resume when it is unpaused.',
+    vault_paused: 'The vault is paused by its owner. Withdrawals reopen at the latest when its pause limit ends.',
     testnet_password_required: 'Enter the Sepolia password to check this balance’s private request status.'
 });
 
-// A throttled mutual close whose ownership proof was already sent keeps the
-// note withdrawal-only on a vault that burns a challenged nullifier.
-const GATEWAY_RATE_LIMITED_WITHDRAWAL_ONLY_MESSAGE = 'The service is receiving too many requests right now. This balance’s ownership proof was already sent, so the balance stays withdrawal-only; try the withdrawal again in a moment, or escape.';
-
 function withdrawalErrorWithMessage(error) {
-    const message = error?.code === 'gateway_rate_limited' && error?.data?.withdrawal_only === true
-        ? GATEWAY_RATE_LIMITED_WITHDRAWAL_ONLY_MESSAGE
-        : WITHDRAWAL_ERROR_MESSAGES[error?.code];
+    const message = WITHDRAWAL_ERROR_MESSAGES[error?.code];
     if (message && error && typeof error === 'object') error.shortMessage = message;
     return error;
-}
-
-// The escape override is explicit: `true` after its general warning, or
-// 'receipt_journal_missing' after that code's own warning (the value a
-// refusal's error.data.escape_override_acknowledgement carries).
-function escapeOverrideAcknowledgement(mode, value) {
-    return mode === 'escape' && (value === true || value === 'receipt_journal_missing') ? value : null;
 }
 
 function tagTransactionError(error, stage, broadcastPossible, transactionHash = null) {
@@ -975,8 +970,10 @@ class ZkapiClient extends EventTarget {
     }
 
     get withdrawalBlocksChat() {
+        // C3: a held exit lock freezes requests until the exit ends (E6).
         return !!this.activeLateWithdrawal
             || !!this.config?.prepared_withdrawal
+            || !!this.config?.exit?.lock
             || ['prepared', 'submitted', 'pending'].includes(this.withdrawal?.phase);
     }
 
@@ -1576,7 +1573,10 @@ class ZkapiClient extends EventTarget {
             commitment: plan.commitment,
             transactionHash: receipt.transactionHash,
             receiptMetadata,
-            expiry_ts: Number(deposited.expiryTs)
+            expiry_ts: Number(deposited.expiryTs),
+            // The root this deposit set: with its path, the note's exit path
+            // for life (Amendment A1).
+            deposit_root: `0x${deposited.newRoot.toString(16)}`
         });
         const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
         onStatus(balanceRefreshPending
@@ -1643,6 +1643,8 @@ class ZkapiClient extends EventTarget {
                     if (receiptMetadata) { confirmedReceipt = candidate; break; }
                 } catch { /* Vault recovery remains available when fee evidence is temporarily unavailable. */ }
             }
+            const recoveredDeposit = confirmedReceipt
+                ? parseNoteDeposited(confirmedReceipt, this.config.funding.contract_address) : null;
             await browserWalletRuntime.confirmDeposit({
                 operationId: plan.operationId,
                 secret: plan.secret,
@@ -1651,7 +1653,9 @@ class ZkapiClient extends EventTarget {
                 commitment: plan.commitment,
                 transactionHash: receiptMetadata?.transactionHash || null,
                 receiptMetadata,
-                expiry_ts: note.expiryTs
+                expiry_ts: note.expiryTs,
+                ...(recoveredDeposit && recoveredDeposit.noteId === BigInt(plan.next_note_id)
+                    ? { deposit_root: `0x${recoveredDeposit.newRoot.toString(16)}` } : {})
             });
             const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
             onStatus(balanceRefreshPending
@@ -1974,6 +1978,15 @@ class ZkapiClient extends EventTarget {
         }
         const balance = BigInt(await this.ethereum.request({ method: 'eth_getBalance', params: [address, 'latest'] }));
         if (balance < nativeDepositValue(amount, funding)) throw new Error('Your wallet needs more ETH for this deposit and its network fee.');
+        // Design §6.5: the deployment pins, through the provider that will
+        // sign and through the pinned RPC, and the canary caps, before every
+        // deposit. A mismatch refuses the deposit; exits stay allowed.
+        onStatus('Verifying the vault deployment…');
+        const provider = this.ethereum;
+        await browserWalletRuntime.verifyDeploymentForDeposit({
+            walletRequest: args => provider.request(args),
+            depositWei: nativeDepositValue(amount, funding)
+        });
 
         onStatus('Generating the private note commitment locally…');
         let plan = await browserWalletRuntime.prepareDeposit(Number(amount), { preparedOperationId });
@@ -2066,10 +2079,16 @@ class ZkapiClient extends EventTarget {
         return this.confirmBrowserDepositReceipt(plan, receipt, vaultAddress, onStatus);
     }
 
+    /**
+     * Withdraw the selected balance. `mode` 'mutual' asks for a cooperative
+     * close where the exit rules allow one (design §6.4 E2); the rules may
+     * turn it into an escape. 'escape' exits unilaterally now. `concede`
+     * ('zero', the default, or 'bound') is the concession of an escape
+     * forced before its settlement time T (E3).
+     */
     async withdraw(mode, onStatus = () => {}, {
         destination,
-        overrideUnsettledRequest = false,
-        overrideDestinationCheck = false
+        concede = 'zero'
     } = {}) {
         // The password dialog must not transfer an earlier withdrawal click
         // to a successor note installed by another tab while it was open.
@@ -2081,23 +2100,13 @@ class ZkapiClient extends EventTarget {
             throw new Error('The private balance changed while withdrawal was opening. Review the current balance before continuing.');
         }
         const requestedDestination = normalizeWithdrawalDestination(destination, this.config?.funding);
-        // The escape-only override is an explicit, separately keyed action.
-        const acknowledgement = escapeOverrideAcknowledgement(mode, overrideUnsettledRequest);
-        const override = acknowledgement != null;
-        // So is an escape to a destination that a vault without payout
-        // credits could never pay.
-        const destinationOverride = mode === 'escape' && overrideDestinationCheck === true;
-        const operationKey = `${mode}:${requestedDestination || ''}${override ? `:override:${acknowledgement}` : ''}`
-            + (destinationOverride ? ':destination-override' : '');
+        if (!['zero', 'bound'].includes(concede)) throw new TypeError('Choose zero or bound for a forced escape.');
+        const operationKey = `${mode}:${requestedDestination || ''}:${concede}`;
         if (this.withdrawPromise) {
             if (this.withdrawPromiseKey === operationKey) return this.withdrawPromise;
             throw new Error('A different withdrawal action is already running.');
         }
-        const options = {
-            destination,
-            ...(override ? { overrideUnsettledRequest: acknowledgement } : {}),
-            ...(destinationOverride ? { overrideDestinationCheck: true } : {})
-        };
+        const options = { destination, concede };
         const operation = (async () => {
             try {
                 return await this.performWithdrawal(mode, onStatus, options);
@@ -2133,27 +2142,13 @@ class ZkapiClient extends EventTarget {
 
     async performWithdrawal(mode, onStatus = () => {}, {
         destination: requested,
-        overrideUnsettledRequest = false,
-        overrideDestinationCheck = false
+        concede = 'zero'
     } = {}) {
         const requestedDestination = normalizeWithdrawalDestination(requested, this.config?.funding);
         const note = this.note;
         if (!note) throw new Error('There is no active private note to withdraw.');
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
         await this.assertBalanceNotClaimed(note.note_id);
-        const acknowledgement = escapeOverrideAcknowledgement(mode, overrideUnsettledRequest);
-        const override = acknowledgement != null;
-
-        try {
-            await this.settleActiveLease(onStatus);
-        } catch (error) {
-            // The runtime applies the escape override's time gate (and refuses
-            // it outright on a vault without non-destructive challenges).
-            if (!override || error?.code === 'lease_requests_in_flight' || error?.name === 'AbortError') {
-                // A receipt this browser cannot apply offers the override.
-                throw mode === 'escape' ? browserWalletRuntime.withEscapeOverrideData(error) : error;
-            }
-        }
 
         onStatus('Connecting to MetaMask…');
         const from = await this.connectWallet();
@@ -2194,36 +2189,24 @@ class ZkapiClient extends EventTarget {
         let submission = null;
         let submissionMetadata = null;
         // The vault accepts any root it ever held and exits carry no Merkle
-        // path, so a saved proof is reused until its valid_until. A repeated
-        // root rejection or UnknownRoot() re-proves from a fresh path.
+        // path, so a saved proof is reused until its valid_until (E4.7). An
+        // expired proof or UnknownRoot() re-proves.
         const withdrawalAttempts = 4;
         let reprove = false;
-        let rootRejections = 0;
         // An escape's destination is fixed once its proof exists. Before
-        // proving, check the vault's payout push to it.
+        // proving, check the vault's payout push to it: a destination that
+        // rejects ETH is only credited, which anyone can claim for it later.
         let destinationWarning = null;
         if (mode === 'escape' && !submittedHash) {
-            let destinationCheck = null;
             try {
                 // A zero balance is never pushed. Otherwise a nominal value
                 // keeps the balance out of this read.
-                destinationCheck = await this.checkEscapeDestination(destination, {
+                const destinationCheck = await this.checkEscapeDestination(destination, {
                     finalBalance: Number(note.current_balance) > 0 ? 1 : 0
                 });
+                destinationWarning = destinationCheck?.warning || null;
             } catch (error) {
                 if (error?.code === 'wrong_network') throw error;
-            }
-            destinationWarning = destinationCheck?.warning || null;
-            // A hardened vault credits a payout its destination rejects, and
-            // anyone can claim it later. An older vault cannot finalize such
-            // an escape at all: the note would stay PendingWithdrawal, which
-            // expiry cannot claim either. Refuse unless acknowledged.
-            if (destinationCheck?.accepts === false && overrideDestinationCheck !== true
-                && browserWalletRuntime.vaultCapabilities?.().hardenedVault !== true) {
-                throw Object.assign(new Error(ESCAPE_DESTINATION_LOCK_WARNING), {
-                    code: 'escape_destination_unpayable',
-                    data: { destination, override_option: 'overrideDestinationCheck' }
-                });
             }
             if (destinationWarning) onStatus(destinationWarning);
         }
@@ -2242,22 +2225,28 @@ class ZkapiClient extends EventTarget {
             } else for (let attempt = 0; attempt < withdrawalAttempts; attempt += 1) {
                 onStatus(attempt === 0
                     ? (mode === 'mutual'
-                        ? 'Requesting server clearance and generating the withdrawal proof…'
-                        : 'Generating a unilateral escape proof locally…')
-                    : reprove
-                        ? 'The vault changed during preparation. Refreshing the Merkle path and proof…'
-                        : 'The vault changed during preparation. Refreshing the Merkle path…');
-                const expectedActiveRoot = await this.readContractUint(
-                        this.config.funding.contract_address,
-                        `0x${ABI.currentRoot}`
-                    );
+                        ? 'Checking this balance and requesting a cooperative close…'
+                        : 'Preparing a unilateral escape locally…')
+                    : 'The withdrawal proof expired or the vault refused its root. Proving again…');
+                const expectedActiveRoot = mode === 'mutual'
+                    ? await this.readContractUint(this.config.funding.contract_address, `0x${ABI.currentRoot}`)
+                    : null;
                 plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
                     expectedActiveRoot,
                     reprove,
-                    ...(override ? { overrideUnsettledRequest: acknowledgement } : {})
+                    earlyConcession: concede,
+                    onProgress: (_phase, message) => onStatus(message)
                 });
                 if (Number(plan.public_inputs?.note_id) !== Number(note.note_id)) {
                     throw new Error('The private wallet returned a withdrawal for a different note.');
+                }
+                if (plan.mode !== mode) {
+                    // E2: the exit rules turned a mutual request into an escape.
+                    onStatus(plan.decision?.clearance_error_code
+                        ? 'The server did not grant a cooperative close, so this balance exits by escape, conceding nothing.'
+                        : 'This balance exits by escape.');
+                    mode = plan.mode;
+                    withdrawal.mode = mode;
                 }
                 submittedHash = plan.transactionHash || submittedHash;
                 this.rememberWithdrawal({
@@ -2280,7 +2269,8 @@ class ZkapiClient extends EventTarget {
                     plan,
                     mode,
                     destination,
-                    this.config.funding.contract_address
+                    this.config.funding.contract_address,
+                    { conceded: plan.public_inputs.conceded }
                 );
                 const claim = await browserWalletRuntime.claimPreparedWithdrawalSubmission();
                 submission = claim;
@@ -2289,6 +2279,12 @@ class ZkapiClient extends EventTarget {
                     onStatus(`Checking submitted transaction ${this.compact(submittedHash)}…`);
                     receipt = await this.waitForReceipt(submittedHash);
                     break;
+                }
+                // E4.6: one more bounded recovery pass before broadcast. A
+                // successor that arrives now is archived until the exit ends.
+                const late = await browserWalletRuntime.exitBeforeBroadcast().catch(() => null);
+                if (late?.lateSuccessor) {
+                    onStatus('A settled private request arrived after the exit proof was made. It is kept and applied if this exit expires unused.');
                 }
                 onStatus(mode === 'mutual'
                     ? 'Confirm the mutual close in MetaMask…'
@@ -2333,13 +2329,14 @@ class ZkapiClient extends EventTarget {
                     );
                     break;
                 } catch (error) {
-                    const rootRejection = ['stale_root', 'unknown_root'].includes(error?.code);
-                    if (!rootRejection || attempt + 1 >= withdrawalAttempts) throw error;
+                    // A proof past its valid_until (E4.7) or a root the vault
+                    // does not know is proved again: another release.
+                    const reprovable = ['proof_expired', 'unknown_root'].includes(error?.code);
+                    if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;
-                    rootRejections += 1;
-                    reprove = error.code === 'unknown_root' || rootRejections > 1;
+                    reprove = true;
                 }
             }
         } catch (failure) {
@@ -2358,21 +2355,19 @@ class ZkapiClient extends EventTarget {
             if (recoveredReceipt && BigInt(recoveredReceipt.status || '0x0') === 1n) {
                 receipt = recoveredReceipt;
             }
-            if (!receipt) {
-                if (error?.code === 'challenged_nullifier') {
-                    // Never re-escape a challenged nullifier: recover the
-                    // server-signed successor state instead.
-                    await browserWalletRuntime.recoverPending({ quiet: true, sweep: true }).catch(() => false);
-                    await this.refresh({ quiet: true });
-                }
-                throw error;
-            }
+            if (!receipt) throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, mode);
         if (!event || event.noteId !== BigInt(note.note_id)
             || event.destination.toLowerCase() !== destination.toLowerCase()
             || event.finalBalance !== BigInt(plan.public_inputs.final_balance)) {
             throw new Error('The transaction succeeded, but its withdrawal event did not match the prepared note.');
+        }
+        if (mode === 'escape' && event.concession
+            && (event.concession.conceded !== BigInt(plan.public_inputs.conceded)
+                || event.concession.stateBalance !== BigInt(plan.public_inputs.final_balance) + BigInt(plan.public_inputs.conceded)
+                || event.concession.nextNullifier !== BigInt(plan.public_inputs.next_nullifier))) {
+            throw new Error('The transaction succeeded, but its recorded concession did not match the prepared escape.');
         }
 
         onStatus('Confirming the vault state and updating this browser…');
@@ -2424,12 +2419,10 @@ class ZkapiClient extends EventTarget {
             event,
             receipt,
             recordId: record.recordId,
+            conceded: BigInt(plan.public_inputs.conceded),
+            decision: plan.decision || null,
             ...(destinationWarning ? { destinationWarning } : {})
         };
-        this.rememberWithdrawal({ ...withdrawal, phase: 'pending', challengeDeadline: deadline });
-        await this.refresh();
-        onStatus('Escape started. Return after the safety window to finalize.');
-        return { status: 'pending_withdrawal', deadline, event, receipt };
     }
 
     async recoverFailedWithdrawalSubmission({
@@ -2549,9 +2542,11 @@ class ZkapiClient extends EventTarget {
             if (!remainingHashes.length) {
                 await browserWalletRuntime.clearPreparedWithdrawal();
                 this.rememberWithdrawal(null, { emit: false });
+                // E6: the proof reached the wallet, so the exit lock holds the
+                // balance until that proof expires; another escape is allowed.
                 error.shortMessage = rejectedBeforeSubmission
-                    ? 'MetaMask canceled the escape. No funds moved, and your private balance is ready to use.'
-                    : 'The wallet refused the escape before broadcast. No funds moved, and your private balance is ready to use.';
+                    ? 'MetaMask canceled the escape. No funds moved. The escape proof already reached the wallet, so this balance stays withdrawal-only until that proof expires; you can still escape.'
+                    : 'The wallet refused the escape before broadcast. No funds moved. The escape proof already reached the wallet, so this balance stays withdrawal-only until that proof expires; you can still escape.';
             } else {
                 error.shortMessage = 'MetaMask canceled this prompt. Another submitted withdrawal is still being checked.';
             }
@@ -4162,6 +4157,8 @@ class ZkapiClient extends EventTarget {
                 // A matching finalization receipt that also carries the
                 // vault's EscapePayoutDeferred log: closed, but only credited.
                 let payoutCredit = null;
+                // The matched finalized amount (E5), after any raise.
+                let payoutMatch = null;
                 let minimumObservedBlock = Math.max(
                     Number(record.startBlockNumber || 0),
                     Number(record.lastObservedBlock || 0)
@@ -4469,16 +4466,19 @@ class ZkapiClient extends EventTarget {
                             this.config.funding.contract_address,
                             'finalize'
                         );
+                        const receiptBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+                        // E5: after raises the vault pays B − c_final.
+                        const match = event ? await this.escapePayoutMatch(record, event.finalBalance, receiptBlock) : null;
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || !match?.accepted) {
                             await browserWalletRuntime.releaseWithdrawalFinalization(record.recordId, {
                                 transactionHash: hash
                             });
                             changed = true;
                             continue;
                         }
-                        const receiptBlock = Number(BigInt(receipt.blockNumber || '0x0'));
+                        payoutMatch = { amount: Number(event.finalBalance), match };
                         if (Number(status.observed_block || 0) < receiptBlock) {
                             status = await this.readBrowserWithdrawalStatus(record.noteId);
                         }
@@ -4535,7 +4535,10 @@ class ZkapiClient extends EventTarget {
                     // (A push an earlier pass proved is not re-read.)
                     payoutCredit = await this.observedEscapePayoutCredit(record, status);
                 }
-                const payout = closedWithdrawalPayout(record, payoutVerified, payoutCredit);
+                const payout = {
+                    ...closedWithdrawalPayout(record, payoutVerified, payoutCredit),
+                    ...(payoutMatch ? this.payoutMatchFields(payoutMatch, onStatus) : {})
+                };
                 if (payoutCredit && record.payoutCredited !== true) {
                     creditedPayouts += 1;
                     onStatus(ESCAPE_PAYOUT_CREDITED_MESSAGE);
@@ -4618,6 +4621,12 @@ class ZkapiClient extends EventTarget {
                 } else if (status.status === 'pending_withdrawal') {
                     const stillFinalizing = Boolean(record.finalizeTransactionHash
                         || record.finalizeSubmissionId);
+                    // E5: an EscapeConcessionRaised lowers the payout in place;
+                    // pendingWithdrawals and pendingConcessions show it.
+                    if (status.conceded != null && record.concededCurrent != null
+                        && BigInt(status.conceded) > BigInt(record.concededCurrent)) {
+                        onStatus(`The operator raised this escape’s concession; it now pays ${this.formatMoney(Number(status.final_balance))}.`);
+                    }
                     const patch = {
                         mode: 'escape',
                         phase: record.phase === 'ambiguous'
@@ -4629,6 +4638,7 @@ class ZkapiClient extends EventTarget {
                         challengeDeadline: Number(status.challenge_deadline),
                         destination: status.destination || record.destination,
                         finalBalance: Number(status.final_balance ?? record.finalBalance),
+                        ...(status.conceded != null ? { concededCurrent: String(status.conceded) } : {}),
                         lastObservedBlock: Math.max(
                             minimumObservedBlock,
                             Number(status.observed_block || 0)
@@ -4781,10 +4791,13 @@ class ZkapiClient extends EventTarget {
                                         minimumObservedBlock,
                                         Number(status.observed_block || 0)
                                     ),
-                                    ...(challengeEvidence ? { challengeEvidence } : {}),
-                                    error: withdrawalOnly && record.mode === 'escape'
-                                        ? 'The escape was challenged. This balance remains withdrawal-only because its close authorization was already reserved.'
-                                        : null
+                                    ...(challengeEvidence ? { challengeEvidence, deviceNotNewest: true } : {}),
+                                    // A defeat needs a request from this state's
+                                    // successor: this device is not the newest.
+                                    error: challengeEvidence ? DEVICE_NOT_NEWEST_MESSAGE
+                                        : withdrawalOnly && record.mode === 'escape'
+                                            ? 'The escape was defeated. This balance remains withdrawal-only because its close authorization was already reserved.'
+                                            : null
                                 }, { expectedRevision: record.revision });
                                 changed = true;
                             } catch (error) {
@@ -5172,9 +5185,14 @@ class ZkapiClient extends EventTarget {
             throw error;
         }
         const event = parseWithdrawalReceipt(receipt, this.config.funding.contract_address, 'finalize');
+        // E5: after raises the vault pays B − c_final, not the amount the
+        // escape started with.
+        const match = event
+            ? await this.escapePayoutMatch(withdrawal, event.finalBalance, Number(BigInt(receipt?.blockNumber || '0x0')))
+            : null;
         if (!event || event.noteId !== BigInt(withdrawal.noteId)
             || event.destination.toLowerCase() !== withdrawal.destination.toLowerCase()
-            || event.finalBalance !== BigInt(withdrawal.finalBalance)) {
+            || !match?.accepted) {
             throw new Error('The finalization event did not match the pending withdrawal.');
         }
         const confirmed = await this.confirmMinedWithdrawalStatus(withdrawal.noteId, receipt);
@@ -5193,6 +5211,7 @@ class ZkapiClient extends EventTarget {
                 amount: Number(event.creditedAmount),
                 evidence: 'receipt'
             } : null),
+            ...this.payoutMatchFields({ amount: Number(event.finalBalance), match }, onStatus),
             closedAt: Date.now(),
             closeBlockNumber: Number(BigInt(receipt?.blockNumber || '0x0')),
             lastObservedBlock: Number(confirmed.observed_block || 0),
@@ -5203,6 +5222,75 @@ class ZkapiClient extends EventTarget {
             ? `${ESCAPE_PAYOUT_CREDITED_MESSAGE} Finality is being checked safely in the background.`
             : 'Escape withdrawal returned. Finality is being checked safely in the background.');
         return { status: 'closed', event, receipt, ...(credited ? { payoutCredited: true } : {}) };
+    }
+
+    /**
+     * E5: whether an escape's finalized or credited amount matches its
+     * record: f' == B − c_final after every EscapeConcessionRaised of the
+     * note between initiation and `toBlock`, and B − b <= f' <= B − c_init
+     * (below B − b the record still closes, with an alert). A record saved
+     * before vault revision 3 (no B or c_init) must match exactly.
+     */
+    async escapePayoutMatch(record, amount, toBlock) {
+        if (record?.stateBalance == null || record?.concededAtInit == null) {
+            const accepted = BigInt(amount) === BigInt(record?.finalBalance ?? -1);
+            return { accepted, exact: true, concededFinal: null, alert: null };
+        }
+        const raises = await this.escapeConcessionRaisesFor(record, toBlock);
+        return matchEscapePayout({
+            stateBalance: record.stateBalance,
+            concededAtInit: record.concededAtInit,
+            boundAtState: record.boundAtState ?? null,
+            raises: raises == null ? null : [...raises, ...(record.concededCurrent != null ? [record.concededCurrent] : [])],
+            amount
+        });
+    }
+
+    /**
+     * Every EscapeConcessionRaised log of this escape (its note and
+     * nullifier) from its start block to `toBlock`, or null when the logs
+     * cannot be read.
+     */
+    async escapeConcessionRaisesFor(record, toBlock) {
+        const fromBlock = Number(record.startBlockNumber || 0);
+        const vault = this.config?.funding?.contract_address;
+        if (!vault || !Number.isSafeInteger(fromBlock) || fromBlock <= 0
+            || !Number.isSafeInteger(Number(toBlock)) || Number(toBlock) < fromBlock) return null;
+        let logs;
+        try {
+            logs = await this.ethereum.request({
+                method: 'eth_getLogs',
+                params: [{ address: vault, topics: [ABI.escapeConcessionRaisedEvent, `0x${abiWord(record.noteId)}`],
+                    fromBlock: rpcQuantity(fromBlock), toBlock: rpcQuantity(Number(toBlock)) }]
+            });
+        } catch {
+            return null;
+        }
+        if (!Array.isArray(logs)) return null;
+        const raises = [];
+        for (const log of logs) {
+            let event;
+            try {
+                event = decodeVaultEvent(log, vault);
+            } catch {
+                return null;
+            }
+            if (event?.event !== 'EscapeConcessionRaised' || event.noteId !== BigInt(record.noteId)) continue;
+            if (record.withdrawalNullifier != null && event.nullifier !== BigInt(record.withdrawalNullifier)) continue;
+            raises.push({ conceded: event.conceded, finalBalance: event.finalBalance });
+        }
+        return raises;
+    }
+
+    /** The record fields of a matched payout: its amount, c_final and any alert. */
+    payoutMatchFields({ amount, match }, onStatus = () => {}) {
+        if (!match || match.concededFinal == null) return {};
+        if (match.alert) onStatus(CONCESSION_EXCEEDED_BOUND_MESSAGE);
+        return {
+            finalBalance: Number(amount),
+            concededFinal: String(match.concededFinal),
+            ...(match.alert ? { payoutAlert: match.alert } : {})
+        };
     }
 
     /** Credited escape payouts this browser has not yet seen delivered. */
@@ -5240,7 +5328,6 @@ class ZkapiClient extends EventTarget {
     // claim delivers it either way). Read failures leave the record unchanged.
     async observedEscapePayoutCredit(record, status) {
         if (Number(record.finalBalance || 0) <= 0
-            || !browserWalletRuntime.vaultCapabilities?.().hardenedVault
             || !/^0x[0-9a-fA-F]{40}$/.test(record.destination || '')) return null;
         const observedBlock = Number(status.observed_block || 0);
         try {
@@ -5506,7 +5593,6 @@ class ZkapiClient extends EventTarget {
         if (!normalized) throw new TypeError('Choose a valid nonzero Ethereum withdrawal address.');
         const units = BigInt(finalBalance);
         if (units <= 0n) return { destination: normalized, accepts: true, warning: null };
-        const hardened = browserWalletRuntime.vaultCapabilities?.().hardenedVault === true;
         await this.assertFundingChain();
         try {
             await this.ethereum.request({
@@ -5515,7 +5601,7 @@ class ZkapiClient extends EventTarget {
                     from: vault,
                     to: normalized,
                     value: rpcQuantity(units * NATIVE_WEI_PER_UNIT),
-                    ...(hardened ? { gas: rpcQuantity(ESCAPE_DESTINATION_CHECK_GAS) } : {})
+                    gas: rpcQuantity(ESCAPE_DESTINATION_CHECK_GAS)
                 }, 'latest']
             });
             return { destination: normalized, accepts: true, warning: null };
@@ -5525,7 +5611,7 @@ class ZkapiClient extends EventTarget {
             return {
                 destination: normalized,
                 accepts: false,
-                warning: hardened ? ESCAPE_DESTINATION_CREDIT_WARNING : ESCAPE_DESTINATION_LOCK_WARNING
+                warning: ESCAPE_DESTINATION_CREDIT_WARNING
             };
         }
     }
@@ -5580,6 +5666,19 @@ class ZkapiClient extends EventTarget {
         if (pendingWords.length < 6 || BigInt(`0x${pendingWords[0]}`) !== 1n) {
             throw new Error('The vault pending-withdrawal record is missing.');
         }
+        // Vault revision 3: the escape's concession at the same block
+        // (pendingWithdrawals.finalBalance + conceded == stateBalance).
+        let concession = null;
+        try {
+            const encodedConcession = await this.ethereum.request({
+                method: 'eth_call',
+                params: [{ to: this.config.funding.contract_address, data: `0x${ABI.pendingConcessions}${abiWord(noteId)}` }, blockTag]
+            });
+            concession = decodePendingConcessions(encodedConcession);
+            if (concession.stateBalance !== BigInt(`0x${pendingWords[3]}`) + concession.conceded) concession = null;
+        } catch {
+            concession = null;
+        }
         return {
             status: 'pending_withdrawal',
             note_id: Number(noteId),
@@ -5588,6 +5687,11 @@ class ZkapiClient extends EventTarget {
             final_balance: Number(BigInt(`0x${pendingWords[3]}`)),
             destination: `0x${pendingWords[4].slice(-40)}`,
             challenge_deadline: Number(BigInt(`0x${pendingWords[5]}`)),
+            ...(concession ? {
+                next_nullifier: `0x${concession.nextNullifier.toString(16)}`,
+                state_balance: Number(concession.stateBalance),
+                conceded: Number(concession.conceded)
+            } : {}),
             observed_block: observedBlock
         };
     }

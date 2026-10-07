@@ -136,6 +136,14 @@ then creates a draft release for publication. Homebrew taps and AUR packages
 are not automatically published. Publish a client prerelease only after the
 native, installer and package validation jobs succeed.
 
+This release line serves the concession-exit vault. Its warnings send owners
+of an earlier vault's note to that vault's point release, `zkapi-clientd
+0.1.7` from the `release/v2-note-bound` line (deposits closed, mutual close
+and escape kept). Release assembly (`scripts/assemble-release.py`) refuses
+any other version until that release is published and its checksum record,
+`zkapi-clientd/packaging/releases/clientd-0.1.7.json`, is checked in here;
+`--fixture` skips the check for test fixtures only.
+
 After publishing a release, add its tag and four native archive hashes to
 `zkapi-clientd/packaging/releases/clientd-VERSION.json`, then refresh the
 installable manifests from the templates and pinned hashes:

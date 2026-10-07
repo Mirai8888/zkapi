@@ -18,11 +18,13 @@ vault: run it only in the stack of a concession-exit vault. It decodes the
 complete ABI, checks that a defeat's or raise's proof names this deployment and
 carries a 256-byte Groth16 proof, simulates the call again, and checks the gas,
 fee, transaction fee and balance bounds before signing an EIP-1559 (type 2)
-transaction with ethers. Leaf retirements also have a budget: at most
+transaction with ethers. Leaf retirements follow the operator's policy of
+design §5.4: only with `ZKAPI_CHALLENGE_RETIRE_ON_MISS` on, only for a note an
+escape finalized (a missed defeat is an escape that finalized), at most
 `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` retirement nonces per rolling 24
 hours, and one pending nonce per note (see
-[Retirement budget](#retirement-budget)). It does not expose generic
-signing or raw-transaction forwarding.
+[Retirement policy and budget](#retirement-policy-and-budget)). It does not
+expose generic signing or raw-transaction forwarding.
 
 ## Configuration
 
@@ -43,7 +45,9 @@ leading zeros are refused, and an empty value means the default.
 | `ZKAPI_CHALLENGE_FEE_CEILING_WEI` | 10,000 gwei; at most 1,000,000 gwei | Typo guard: the fee cap must not exceed it. |
 | `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` | 1 ETH (`1000000000000000000`) | Transaction fee cap: the highest gas limit x `maxFeePerGas` the signer signs, for proposed and default bids alike. Match the upstream node's `--rpc.txfeecap`; see [Node transaction fee cap](#node-transaction-fee-cap). The challenger reads its own copy from `deployment.env`. |
 | `ZKAPI_CHALLENGE_MAX_GAS` | 12,000,000; at most 16,777,216 | Gas limit cap. |
-| `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 2; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement budget](#retirement-budget). |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | `true`; `true` or `false` | The operator's retire-on-miss policy (design §5.4). Keep it equal to the challenger's `ZKAPI_CHALLENGE_RETIRE_ON_MISS` in `deployment.env`; `false` refuses every leaf retirement with `retirement_disabled`. |
+| `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` | 50,400 (about 7 days of 12 s blocks); 1 to 5,000,000 | How far back a leaf retirement's note must show an `EscapeWithdrawalFinalized` log. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` | 2; 0 to 1,000 | Nonces on which the signer signs a leaf retirement (`retireClosedLeaf`) per rolling 24 hours; fee replacements on a counted nonce are free, and 0 refuses every retirement. See [Retirement policy and budget](#retirement-policy-and-budget). |
 | `ZKAPI_CHALLENGE_LISTEN_HOST`, `ZKAPI_CHALLENGE_PORT` | `127.0.0.1`, `8547` | Bind address. Compose sets the host to `0.0.0.0` on its private backend network and publishes no signer port. |
 | `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` | removed | Startup refuses while it is present, even when empty, because its meaning changed. |
 
@@ -102,7 +106,7 @@ aggregate budget beyond the sender balance: each needs a real pending escape
 with evidence. Leaf retirements have one (below). Fund the sender to the target
 below rather than far beyond it.
 
-### Retirement budget
+### Retirement policy and budget
 
 A defeat or raise needs a pending escape and a request proof the vault
 accepts, so a caller can spend gas on them only as fast as real escapes need
@@ -112,7 +116,24 @@ and each changes the vault root, so every request proof in flight must be made
 again at the new root. A compromised challenger host could otherwise spend the
 float meant for defeats and raises on the ever-growing set of closed notes.
 The challenger retires a leaf only after a missed defeat, which is rare and
-already a critical alarm.
+already a critical alarm, and only with `--retire-on-miss` (design §5.4).
+
+The signer applies the same policy before it counts a retirement:
+
+- With `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` every retirement is refused with
+  `retirement_disabled` before any upstream call. Set the same value as the
+  challenger's.
+- A missed defeat is an escape that finalized, so the note must show an
+  `EscapeWithdrawalFinalized` log of this vault within the last
+  `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` blocks (default 50,400, about
+  seven days). The signer reads `eth_getLogs` newest first, 10,000 blocks at a
+  time, after the in-flight check below; a note closed by a mutual close or an
+  expiry claim, or finalized longer ago, is refused with
+  `retirement_not_after_escape` (data `note_id`, `lookback_blocks`) and takes
+  no budget. The challenger retires right after it confirms a miss, so the log
+  is in the newest range; raise the lookback (and recreate the signer) only
+  when a retirement waited longer, for example after a long outage. Fee
+  replacements on a counted nonce are not checked again.
 
 The budget counts nonces, not notes. A nonce mines at most one transaction,
 and every retirement that mines pays about 6M gas, including a copy that
@@ -131,9 +152,9 @@ hours, each counted from its first signing:
   the earlier one mined and reverted (a root race), so it never meets this
   refusal; a `challenge_refused` line with this reason means the caller
   misbehaves.
-- A retirement refused before broadcast (simulation, fees, balance, the
-  node's fee-cap refusal, an unreadable nonce count) takes no budget; one
-  whose broadcast is ambiguous counts.
+- A retirement refused before broadcast (the policy above, simulation, fees,
+  balance, the node's fee-cap refusal, an unreadable nonce count or log range)
+  takes no budget; one whose broadcast is ambiguous counts.
 
 The retirement gas any caller can spend is thus at most the budget x
 `MAX_GAS` x fee cap per rolling day. One missed defeat needs one unit, and
@@ -237,8 +258,10 @@ wei values as hex quantities:
 | -32003 | `base_fee_above_max_fee` | `base_fee_per_gas`, `max_fee_per_gas` | The latest base fee exceeds this transaction's `maxFeePerGas`. Retry the same nonce later or with a higher bid. |
 | -32003 | `insufficient_balance` | `balance`, `required_balance` | The balance is below gas limit x `maxFeePerGas`. Fund the sender. |
 | -32003 | `tx_fee_above_cap` | `gas_limit`, `max_fee_per_gas`, `tx_fee_cap_wei`, `max_fee_per_gas_allowed` (floor of the cap / gas limit) | Gas limit x `maxFeePerGas`, proposed or default, exceeds `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. Checked before any upstream call. Bid at most `max_fee_per_gas_allowed`. |
-| -32003 | `retirement_budget_exhausted` | `max_retirements_per_day` | A leaf retirement on a nonce not yet counted while `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` retirement nonces were counted in the last 24 hours. Checked before any upstream call. See [Retirement budget](#retirement-budget). |
-| -32003 | `retirement_in_flight` | `retirement_nonce` | A leaf retirement of a note on a new nonce while the sender's `latest` nonce count is not past `retirement_nonce`, the latest nonce a retirement of that note was counted on. Re-send on that nonce, or wait for it to mine. See [Retirement budget](#retirement-budget). |
+| -32003 | `retirement_disabled` | none | A leaf retirement while `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false`. Checked before any upstream call. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| -32003 | `retirement_budget_exhausted` | `max_retirements_per_day` | A leaf retirement on a nonce not yet counted while `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` retirement nonces were counted in the last 24 hours. Checked before any upstream call. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| -32003 | `retirement_in_flight` | `retirement_nonce` | A leaf retirement of a note on a new nonce while the sender's `latest` nonce count is not past `retirement_nonce`, the latest nonce a retirement of that note was counted on. Re-send on that nonce, or wait for it to mine. See [Retirement policy and budget](#retirement-policy-and-budget). |
+| -32003 | `retirement_not_after_escape` | `note_id`, `lookback_blocks` | A leaf retirement of a note that no `EscapeWithdrawalFinalized` log of this vault closed within the last `lookback_blocks` blocks. See [Retirement policy and budget](#retirement-policy-and-budget). |
 | -32003 | `upstream_tx_fee_cap` | `gas_limit`, `max_fee_per_gas` | The upstream node refused the broadcast because gas limit x `maxFeePerGas` exceeds its own `--rpc.txfeecap`, which is below `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`. The node refuses before its pool, so nothing was broadcast. Lower the variable to the node's cap, or raise both. |
 | -32000 | `upstream_unavailable`, `upstream_rejected`, `upstream_chain_mismatch`, `base_fee_unavailable`, `simulation_failed` | none | Upstream or simulation failure. Transient. |
 | -32603 | none | none | Signer self-check failed or an internal error. Nothing was broadcast, but `zkapi-challenged` treats the code as possibly broadcast, as it does any error it cannot attribute to this signer: it keeps the nonce and re-sends on it as a valid replacement. If the obligation expires first, the nonce is held (`nonce_blocked`) until resolved as in [Recovery and verification](../../../docs/challenge-service.md#recovery-and-verification). |
@@ -259,15 +282,19 @@ known" answer from the pool returns the same hash as success.
 `simulation_failed` covers every upstream error from `eth_call` or
 `eth_estimateGas`, including provider rate limits, so it is transient and never
 proves the evidence invalid. Each upstream call times out after 8 seconds, and a
-send waits on at most seven sequential upstream round trips (the base-fee and
-balance reads run in parallel; the seventh, the nonce count, only for a
-retirement of a counted note on a new nonce), about 56 seconds at worst. Give
-the daemon an `eth_sendTransaction` timeout of at least 90 seconds.
+send waits on at most six sequential upstream round trips for a defeat or a
+raise (the base-fee and balance reads run in parallel, and the sixth is the
+transaction lookup after a failed broadcast), about 48 seconds at worst. A new
+retirement adds the block number and the newest log range, and the nonce count
+for a counted note on a new nonce: nine, about 72 seconds at worst (a refused
+one may read up to ⌈lookback / 10,000⌉ log ranges). Give the daemon an
+`eth_sendTransaction` timeout of at least 90 seconds.
 
 `zkapi_signerStatus []` returns `{chain_id, sender, vault, transaction_type:
 "0x2", fee_cap_source, max_fee_per_gas, priority_fee_per_gas,
 max_priority_fee_per_gas, fee_ceiling, tx_fee_cap_wei, max_gas,
-required_balance, max_retirements_per_day, retirements_last_24h,
+required_balance, max_retirements_per_day, retire_on_miss,
+retirement_lookback_blocks, retirements_last_24h,
 retirement_refusals, last_retirement_refusal_at, block_number,
 base_fee_per_gas, balance, warnings}`. The retirement fields are plain numbers:
 the retirement nonces counted in the window, the refusals for the budget since start,
@@ -289,7 +316,7 @@ challenger bids within the lower of its own
   defeats and raises, well below `MAX_GAS`, still sign at the fee cap (see
   [Node transaction fee cap](#node-transaction-fee-cap));
 - `retirement_budget_exhausted`: a leaf retirement was refused for the
-  [retirement budget](#retirement-budget) in the last 24 hours. After a real
+  [retirement budget](#retirement-policy-and-budget) in the last 24 hours. After a real
   missed defeat, raise the budget or wait for the window.
 
 The read-only passthrough allows `eth_chainId`, `eth_blockNumber`,

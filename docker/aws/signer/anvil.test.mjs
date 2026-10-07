@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Transaction, Wallet } from 'ethers';
-import { GWEI, createSigner, createUpstream, vaultInterface } from './signer.mjs';
+import { ESCAPE_FINALIZED_TOPIC, GWEI, createSigner, createUpstream, vaultInterface } from './signer.mjs';
 
 const CHAIN_ID = 11155111n;
 const haveAnvil = spawnSync('anvil', ['--version'], { stdio: 'ignore' }).status === 0;
@@ -242,4 +242,29 @@ test('bids above a node\'s 1 ETH fee cap are refused as never broadcast; a bid w
   assert.deepEqual([signed.nonce, signed.gasLimit, signed.maxFeePerGas], [0, gas, allowed]);
   assert.equal(await nonceOf(rpc, 'latest'), 1);
   assert.equal(node.refused.length, 1);
+});
+
+test('a leaf retirement is signed only for a note whose EscapeWithdrawalFinalized log the node returns', { skip }, async t => {
+  const rpc = await startAnvil(t);
+  // A vault stand-in that emits EscapeWithdrawalFinalized(9) (LOG2: topic0,
+  // then note 9) on every call, so the retirement of note 9 also simulates.
+  const topic = ESCAPE_FINALIZED_TOPIC.slice(2);
+  const note9 = (9).toString(16).padStart(64, '0');
+  await rpc('anvil_setCode', [vault, `0x7f${note9}7f${topic}60006000a200`]);
+  // Another funded account emits it: the signer's sender keeps nonce 0.
+  const [, funded] = await rpc('eth_accounts', []);
+  await rpc('eth_sendTransaction', [{ from: funded, to: vault, gas: '0x30000' }]);
+  await mine(rpc);
+  const logs = await rpc('eth_getLogs', [{ address: vault, fromBlock: '0x0', toBlock: 'latest', topics: [ESCAPE_FINALIZED_TOPIC] }]);
+  assert.equal(logs.length, 1);
+  const signer = signerFor(rpc, { maxFeePerGas: 10n * GWEI });
+  const retire = (note, nonce) => ({ from: sender, to: vault, gas: wei(GAS), nonce: wei(BigInt(nonce)),
+    data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, Array(32).fill(0)]) });
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(10, 0)]),
+    { code: -32003, data: { reason: 'retirement_not_after_escape', note_id: '0xa', lookback_blocks: wei(50_400n) } });
+  assert.equal(await poolSize(rpc), 0, 'nothing was broadcast');
+  const hash = await signer.handle('eth_sendTransaction', [retire(9, 0)]);
+  await mine(rpc);
+  assert.equal((await receipt(rpc, hash)).status, '0x1');
+  assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 1);
 });

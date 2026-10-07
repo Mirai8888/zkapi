@@ -1,4 +1,4 @@
-import { Interface, Transaction, Wallet, getAddress, isHexString, keccak256 } from 'ethers';
+import { Interface, Transaction, Wallet, getAddress, id, isHexString, keccak256 } from 'ethers';
 
 // Configuration errors carry fixed, secret-free messages that startup may print.
 export class ConfigError extends Error {}
@@ -34,6 +34,18 @@ export const UPSTREAM_TIMEOUT_MS = 8_000;
 export const DEFAULT_MAX_RETIREMENTS_PER_DAY = 2n;
 export const MAX_RETIREMENTS_PER_DAY_LIMIT = 1_000n;
 export const RETIREMENT_WINDOW_MS = 86_400_000;
+// The operator's retirement policy (design §5.4): the challenger retires a
+// leaf only with --retire-on-miss (ZKAPI_CHALLENGE_RETIRE_ON_MISS, default
+// true), only after a missed defeat, which is an escape that finalized. The
+// signer applies the same switch and signs a retirement only for a note an
+// escape finalized within the last ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS
+// (default 50,400, about 7 days of 12 s blocks), so a compromised caller
+// cannot spend retirements on notes closed by a mutual close or an expiry
+// claim. The logs are read newest first, RETIREMENT_LOG_RANGE_BLOCKS at a time.
+export const ESCAPE_FINALIZED_TOPIC = id('EscapeWithdrawalFinalized(uint32,uint256,uint128,address)');
+export const DEFAULT_RETIREMENT_LOOKBACK_BLOCKS = 50_400n;
+export const MAX_RETIREMENT_LOOKBACK_BLOCKS = 5_000_000n;
+export const RETIREMENT_LOG_RANGE_BLOCKS = 10_000n;
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
   'eth_getTransactionReceipt', 'eth_getTransactionByHash',
@@ -83,6 +95,15 @@ function envInteger(env, name) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,30}$/.test(value)) throw new ConfigError(`${name} must be a positive decimal integer`);
   return BigInt(value);
 }
+// A positive block count up to MAX_RETIREMENT_LOOKBACK_BLOCKS: unset or empty
+// means the default.
+function envLookback(env, name) {
+  const value = envInteger(env, name);
+  if (value !== undefined && value > MAX_RETIREMENT_LOOKBACK_BLOCKS) {
+    throw new ConfigError(`${name} must be a decimal integer from 1 to ${MAX_RETIREMENT_LOOKBACK_BLOCKS}`);
+  }
+  return value;
+}
 // A count that may be zero: unset or empty means the default.
 function envCount(env, name, limit) {
   const value = env[name];
@@ -91,6 +112,13 @@ function envCount(env, name, limit) {
     throw new ConfigError(`${name} must be a decimal integer from 0 to ${limit}`);
   }
   return BigInt(value);
+}
+// Unset or empty means the default; otherwise exactly "true" or "false".
+function envBoolean(env, name) {
+  const value = env[name];
+  if (value === undefined || value === '') return undefined;
+  if (value !== 'true' && value !== 'false') throw new ConfigError(`${name} must be true or false`);
+  return value === 'true';
 }
 export function parseSignerConfig(env) {
   if (env.ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI !== undefined) {
@@ -112,6 +140,8 @@ export function parseSignerConfig(env) {
     feeCeiling: envInteger(env, 'ZKAPI_CHALLENGE_FEE_CEILING_WEI'),
     txFeeCap: envInteger(env, 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI'),
     maxRetirementsPerDay: envCount(env, 'ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY', MAX_RETIREMENTS_PER_DAY_LIMIT),
+    retireOnMiss: envBoolean(env, 'ZKAPI_CHALLENGE_RETIRE_ON_MISS'),
+    retirementLookbackBlocks: envLookback(env, 'ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS'),
   };
 }
 
@@ -144,7 +174,7 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
+export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, retireOnMiss, retirementLookbackBlocks, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
   requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
   // Mainnet never inherits the testnet default; null counts as unset.
@@ -162,6 +192,11 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   requireValid(positive(txFeeCap), 'Transaction fee cap is invalid');
   maxRetirementsPerDay ??= DEFAULT_MAX_RETIREMENTS_PER_DAY;
   requireValid(typeof maxRetirementsPerDay === 'bigint' && maxRetirementsPerDay >= 0n && maxRetirementsPerDay <= MAX_RETIREMENTS_PER_DAY_LIMIT, 'Retirement budget is invalid');
+  retireOnMiss ??= true;
+  requireValid(typeof retireOnMiss === 'boolean', 'Retirement policy is invalid');
+  retirementLookbackBlocks ??= DEFAULT_RETIREMENT_LOOKBACK_BLOCKS;
+  requireValid(typeof retirementLookbackBlocks === 'bigint' && retirementLookbackBlocks > 0n
+    && retirementLookbackBlocks <= MAX_RETIREMENT_LOOKBACK_BLOCKS, 'Retirement lookback is invalid');
   requireValid(positive(maxFeePerGas) && maxFeePerGas <= feeCeiling, 'Fee cap is invalid or exceeds the fee ceiling');
   requireValid(maxPriorityFeePerGas == null || (positive(maxPriorityFeePerGas) && maxPriorityFeePerGas <= maxFeePerGas), 'Priority fee cap is invalid or exceeds the fee cap');
   priorityFeePerGas ??= min(DEFAULT_PRIORITY_FEE_PER_GAS, maxPriorityFeePerGas ?? maxFeePerGas);
@@ -179,6 +214,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling), tx_fee_cap_wei: hex(txFeeCap),
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
     max_retirements_per_day: Number(maxRetirementsPerDay),
+    retire_on_miss: retireOnMiss, retirement_lookback_blocks: Number(retirementLookbackBlocks),
   });
 
   // The leaf retirements broadcast (or possibly broadcast) in the last
@@ -225,6 +261,30 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     if (mined > BigInt(earlier)) return;
     throw new RpcError(-32003, 'A retirement of this note may still mine on an earlier nonce', 'retirement_in_flight', {
       retirement_nonce: hex(earlier),
+    });
+  }
+  // §5.4: a retirement follows a missed defeat, so an escape of the note
+  // finalized. Looks for its EscapeWithdrawalFinalized log, newest blocks
+  // first, within the lookback; an unreadable log range is a transient
+  // upstream failure. Takes no budget either way.
+  async function requireEscapeFinalized(note) {
+    const latest = upstreamQuantity(await rpc('eth_blockNumber', []), 'Upstream RPC returned an invalid block number');
+    const floor = latest >= retirementLookbackBlocks ? latest - retirementLookbackBlocks + 1n : 0n;
+    const noteTopic = `0x${BigInt(note).toString(16).padStart(64, '0')}`;
+    const finalizes = entry => entry && typeof entry === 'object' && entry.removed !== true
+      && typeof entry.address === 'string' && entry.address.toLowerCase() === destination
+      && Array.isArray(entry.topics) && entry.topics.length === 2
+      && String(entry.topics[0]).toLowerCase() === ESCAPE_FINALIZED_TOPIC && String(entry.topics[1]).toLowerCase() === noteTopic;
+    for (let to = latest; ; ) {
+      const from = to - floor + 1n > RETIREMENT_LOG_RANGE_BLOCKS ? to - RETIREMENT_LOG_RANGE_BLOCKS + 1n : floor;
+      const logs = await rpc('eth_getLogs', [{ address: destination, fromBlock: hex(from), toBlock: hex(to), topics: [ESCAPE_FINALIZED_TOPIC, noteTopic] }]);
+      if (!Array.isArray(logs)) throw new RpcError(-32000, 'Upstream RPC returned invalid logs', 'upstream_unavailable');
+      if (logs.some(finalizes)) return;
+      if (from === floor) break;
+      to = from - 1n;
+    }
+    throw new RpcError(-32003, 'No escape of this note finalized within the retirement lookback', 'retirement_not_after_escape', {
+      note_id: hex(BigInt(note)), lookback_blocks: hex(retirementLookbackBlocks),
     });
   }
   function retirementStatus() {
@@ -371,6 +431,9 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const transaction = validateTransaction(tx);
     const call = vaultInterface.parseTransaction({ data: transaction.data });
     const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
+    if (retiredNote !== null && !retireOnMiss) {
+      throw new RpcError(-32003, 'Leaf retirements are off (ZKAPI_CHALLENGE_RETIRE_ON_MISS=false)', 'retirement_disabled');
+    }
     const newRetirement = retiredNote !== null && requireRetirementBudget(retiredNote, transaction.nonce);
     // Nodes refuse a gas limit x maxFeePerGas above their RPC fee cap, so
     // neither a proposed nor the default bid above it is ever offered.
@@ -381,7 +444,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       });
     }
     await checkChain();
-    if (newRetirement) await requireNoRetirementInFlight(retiredNote);
+    if (newRetirement) {
+      await requireNoRetirementInFlight(retiredNote);
+      await requireEscapeFinalized(retiredNote);
+    }
     const simulation = { from: sender, to: destination, data: transaction.data, value: '0x0' };
     await simulate(() => rpc('eth_call', [simulation, 'latest']));
     const estimate = upstreamQuantity(await simulate(() => rpc('eth_estimateGas', [simulation])), 'Upstream RPC returned an invalid gas estimate');

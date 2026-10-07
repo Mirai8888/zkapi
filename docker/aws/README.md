@@ -186,7 +186,12 @@ they retire a leaf or revert. Fee replacements on a counted nonce are free; a
 further retirement is refused with `retirement_budget_exhausted` (the
 challenger reports `signer_refused`), and defeats and raises are never
 affected. One missed defeat takes one unit, plus one for each re-send after a
-root race.
+root race. The signer also follows the operator's retire-on-miss policy
+(design §5.4): `ZKAPI_CHALLENGE_RETIRE_ON_MISS=false` in `signer.env` refuses
+every retirement (`retirement_disabled`), and a retirement is signed only for a
+note whose escape finalized within `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`
+(default 50,400; `retirement_not_after_escape` otherwise), never for one closed
+by a mutual close or an expiry claim.
 
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
@@ -251,7 +256,7 @@ The challenger also reads from `deployment.env` (see
 | --- | --- |
 | `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
 | `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
-| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. Set the same value in `signer.env`: the signer refuses retirements when it is `false`, and signs one only for a note an escape finalized within its `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS`. |
 
 The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
 SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which

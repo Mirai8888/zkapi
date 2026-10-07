@@ -8,8 +8,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
-  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, GWEI, RpcError, UPSTREAM_TIMEOUT_MS, createSigner, createUpstream,
-  parseChainId, parseSignerConfig, vaultInterface,
+  ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, ESCAPE_FINALIZED_TOPIC, GWEI, RpcError, UPSTREAM_TIMEOUT_MS,
+  createSigner, createUpstream, parseChainId, parseSignerConfig, vaultInterface,
 } from './signer.mjs';
 import { createHttpServer } from './server.mjs';
 
@@ -41,6 +41,8 @@ function fixture(overrides = {}, options = {}) {
     eth_getBlockByNumber: { number: '0x10', baseFeePerGas: '0x3b9aca00' },
     eth_getBalance: ONE_ETH, eth_getTransactionByHash: null,
     eth_sendRawTransaction: raw => keccak256(raw), eth_blockNumber: '0x1',
+    // An escape of every note finalized (in the newest block range read).
+    eth_getLogs: filter => [{ address: filter.address, topics: filter.topics, data: `0x${'00'.repeat(96)}`, removed: false }],
     ...overrides,
   };
   // Unexpected methods fail the test, which proves eth_gasPrice is never read.
@@ -284,6 +286,67 @@ test('a note retires on one nonce at a time: fee replacements are free, a later 
     await one.signer.handle('eth_sendTransaction', [retire(9, nonce)]).catch(error => assert.equal(error.data?.reason, 'retirement_budget_exhausted'));
   }
   assert.deepEqual(broadcasts(one.calls).map(call => Transaction.from(call.params[0]).nonce), [4]);
+});
+
+test('a retirement follows the operator policy: retire-on-miss is on and an escape of the note finalized within the lookback', async () => {
+  assert.equal(ESCAPE_FINALIZED_TOPIC, keccak256(Buffer.from('EscapeWithdrawalFinalized(uint32,uint256,uint128,address)')));
+  const noteTopic = note => `0x${note.toString(16).padStart(64, '0')}`;
+  const finalized = (note, extra = {}) => ({ address: vault, topics: [ESCAPE_FINALIZED_TOPIC, noteTopic(note)], data: `0x${'00'.repeat(96)}`, removed: false, ...extra });
+  // Logs by block: note 9's escape finalized at block 30,000 of 100,000.
+  let found = { 30_000n: [finalized(9)] };
+  const ranges = [];
+  const getLogs = filter => {
+    assert.equal(filter.address, vault);
+    assert.deepEqual(filter.topics, [ESCAPE_FINALIZED_TOPIC, noteTopic(BigInt(filter.topics[1]))]);
+    const [from, to] = [BigInt(filter.fromBlock), BigInt(filter.toBlock)];
+    ranges.push([from, to]);
+    return Object.entries(found).filter(([block]) => BigInt(block) >= from && BigInt(block) <= to).flatMap(([, logs]) => logs);
+  };
+  const { signer, calls, logs } = fixture({ eth_blockNumber: wei(100_000n), eth_getLogs: getLogs, eth_getTransactionCount: '0x4' },
+    { maxRetirementsPerDay: 5n, retirementLookbackBlocks: 80_000n });
+  assert.deepEqual([signer.policy.retire_on_miss, signer.policy.retirement_lookback_blocks], [true, 80_000]);
+  // Found three 10,000-block ranges back, newest first: the retirement signs.
+  await signer.handle('eth_sendTransaction', [retire(9, 4n)]);
+  assert.deepEqual(ranges, [[90_001n, 100_000n], [80_001n, 90_000n], [70_001n, 80_000n], [60_001n, 70_000n],
+    [50_001n, 60_000n], [40_001n, 50_000n], [30_001n, 40_000n], [20_001n, 30_000n]]);
+  assert.equal(broadcasts(calls).length, 1);
+  // A fee replacement on the counted nonce does not read the logs again.
+  ranges.length = 0;
+  await signer.handle('eth_sendTransaction', [{ ...retire(9, 4n), ...fees(5n * GWEI, 2n * GWEI) }]);
+  assert.deepEqual(ranges, []);
+  // No finalization of note 10 within the lookback (one at 20,000 is
+  // older; another note's, a removed log and another contract's do not
+  // count): refused after the whole lookback, nothing simulated or sent, no budget taken.
+  found = { 20_000n: [finalized(10)], 50_000n: [finalized(11), finalized(10, { removed: true }), finalized(10, { address: '0x0000000000000000000000000000000000004321' })] };
+  ranges.length = 0;
+  const before = calls.length;
+  const refused = { code: -32003, message: 'No escape of this note finalized within the retirement lookback',
+    data: { reason: 'retirement_not_after_escape', note_id: '0xa', lookback_blocks: wei(80_000n) } };
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(10, 5n)]), refused);
+  assert.deepEqual(ranges.at(-1), [20_001n, 30_000n]);
+  assert.equal(ranges.length, 8);
+  assert.ok(!calls.slice(before).some(call => ['eth_call', 'eth_estimateGas', 'eth_sendRawTransaction'].includes(call.method)));
+  assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 1);
+  assert.deepEqual(logs.at(-1), { event: 'challenge_refused', nonce: 5, code: -32003, reason: 'retirement_not_after_escape',
+    message: refused.message, note_id: '10', lookback_blocks: '80000' });
+  // An unreadable log range is transient and takes nothing.
+  const flaky = fixture({ eth_getLogs: () => { throw new RpcError(-32000, 'Upstream RPC request failed', 'upstream_unavailable'); } });
+  await assert.rejects(flaky.signer.handle('eth_sendTransaction', [retire(9)]), { code: -32000, data: { reason: 'upstream_unavailable' } });
+  assert.equal(broadcasts(flaky.calls).length, 0);
+  const malformed = fixture({ eth_getLogs: { logs: [] } });
+  await assert.rejects(malformed.signer.handle('eth_sendTransaction', [retire(9)]), { code: -32000, data: { reason: 'upstream_unavailable' } });
+  // With retire-on-miss off, every retirement is refused before any upstream
+  // call; defeats and raises still sign.
+  const off = fixture({}, { retireOnMiss: false });
+  assert.equal(off.signer.policy.retire_on_miss, false);
+  await assert.rejects(off.signer.handle('eth_sendTransaction', [retire(9)]),
+    { code: -32003, message: 'Leaf retirements are off (ZKAPI_CHALLENGE_RETIRE_ON_MISS=false)', data: { reason: 'retirement_disabled' } });
+  assert.equal(off.calls.length, 0);
+  await off.signer.handle('eth_sendTransaction', [validTx]);
+  assert.equal(broadcasts(off.calls).length, 1);
+  for (const [option, value] of [['retireOnMiss', 'yes'], ['retirementLookbackBlocks', 0n], ['retirementLookbackBlocks', 5_000_001n], ['retirementLookbackBlocks', 10]]) {
+    assert.throws(() => fixture({}, { [option]: value }), { message: option === 'retireOnMiss' ? 'Retirement policy is invalid' : 'Retirement lookback is invalid' });
+  }
 });
 
 test('fee proposals outside 0 < tip <= max fee <= cap and tip <= tip cap are refused before any RPC', async () => {
@@ -595,7 +658,8 @@ test('signer status reports policy, base fee, balance coverage and warnings', as
     chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
-    max_retirements_per_day: 2, retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
+    max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
     block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
   const warnings = async (baseFee, balance = ONE_ETH) => (await fixture({
@@ -690,7 +754,8 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
     status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
-    max_retirements_per_day: 2, retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
+    max_retirements_per_day: 2, retire_on_miss: true, retirement_lookback_blocks: 50400,
+    retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
   });
   const failed = await post({ jsonrpc: '2.0', id: 8, method: 'eth_blockNumber', params: [] });
   assert.deepEqual(failed, { jsonrpc: '2.0', id: 8, error: { code: -32603, message: 'Signer request failed' } });
@@ -786,9 +851,24 @@ test('Mainnet refuses to start without an explicit fee cap; Sepolia uses a repor
   assert.deepEqual(configured, {
     chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
     maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI,
-    txFeeCap: 2_700_000_000_000_000_000n, maxRetirementsPerDay: 0n,
+    txFeeCap: 2_700_000_000_000_000_000n, maxRetirementsPerDay: 0n, retireOnMiss: undefined, retirementLookbackBlocks: undefined,
   });
   assert.equal(parseSignerConfig(env).maxRetirementsPerDay, undefined);
+  assert.deepEqual([parseSignerConfig(env).retireOnMiss, parseSignerConfig(env).retirementLookbackBlocks], [undefined, undefined]);
+  assert.deepEqual([parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIRE_ON_MISS: '', ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: '' }).retireOnMiss,
+    parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: '' }).retirementLookbackBlocks], [undefined, undefined]);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIRE_ON_MISS: 'false' }).retireOnMiss, false);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIRE_ON_MISS: 'true' }).retireOnMiss, true);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: '5000000' }).retirementLookbackBlocks, 5_000_000n);
+  for (const bad of ['TRUE', '0', '1', 'no', ' true']) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIRE_ON_MISS: bad }), configError('ZKAPI_CHALLENGE_RETIRE_ON_MISS must be true or false'), bad);
+  }
+  assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: '5000001' }),
+    configError('ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS must be a decimal integer from 1 to 5000000'));
+  for (const bad of ['0', '-1', '0x10', '01']) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS: bad }),
+      configError('ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS must be a positive decimal integer'), bad);
+  }
   assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '' }).maxRetirementsPerDay, undefined);
   assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '1000' }).maxRetirementsPerDay, 1_000n);
   for (const bad of ['1001', '-1', '0x2', '02', ' 2', '2.0', 'two']) {
@@ -947,6 +1027,7 @@ test('server process starts from strict configuration and prints its fee policy 
     // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
     max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1', max_retirements_per_day: 2,
+    retire_on_miss: true, retirement_lookback_blocks: 50400,
     base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required', 'tx_fee_cap_below_fee_cap'],
   });
   const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());

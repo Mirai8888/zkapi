@@ -13,6 +13,9 @@
 //! task so the async runtime stays responsive.
 
 use crate::oa_station_trust::{StationTrust, TRUSTED_STATION};
+
+#[path = "exit.rs"]
+pub(crate) mod exit;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -752,10 +755,12 @@ impl AuthService {
         std::fs::create_dir_all(&config.state_dir)
             .map_err(|err| AuthError::Wallet(err.to_string()))?;
         let prepared_withdrawal = load_prepared_withdrawal(&config.state_dir)?;
+        // C1: the one process-wide lock of this wallet.
+        let wallet_mutex = crate::wallet_lock::WalletLock::for_state_dir(&config.state_dir);
         Ok(Arc::new(Self {
             indexer: IndexerClient::new(config.indexer_url.clone()),
             config,
-            wallet_mutex: Arc::new(Mutex::new(())),
+            wallet_mutex,
             direct_lease: tokio::sync::Mutex::new(None),
             direct_request_mutex: Arc::new(tokio::sync::RwLock::new(())),
             prepared_withdrawal: tokio::sync::Mutex::new(prepared_withdrawal),
@@ -768,7 +773,13 @@ impl AuthService {
     // never enters the wallet/prover bridge or the zkAPI payment server.
     pub fn oa_bridge_status(&self) -> serde_json::Value {
         serde_json::json!({
-            "bridge_version": 4,
+            // 5: circuit zkapi-v2-concession-v1 with the escape routes
+            // /oa/v1/withdraw/escape/{prepare,submit,status,finalize}.
+            "bridge_version": 5,
+            "exit_concession": 1,
+            "setup_id": self.config.setup_id,
+            "settlement_window_seconds": self.config.settlement_window_seconds,
+            "escape_routes_version": 1,
             "session_events_version": 1,
             "deployment_id": self.config.deployment_id,
             "contract_address": self.config.contract_address,
@@ -779,7 +790,8 @@ impl AuthService {
             // Clearance requests carry an ownership proof (kind 2 on
             // circuit zkapi-v2-concession-v1).
             "clearance_ownership_proof_version": 1,
-            // /oa/v1/withdraw/prepare accepts accept_unsettled_request_risk.
+            // /oa/v1/withdraw/prepare accepts accept_unsettled_request_risk
+            // (ignored: the exit rules of §6.4 decide).
             "unsettled_request_override_version": 1,
             "chain_id": self.config.chain_id,
             "mode": self.config.request_mode,
@@ -850,7 +862,8 @@ impl AuthService {
             }
         }
         // Same order as issuance: lease mutex, wallet mutex, then filesystem lock.
-        // Hold all three through clearance so no inference can race the snapshot.
+        // Hold all three through the decision and the clearance so no
+        // inference can race the snapshot (C1).
         let mut lease = self.direct_lease.lock().await;
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
@@ -881,57 +894,51 @@ impl AuthService {
             }
             let runtime = current_thread_runtime()?;
             runtime.block_on(async move {
-                if wallet.get_pending_journal()?.is_some() {
-                    if existing.as_ref().is_some_and(|record| !record.complete) {
-                        return Err(AuthError::PendingSettlement);
-                    }
-                    if let Some(response) = wallet.recover().await? {
-                        session_events
-                            .settled(&response, wallet.state().map(|state| state.current_balance));
-                    }
-                    if let Some(pending) = wallet.get_pending_journal()? {
-                        // A pending request that the server refused because
-                        // another request, whose journal is gone, settled
-                        // this state can never settle.
-                        if receipt_journal_missing(
-                            &config,
-                            &pending.nullifier,
-                            Some(&pending.client_request_id),
-                        )
-                        .await
-                            && wallet.state().is_some_and(|state| {
-                                core_v2::nullifier(
-                                    &state.secret_s,
-                                    state.note_id,
-                                    &state.current_anchor,
-                                ) == pending.nullifier
-                            })
-                        {
-                            return Err(AuthError::ReceiptJournalMissing(pending.nullifier));
+                // A reservation that already holds its close is handed out
+                // again, whatever happened since.
+                if let Some(record) = existing.as_ref().filter(|record| !record.complete) {
+                    if let Some(plan) = &record.plan {
+                        if record.destination != destination {
+                            return Err(AuthError::WithdrawalConflict);
                         }
-                        return Err(AuthError::PendingSettlement);
-                    }
-                } else if existing.as_ref().is_none_or(|record| record.complete)
-                    && !wallet.archive_at_current_state()?.is_empty()
-                {
-                    // A request set aside at this state may since have been
-                    // finalized: install its verified receipt first, so the
-                    // withdrawal closes the note's settled successor state.
-                    // Never under a reservation, which freezes this state.
-                    if let Some(response) = wallet.recover().await? {
-                        session_events
-                            .settled(&response, wallet.state().map(|state| state.current_balance));
+                        return Ok(plan.clone());
                     }
                 }
-                let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-                let mut record = crate::oa_withdrawal::reserve(&config, state, destination)?;
+                // E2 step 1: the exit lock, in mutual mode, before E1. An
+                // escape already released from this state keeps the exit in
+                // escape mode.
+                if let Err(zkapi_client::error::ClientError::ExitLockConflict(_)) =
+                    wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual)
+                {
+                    return Err(AuthError::EscapeRequired(serde_json::json!({
+                        "action": "escape", "reason": "escape_in_progress"
+                    })));
+                }
+                // An explicit mutual retry asks for the clearance again; a
+                // refusal recorded earlier steers only the escape route.
+                let decided = exit::decide(&config, &mut wallet, None, None, true).await?;
+                if let Some(response) = &decided.installed {
+                    session_events
+                        .settled(response, wallet.state().map(|state| state.current_balance));
+                }
+                match decided.decision {
+                    zkapi_client::exit_policy::ExitDecision::Mutual => {}
+                    // E3: a released request is unresolved; wait for it.
+                    zkapi_client::exit_policy::ExitDecision::Wait { .. } => {
+                        return Err(AuthError::PendingSettlement)
+                    }
+                    zkapi_client::exit_policy::ExitDecision::Escape { .. } => {
+                        return Err(AuthError::EscapeRequired(decided.to_json()))
+                    }
+                }
+                let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
+                let mut record = crate::oa_withdrawal::reserve(&config, &state, destination)?;
                 if record.complete {
                     return record.plan.ok_or(AuthError::WithdrawalConflict);
                 }
-                // Clearance is idempotent for this reserved nullifier. Rebuild a
-                // proof against the current Merkle root on every explicit retry.
-                // The wallet resends one ownership proof while the server has not
-                // observed its root; after that, re-prove once at a fresh root.
+                // E2 step 3: ownership proof, clearance, close. A retry
+                // resends the ownership proof still valid from an earlier
+                // attempt (at most one is live, C3).
                 let mut reproved = false;
                 let (public_inputs, proof, siblings) = loop {
                     let root = indexer.root().await?;
@@ -962,20 +969,45 @@ impl AuthService {
                     if let Some(error) = storage_failure {
                         return Err(error);
                     }
-                    match closed {
+                    use zkapi_client::error::ClientError;
+                    let outcome = match closed {
                         Ok((public_inputs, proof)) => break (public_inputs, proof, siblings),
-                        Err(zkapi_client::error::ClientError::StaleRoot) if !reproved => {
-                            reproved = true
+                        Err(ClientError::StaleRoot) if !reproved => {
+                            reproved = true;
+                            continue;
                         }
-                        Err(zkapi_client::error::ClientError::ClearanceRefused(code))
-                            if code == "nullifier_used"
-                                && receipt_journal_missing(&config, &record.nullifier, None)
-                                    .await =>
-                        {
-                            return Err(AuthError::ReceiptJournalMissing(record.nullifier));
+                        // E2 step 4: the server claims a reservation.
+                        Err(ClientError::ClearanceRefused(code)) if code == "nullifier_used" => {
+                            zkapi_client::exit_policy::MutualOutcome::NullifierUsed
                         }
-                        Err(error) => return Err(error.into()),
+                        // Not the operator's answer.
+                        Err(
+                            error @ (ClientError::TestnetPasswordRequired
+                            | ClientError::ProofGeneration(_)
+                            | ClientError::Io(_)
+                            | ClientError::Serialization(_)
+                            | ClientError::ExitLockConflict(_)
+                            | ClientError::NoActiveNote),
+                        ) => return Err(error.into()),
+                        // E2 step 5: any other refusal, or unreachable.
+                        Err(error) => {
+                            tracing::warn!(%error, "the clearance was refused or unreachable; the exit continues as an escape");
+                            zkapi_client::exit_policy::MutualOutcome::RefusedOrUnreachable
+                        }
+                    };
+                    record.clearance_outcome = Some(outcome);
+                    crate::oa_withdrawal::save(&config, &record)?;
+                    if outcome == zkapi_client::exit_policy::MutualOutcome::RefusedOrUnreachable {
+                        wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
                     }
+                    let decided =
+                        exit::decide(&config, &mut wallet, Some(outcome), None, false).await?;
+                    return Err(match decided.decision {
+                        zkapi_client::exit_policy::ExitDecision::Wait { .. } => {
+                            AuthError::PendingSettlement
+                        }
+                        _ => AuthError::EscapeRequired(decided.to_json()),
+                    });
                 };
                 let plan = WithdrawalPlan {
                     mode: WithdrawalMode::Mutual,
@@ -1093,6 +1125,9 @@ impl AuthService {
             crate::oa_withdrawal::release(&config, &record, state, || {
                 Ok(leaf_in_tree.unwrap_or(true))
             })?;
+            // E6: the owner cancels an exit that released no exit proof.
+            let mut wallet = wallet;
+            wallet.cancel_exit_lock()?;
             Ok(crate::oa_withdrawal::public_status(None))
         })
         .await;
@@ -2738,9 +2773,11 @@ impl AuthService {
                 }
                 return Ok(request);
             }
+            // C3, C4, C5 before any proof work.
+            wallet.check_request_allowed()?;
             let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-            crate::oa_withdrawal::check_request_state(&config, state)?;
             let note_id = state.note_id;
+            let bound_at_state = state.bound_at_state;
             let runtime = current_thread_runtime()?;
             // Withdrawal settlement sets aside a retry whose nullifier the
             // server reports reserved for a clearance
@@ -2775,16 +2812,27 @@ impl AuthService {
             let (active_root, siblings) = runtime.block_on(async move {
                 Ok::<_, AuthError>((indexer.root().await?, indexer.note_path(note_id).await?))
             })?;
+            let mut solvency_bound = wallet.configured_solvency_bound();
             let authorization = if config.billing_asset == "native_eth" {
                 let quote = runtime.block_on(crate::oa_native::verified_quote(&config))?;
-                let mut proof_config = config.clone();
-                proof_config.request_charge_cap = quote.budget_units(request_limit_micro_usd.ok_or_else(|| AuthError::Wallet("native lease requires a reviewed model budget".into()))?)?.max(config.request_charge_cap);
-                wallet = load_wallet(&proof_config)?;
+                solvency_bound = quote.budget_units(request_limit_micro_usd.ok_or_else(|| AuthError::Wallet("native lease requires a reviewed model budget".into()))?)?.max(config.request_charge_cap);
                 serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote}).to_string()
             } else { authorization };
+            // C2: every request proof at a state carries the state's one
+            // bound. A later request at the same state reuses it when it
+            // covers this request's budget; otherwise it must wait.
+            if bound_at_state != 0 {
+                if bound_at_state < solvency_bound {
+                    return Err(AuthError::BoundFixedAtState {
+                        bound: bound_at_state,
+                        requested: solvency_bound,
+                    });
+                }
+                solvency_bound = bound_at_state;
+            }
             let payload_hash = compute_payload_hash(authorization.as_bytes());
             wallet
-                .prepare_request(&authorization, payload_hash, active_root, siblings)
+                .prepare_request_with_bound(&authorization, payload_hash, active_root, siblings, solvency_bound)
                 .map_err(Into::into)
         })
         .await
@@ -3193,8 +3241,8 @@ impl AuthService {
                     }
                 }
 
+                wallet.check_request_allowed()?;
                 let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
-                crate::oa_withdrawal::check_request_state(&config, state)?;
                 let note_id = state.note_id;
                 let started = Instant::now();
                 tracing::info!(
@@ -3337,31 +3385,20 @@ impl AuthService {
                 let root = indexer.root().await?;
                 let siblings = indexer.note_path(note_id).await?;
                 let plan_siblings = siblings.clone();
+                // The exit lock is durable before any exit proof exists; the
+                // wallet records each proof as released before returning it
+                // and marks the state for C5 when an ownership proof leaves.
                 let (public_inputs, proof) = match mode {
                     WithdrawalMode::Mutual => {
-                        // No reservation guards this route. The state is
-                        // marked before the request carrying its ownership
-                        // proof leaves (`record_ownership_proof_marker`).
-                        let mut storage_failure = None;
-                        let state = wallet.state().ok_or(AuthError::NoActiveNote)?.clone();
-                        let closed = wallet
-                            .withdrawal_mutual_close_recorded(destination, root, siblings, || {
-                                crate::oa_withdrawal::record_ownership_proof_marker(&config, &state)
-                                    .map_err(|error| {
-                                        let message = error.to_string();
-                                        storage_failure = Some(error);
-                                        zkapi_client::error::ClientError::Serialization(message)
-                                    })
-                            })
-                            .await;
-                        if let Some(error) = storage_failure {
-                            return Err(error);
-                        }
-                        closed?
+                        wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Mutual)?;
+                        wallet
+                            .withdrawal_mutual_close(destination, root, siblings)
+                            .await?
                     }
                     // Concedes nothing. The concession rules of an exit from
                     // a state with a released request are the exit routes'.
                     WithdrawalMode::Escape => {
+                        wallet.set_exit_lock(zkapi_client::exit_lock::ExitMode::Escape)?;
                         wallet.withdrawal_escape_hatch(destination, 0, root, siblings)?
                     }
                 };
@@ -3983,6 +4020,7 @@ fn client_config(config: &AuthConfig) -> ClientConfig {
         },
         state_signing_key: config.state_signing_key.clone(),
         clearance_signing_key: config.clearance_signing_key.clone(),
+        settlement_window_seconds: config.settlement_window_seconds,
     }
 }
 
@@ -4558,7 +4596,8 @@ mod oa_withdrawal_tests {
                 nullifier: core_v2::nullifier(&note.secret_s, note.note_id, &note.current_anchor),
                 payload_hash: Felt252::ONE,
                 user_rerandomization: Felt252::ONE,
-                created_at_ms: 1,
+                // Just sent: E3 waits for its settlement.
+                created_at_ms: now_seconds() * 1_000,
                 prepared_request: None,
             },
         )
@@ -4742,14 +4781,24 @@ mod oa_withdrawal_tests {
             .verify(&ownership.public_inputs, &ownership.proof)
             .unwrap());
         assert!(verifier.verify(&plan.public_inputs, &plan.proof).unwrap());
-        // Only the mutual plan is saved; the ownership proof never is.
+        // The mutual plan is saved in the reservation. The ownership proof is
+        // kept only in the exit lock, so a retry resends it instead of
+        // releasing another (it is kind 2: no vault entry point accepts it).
         assert_eq!(
             oa_withdrawal::load(&config).unwrap().unwrap().plan.unwrap(),
             plan
         );
+        let lock = load_wallet(&config).unwrap().exit_lock().unwrap().unwrap();
+        assert_eq!(
+            lock.released
+                .iter()
+                .map(|proof| proof.kind)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
         for entry in std::fs::read_dir(directory.path()).unwrap() {
             let path = entry.unwrap().path();
-            if path.is_file() {
+            if path.is_file() && !path.ends_with("exit_lock.json") {
                 assert!(
                     !std::fs::read_to_string(&path)
                         .unwrap_or_default()
@@ -4969,7 +5018,16 @@ mod oa_withdrawal_tests {
                     .collect::<String>(),
             );
             std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join("1700000000000-0.json"), b"").unwrap();
+            let torn = directory.join("1700000000000-0.json");
+            std::fs::write(&torn, b"").unwrap();
+            // Damaged long ago: the exit decision bounds an unreadable
+            // record's request time by its modification time.
+            std::fs::File::options()
+                .write(true)
+                .open(&torn)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                .unwrap();
             std::fs::write(directory.join(".DS_Store"), b"\0\0\0\x01Bud1").unwrap();
         };
         if archive == Archive::Unreadable {
@@ -5162,7 +5220,7 @@ mod oa_withdrawal_tests {
             let reads = seen.lock().unwrap().1 - reads;
             // Only while something still stands in the way: a lease after
             // a release proves a real request.
-            let lease = if vault_revision < 2 && released.is_err() {
+            let lease = if released.is_err() {
                 Some(service.prepare_direct_lease_request(None).await)
             } else {
                 None
@@ -5276,14 +5334,33 @@ mod oa_withdrawal_tests {
             assert_eq!(run.requests[0].withdrawal_nullifier, run.nullifier);
             assert_eq!(run.phase, "reserved");
             assert_eq!(run.ownership_proof_sent, Some(true));
-            // The recovery attempt before the gate found nothing to install.
-            assert_eq!(run.reads, usize::from(archived), "{case}");
+            // The recovery attempt before the gate found nothing to install
+            // (it reads only when something was archived), and the exit
+            // decision read the nullifier once.
+            assert_eq!(run.reads, 1 + usize::from(archived), "{case}");
         }
-        // A request that owns the nullifier refuses the clearance and
-        // reserves nothing new; the refusal is reported.
-        let run = prepare_with(Route::Oa, 3, true, Clearance::NullifierUsed, "reserved").await;
-        assert!(run.result.is_err(), "{:?}", run.result);
+        // E2 step 4: a clearance refused as nullifier_used means the server
+        // claims a reservation: E3 from the newest release, here long past
+        // T, so the exit is an escape conceding the state's bound.
+        let run = prepare_with(Route::Oa, 3, true, Clearance::NullifierUsed, "unknown").await;
         assert_eq!(run.requests.len(), 1);
+        match &run.result {
+            Err(error @ AuthError::EscapeRequired(detail)) => {
+                assert_eq!(error.code(), "escape_required");
+                assert_eq!(detail["action"], "escape");
+                assert_eq!(detail["reason"], "at_deadline");
+            }
+            other => panic!("{other:?}"),
+        }
+        // E3: a reading of `reserved` leaves the archived request unresolved;
+        // no clearance is asked for at all.
+        let run = prepare_with(Route::Oa, 3, true, Clearance::Grant, "reserved").await;
+        assert!(run.requests.is_empty(), "{:?}", run.requests);
+        assert!(
+            matches!(&run.result, Err(AuthError::EscapeRequired(detail)) if detail["reason"] == "at_deadline"),
+            "{:?}",
+            run.result
+        );
     }
 
     /// When the request set aside at this state was finalized after all,
@@ -5418,13 +5495,13 @@ mod oa_withdrawal_tests {
     }
 
     /// A note state settled by a request whose journal an earlier release
-    /// deleted can never move: its receipt cannot be installed, and the
-    /// retry stays refused. Withdrawal reports receipt_journal_missing with
-    /// the nullifier the operator needs, whether a refused retry is pending
-    /// or the ownership-proof clearance is refused as nullifier_used,
-    /// instead of waiting for settlement forever or failing opaquely.
+    /// deleted can never move: its receipt cannot be installed. E3 "lost ε":
+    /// the withdrawal is an escape conceding the reported charge (at most the
+    /// state's bound), at once, and no clearance is asked for. It used to end
+    /// in receipt_journal_missing, waiting for the operator.
     #[tokio::test]
-    async fn a_state_settled_by_a_request_without_a_journal_reports_receipt_journal_missing() {
+    async fn a_state_settled_by_a_request_without_a_journal_escapes_conceding_the_reported_charge()
+    {
         for setup in [
             Setup {
                 pending_retry: true,
@@ -5435,39 +5512,37 @@ mod oa_withdrawal_tests {
             let run = prepare_with_setup(setup).await;
             let case = format!("{setup:?}");
             match &run.result {
-                Err(error @ AuthError::ReceiptJournalMissing(nullifier)) => {
-                    assert_eq!(*nullifier, run.nullifier, "{case}");
-                    assert_eq!(error.code(), "receipt_journal_missing", "{case}");
+                Err(error @ AuthError::EscapeRequired(detail)) => {
                     assert_eq!(
                         error.status_code(),
                         axum::http::StatusCode::CONFLICT,
                         "{case}"
                     );
-                    assert_eq!(error.nullifier(), Some(run.nullifier.to_string()), "{case}");
+                    assert_eq!(detail["reason"], "lost_epsilon", "{case}");
+                    assert_eq!(detail["conceded"], "0", "{case}");
                 }
                 other => panic!("{case}: {other:?}"),
             }
+            assert!(run.requests.is_empty(), "{case}");
         }
     }
 
     /// sdk cross-component request 2: once a clearance request carrying an
     /// ownership proof has left, whatever answer follows (a gateway 429, a
     /// 5xx, an answer that is no clearance) may come from someone who kept
-    /// the proof, a submittable escape at this nullifier. On a vault below
-    /// revision 2 a request proof from the same state would let them escape
-    /// and challenge, which burns the nullifier. The reservation records the
-    /// proof before the request leaves and is then never released, not even
-    /// on the server's unsigned "unknown" reading, so no lease is made from
-    /// that state. Closing again is the way out. A hardened vault restores a
-    /// challenged nullifier, so there the reservation is released as before.
+    /// the proof. The reservation records the proof before the request leaves
+    /// and is then never released on any vault (C5), not even on the server's
+    /// unsigned "unknown" reading, so no lease is made from that state. The
+    /// refusal turns the exit into an escape conceding nothing (E2 step 5);
+    /// closing again still works.
     #[tokio::test]
-    async fn an_ownership_proof_that_left_keeps_the_reservation_on_a_legacy_vault() {
+    async fn an_ownership_proof_that_left_keeps_the_reservation_and_offers_the_escape() {
         for clearance in [
             Clearance::GatewayThrottled,
             Clearance::ServerFailure,
             Clearance::Garbled,
         ] {
-            for vault_revision in [0, 2] {
+            for vault_revision in [0, 3] {
                 let case = format!("{clearance:?}, vault_revision {vault_revision}");
                 let run = prepare_with_setup(Setup {
                     vault_revision,
@@ -5475,15 +5550,16 @@ mod oa_withdrawal_tests {
                     ..Setup::new(Archive::Empty, clearance, "unknown")
                 })
                 .await;
-                assert!(run.result.is_err(), "{case}: {:?}", run.result);
+                match &run.result {
+                    Err(AuthError::EscapeRequired(detail)) => {
+                        assert_eq!(detail["reason"], "mutual_refused", "{case}");
+                        assert_eq!(detail["conceded"], "0", "{case}");
+                    }
+                    other => panic!("{case}: {other:?}"),
+                }
                 assert!(!run.requests.is_empty(), "{case}");
                 assert_eq!(run.ownership_proof_sent, Some(true), "{case}");
                 let (released, lease, reads) = run.follow_up.unwrap();
-                if vault_revision >= 2 {
-                    assert_eq!(released.unwrap()["phase"], "none", "{case}");
-                    assert_eq!(run.phase, "none", "{case}");
-                    continue;
-                }
                 match &released {
                     Err(error @ AuthError::OwnershipProofSent) => {
                         assert_eq!(error.code(), "ownership_proof_sent", "{case}");
@@ -5504,7 +5580,8 @@ mod oa_withdrawal_tests {
             }
         }
 
-        // Closing again completes the close.
+        // Closing again completes the close, resending the same ownership
+        // proof (at most one is live).
         let run = prepare_with_setup(Setup {
             again: true,
             ..Setup::new(Archive::Empty, Clearance::ThrottledOnce, "unknown")
@@ -5513,6 +5590,10 @@ mod oa_withdrawal_tests {
         assert!(run.result.is_err(), "{:?}", run.result);
         assert!(matches!(run.again, Some(Ok(_))), "{:?}", run.again);
         assert_eq!(run.requests.len(), 2);
+        assert_eq!(
+            run.requests[0].ownership_proof.proof,
+            run.requests[1].ownership_proof.proof
+        );
         assert_eq!(run.ownership_proof_sent, Some(true));
         assert_eq!(run.phase, "reserved");
 
@@ -5527,11 +5608,11 @@ mod oa_withdrawal_tests {
         assert!(matches!(run.again, Some(Ok(_))), "{:?}", run.again);
     }
 
-    /// The generic `/wallet/withdraw` mutual close has no reservation. On a
-    /// vault below revision 2 it marks the state before the request carrying
-    /// its ownership proof leaves; whatever the answer, no lease or proxied
-    /// request proof is made from that state afterwards, while closing again
-    /// still works.
+    /// The generic `/wallet/withdraw` mutual close has no reservation. It
+    /// holds the exit lock and marks the state (C5) before the request
+    /// carrying its ownership proof leaves; whatever the answer, no lease or
+    /// proxied request proof is made from that state afterwards (C3 while
+    /// the lock is held), while closing again still works.
     #[tokio::test]
     async fn the_generic_mutual_close_keeps_a_state_whose_ownership_proof_left_withdrawal_only() {
         let run = prepare_with_setup(Setup {
@@ -5545,13 +5626,13 @@ mod oa_withdrawal_tests {
         assert!(!run.requests.is_empty());
         let (_, lease, _) = run.follow_up.unwrap();
         assert!(
-            matches!(lease, Some(Err(AuthError::OwnershipProofSent))),
+            matches!(lease, Some(Err(AuthError::ExitLocked))),
             "{lease:?}"
         );
         // A proxied request (`RequestMode::Proxy`) from that state is refused
         // as well, before it makes a request proof or journal.
         assert!(
-            matches!(run.proxied, Some(Err(AuthError::OwnershipProofSent))),
+            matches!(run.proxied, Some(Err(AuthError::ExitLocked))),
             "{:?}",
             run.proxied
         );
@@ -6891,6 +6972,7 @@ mod oa_request_archive_tests {
             [
                 ("original", "discarded_stale_root"),
                 ("retry", "superseded"),
+                ("original", "installed"),
                 ("retry", "superseded")
             ]
         );
@@ -7040,7 +7122,8 @@ mod oa_request_archive_tests {
                 nullifier,
                 payload_hash: retry.payload_hash,
                 user_rerandomization: Felt252::from_u64(6),
-                created_at_ms: 2,
+                // Just sent: E3 waits for its settlement.
+                created_at_ms: now_seconds() * 1_000,
                 prepared_request: Some(retry),
             },
         )
@@ -7300,7 +7383,8 @@ mod oa_request_archive_tests {
                 .collect::<Vec<_>>(),
             [
                 ("original", "discarded_stale_root"),
-                ("retry", "superseded")
+                ("retry", "superseded"),
+                ("original", "installed")
             ],
             "{driver:?}"
         );

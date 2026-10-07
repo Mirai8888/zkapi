@@ -18,6 +18,7 @@ zkapi-auth = { path = "../zkapi-auth" }
 anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
+hex = { workspace = true }
 clap = { workspace = true }
 fs2 = { workspace = true }
 futures-util = "0.3"

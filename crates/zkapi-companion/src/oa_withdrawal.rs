@@ -48,6 +48,10 @@ pub(crate) struct Reservation {
     /// `claimEscapePayout(destination)` delivers it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub escape_payout_credited: bool,
+    /// How the clearance of this reservation was refused, if it was (E2
+    /// steps 4 and 5): the exit decision then waits (E3) or escapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance_outcome: Option<zkapi_client::exit_policy::MutualOutcome>,
 }
 
 impl Reservation {
@@ -87,9 +91,9 @@ pub(crate) async fn note_leaf_in_tree(
 }
 
 /// Recorded, before the request leaves, that a clearance request carrying
-/// this reservation's ownership proof is about to be sent. On a vault below
-/// revision 2 the reservation then stays until the note closes: it is never
-/// released, so no request proof is made at its nullifier.
+/// this reservation's ownership proof is about to be sent. The reservation
+/// then stays until the note closes: it is never released, and no request
+/// proof is made at its nullifier (C5).
 pub(crate) fn record_ownership_proof_sent(
     config: &AuthConfig,
     record: &mut Reservation,
@@ -252,6 +256,7 @@ pub(crate) fn reserve(
         unsettled_request_risk_accepted: false,
         ownership_proof_sent: Some(false),
         escape_payout_credited: false,
+        clearance_outcome: None,
     };
     save(config, &record)?;
     Ok(record)
@@ -262,62 +267,6 @@ pub(crate) fn save(config: &AuthConfig, record: &Reservation) -> Result<(), Auth
         &config.state_dir.join(FILE),
         &serde_json::to_vec(record).map_err(|_| storage_error())?,
     )
-}
-
-/// The generic `/wallet/withdraw` mutual close has no reservation. On a vault
-/// below revision 2 it records here, before a clearance request carrying an
-/// ownership proof leaves, the state that proof was made at; no request proof
-/// is made at that state's nullifier afterwards (`check_request_state`).
-const OWNERSHIP_PROOF_MARKER: &str = "oa-ownership-proof-sent.json";
-
-#[derive(Serialize, Deserialize)]
-struct OwnershipProofMarker {
-    version: u8,
-    note_id: u32,
-    nullifier: Felt252,
-}
-
-pub(crate) fn record_ownership_proof_marker(
-    config: &AuthConfig,
-    state: &NoteState,
-) -> Result<(), AuthError> {
-    if config.vault_revision >= 2 {
-        return Ok(());
-    }
-    let marker = OwnershipProofMarker {
-        version: 1,
-        note_id: state.note_id,
-        nullifier: v2::nullifier(&state.secret_s, state.note_id, &state.current_anchor),
-    };
-    atomic_write(
-        &config.state_dir.join(OWNERSHIP_PROOF_MARKER),
-        &serde_json::to_vec(&marker).map_err(|_| storage_error())?,
-    )
-}
-
-/// Refuse a new request proof from `state` when a clearance request carrying
-/// its ownership proof may have left the companion: whoever saw that request
-/// could escape with the proof and challenge the escape with the request,
-/// which burns the nullifier on a vault below revision 2. The note stays
-/// withdrawal-only; closing again or escaping still works.
-pub(crate) fn check_request_state(config: &AuthConfig, state: &NoteState) -> Result<(), AuthError> {
-    let path = config.state_dir.join(OWNERSHIP_PROOF_MARKER);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(storage_error()),
-    };
-    let marker: OwnershipProofMarker =
-        serde_json::from_slice(&bytes).map_err(|_| storage_error())?;
-    if marker.version != 1 {
-        return Err(storage_error());
-    }
-    if marker.note_id == state.note_id
-        && marker.nullifier == v2::nullifier(&state.secret_s, state.note_id, &state.current_anchor)
-    {
-        return Err(AuthError::OwnershipProofSent);
-    }
-    Ok(())
 }
 
 pub(crate) fn check_spending(config: &AuthConfig, note_id: Option<u32>) -> Result<(), AuthError> {
@@ -365,6 +314,16 @@ pub(crate) fn public_status(record: Option<&Reservation>) -> Value {
             status
         }
     }
+}
+
+/// Write a private (0600) file durably: synced, renamed and the rename synced.
+pub(crate) fn write_private_durably(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
+    atomic_write(path, bytes)
+}
+
+/// Check a 32-byte `0x` transaction hash.
+pub(crate) fn transaction_hash(value: &str) -> Result<(), AuthError> {
+    hex_bytes(value, 32).map(|_| ())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
@@ -416,14 +375,11 @@ fn archive(
 }
 
 /// Only an incomplete reservation without a plan, for the unchanged active
-/// note, may be released: it never produced a mutual-close proof. On a vault
-/// below revision 2 it also must not have sent an ownership proof: whoever
-/// saw that request (the server, or a gateway that answered it) may hold a
-/// submittable escape at this nullifier, and a request proof from the same
-/// state would let them escape and challenge, which burns the nullifier
-/// there. The server's answer that it knows nothing of the nullifier is
-/// unsigned, so no reading lifts this. `leaf_in_tree` is `note_leaf_in_tree`
-/// for the active note (see `Reservation::ownership_proof_may_have_left`).
+/// note, may be released: it never produced a mutual-close proof. It also
+/// must not have sent an ownership proof (C5): no request is made from a
+/// state whose ownership proof left, so releasing it would gain nothing.
+/// `leaf_in_tree` is `note_leaf_in_tree` for the active note (see
+/// `Reservation::ownership_proof_may_have_left`).
 pub(crate) fn check_release(
     config: &AuthConfig,
     record: &Reservation,
@@ -433,7 +389,8 @@ pub(crate) fn check_release(
     if record.complete || record.plan.is_some() || !same_state(active, &record.snapshot) {
         return Err(AuthError::WithdrawalConflict);
     }
-    if config.vault_revision < 2 && record.ownership_proof_may_have_left(leaf_in_tree)? {
+    let _ = config;
+    if record.ownership_proof_may_have_left(leaf_in_tree)? {
         return Err(AuthError::OwnershipProofSent);
     }
     Ok(())
@@ -503,6 +460,23 @@ pub(crate) fn complete(
         .map_err(|_| storage_error())?;
     record.complete = true;
     save(config, record)
+}
+
+/// The reservation of a note an escape closed (`exit::finalize`): mark it
+/// complete with the finalize transaction. The note was archived already.
+pub(crate) fn complete_for_escape(
+    config: &AuthConfig,
+    escape: &crate::service::exit::EscapeRecord,
+    hash: &str,
+) -> Result<(), AuthError> {
+    let Some(mut record) = load(config)? else {
+        return Ok(());
+    };
+    if record.complete || record.snapshot.note_id != escape.note_id {
+        return Ok(());
+    }
+    record.escape_payout_credited = escape.payout_credited;
+    complete(config, &mut record, hash)
 }
 
 /// Complete with the evidence `confirm_receipt` returned. A finalized escape
@@ -583,6 +557,10 @@ pub(crate) struct CloseEvidence {
     /// note and destination precedes `EscapeWithdrawalFinalized`. Nothing has
     /// reached the destination until `claimEscapePayout(destination)`.
     pub escape_payout_credited: bool,
+    /// The receipt is a finalized escape of the reserved state that paid
+    /// this amount, which a raise may have lowered below the snapshot
+    /// balance: `confirm_receipt` matches it against the escape record (E5).
+    pub escape_paid: Option<u128>,
 }
 
 pub(crate) fn validate_close_event(
@@ -599,9 +577,9 @@ pub(crate) fn validate_close_event(
             "withdrawal receipt is not a successful matching transaction".into(),
         ));
     }
-    // A finalized escape is the only other payout of this note, for example
-    // after the clearance ownership proof was submitted as an escape. Both
-    // events carry the same fields, which must match the reservation exactly.
+    // A finalized escape of the reserved state is the only other payout of
+    // this note. It pays B − c_final, which a concession or a raise may set
+    // below the snapshot balance; `confirm_receipt` matches the amount (E5).
     let topics = [
         b"MutualClose(uint32,uint256,uint128,address)".as_slice(),
         b"EscapeWithdrawalFinalized(uint32,uint256,uint128,address)".as_slice(),
@@ -609,35 +587,61 @@ pub(crate) fn validate_close_event(
     .map(|signature| format!("0x{:x}", Keccak256::digest(signature)));
     let vault = hex(&record.snapshot.contract_address.as_bytes()[12..]);
     let note_topic = format!("0x{:064x}", record.snapshot.note_id);
-    // All event parameters except indexed noteId are fixed ABI words.
-    let expected_data = format!(
-        "{}{:064x}{}{}",
-        hex(record.nullifier.as_bytes()),
-        record.snapshot.current_balance,
-        "0".repeat(24),
-        &hex(&record.destination)[2..]
-    );
+    let nullifier_word = &hex(record.nullifier.as_bytes())[2..];
+    let destination_word = format!("{}{}", "0".repeat(24), &hex(&record.destination)[2..]);
+    let mut escape_paid = None;
     let matches: Vec<&Value> = receipt["logs"]
         .as_array()
         .ok_or_else(storage_error)?
         .iter()
         .filter(|log| {
-            log["removed"] != true
-                && log["address"]
+            if log["removed"] == true
+                || !log["address"]
                     .as_str()
                     .is_some_and(|value| value.eq_ignore_ascii_case(&vault))
-                && log["topics"].as_array().is_some_and(|log_topics| {
-                    log_topics.len() == 2
-                        && log_topics[0].as_str().is_some_and(|value| {
-                            topics.iter().any(|topic| value.eq_ignore_ascii_case(topic))
-                        })
-                        && log_topics[1]
-                            .as_str()
-                            .is_some_and(|value| value.eq_ignore_ascii_case(&note_topic))
-                })
-                && log["data"]
-                    .as_str()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(&expected_data))
+            {
+                return false;
+            }
+            let Some(log_topics) = log["topics"].as_array().filter(|topics| topics.len() == 2)
+            else {
+                return false;
+            };
+            if !log_topics[1]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&note_topic))
+            {
+                return false;
+            }
+            let escape = log_topics[0]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&topics[1]));
+            let mutual = log_topics[0]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&topics[0]));
+            let Some(data) = log["data"]
+                .as_str()
+                .and_then(|value| value.strip_prefix("0x"))
+                .filter(|value| value.len() == 192)
+            else {
+                return false;
+            };
+            if !data[..64].eq_ignore_ascii_case(nullifier_word)
+                || !data[128..].eq_ignore_ascii_case(&destination_word)
+                || !data[64..96].bytes().all(|byte| byte == b'0')
+            {
+                return false;
+            }
+            let Ok(paid) = u128::from_str_radix(&data[96..128], 16) else {
+                return false;
+            };
+            if mutual {
+                paid == record.snapshot.current_balance
+            } else if escape && paid <= record.snapshot.current_balance {
+                escape_paid = Some(paid);
+                true
+            } else {
+                false
+            }
         })
         .collect();
     if matches.len() != 1 {
@@ -682,6 +686,7 @@ pub(crate) fn validate_close_event(
             });
     Ok(CloseEvidence {
         escape_payout_credited,
+        escape_paid: escape.then_some(escape_paid).flatten(),
     })
 }
 
@@ -716,6 +721,9 @@ where
     }
     let evidence = validate_close_event(record, &receipt, hash)?;
     let number = quantity(&receipt["blockNumber"])?;
+    if let Some(paid) = evidence.escape_paid {
+        check_escape_payout(config, record, paid, number, &mut request).await?;
+    }
     let hash = receipt["blockHash"].as_str().ok_or_else(storage_error)?;
     hex_bytes(hash, 32)?;
     let finalized = request("eth_getBlockByNumber", json!(["finalized", false])).await?;
@@ -738,6 +746,74 @@ where
         return Err(AuthError::WithdrawalConflict);
     }
     Ok(evidence)
+}
+
+/// E5 for a reservation closed by an escape: `paid` must be the escape
+/// record's `B − c_final`, with `c_final` the largest of its initial
+/// concession and every `EscapeConcessionRaised` since it was prepared. With
+/// no escape record of the reserved state (another device escaped), only an
+/// escape conceding nothing is accepted.
+async fn check_escape_payout<F, Fut>(
+    config: &AuthConfig,
+    record: &Reservation,
+    paid: u128,
+    block: u64,
+    request: &mut F,
+) -> Result<(), AuthError>
+where
+    F: FnMut(&'static str, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, AuthError>>,
+{
+    let mismatch = || {
+        AuthError::InvalidInput(
+            "the escape payout matches neither the reserved balance nor the escape's balance less its concessions".into(),
+        )
+    };
+    let escape = crate::service::exit::load_record(config)?.filter(|escape| {
+        escape.note_id == record.snapshot.note_id && escape.withdrawal_nullifier == record.nullifier
+    });
+    let Some(escape) = escape else {
+        return (paid == record.snapshot.current_balance)
+            .then_some(())
+            .ok_or_else(mismatch);
+    };
+    let logs = request(
+        "eth_getLogs",
+        json!([{
+            "address": hex(&record.snapshot.contract_address.as_bytes()[12..]),
+            "fromBlock": format!("0x{:x}", escape.start_block),
+            "toBlock": format!("0x{block:x}"),
+            "topics": [crate::chain::escape_concession_raised_topic(), format!("0x{:064x}", record.snapshot.note_id)],
+        }]),
+    )
+    .await?;
+    let nullifier_word = &hex(record.nullifier.as_bytes())[2..];
+    let mut raises = Vec::new();
+    for log in logs.as_array().ok_or_else(storage_error)? {
+        if log["removed"] == true {
+            continue;
+        }
+        let data = log["data"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("0x"))
+            .filter(|value| value.len() == 192)
+            .ok_or_else(storage_error)?;
+        if data[..64].eq_ignore_ascii_case(nullifier_word)
+            && data[64..96].bytes().all(|b| b == b'0')
+        {
+            raises.push(u128::from_str_radix(&data[96..128], 16).map_err(|_| storage_error())?);
+        }
+    }
+    match zkapi_client::exit_policy::match_escape_payout(
+        paid,
+        escape.state_balance(),
+        escape.conceded_at_init(),
+        &raises,
+        Some(escape.bound()),
+    ) {
+        zkapi_client::exit_policy::PayoutMatch::Matches { .. } => Ok(()),
+        zkapi_client::exit_policy::PayoutMatch::Mismatch => Err(mismatch()),
+    }
 }
 
 #[cfg(test)]
@@ -1189,8 +1265,8 @@ pub(crate) mod tests {
             .is_none());
     }
 
-    /// Release is refused, on a vault below revision 2, for a reservation
-    /// whose ownership proof may have left. A reservation saved before
+    /// Release is refused, on every vault (C5), for a reservation whose
+    /// ownership proof may have left. A reservation saved before
     /// `ownership_proof_sent` existed says nothing: builds sent one only when
     /// they could build it, which needs the state's note leaf in the vault's
     /// tree.
@@ -1245,35 +1321,15 @@ pub(crate) mod tests {
             Err(AuthError::Indexer(_))
         ));
 
-        // A hardened vault restores a challenged nullifier.
-        config.vault_revision = 2;
-        check_release(&config, &saved, &note, unasked).unwrap();
-        check_release(&config, &legacy, &note, unasked).unwrap();
-    }
-
-    #[test]
-    fn a_marked_state_makes_no_request_proof() {
-        let (_directory, mut config, note) = fixture();
-        check_request_state(&config, &note).unwrap();
-        config.vault_revision = 2;
-        record_ownership_proof_marker(&config, &note).unwrap();
-        check_request_state(&config, &note).unwrap();
-        config.vault_revision = 0;
-        record_ownership_proof_marker(&config, &note).unwrap();
-        assert!(matches!(
-            check_request_state(&config, &note),
-            Err(AuthError::OwnershipProofSent)
-        ));
-        // Another state, or another note, is not affected.
-        let mut next = note.clone();
-        next.current_anchor = Felt252::from_u64(77);
-        check_request_state(&config, &next).unwrap();
-        let mut other = note.clone();
-        other.note_id += 1;
-        check_request_state(&config, &other).unwrap();
-        // A damaged marker fails closed.
-        fs::write(config.state_dir.join(OWNERSHIP_PROOF_MARKER), "broken").unwrap();
-        assert!(check_request_state(&config, &next).is_err());
+        // C5 holds on every vault revision: earlier builds released such a
+        // reservation on a vault with vault_revision 2.
+        for revision in [2, 3] {
+            config.vault_revision = revision;
+            assert!(matches!(
+                check_release(&config, &saved, &note, unasked),
+                Err(AuthError::OwnershipProofSent)
+            ));
+        }
     }
 
     #[test]

@@ -50,6 +50,24 @@ pub enum AuthError {
     ReceiptJournalMissing(Felt252),
     #[error("this note state is withdrawal-only: a withdrawal clearance request carrying its ownership proof was sent, or may have been sent, and whoever saw that request may hold the proof, which is a valid escape at this state; on this vault a chat request from this state would let them escape and challenge it, which burns the note's nullifier, so no chat request is made from it and its withdrawal reservation is not released. Retry the withdrawal (in zkapi-clientd: config --menu, then withdraw) to close the note")]
     OwnershipProofSent,
+    #[error("bound_fixed_at_state: every request from this note state must carry the solvency bound {bound}; this request needs {requested}. Choose a cheaper model, or wait for the earlier request to settle")]
+    BoundFixedAtState { bound: u128, requested: u128 },
+    #[error("exit_locked: an exit of this note is in progress, so no chat request is made; finish or cancel the withdrawal")]
+    ExitLocked,
+    #[error("note_near_expiry: the note is too close to the latest time to start an exit for a new request to settle first; withdraw the balance")]
+    NoteNearExpiry,
+    #[error("invalid_successor: the server signed a successor that fails the wallet's checks ({0}); the state is treated as withheld, so withdraw by escape")]
+    InvalidSuccessor(String),
+    #[error("late_successor: a successor arrived after an exit proof was released; it is kept until that exit is dead")]
+    LateSuccessor,
+    #[error("escape_required: a mutual close is not possible from this note state; use the escape withdrawal")]
+    EscapeRequired(serde_json::Value),
+    #[error("conceded_mismatch: the confirmed concession is not the one the exit rules allow now; review the escape again")]
+    ConcededMismatch(serde_json::Value),
+    #[error("device_not_newest: another device spent this note state; restore the newest backup before exiting")]
+    DeviceNotNewest,
+    #[error("exit_lock_conflict: {0}")]
+    ExitLockConflict(String),
     #[error("this note state is reserved for a withdrawal: the server holds a clearance for its nullifier (an earlier withdrawal reserved it, or the operator released a stuck state) and refuses every request at it as a replay, so no chat request can settle this state; withdraw the balance by mutual close (in zkapi-clientd: config --menu, then withdraw), which sets the refused request aside first")]
     ClearanceReservedState,
 }
@@ -64,7 +82,16 @@ impl AuthError {
             | Self::WithdrawalConflict
             | Self::ReceiptJournalMissing(_)
             | Self::OwnershipProofSent
-            | Self::ClearanceReservedState => StatusCode::CONFLICT,
+            | Self::ClearanceReservedState
+            | Self::BoundFixedAtState { .. }
+            | Self::ExitLocked
+            | Self::NoteNearExpiry
+            | Self::InvalidSuccessor(_)
+            | Self::LateSuccessor
+            | Self::EscapeRequired(_)
+            | Self::ConcededMismatch(_)
+            | Self::DeviceNotNewest
+            | Self::ExitLockConflict(_) => StatusCode::CONFLICT,
             Self::NoActiveNote | Self::InsufficientBalance => StatusCode::PAYMENT_REQUIRED,
             Self::PendingRequest
             | Self::LeasePending(_)
@@ -100,6 +127,24 @@ impl AuthError {
             Self::ReceiptJournalMissing(_) => "receipt_journal_missing",
             Self::ClearanceReservedState => "clearance_reserved_state",
             Self::OwnershipProofSent => "ownership_proof_sent",
+            Self::BoundFixedAtState { .. } => "bound_fixed_at_state",
+            Self::ExitLocked => "exit_locked",
+            Self::NoteNearExpiry => "note_near_expiry",
+            Self::InvalidSuccessor(_) => "invalid_successor",
+            Self::LateSuccessor => "late_successor",
+            Self::EscapeRequired(_) => "escape_required",
+            Self::ConcededMismatch(_) => "conceded_mismatch",
+            Self::DeviceNotNewest => "device_not_newest",
+            Self::ExitLockConflict(_) => "exit_lock_conflict",
+        }
+    }
+
+    /// Structured detail for the bridge: the exit decision behind
+    /// `escape_required` and `conceded_mismatch`.
+    pub fn detail(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::EscapeRequired(detail) | Self::ConcededMismatch(detail) => Some(detail),
+            _ => None,
         }
     }
 
@@ -124,6 +169,15 @@ impl From<ClientError> for AuthError {
             ClientError::NoActiveNote => Self::NoActiveNote,
             ClientError::InsufficientBalance { .. } => Self::InsufficientBalance,
             ClientError::PendingRequest => Self::PendingRequest,
+            ClientError::BoundFixedAtState { bound, requested } => {
+                Self::BoundFixedAtState { bound, requested }
+            }
+            ClientError::ExitLocked => Self::ExitLocked,
+            ClientError::NoteNearExpiry => Self::NoteNearExpiry,
+            ClientError::OwnershipProofSent => Self::OwnershipProofSent,
+            ClientError::InvalidSuccessor(reason) => Self::InvalidSuccessor(reason),
+            ClientError::LateSuccessor => Self::LateSuccessor,
+            ClientError::ExitLockConflict(reason) => Self::ExitLockConflict(reason),
             other => Self::Wallet(other.to_string()),
         }
     }

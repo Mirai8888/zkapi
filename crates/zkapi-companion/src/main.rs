@@ -48,6 +48,10 @@ struct Cli {
     /// Require verifier-backed OA-org keys and reject direct/legacy leases.
     #[arg(long, env = "ZKAPI_REQUIRE_OA_ORG_KEY_SOURCE", default_value_t = false)]
     require_oa_org_key_source: bool,
+    /// The user's own Ethereum RPC for exits: the latest exit time, Merkle
+    /// path checks and log rebuilds also read through it (design §6.4 E0).
+    #[arg(long, env = "ZKAPI_EXIT_RPC_URL", global = true)]
+    exit_rpc_url: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -122,6 +126,19 @@ struct DeploymentManifest {
     native_price_max_age_seconds: u64,
     #[serde(default)]
     vault_revision: u32,
+    /// `not_deployed` for a placeholder profile (design §10.5).
+    #[serde(default)]
+    deployment_status: Option<String>,
+    /// 1 for a vault with the concession exit (revision 3).
+    #[serde(default)]
+    exit_concession: u8,
+    /// W, the build-pinned settlement window (design §6.4 E0).
+    #[serde(default)]
+    settlement_window_seconds: u64,
+    #[serde(default)]
+    unsettled_request_escape_after_seconds: Option<u64>,
+    #[serde(default)]
+    deploy_block: u64,
     #[serde(default)]
     demo_mint_enabled: bool,
     protocol_server_url: String,
@@ -140,6 +157,8 @@ struct DeploymentManifest {
 struct DeploymentProofSetup {
     #[serde(default)]
     circuit_id: String,
+    #[serde(default)]
+    setup_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +178,7 @@ struct ClientOptions {
     oa_verifier_url: String,
     openrouter_inference_base: String,
     require_oa_org_key_source: bool,
+    exit_rpc_url: Option<String>,
 }
 
 #[tokio::main]
@@ -195,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
                 oa_verifier_url: cli.oa_verifier_url,
                 openrouter_inference_base: cli.openrouter_inference_base,
                 require_oa_org_key_source: cli.require_oa_org_key_source,
+                exit_rpc_url: cli.exit_rpc_url,
             })
             .await
         }
@@ -236,6 +257,7 @@ async fn run_client(options: ClientOptions) -> anyhow::Result<()> {
     validate_oa_bridge_transport()?;
     let manifest = load_deployment_manifest(&options.deployment).await?;
     validate_deployment_manifest(&manifest)?;
+    check_setup_directory(&manifest, &options.proof_setup_dir)?;
     let expected_chain: u64 = std::env::var("OA_ZKAPI_CHAIN_ID")
         .unwrap_or_else(|_| "1".to_string())
         .parse()?;
@@ -366,10 +388,61 @@ fn validate_deployment_manifest(manifest: &DeploymentManifest) -> anyhow::Result
             zkapi_proof::compact::CIRCUIT_ID
         );
     }
+    if manifest.deployment_status.as_deref() == Some("not_deployed") {
+        anyhow::bail!(
+            "deployment_not_deployed: deployment {} is a placeholder; its vault is not deployed yet",
+            manifest.deployment_id
+        );
+    }
+    if manifest.exit_concession != 1 || manifest.vault_revision < 3 {
+        anyhow::bail!(
+            "deployment {} has no concession exit (exit_concession 1, vault_revision 3); this companion serves only such a vault",
+            manifest.deployment_id
+        );
+    }
+    if manifest.settlement_window_seconds == 0 || manifest.proof_setup.setup_id.is_empty() {
+        anyhow::bail!(
+            "deployment {} does not pin settlement_window_seconds and proof_setup.setup_id",
+            manifest.deployment_id
+        );
+    }
     if manifest.protocol_server_url.is_empty() || manifest.indexer_url.is_empty() {
         anyhow::bail!(
             "deployment {} is missing public service URLs",
             manifest.deployment_id
+        );
+    }
+    Ok(())
+}
+
+/// The proving keys must be the setup the deployment pins: the setup
+/// directory's `manifest.json` names its `setup_id` and circuit.
+fn check_setup_directory(
+    manifest: &DeploymentManifest,
+    setup_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct SetupManifest {
+        circuit_id: String,
+        setup_id: String,
+    }
+    let path = setup_dir.join("manifest.json");
+    let setup: SetupManifest = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid {}: {error}", path.display()))?;
+    if setup.circuit_id != zkapi_proof::compact::CIRCUIT_ID
+        || setup.setup_id != manifest.proof_setup.setup_id
+    {
+        anyhow::bail!(
+            "the proving setup in {} is {} / {}, but deployment {} pins {} / {}",
+            setup_dir.display(),
+            setup.circuit_id,
+            setup.setup_id,
+            manifest.deployment_id,
+            zkapi_proof::compact::CIRCUIT_ID,
+            manifest.proof_setup.setup_id
         );
     }
     Ok(())
@@ -399,6 +472,11 @@ fn auth_service_from_manifest(
         native_price_feed_decimals: manifest.native_price_feed_decimals,
         native_price_max_age_seconds: manifest.native_price_max_age_seconds,
         vault_revision: manifest.vault_revision,
+        setup_id: manifest.proof_setup.setup_id.clone(),
+        settlement_window_seconds: manifest.settlement_window_seconds,
+        unsettled_request_escape_after_seconds: manifest.unsettled_request_escape_after_seconds,
+        deploy_block: manifest.deploy_block,
+        exit_rpc_url: options.exit_rpc_url.clone(),
         protocol_version: manifest.protocol_version,
         chain_id: manifest.chain_id,
         contract_address: parse_felt("deployment contract address", &manifest.contract_address)?,
@@ -566,6 +644,8 @@ mod tests {
             "protocol_server_url": "https://server.example",
             "indexer_url": "https://indexer.example", "request_charge_cap": 1,
             "proof_backend": "groth16_bn254",
+            "vault_revision": 3, "exit_concession": 1,
+            "settlement_window_seconds": 21905,
             "state_signing_key": {"x": "0x1", "y": "0x2"},
             "clearance_signing_key": {"x": "0x3", "y": "0x4"}
         })
@@ -592,7 +672,8 @@ mod tests {
         ] {
             json.as_object_mut().unwrap().remove("proof_setup");
             if let Some(circuit_id) = circuit {
-                json["proof_setup"] = serde_json::json!({"circuit_id": circuit_id});
+                json["proof_setup"] =
+                    serde_json::json!({"circuit_id": circuit_id, "setup_id": "dev"});
             }
             let manifest: DeploymentManifest = serde_json::from_value(json.clone()).unwrap();
             let error = validate_deployment_manifest(&manifest)
@@ -601,8 +682,56 @@ mod tests {
             assert!(error.contains("incompatible proof circuit"), "{error}");
             assert!(error.contains("zkapi-v2-concession-v1"), "{error}");
         }
-        json["proof_setup"] = serde_json::json!({"circuit_id": "zkapi-v2-concession-v1"});
-        let manifest: DeploymentManifest = serde_json::from_value(json).unwrap();
+        json["proof_setup"] =
+            serde_json::json!({"circuit_id": "zkapi-v2-concession-v1", "setup_id": "dev"});
+        let manifest: DeploymentManifest = serde_json::from_value(json.clone()).unwrap();
         validate_deployment_manifest(&manifest).unwrap();
+        // The keys must be the pinned setup.
+        let dev = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../protocol/setup/v2-concession-dev"
+        ));
+        check_setup_directory(&manifest, dev).unwrap();
+        let mut ceremony = json.clone();
+        ceremony["proof_setup"]["setup_id"] = serde_json::json!("mpc-1");
+        let ceremony: DeploymentManifest = serde_json::from_value(ceremony).unwrap();
+        let error = check_setup_directory(&ceremony, dev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pins zkapi-v2-concession-v1 / mpc-1"),
+            "{error}"
+        );
+    }
+
+    /// A placeholder profile, a vault without the concession exit and a
+    /// profile without the settlement window are refused.
+    #[test]
+    fn deployment_manifest_requires_a_deployed_concession_vault() {
+        let mut base = manifest_json();
+        base["proof_setup"] =
+            serde_json::json!({"circuit_id": "zkapi-v2-concession-v1", "setup_id": "dev"});
+        for (field, value, needle) in [
+            (
+                "deployment_status",
+                serde_json::json!("not_deployed"),
+                "deployment_not_deployed",
+            ),
+            ("exit_concession", serde_json::json!(0), "concession exit"),
+            ("vault_revision", serde_json::json!(2), "concession exit"),
+            (
+                "settlement_window_seconds",
+                serde_json::json!(0),
+                "settlement_window_seconds",
+            ),
+        ] {
+            let mut json = base.clone();
+            json[field] = value;
+            let manifest: DeploymentManifest = serde_json::from_value(json).unwrap();
+            let error = validate_deployment_manifest(&manifest)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{field}: {error}");
+        }
     }
 }

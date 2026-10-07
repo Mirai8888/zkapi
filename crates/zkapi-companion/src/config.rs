@@ -42,10 +42,21 @@ pub struct AuthConfig {
     pub native_price_feed_address: String,
     pub native_price_feed_decimals: u8,
     pub native_price_max_age_seconds: u64,
-    /// The manifest's `vault_revision`. Below 2 (every packaged deployment)
-    /// the vault burns a challenged escape's nullifier, so an escape-form
-    /// ownership proof is never sent at a state with an unsettled request.
+    /// The manifest's `vault_revision` (3 for circuit
+    /// `zkapi-v2-concession-v1`); reported, not branched on.
     pub vault_revision: u32,
+    /// The manifest's `proof_setup.setup_id` (`mpc-1`, or `dev` for drills
+    /// and tests): reported on `/oa/v1/status`.
+    pub setup_id: String,
+    /// W: the build-pinned `settlement_window_seconds` (C4, E3).
+    pub settlement_window_seconds: u64,
+    /// E3's `unsettled_request_escape_after_seconds`; `None` is 43,200 s.
+    pub unsettled_request_escape_after_seconds: Option<u64>,
+    /// The vault's deployment block: where a log rebuild starts (§6.6).
+    pub deploy_block: u64,
+    /// The user's own RPC for exits (`--exit-rpc-url`): `E_low`, rebuilds
+    /// and advisory reads also go through it.
+    pub exit_rpc_url: Option<String>,
 
     pub protocol_version: u16,
     pub chain_id: u64,
@@ -101,7 +112,12 @@ impl Default for AuthConfig {
             native_price_feed_address: String::new(),
             native_price_feed_decimals: 8,
             native_price_max_age_seconds: 3600,
-            vault_revision: 0,
+            vault_revision: 3,
+            setup_id: "dev".into(),
+            settlement_window_seconds: 21_905,
+            unsettled_request_escape_after_seconds: None,
+            deploy_block: 0,
+            exit_rpc_url: None,
             protocol_version: 2,
             chain_id: 1,
             contract_address: Felt252::ZERO,

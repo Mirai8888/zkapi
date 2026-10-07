@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod compat;
 pub mod config;
 pub mod error;
@@ -5,6 +6,7 @@ pub mod indexer;
 mod oa_withdrawal;
 pub mod routes;
 pub mod service;
+pub mod wallet_lock;
 
 pub use config::{AuthConfig, ModelDescriptor, RequestMode};
 pub use routes::{build_router, run};
@@ -15,6 +17,7 @@ pub use service::{
     ServerAttestationSnapshot, ServerHealthSnapshot, ServerSnapshot, WalletStatus,
     WithdrawalChainStatus, WithdrawalMode, WithdrawalPlan, ZkapiConfig, CREDITS_PER_USD,
 };
+pub use wallet_lock::WalletLock;
 
 mod oa_native;
 

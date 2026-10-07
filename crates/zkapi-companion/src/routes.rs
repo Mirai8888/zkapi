@@ -92,6 +92,10 @@ pub fn build_router_with_token(service: Arc<AuthService>, token: Option<String>)
         .route("/oa/v1/withdraw/prepare", post(oa_prepare_withdrawal))
         .route("/oa/v1/withdraw/confirm", post(oa_confirm_withdrawal))
         .route("/oa/v1/withdraw/release", post(oa_release_withdrawal))
+        .route("/oa/v1/withdraw/escape/prepare", post(oa_escape_prepare))
+        .route("/oa/v1/withdraw/escape/submit", post(oa_escape_submit))
+        .route("/oa/v1/withdraw/escape/status", get(oa_escape_status))
+        .route("/oa/v1/withdraw/escape/finalize", post(oa_escape_finalize))
         .route("/oa/v1/deposit/path", get(oa_deposit_path))
         .route("/healthz", get(healthz))
         .route("/request", post(core_request))
@@ -262,6 +266,43 @@ async fn oa_release_withdrawal(
         .oa_release_withdrawal(body.note_id, body.withdrawal_nullifier)
         .await
     {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_escape_prepare(
+    State(service): State<Arc<AuthService>>,
+    Json(body): Json<crate::service::exit::EscapePrepareRequest>,
+) -> Response {
+    match service.oa_escape_prepare(body).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_escape_submit(
+    State(service): State<Arc<AuthService>>,
+    Json(body): Json<OaWithdrawalConfirmBody>,
+) -> Response {
+    match service.oa_escape_submit(body.transaction_hash).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_escape_status(State(service): State<Arc<AuthService>>) -> Response {
+    match service.oa_escape_status().await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => generic_error(error),
+    }
+}
+
+async fn oa_escape_finalize(
+    State(service): State<Arc<AuthService>>,
+    Json(body): Json<OaWithdrawalConfirmBody>,
+) -> Response {
+    match service.oa_escape_finalize(body.transaction_hash).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => generic_error(error),
     }
@@ -852,6 +893,9 @@ fn generic_error(err: AuthError) -> Response {
     if let Some(nullifier) = err.nullifier() {
         body["error"]["nullifier"] = json!(nullifier);
     }
+    if let Some(detail) = err.detail() {
+        body["error"]["detail"] = detail.clone();
+    }
     (status, Json(body)).into_response()
 }
 
@@ -1024,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oa_status_advertises_clearance_ownership_proofs_without_a_bridge_bump() {
+    async fn oa_status_advertises_the_concession_exit_and_bridge_version_5() {
         let directory = tempfile::tempdir().unwrap();
         let service = AuthService::new(AuthConfig {
             state_dir: directory.path().to_path_buf(),
@@ -1054,7 +1098,12 @@ mod tests {
         assert_eq!(value["clearance_ownership_proof_version"], 1);
         assert_eq!(value["unsettled_request_override_version"], 1);
         assert_eq!(value["withdrawal_bridge_version"], 1);
-        assert_eq!(value["bridge_version"], 4);
+        assert_eq!(value["bridge_version"], 5);
+        assert_eq!(value["exit_concession"], 1);
+        assert_eq!(value["escape_routes_version"], 1);
+        assert_eq!(value["setup_id"], "dev");
+        assert_eq!(value["settlement_window_seconds"], 21_905);
+        assert_eq!(value["circuit_id"], "zkapi-v2-concession-v1");
     }
 
     #[test]

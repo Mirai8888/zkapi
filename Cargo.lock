@@ -3186,6 +3186,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures-util",
+ "hex",
  "http-body-util",
  "rayon",
  "reqwest",

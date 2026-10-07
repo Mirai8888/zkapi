@@ -153,8 +153,12 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
     );
     // Read while holding the writer lock, before anything is written.
     ensure_key_sources_drained(&config, processor.store())?;
-    // Record a fresh verification only while holding the writer lock.
+    // Record a fresh verification only while holding the writer lock, over
+    // no binding or one of this deployment.
     if binding_source == BindingSource::VerifiedNow {
+        if let Some(recorded) = processor.store().read_deployment_binding()? {
+            check_recorded_binding(&config, &identity, &recorded)?;
+        }
         processor.store().write_deployment_binding(&binding)?;
     }
     // O5: admission needs a root the indexer and the vault agree on.
@@ -274,24 +278,8 @@ async fn establish_deployment_binding(
     identity: &StatementIdentity,
     retry: StartupRetry,
 ) -> anyhow::Result<(DeploymentBinding, BindingSource)> {
-    let contract_address = vault_address_hex(&config.contract_address);
-    if let Some(recorded) = recorded_deployment_binding(&config.db_path) {
-        anyhow::ensure!(
-            recorded.chain_id == config.chain_id && recorded.contract_address == contract_address,
-            "refusing to start: server database {} is bound to vault {} on chain {}, not vault {} on chain {}; use a separate database for each deployment",
-            config.db_path,
-            recorded.contract_address,
-            recorded.chain_id,
-            contract_address,
-            config.chain_id
-        );
-        if let Some(mismatch) = identity.mismatch(&recorded) {
-            anyhow::bail!(
-                "refusing to start: server database {} is bound to another statement: {mismatch}; \
-                 use a fresh database (`zkapi db init`) for each circuit and setup",
-                config.db_path
-            );
-        }
+    if let Some(recorded) = recorded_deployment_binding(&config.db_path)? {
+        check_recorded_binding(config, identity, &recorded)?;
         if recorded.source == BINDING_SOURCE_MANIFEST {
             // Recorded by `zkapi db init`: the same deployment, verified
             // against the vault below before anything is served.
@@ -322,21 +310,46 @@ async fn establish_deployment_binding(
     Ok((binding, BindingSource::VerifiedNow))
 }
 
-/// Read the binding of an existing database without opening it for writes.
-/// One that cannot be read this way (an older schema, a hot journal) falls
-/// back to the vault check rather than failing open.
-fn recorded_deployment_binding(db_path: &str) -> Option<DeploymentBinding> {
+/// Refuse a database bound to another vault or statement.
+fn check_recorded_binding(
+    config: &ServerConfig,
+    identity: &StatementIdentity,
+    recorded: &DeploymentBinding,
+) -> anyhow::Result<()> {
+    let contract_address = vault_address_hex(&config.contract_address);
+    anyhow::ensure!(
+        recorded.chain_id == config.chain_id && recorded.contract_address == contract_address,
+        "refusing to start: server database {} is bound to vault {} on chain {}, not vault {} on chain {}; use a separate database for each deployment",
+        config.db_path,
+        recorded.contract_address,
+        recorded.chain_id,
+        contract_address,
+        config.chain_id
+    );
+    if let Some(mismatch) = identity.mismatch(recorded) {
+        anyhow::bail!(
+            "refusing to start: server database {} is bound to another statement: {mismatch}; \
+             use a fresh database (`zkapi db init`) for each circuit and setup",
+            config.db_path
+        );
+    }
+    Ok(())
+}
+
+/// Read the binding of an existing database before it is opened for writes
+/// (which migrates its schema), whatever release wrote it. Only a database
+/// with no binding row goes to the vault check unbound; one whose binding
+/// cannot be read is refused, never taken for unbound.
+fn recorded_deployment_binding(db_path: &str) -> anyhow::Result<Option<DeploymentBinding>> {
     if !std::path::Path::new(db_path).is_file() {
-        return None;
+        return Ok(None);
     }
-    match NullifierStore::open_read_only(db_path).and_then(|store| store.read_deployment_binding())
-    {
-        Ok(binding) => binding,
-        Err(error) => {
-            tracing::warn!(error = %error, "cannot read the recorded deployment binding; checking the vault");
-            None
-        }
-    }
+    NullifierStore::read_recorded_deployment_binding(db_path).map_err(|error| {
+        anyhow::anyhow!(
+            "refusing to start: cannot read the deployment binding recorded in server database \
+             {db_path}: {error}"
+        )
+    })
 }
 
 struct VaultDeployment {
@@ -2406,6 +2419,83 @@ mod startup_tests {
                 .unwrap(),
             Some(other_vault)
         );
+    }
+
+    /// Review regression: the binding of a database this release's readers
+    /// cannot open (the pre-change schema ac9be63, or a database without its
+    /// evidence table) is still read and must match. One bound to another
+    /// vault, or to this vault before circuit identifiers were recorded
+    /// (circuit zkapi-v2-note-bound-v1), is refused before any RPC, and is
+    /// neither migrated nor rebound.
+    #[tokio::test]
+    async fn a_database_of_an_older_schema_keeps_its_binding_and_is_refused_before_rpc() {
+        let seeds = strong_test_seeds();
+        let keys = keys_of(seeds);
+        const OTHER: &str = "0x0000000000000000000000000000000000009999";
+        for (case, vault, expected) in [
+            ("ac9be63", OTHER, format!("is bound to vault {OTHER}")),
+            ("ac9be63", VAULT, "zkapi-v2-note-bound-v1".to_string()),
+            (
+                "no evidence table",
+                OTHER,
+                format!("is bound to vault {OTHER}"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("server.db");
+            if case == "ac9be63" {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(crate::nullifier_store::tests::SCHEMA_4F21B66)
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                        state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                        verified_at)
+                     VALUES (1, 1, ?1, ?2, ?3, ?4, ?5, 86400, 7)",
+                    rusqlite::params![
+                        vault,
+                        keys.state.x.to_hex(),
+                        keys.state.y.to_hex(),
+                        keys.clearance.x.to_hex(),
+                        keys.clearance.y.to_hex()
+                    ],
+                )
+                .unwrap();
+            } else {
+                NullifierStore::new(&db_path)
+                    .unwrap()
+                    .write_deployment_binding(&DeploymentBinding {
+                        contract_address: vault.into(),
+                        ..recorded_binding(seeds)
+                    })
+                    .unwrap();
+                rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .execute_batch(
+                        "DROP TRIGGER request_evidence_no_update;
+                         DROP TRIGGER request_evidence_no_delete;
+                         DROP TABLE request_evidence;",
+                    )
+                    .unwrap();
+            }
+            assert!(NullifierStore::open_read_only(&db_path).is_err(), "{case}");
+            let before = std::fs::read(&db_path).unwrap();
+            let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+            let mut config = config(&rpc, &db_path, seeds);
+            config.listen_addr = free_listen_addr().await;
+            let error =
+                tokio::time::timeout(Duration::from_secs(20), run_server_with(config, TEST_RETRY))
+                    .await
+                    .unwrap_or_else(|_| panic!("{case} {vault}: served"))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(&expected), "{case} {vault}: {error}");
+            assert!(methods(&calls).is_empty(), "{case} {vault}");
+            assert!(
+                std::fs::read(&db_path).unwrap() == before,
+                "{case} {vault}: the database was changed"
+            );
+        }
     }
 
     #[tokio::test]

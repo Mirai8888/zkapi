@@ -304,6 +304,29 @@ pub fn init_database(
     now: u64,
 ) -> anyhow::Result<DbInitReport> {
     manifest.check_statement(loaded)?;
+    let refuse_another = |recorded: &DeploymentBinding| match manifest.binding_mismatch(recorded) {
+        Some(mismatch) => Err(anyhow::anyhow!(
+            "refusing to initialize {}: {mismatch}; use a fresh database for each deployment, \
+             circuit and setup",
+            db_path.display()
+        )),
+        None => Ok(()),
+    };
+    // Before the schema is created or migrated: an existing database of any
+    // release keeps a binding to another deployment untouched.
+    if db_path.is_file() {
+        if let Some(recorded) =
+            crate::nullifier_store::NullifierStore::read_recorded_deployment_binding(db_path)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "refusing to initialize {}: cannot read its deployment binding: {error}",
+                        db_path.display()
+                    )
+                })?
+        {
+            refuse_another(&recorded)?;
+        }
+    }
     let store = crate::nullifier_store::NullifierStore::new(db_path)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let _writer_lock = store
@@ -314,13 +337,7 @@ pub fn init_database(
         .map_err(|error| anyhow::anyhow!("{error}"))?
     {
         Some(recorded) => {
-            if let Some(mismatch) = manifest.binding_mismatch(&recorded) {
-                bail!(
-                    "refusing to initialize {}: {mismatch}; use a fresh database for each \
-                     deployment, circuit and setup",
-                    db_path.display()
-                );
-            }
+            refuse_another(&recorded)?;
             ("already_bound", recorded)
         }
         None => {
@@ -643,6 +660,66 @@ pub(crate) mod tests {
         .unwrap();
         let error = manifest.check_statement(&identity).unwrap_err();
         assert!(error.to_string().contains("do not match"), "{error}");
+    }
+
+    /// Review regression: `zkapi db init` reads the binding of a database of
+    /// the pre-change schema too, and refuses one bound to another vault, or
+    /// bound before circuit identifiers were recorded, before migrating it.
+    #[test]
+    fn init_refuses_a_pre_change_database_without_migrating_it() {
+        let identity = dev_identity();
+        let keys = keys();
+        let manifest = DeploymentManifest::parse(
+            &manifest_json(
+                "0x00000000000000000000000000000000000000aa",
+                &keys,
+                &identity,
+            )
+            .to_string(),
+        )
+        .unwrap();
+        for (vault, expected) in [
+            (
+                "0x0000000000000000000000000000000000009999",
+                "another vault",
+            ),
+            (
+                "0x00000000000000000000000000000000000000aa",
+                "another statement",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("server.db");
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch(crate::nullifier_store::tests::SCHEMA_4F21B66)
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                        state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                        verified_at)
+                     VALUES (1, 1, ?1, ?2, ?3, ?4, ?5, 86400, 7)",
+                    rusqlite::params![
+                        vault,
+                        keys.state.x.to_hex(),
+                        keys.state.y.to_hex(),
+                        keys.clearance.x.to_hex(),
+                        keys.clearance.y.to_hex()
+                    ],
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let error = init_database(&path, &manifest, &identity, 9).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{vault}: {error:#}"
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "{vault}: the database was migrated or rebound"
+            );
+        }
     }
 
     #[test]

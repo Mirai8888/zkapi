@@ -819,6 +819,70 @@ impl NullifierStore {
         })
     }
 
+    /// The deployment binding recorded in the database file at `path`, read
+    /// before the database is opened for writes, whatever release wrote it:
+    /// unlike [`Self::open_read_only`], an older schema is no reason to skip
+    /// the binding. A column an older release did not record reads as absent
+    /// (None, and `source` "vault"), so a binding recorded before circuit
+    /// identifiers names no circuit (zkapi-v2-note-bound-v1) and matches no
+    /// statement of this release. None only when no binding row exists.
+    /// Nothing is written: the file is opened query-only, read-write only so
+    /// that SQLite can roll back a hot journal as any opener does.
+    pub fn read_recorded_deployment_binding<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Option<DeploymentBinding>, ServerError> {
+        let failed = |error: rusqlite::Error| {
+            ServerError::Database(format!("deployment binding read failed: {error}"))
+        };
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(failed)?;
+        conn.execute_batch("PRAGMA query_only = ON")
+            .map_err(failed)?;
+        let present = conn
+            .prepare("SELECT name FROM pragma_table_info('deployment_binding')")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(failed)?;
+        if present.is_empty() {
+            // No binding table: a database older than the binding.
+            return Ok(None);
+        }
+        let column = |name: &str, absent: &str| {
+            if present.iter().any(|column| column == name) {
+                name.to_string()
+            } else {
+                format!("{absent} AS {name}")
+            }
+        };
+        // The columns every binding table has are read as they are: one
+        // missing fails the read.
+        conn.query_row(
+            &format!(
+                "SELECT chain_id, contract_address, state_key_x, state_key_y, clearance_key_x,
+                    clearance_key_y, challenge_period_seconds, verified_at, {}, {}, {}, {}, {}, {}
+                 FROM deployment_binding WHERE id = 1",
+                column("verified_block", "NULL"),
+                column("circuit_id", "NULL"),
+                column("setup_id", "NULL"),
+                column("request_vk_keccak256", "NULL"),
+                column("withdrawal_vk_keccak256", "NULL"),
+                column("source", "'vault'"),
+            ),
+            [],
+            row_to_deployment_binding,
+        )
+        .optional()
+        .map_err(failed)
+    }
+
     /// Record the vault-verified deployment this database serves.
     pub fn write_deployment_binding(&self, binding: &DeploymentBinding) -> Result<(), ServerError> {
         let conn = self
@@ -4306,7 +4370,7 @@ fn current_timestamp() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn lease_request(client_request_id: &str, nullifier: u64) -> ApiRequestV2 {
@@ -4943,6 +5007,83 @@ mod tests {
             }
             assert!(dropped > 0, "no column of {table} could be dropped");
         }
+    }
+
+    #[test]
+    fn the_recorded_binding_is_read_from_a_database_of_any_release_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.db");
+        let read = || NullifierStore::read_recorded_deployment_binding(&path);
+        // A database older than the binding table, then the pre-change
+        // schema with no binding row: unbound.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE nullifiers (nullifier TEXT PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(read().unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SCHEMA_4F21B66)
+            .unwrap();
+        assert_eq!(read().unwrap(), None);
+        // Its binding: no statement recorded, verified against the vault.
+        let legacy = deployment_binding();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO deployment_binding (id, chain_id, contract_address, state_key_x,
+                    state_key_y, clearance_key_x, clearance_key_y, challenge_period_seconds,
+                    verified_at, verified_block)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 9)",
+                params![
+                    legacy.chain_id,
+                    legacy.contract_address,
+                    legacy.state_signing_key.x.to_hex(),
+                    legacy.state_signing_key.y.to_hex(),
+                    legacy.clearance_signing_key.x.to_hex(),
+                    legacy.clearance_signing_key.y.to_hex(),
+                    legacy.challenge_period_seconds,
+                    legacy.verified_at
+                ],
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            read().unwrap(),
+            Some(DeploymentBinding {
+                verified_block: Some(9),
+                circuit_id: None,
+                setup_id: None,
+                request_vk_keccak256: None,
+                withdrawal_vk_keccak256: None,
+                source: BINDING_SOURCE_VAULT.into(),
+                ..legacy
+            })
+        );
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "nothing is written"
+        );
+        assert!(NullifierStore::open_read_only(&path).is_err());
+        // Migrated, it reads as `read_deployment_binding` reads it.
+        let store = NullifierStore::new(&path).unwrap();
+        store
+            .write_deployment_binding(&deployment_binding())
+            .unwrap();
+        drop(store);
+        assert_eq!(read().unwrap(), Some(deployment_binding()));
+        // A binding table without a column every release recorded is an
+        // error, never "unbound".
+        let damaged = directory.path().join("damaged.db");
+        Connection::open(&damaged)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE deployment_binding (id INTEGER PRIMARY KEY, chain_id INTEGER);
+                 INSERT INTO deployment_binding VALUES (1, 1);",
+            )
+            .unwrap();
+        assert!(NullifierStore::read_recorded_deployment_binding(&damaged).is_err());
     }
 
     #[test]
@@ -5813,7 +5954,7 @@ mod tests {
 
     /// The schema `NullifierStore::new` created before the concession exit
     /// (circuit zkapi-v2-note-bound-v1, release ac9be63).
-    const SCHEMA_4F21B66: &str = "CREATE TABLE nullifiers (
+    pub(crate) const SCHEMA_4F21B66: &str = "CREATE TABLE nullifiers (
             nullifier TEXT PRIMARY KEY, status TEXT NOT NULL,
             reservation_kind TEXT NOT NULL DEFAULT 'proxy', client_request_id TEXT,
             payload_hash TEXT, charge_applied INTEGER, response_code INTEGER,

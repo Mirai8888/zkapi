@@ -110,6 +110,63 @@ function mutualPlan(changes = {}) {
 const ESCAPE_DESTINATION = "0x2222222222222222222222222222222222222222";
 const MUTUAL_DESTINATION = "0x5615deb798bb3e4dfa0139dfa1b3d433cc23b72f";
 
+// The real revision-3 vault's selectors and event topics, from the compiled
+// protocol/contracts sources (crates/zkapi-serverd/tests/fixtures/
+// check-calldata-golden.sh keeps this file equal to them).
+const REAL_VAULT = JSON.parse(readFileSync(new URL("../../crates/zkapi-serverd/tests/fixtures/vault_calldata_golden.json", import.meta.url), "utf8"));
+
+test("every selector and event topic is the real vault's", () => {
+  const legacy = new Set(["legacyChallengePeriod"]);
+  const events = {
+    noteDeposited: "NoteDeposited",
+    mutualCloseEvent: "MutualClose",
+    escapeInitiatedEvent: "EscapeWithdrawalInitiated",
+    escapeFinalizedEvent: "EscapeWithdrawalFinalized",
+    escapeChallengedEvent: "EscapeWithdrawalChallenged",
+    escapeConcessionRecordedEvent: "EscapeConcessionRecorded",
+    escapeConcessionRaisedEvent: "EscapeConcessionRaised",
+    closedLeafRetiredEvent: "ClosedLeafRetired",
+    expiredClaimedEvent: "ExpiredClaimed",
+    escapePayoutDeferredEvent: "EscapePayoutDeferred",
+    escapePayoutClaimedEvent: "EscapePayoutClaimed",
+  };
+  let checked = 0;
+  for (const [name, value] of Object.entries(wallet.ABI)) {
+    if (legacy.has(name)) continue;
+    if (events[name]) {
+      assert.equal(value, REAL_VAULT.events[events[name]].topic0, name);
+    } else {
+      assert.equal(`0x${value}`, REAL_VAULT.selectors[name], name);
+    }
+    checked += 1;
+  }
+  assert.equal(checked, Object.keys(wallet.ABI).length - legacy.size);
+  // The decoders read the logs the real vault emits (VaultCalldataGolden.t.sol).
+  const vault = "0x00000000000000000000000000000000000000aa";
+  const log = name => ({ address: vault, data: REAL_VAULT.events[name].data,
+    topics: REAL_VAULT.events[name].topics.slice(2).match(/.{64}/g).map(word => `0x${word}`) });
+  // The tree and lifecycle events the SDK's strict decoder reads (others,
+  // such as MutualClose, are matched by topic in the receipt matchers).
+  const decodable = ["NoteDeposited", "EscapeWithdrawalInitiated", "EscapeConcessionRecorded", "EscapeConcessionRaised",
+    "EscapeWithdrawalChallenged", "ClosedLeafRetired", "ExpiredClaimed"];
+  const decoded = Object.fromEntries(decodable.map(name => [name, wallet.decodeVaultEvent(log(name), vault)]));
+  assert.deepEqual(decoded.NoteDeposited, { event: "NoteDeposited", noteId: 7n, commitment: `0x${"0c0c".padStart(64, "0")}`,
+    amount: 1_000_000n, expiryTs: 2_000_000_000n, newRoot: 0x0a0an });
+  assert.equal(decoded.EscapeWithdrawalInitiated.challengeDeadline, 2_000_086_400n);
+  assert.equal(decoded.EscapeWithdrawalInitiated.destination.toLowerCase(), "0x1111111111111111111111111111111111111111");
+  assert.deepEqual(wallet.escapeConcessionRecorded({ logs: [log("EscapeConcessionRecorded")] }, vault, 7),
+    { nextNullifier: 0x0202n, stateBalance: 1_000_000n, conceded: 100_000n });
+  assert.deepEqual(wallet.escapeConcessionRaises({ logs: [log("EscapeConcessionRaised")] }, vault, 7),
+    [{ nullifier: 0x0101n, conceded: 150_000n, finalBalance: 850_000n }]);
+  for (const [name, event] of Object.entries(decoded)) {
+    assert.equal(event?.event, name, name);
+    assert.equal(event.noteId ?? 7n, 7n, name);
+  }
+  assert.equal(REAL_VAULT.getter_words.pendingConcessions, 3);
+  assert.equal(REAL_VAULT.getter_words.pendingWithdrawals, 6);
+  assert.equal(wallet.decodePendingConcessions(`0x${"00".repeat(96)}`).nextNullifier, 0n);
+});
+
 test("every vault selector and event topic is the keccak of its signature", () => {
   const W = wallet.WITHDRAWAL_TUPLE;
   const Q = wallet.REQUEST_TUPLE;

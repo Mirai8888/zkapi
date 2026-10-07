@@ -1098,6 +1098,38 @@ mod tests {
         );
     }
 
+    /// The getters, the EscapeConcessionRecorded topic and its data layout
+    /// are the real vault's (vault_calldata_golden.json, from the compiled
+    /// protocol/contracts sources): `nextNullifier` is data word 0 of three.
+    #[test]
+    fn vault_reads_match_the_real_vault() {
+        use crate::test_support::{real_event, real_getter_words, real_selector};
+        for (name, selector) in [
+            ("stateSigningKeyX", STATE_SIGNING_KEY_X_SELECTOR),
+            ("stateSigningKeyY", STATE_SIGNING_KEY_Y_SELECTOR),
+            ("clearanceSigningKeyX", CLEARANCE_SIGNING_KEY_X_SELECTOR),
+            ("clearanceSigningKeyY", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
+            ("challengePeriod", CHALLENGE_PERIOD_SELECTOR),
+            ("currentRoot", CURRENT_ROOT_SELECTOR),
+            ("usedNullifiers", USED_NULLIFIERS_SELECTOR),
+            ("challengedNullifiers", CHALLENGED_NULLIFIERS_SELECTOR),
+            ("knownRoots", KNOWN_ROOTS_SELECTOR),
+        ] {
+            assert_eq!(real_selector(name), selector, "{name}");
+        }
+        // knownRoots(root) answers one boolean word.
+        assert_eq!(real_getter_words("knownRoots"), 1);
+        let (topics, data) = real_event("EscapeConcessionRecorded");
+        assert_eq!(topics[0], ESCAPE_CONCESSION_RECORDED_TOPIC);
+        let vault = "0x00000000000000000000000000000000000000aa";
+        let log = json!({"address": vault, "topics": topics, "data": data});
+        // emit EscapeConcessionRecorded(7, 0x0202, 1_000_000, 100_000).
+        assert_eq!(
+            next_nullifier_of(&log, vault).unwrap(),
+            format!("0x{:064x}", 0x0202)
+        );
+    }
+
     #[test]
     fn decode_field_word_rejects_short_and_out_of_field_words() {
         let error = decode_field_word("0x").unwrap_err().to_string();

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Regenerate the golden vault calldata with Forge (VaultCalldataGolden.t.sol,
-# Solidity's abi.encodeCall) and compare it with vault_calldata_golden.json,
-# which zkapi-serverd's watcher::tests::golden_calldata_matches_forge_abi_encode
-# pins its encoders against. With --update, rewrite the JSON instead.
-# Needs forge and node; uses the vendored forge-std of protocol/contracts.
+# Regenerate the golden vault calldata, getter selectors and layouts, and
+# event layouts with Forge (VaultCalldataGolden.t.sol, which compiles the real
+# protocol/contracts sources: abi.encodeCall against ZkApiVault, and the
+# vault's own Events) and compare them with vault_calldata_golden.json, which
+# zkapi-serverd (watcher, native_billing) and zkapi-indexerd (poller) pin
+# their encoders, selectors and decoders against. With --update, rewrite the
+# JSON instead. Needs forge and node; uses the vendored forge-std of
+# protocol/contracts and its compiler settings.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
@@ -14,48 +17,65 @@ trap 'rm -rf "$work"' EXIT
 
 mkdir -p "$work/src" "$work/test"
 cp "$here/VaultCalldataGolden.t.sol" "$work/test/"
+# The protocol profile's settings (via_ir and the optimizer), so the vault
+# compiles as it does in protocol/contracts.
 cat >"$work/foundry.toml" <<EOF
 [profile.default]
 src = "src"
 test = "test"
 out = "out"
 libs = ["$repo/protocol/contracts/lib"]
-remappings = ["forge-std/=$repo/protocol/contracts/lib/forge-std/src/"]
+allow_paths = ["$repo/protocol/contracts"]
+remappings = ["forge-std/=$repo/protocol/contracts/lib/forge-std/src/", "@openzeppelin/=$repo/protocol/contracts/lib/openzeppelin-contracts/", "zkapi/=$repo/protocol/contracts/src/"]
 solc = "0.8.28"
+optimizer = true
+optimizer_runs = 10000
+via_ir = true
 EOF
 
-(cd "$work" && forge test --match-contract GoldenTest -vv) >"$work/forge.log"
+if ! (cd "$work" && forge test --match-contract GoldenTest -vv) >"$work/forge.log" 2>&1; then
+  cat "$work/forge.log" >&2
+  exit 1
+fi
 
 node - "$work/forge.log" "$golden" "${1:-}" <<'JS'
 const fs = require("node:fs");
+const assert = require("node:assert/strict");
 const [log, goldenPath, mode] = process.argv.slice(2);
 const lines = fs.readFileSync(log, "utf8").split("\n").map((line) => line.trim());
 const start = lines.indexOf("Logs:");
 if (start < 0) throw new Error("forge printed no logs");
-const vectors = {};
-for (let i = start + 1; i + 1 < lines.length; i += 2) {
-  const [name, hex] = [lines[i], lines[i + 1]];
-  if (!/^[a-z]+$/.test(name) || !/^0x[0-9a-f]+$/.test(hex)) break;
-  vectors[name] = hex;
+const vectors = { selectors: {}, getter_words: {}, events: {} };
+for (const line of lines.slice(start + 1)) {
+  const match = /^([A-Za-z0-9_.]+)=(\S+)$/.exec(line);
+  if (!match) break;
+  const [, key, value] = match;
+  const [kind, name, field] = key.split(".");
+  if (kind === "calldata") vectors[name] = value;
+  else if (kind === "selector") vectors.selectors[name] = value;
+  else if (kind === "getter_words") vectors.getter_words[name] = Number(value);
+  else if (kind === "event") {
+    vectors.events[name] ??= {};
+    vectors.events[name][field] = value;
+  } else throw new Error(`unexpected forge line: ${line}`);
+}
+const names = ["defeat", "raise", "escape", "close", "retire"];
+for (const name of names) {
+  if (!vectors[name]) throw new Error(`forge did not print ${name}`);
 }
 const golden = JSON.parse(fs.readFileSync(goldenPath, "utf8"));
-const names = ["defeat", "raise", "escape", "close", "retire"];
 if (mode === "--update") {
-  for (const name of names) golden[name] = vectors[name];
-  fs.writeFileSync(goldenPath, `${JSON.stringify(golden, null, 2)}\n`);
+  fs.writeFileSync(goldenPath, `${JSON.stringify({ generator: golden.generator, ...vectors }, null, 2)}\n`);
   console.log(`updated ${goldenPath}`);
   process.exit(0);
 }
-let failed = false;
-for (const name of names) {
-  if (!vectors[name]) {
-    console.error(`forge did not print ${name}`);
-    failed = true;
-  } else if (vectors[name] !== golden[name]) {
-    console.error(`${name}: vault_calldata_golden.json differs from forge's abi.encodeCall`);
-    failed = true;
-  }
+const { generator: _, ...pinned } = golden;
+try {
+  assert.deepStrictEqual(pinned, vectors);
+} catch (error) {
+  console.error("vault_calldata_golden.json differs from the real contracts (forge abi.encodeCall, selectors, getters and events):");
+  console.error(error.message);
+  process.exit(1);
 }
-if (failed) process.exit(1);
-console.log(`golden calldata matches forge: ${names.join(", ")}`);
+console.log(`golden vectors match the real contracts: ${names.join(", ")}, ${Object.keys(vectors.selectors).length} selectors, ${Object.keys(vectors.getter_words).length} getters, ${Object.keys(vectors.events).length} events`);
 JS

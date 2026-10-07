@@ -591,6 +591,27 @@ pub(crate) mod tests {
         StatementIdentity::load(&crate::test_support::setup_directory()).unwrap()
     }
 
+    /// The startup probes read the real vault's and adapter's getters
+    /// (vault_calldata_golden.json, from the compiled protocol/contracts
+    /// sources).
+    #[test]
+    fn probe_selectors_are_the_real_vault_and_adapter_getters() {
+        use crate::test_support::real_selector;
+        for (name, selector) in [
+            (
+                "CONCESSION_ESCAPE_VERSION",
+                CONCESSION_ESCAPE_VERSION_SELECTOR,
+            ),
+            ("ROOT_HISTORY_WINDOW", ROOT_HISTORY_WINDOW_SELECTOR),
+            ("proofAdapter", PROOF_ADAPTER_SELECTOR),
+            ("CIRCUIT_ID_HASH", CIRCUIT_ID_HASH_SELECTOR),
+            ("REQUEST_VK_HASH", REQUEST_VK_HASH_SELECTOR),
+            ("WITHDRAWAL_VK_HASH", WITHDRAWAL_VK_HASH_SELECTOR),
+        ] {
+            assert_eq!(real_selector(name), selector, "{name}");
+        }
+    }
+
     #[test]
     fn manifests_parse_bare_or_wrapped_and_refuse_placeholders_and_other_circuits() {
         let identity = dev_identity();

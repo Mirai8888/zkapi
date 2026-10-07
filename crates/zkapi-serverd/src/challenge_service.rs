@@ -11291,6 +11291,78 @@ mod tests {
         assert!(decode_scan_event(&three_topics).is_err());
     }
 
+    /// The challenger's reads and its event scan follow the real vault
+    /// (vault_calldata_golden.json, from the compiled protocol/contracts
+    /// sources): the getters' selectors and word counts, and each scanned
+    /// event's topic and data layout, decoded from the vault's own log.
+    #[test]
+    fn reads_and_scan_follow_the_real_vault() {
+        use crate::test_support::{real_event, real_getter_words, real_selector};
+        for (name, signature) in [
+            ("pendingWithdrawals", "pendingWithdrawals(uint32)"),
+            ("pendingConcessions", "pendingConcessions(uint32)"),
+            ("notes", "notes(uint32)"),
+            ("challengedNullifiers", "challengedNullifiers(uint256)"),
+            ("currentRoot", "currentRoot()"),
+            ("challengePeriod", "challengePeriod()"),
+        ] {
+            assert_eq!(
+                real_selector(name),
+                format!("0x{}", hex::encode(selector(signature))),
+                "{name}"
+            );
+        }
+        // escape_state's and note_closed_at's strict word counts.
+        assert_eq!(real_getter_words("pendingWithdrawals"), 6);
+        assert_eq!(real_getter_words("pendingConcessions"), 3);
+        assert_eq!(real_getter_words("notes"), 4);
+        let log = |name: &str| {
+            let (topics, data) = real_event(name);
+            json!({ "topics": topics, "data": data })
+        };
+        let n = Felt252::from_u64;
+        assert_eq!(
+            decode_scan_event(&log("EscapeWithdrawalInitiated")).unwrap(),
+            ScanEvent::Initiated {
+                note: 7,
+                nullifier: n(0x0101),
+                deadline: 2_000_086_400
+            }
+        );
+        assert_eq!(
+            decode_scan_event(&log("EscapeConcessionRecorded")).unwrap(),
+            ScanEvent::Recorded {
+                note: 7,
+                next_nullifier: n(0x0202),
+                state_balance: 1_000_000,
+                conceded: 100_000
+            }
+        );
+        assert_eq!(
+            decode_scan_event(&log("EscapeConcessionRaised")).unwrap(),
+            ScanEvent::Raised {
+                note: 7,
+                nullifier: n(0x0101),
+                conceded: 150_000
+            }
+        );
+        assert_eq!(
+            decode_scan_event(&log("EscapeWithdrawalChallenged")).unwrap(),
+            ScanEvent::Challenged {
+                note: 7,
+                nullifier: n(0x0101)
+            }
+        );
+        let (finalized, _) = real_event("EscapeWithdrawalFinalized");
+        assert_eq!(
+            finalized[0],
+            format!(
+                "0x{}",
+                hex::encode(Keccak256::digest(FINALIZED_EVENT.as_bytes()))
+            )
+        );
+    }
+
     /// A manifest of the fixture's deployment and mock vault code.
     fn mock_manifest(fixture: &Fixture, request: &ApiRequestV2) -> DeploymentManifest {
         let identity = &fixture.service().identity.clone();

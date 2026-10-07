@@ -943,6 +943,20 @@ pub(crate) mod tests {
         ] {
             assert_eq!(&Keccak256::digest(signature.as_bytes())[..4], &selector);
         }
+        // And those of the real vault (compiled protocol/contracts sources).
+        for (name, selector) in [
+            ("challengeEscapeWithdrawal", DEFEAT_SELECTOR),
+            ("raiseEscapeConcession", RAISE_SELECTOR),
+            ("retireClosedLeaf", RETIRE_SELECTOR),
+            ("initiateEscapeWithdrawal", ESCAPE_SELECTOR),
+            ("mutualClose", MUTUAL_CLOSE_SELECTOR),
+        ] {
+            assert_eq!(
+                crate::test_support::real_selector(name),
+                format!("0x{}", hex::encode(selector)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

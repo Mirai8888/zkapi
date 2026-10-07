@@ -388,3 +388,45 @@ pub(crate) async fn fake_tree_ownership_fixture() -> &'static OwnershipFixture {
         })
         .await
 }
+
+/// The real revision-3 vault's calldata, getter selectors and layouts, and
+/// event layouts (`tests/fixtures/vault_calldata_golden.json`, checked
+/// against the compiled protocol/contracts sources by
+/// `check-calldata-golden.sh`).
+pub(crate) fn real_vault_layout() -> &'static serde_json::Value {
+    static LAYOUT: OnceLock<serde_json::Value> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        serde_json::from_str(include_str!("../tests/fixtures/vault_calldata_golden.json"))
+            .expect("vault_calldata_golden.json")
+    })
+}
+
+/// The real vault's selector of `name`, as `0x` and 8 hex digits.
+pub(crate) fn real_selector(name: &str) -> &'static str {
+    real_vault_layout()["selectors"][name]
+        .as_str()
+        .unwrap_or_else(|| panic!("no selector {name} in vault_calldata_golden.json"))
+}
+
+/// The ABI words the real vault's struct getter `name` returns.
+pub(crate) fn real_getter_words(name: &str) -> usize {
+    real_vault_layout()["getter_words"][name]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no getter {name} in vault_calldata_golden.json")) as usize
+}
+
+/// A log of the real vault's event `name`: its topics (`0x` words, topic0
+/// first) and its data (`0x` hex).
+pub(crate) fn real_event(name: &str) -> (Vec<String>, String) {
+    let event = &real_vault_layout()["events"][name];
+    let topics = event["topics"]
+        .as_str()
+        .and_then(|topics| topics.strip_prefix("0x"))
+        .unwrap_or_else(|| panic!("no event {name} in vault_calldata_golden.json"));
+    let topics = topics
+        .as_bytes()
+        .chunks(64)
+        .map(|word| format!("0x{}", std::str::from_utf8(word).unwrap()))
+        .collect();
+    (topics, event["data"].as_str().unwrap().to_string())
+}

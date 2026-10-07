@@ -2361,6 +2361,142 @@ mod tests {
         }
     }
 
+    /// Every decoded event is the real vault's: its topic0, topic count and
+    /// data layout, decoded from the log the compiled vault emits
+    /// (crates/zkapi-serverd/tests/fixtures/vault_calldata_golden.json, which
+    /// check-calldata-golden.sh checks against protocol/contracts).
+    #[test]
+    fn decoders_read_the_real_vault_events() {
+        let layout: serde_json::Value = serde_json::from_str(include_str!(
+            "../../zkapi-serverd/tests/fixtures/vault_calldata_golden.json"
+        ))
+        .unwrap();
+        let log = |name: &str| {
+            let event = &layout["events"][name];
+            let topics = event["topics"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0x")
+                .unwrap();
+            let topics: Vec<String> = topics
+                .as_bytes()
+                .chunks(64)
+                .map(|word| format!("0x{}", std::str::from_utf8(word).unwrap()))
+                .collect();
+            assert_eq!(topics[0], event["topic0"].as_str().unwrap());
+            let data = event["data"].as_str().unwrap().strip_prefix("0x").unwrap();
+            let words: Vec<String> = data
+                .as_bytes()
+                .chunks(64)
+                .map(|word| std::str::from_utf8(word).unwrap().to_string())
+                .collect();
+            log_of(topics, &words)
+        };
+        for (name, signature) in [
+            ("NoteDeposited", NOTE_DEPOSITED),
+            ("MutualClose", MUTUAL_CLOSE),
+            ("EscapeWithdrawalInitiated", ESCAPE_INITIATED),
+            ("EscapeConcessionRecorded", CONCESSION_RECORDED),
+            ("EscapeConcessionRaised", CONCESSION_RAISED),
+            ("EscapeWithdrawalChallenged", ESCAPE_CHALLENGED),
+            ("EscapeWithdrawalFinalized", ESCAPE_FINALIZED),
+            ("ExpiredClaimed", EXPIRED_CLAIMED),
+            ("ClosedLeafRetired", CLOSED_LEAF_RETIRED),
+        ] {
+            assert_eq!(
+                event_topic(signature),
+                layout["events"][name]["topic0"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+        let n = Felt252::from_u64;
+        for (name, expected) in [
+            (
+                "NoteDeposited",
+                VaultEvent::NoteDeposited {
+                    note_id: 7,
+                    commitment: n(0x0c0c),
+                    amount: 1_000_000,
+                    expiry_ts: 2_000_000_000,
+                    new_root: n(0x0a0a),
+                },
+            ),
+            (
+                "MutualClose",
+                VaultEvent::MutualClose {
+                    note_id: 7,
+                    nullifier: n(0x0101),
+                    final_balance: 900_000,
+                },
+            ),
+            (
+                "EscapeWithdrawalInitiated",
+                VaultEvent::EscapeWithdrawalInitiated {
+                    note_id: 7,
+                    nullifier: n(0x0101),
+                    final_balance: 900_000,
+                    challenge_deadline: 2_000_086_400,
+                    current_root: n(0x0a0a),
+                },
+            ),
+            (
+                "EscapeConcessionRecorded",
+                VaultEvent::EscapeConcessionRecorded {
+                    note_id: 7,
+                    next_nullifier: n(0x0202),
+                    state_balance: 1_000_000,
+                    conceded: 100_000,
+                },
+            ),
+            (
+                "EscapeConcessionRaised",
+                VaultEvent::EscapeConcessionRaised {
+                    note_id: 7,
+                    nullifier: n(0x0101),
+                    conceded: 150_000,
+                    final_balance: 850_000,
+                },
+            ),
+            (
+                "EscapeWithdrawalChallenged",
+                VaultEvent::EscapeWithdrawalChallenged {
+                    note_id: 7,
+                    nullifier: n(0x0101),
+                    current_root: n(0x0a0a),
+                },
+            ),
+            (
+                "EscapeWithdrawalFinalized",
+                VaultEvent::EscapeWithdrawalFinalized {
+                    note_id: 7,
+                    nullifier: n(0x0101),
+                    final_balance: 850_000,
+                },
+            ),
+            (
+                "ExpiredClaimed",
+                VaultEvent::ExpiredClaimed {
+                    note_id: 7,
+                    deposit_amount: 1_000_000,
+                    current_root: n(0x0a0a),
+                },
+            ),
+            (
+                "ClosedLeafRetired",
+                VaultEvent::ClosedLeafRetired {
+                    note_id: 7,
+                    new_root: n(0x0b0b),
+                },
+            ),
+        ] {
+            assert_eq!(decode_log(&log(name)).unwrap(), Some(expected), "{name}");
+        }
+        // Payout-credit events are not tree events: ignored, not parsed.
+        for name in ["EscapePayoutDeferred", "EscapePayoutClaimed"] {
+            assert_eq!(decode_log(&log(name)).unwrap(), None, "{name}");
+        }
+    }
+
     #[test]
     fn revision_three_event_topics_are_pinned() {
         // topic0 values pinned in the concession-exit spec (section 4.1).

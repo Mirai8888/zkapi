@@ -50,12 +50,14 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      # The challenger's defeat, raise and retirement encoders (and the
-      # escape and close layouts) are pinned against these vectors.
+      # The challenger's defeat, raise and retirement encoders, the escape
+      # and close layouts, and every getter selector and event layout the
+      # server, challenger, indexer, SDK and clientd read are pinned against
+      # these vectors, which Forge takes from the real protocol/contracts.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
-      - name: Golden vault calldata matches forge abi.encodeCall
+      - name: Golden vault calldata, selectors and events match the real contracts
         run: bash crates/zkapi-serverd/tests/fixtures/check-calldata-golden.sh
 
       - name: Build app crates

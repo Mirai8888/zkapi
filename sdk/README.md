@@ -41,6 +41,27 @@ private proof or key issuance requests.
 Never include note secrets, key values, proof bodies, or wallet transactions
 in host logs.
 
+### Exit-only mode
+
+Initialization never waits on the operator or on the pinned RPC, because every
+exit starts with it:
+
+- The wallet configures itself from the build-pinned `trusted_deployment`. The
+  operator's deployment manifest is fetched with a 20-second limit and must
+  equal those pins. When it is missing, slow, untrusted or different, the
+  wallet runs in exit-only mode: withdrawals work, and deposits and new chats
+  fail with the codes below until the manifest matches again. Each deposit or
+  chat attempt fetches the manifest once more.
+- The pinned RPC's native-vault and deployment checks run in the background.
+  Deposits and chats wait for them; exits do not.
+- A request journal left by a closed tab is recovered after initialization,
+  within 120 seconds. A withdrawal started in the same tab stops that recovery
+  and any private key still being issued.
+- A failed initialization is not kept: the next `init()` starts again.
+
+`snapshot().config.service` reports the mode: `{ available, exits: true, code,
+message, detail }`. Show `message` while `available` is false.
+
 ## Sepolia shared password
 
 A Sepolia server can require a shared testnet password. Pass
@@ -367,7 +388,9 @@ Two optional keys tune the timing:
   forced before the state's settlement time `T` (below).
 
 Every operator call made during an exit is limited to 20 seconds. A timeout, a
-5xx, a 401 or a 429 counts as unreachable, and `Retry-After` is ignored. A
+5xx, a 401 or a 429 counts as unreachable, and `Retry-After` is ignored. Every
+other operator call ends after 90 seconds, so no call holds the wallet lock,
+and an exit queued behind it in another tab, for longer. A
 recovery pass re-reads every unresolved request and the state's nullifier,
 installs a verified successor, and lasts at most 120 seconds. Nothing in an
 exit waits past `must_initiate_by`. The decision then depends on the state:
@@ -375,8 +398,11 @@ exit waits past `must_initiate_by`. The decision then depends on the state:
 1. **Fresh state** (no unresolved request): a mutual close. The wallet sends a
    kind-2 ownership proof with `POST /v2/withdraw/clearance`, then submits the
    kind-1 close.
-   - `nullifier_used` makes the state unresolved (2).
-   - Any other refusal, or an unreachable server, escapes with `c = 0`.
+   - `nullifier_used` makes the state unresolved (2). The answer is kept with
+     the exit lock and the withdrawal-only marker, so a retry, also after a
+     cancel, decides the same way and sends no second ownership proof.
+   - Any other refusal, or an unreachable server, escapes with `c = 0`. A
+     retry after such an answer escapes too: a lock sends one ownership proof.
    - `withdraw('escape')`, or a fresh state within an hour of
      `must_initiate_by`, also escapes with `c = 0`.
 2. **Unresolved state**: take the newest unresolved request, with `created`
@@ -397,11 +423,15 @@ Before proving an escape, the wallet does the following:
 1. It takes the Merkle path from the first source that works:
    - the deposit, saved at deposit time and checked against the
      `NoteDeposited` root, which the vault accepts for good;
-   - the indexer, checked against the vault's current root;
+   - the indexer, checked against the vault's current root (read through the
+     exit RPC when one is set);
    - a rebuild from the vault's logs, in adaptively sized chunks with every
      event's root checked. The rebuild uses the user's exit RPC
      (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it) or
      the pinned RPC.
+
+   After the vault refuses a proof's root (`unknown_root`), the proof is made
+   again from the rebuild only.
 2. It asks the server for a request proof at the successor state
    (`GET /v2/nullifiers/{successor}/evidence`). A proof that verifies locally
    refuses the escape with `device_not_newest`: another device is newer. Any
@@ -409,6 +439,14 @@ Before proving an escape, the wallet does the following:
 3. It runs a last recovery pass. Advisory warnings never block the escape,
    for example when the RPC reports either nullifier as already challenged.
 4. It records the proof in the exit lock before the proof is broadcast.
+5. Just before the wallet sees the transaction, it runs one more recovery
+   pass. A successor that arrives now is kept as `late_successor`.
+
+The wallet provider's simulation (`eth_estimateGas`) of an escape or a close
+only warns. When it refuses, the exit RPC's estimate is used if one is set,
+otherwise a fixed limit of 1,000,000 gas, and the status message explains the
+refusal; the wallet still asks the user to confirm. A refusal that a new proof
+can cure (`proof_expired`, `unknown_root`) re-proves once first.
 
 The **exit lock** starts with the first exit decision at a state and freezes
 that state:
@@ -418,8 +456,10 @@ that state:
 - A prepared or cancelled exit keeps the lock until every kind-0 and kind-1
   proof it released is past its `valid_until` (plus a margin) and none
   landed. Only then can chats resume, and a held `late_successor` installs.
-- Escape and close proofs are valid for 3 hours, ownership proofs for 1 hour.
-  The SDK proves again after `proof_expired` or `unknown_root`.
+- Escape and close proofs are valid for 3 hours. Ownership proofs are valid
+  for 55 minutes: the server accepts at most an hour, and the margin absorbs a
+  client clock up to five minutes fast. The SDK proves again after
+  `proof_expired` or `unknown_root`.
 
 ### Raised concessions and the payout
 
@@ -497,6 +537,7 @@ cannot be read.
 
 `snapshot().config` adds:
 
+- `service` ([Exit-only mode](#exit-only-mode));
 - `vault_revision` (3);
 - `exit`, with times in milliseconds:
   - `must_initiate_by`, `near_expiry`, `bound_at_state`, `state_fresh`,
@@ -522,6 +563,7 @@ Each of these errors carries a `shortMessage` for display.
 | --- | --- |
 | Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending` |
 | Deposits | `deployment_mismatch`, `deployment_unverifiable`, `canary_cap_exceeded`, `canary_cap_unverified` |
+| Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
 | Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
 | Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `wrong_network` |

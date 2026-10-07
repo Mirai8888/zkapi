@@ -63,9 +63,19 @@ func (h *FundingHandler) addressLocked(ctx context.Context) (AddressFundingStatu
 }
 
 func (h *FundingHandler) addressSnapshot(ctx context.Context) (fundingConfig, *addressFundingRecord, AddressFundingStatus, error) {
+	return h.addressSnapshotFor(ctx, false)
+}
+
+// addressSnapshotFor is addressSnapshot, read through the owner's exit RPC
+// first (exitConfig) for an escape: when exit is set, or when the saved
+// withdrawal is an escape.
+func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, AddressFundingStatus, error) {
 	config, err := h.config(ctx)
 	if err != nil {
 		return config, nil, AddressFundingStatus{}, err
+	}
+	if exit || h.escapeSaved(config) {
+		config = config.exitConfig()
 	}
 	if err := h.assertAddressChain(ctx, config); err != nil {
 		return config, nil, AddressFundingStatus{}, err
@@ -111,6 +121,16 @@ func (h *FundingHandler) addressSnapshot(ctx context.Context) (fundingConfig, *a
 		}
 	}
 	return config, record, status, nil
+}
+
+// escapeSaved reports whether the saved withdrawal is an escape. It reads
+// the payment record only when one exists, and creates nothing.
+func (h *FundingHandler) escapeSaved(config fundingConfig) bool {
+	if _, err := os.Lstat(h.addressStatePath()); err != nil {
+		return false
+	}
+	record, err := h.loadAddress(config)
+	return err == nil && record.Withdrawal != nil && record.Withdrawal.Mode == "escape"
 }
 
 func (h *FundingHandler) addressHasNote(ctx context.Context) (bool, error) {
@@ -631,10 +651,18 @@ func addressABIWord(value string) string {
 }
 
 func (h *FundingHandler) addressRPC(ctx context.Context, config fundingConfig, method string, params []any, result any) error {
+	err := h.addressRPCAt(ctx, config.RPC, method, params, result)
+	if err != nil && config.FallbackRPC != "" {
+		return h.addressRPCAt(ctx, config.FallbackRPC, method, params, result)
+	}
+	return err
+}
+
+func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, params []any, result any) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.RPC, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return errors.New("invalid payment RPC request")
 	}
@@ -783,16 +811,26 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		params = append(params, map[string]any{record.Address: map[string]string{"balance": "0x" + simulationBalance.Text(16)}})
 	}
 	var simulated string
-	if err := h.addressRPC(ctx, config, "eth_call", params, &simulated); err != nil {
+	var warnings []string
+	simulationErr := h.addressRPC(ctx, config, "eth_call", params, &simulated)
+	gas, estimateErr := h.addressQuantity(ctx, config, "eth_estimateGas", params)
+	var gasLimit uint64
+	if simulationErr == nil && estimateErr == nil {
+		gasLimit, err = paddedAddressGas(gas)
+		if err != nil {
+			return err
+		}
+	} else if escapeKinds[kind] {
+		// Design §6.4 E4 step 5: for an exit the simulation is advisory. A
+		// failed or refused simulation is shown, and the owner may sign at
+		// a fixed gas limit anyway: a genuinely flagged nullifier or an
+		// expired proof reverts cheaply, while an RPC that refuses to
+		// simulate must not block the exit.
+		gasLimit = escapeGasLimits[kind]
+		gas = new(big.Int).SetUint64(gasLimit)
+		warnings = append(warnings, "the escape's simulation failed or was refused; it may revert, and is signed at a fixed gas limit")
+	} else {
 		return errors.New("payment simulation failed; no transaction was sent")
-	}
-	gas, err := h.addressQuantity(ctx, config, "eth_estimateGas", params)
-	if err != nil {
-		return errors.New("payment simulation failed; no transaction was sent")
-	}
-	gasLimit, err := paddedAddressGas(gas)
-	if err != nil {
-		return err
 	}
 	if kind == "return" && record.Return.Sweep {
 		if gas.Uint64() != 21000 {
@@ -817,7 +855,7 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		record.Return.AmountWei = value.String()
 	}
 	if mode != nil && mode.Capture != nil {
-		quote, err := h.savePaymentQuote(record, kind, to, value, balance, gas, gasLimit, nonce.Uint64(), fees, mode.RetryHash)
+		quote, err := h.savePaymentQuote(record, kind, to, value, balance, gas, gasLimit, nonce.Uint64(), fees, mode.RetryHash, warnings...)
 		if err == nil {
 			*mode.Capture = quote
 		}
@@ -937,8 +975,8 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 
 func (h *FundingHandler) broadcastAddress(ctx context.Context, config fundingConfig, tx *addressTransaction) {
 	// Design §6.7: exits are sent through the owner's exit RPC when set.
-	if escapeKinds[tx.Kind] && config.ExitRPC != "" {
-		config.RPC = config.ExitRPC
+	if escapeKinds[tx.Kind] {
+		config = config.exitConfig()
 	}
 	if h.assertAddressChain(ctx, config) != nil {
 		return

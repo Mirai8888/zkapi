@@ -39,8 +39,15 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	concededText := flags.String("conceded", "", "with --escape: the concession the escape decision showed, confirming it")
 	earlyExitText := flags.String("early-exit", "", "with --escape: exit before a sent request can settle, conceding nothing or the state's bound (nothing|bound)")
 	claim := flags.Bool("claim", false, "deliver an escape payout the vault credited to --to")
+	cancel := flags.Bool("cancel", false, "with --escape: cancel an escape that released no exit proof, so chats resume")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *cancel {
+		if !*escape || *claim || *approval != "" || *resume || *confirmationText != "" || *concededText != "" || *earlyExitText != "" || *destinationText != "" || flags.NArg() != 0 {
+			return errors.New("use --escape --cancel alone")
+		}
+		return runEscapeCancel(ctx, c, out)
 	}
 	if *escape || *claim || *concededText != "" || *earlyExitText != "" {
 		if *approval != "" || *resume || *confirmationText != "" || flags.NArg() != 0 || *destinationText == "" || (*escape && *claim) || (!*escape && (*concededText != "" || *earlyExitText != "")) {

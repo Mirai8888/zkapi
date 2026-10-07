@@ -169,6 +169,7 @@ type escapeCompanion struct {
 	deadline        uint64
 	payout          uint64
 	prepares        []map[string]any
+	cancels         int
 }
 
 func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixture) *http.Response {
@@ -197,6 +198,9 @@ func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixt
 		return withdrawalJSONResponse(r, 200, map[string]any{"status": "submitted"})
 	case "/oa/v1/withdraw/escape/status":
 		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout)})
+	case "/oa/v1/withdraw/escape/cancel":
+		e.cancels++
+		return withdrawalJSONResponse(r, 200, map[string]any{"status": "cancelled"})
 	case "/oa/v1/withdraw/escape/finalize":
 		e.finalized = append(e.finalized, fmt.Sprint(body["transaction_hash"]))
 		w.active = false
@@ -213,8 +217,37 @@ func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixt
 // finalizeEscapeWithdrawal whose payout the E5 matcher follows, a credited
 // payout, and a quoted and approved claimEscapePayout.
 func TestTheEscapeIsSignedFinalizedMatchedAndClaimed(t *testing.T) {
+	escapeEndToEnd(t, false)
+}
+
+// Design §1.2(6), §6.7: with --exit-rpc-url set, a pinned RPC that refuses
+// every call blocks nothing: the decision, quotes, signing, following,
+// finalization, the payout match and the claim all read and send through
+// the owner's exit RPC.
+func TestTheEscapeFollowsTheExitRPCWhileThePinnedRPCIsDown(t *testing.T) {
+	f := escapeEndToEnd(t, true)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, method := range []string{"eth_chainId", "eth_getTransactionCount", "eth_estimateGas", "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getLogs"} {
+		found := false
+		for _, called := range f.exitCalls {
+			found = found || called == method
+		}
+		if !found {
+			t.Errorf("%s did not go through the exit RPC: %v", method, f.exitCalls)
+		}
+	}
+}
+
+func escapeEndToEnd(t *testing.T, pinnedDown bool) *withdrawalFixture {
 	f := newWithdrawalFixture(t, true)
 	f.escape = &escapeCompanion{conceded: 700, bound: 1000, chainPhase: "pending"}
+	if pinnedDown {
+		f.h.client.config.ExitRPCURL = f.exitRPC
+		f.mu.Lock()
+		f.pinnedDown = true
+		f.mu.Unlock()
+	}
 	ctx := context.Background()
 	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
 	if err != nil || status.Phase != "escape_decision" || status.Conceded != 700 || status.Amount != 99999-700 || status.Mode != "escape" || !strings.Contains(status.Message, "--conceded 700") {
@@ -261,10 +294,13 @@ func TestTheEscapeIsSignedFinalizedMatchedAndClaimed(t *testing.T) {
 	if _, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, ""); err == nil {
 		t.Fatal("finalization was quoted before the challenge deadline")
 	}
-	// The operator raises the concession to 900 (at most the bound).
+	// The operator raises the concession to 900 (at most the bound). A raise
+	// of the note at another nullifier (an escape from another state) is
+	// not this escape's.
 	nullifier := "0x123"
 	f.mu.Lock()
 	f.logs = append(f.logs, map[string]any{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord(nullifier) + fmt.Sprintf("%064x%064x", 900, 99999-900), "removed": false})
+	f.logs = append(f.logs, map[string]any{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord("0x777") + fmt.Sprintf("%064x%064x", 950, 99999-950), "removed": false})
 	f.mu.Unlock()
 	f.escape.deadline, f.escape.payout = uint64(time.Now().Unix())-1, 99999-900
 	quote, err = f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, "")
@@ -311,6 +347,7 @@ func TestTheEscapeIsSignedFinalizedMatchedAndClaimed(t *testing.T) {
 	if "0x"+hex.EncodeToString(claim.Data()) != strings.ToLower(claimEscapeCalldata(withdrawalTestDestination)) {
 		t.Fatal("not a claimEscapePayout call")
 	}
+	return f
 }
 
 // E5 for a relayed escape of the reserved state (made outside this client,
@@ -322,7 +359,9 @@ func TestARelayedEscapePayoutAfterARaiseIsMatched(t *testing.T) {
 		name     string
 		paid     uint64
 		accepted bool
-	}{{"raised", 99999 - 900, true}, {"unexplained", 99999 - 901, false}} {
+		// otherState records the escape at another state's balance.
+		otherState uint64
+	}{{"raised", 99999 - 900, true, 0}, {"unexplained", 99999 - 901, false, 0}, {"another state", 99999 + 1000 - 900, false, 1000}} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			original := f.withdraw(t)
@@ -334,7 +373,7 @@ func TestARelayedEscapePayoutAfterARaiseIsMatched(t *testing.T) {
 			escapeTopic := crypto.Keccak256Hash([]byte("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)")).Hex()
 			f.mu.Lock()
 			f.logs = []map[string]any{
-				{"address": addressTestVault, "topics": []string{escapeConcessionRecordedTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord("0x999") + fmt.Sprintf("%064x%064x", f.reservedBalance, 100)},
+				{"address": addressTestVault, "topics": []string{escapeConcessionRecordedTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord("0x999") + fmt.Sprintf("%064x%064x", f.reservedBalance+test.otherState, 100)},
 				{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x%064x", 900, f.reservedBalance-900)},
 			}
 			f.receipts[other] = map[string]any{"transactionHash": other, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestToken, "logs": []map[string]any{{"address": addressTestVault, "topics": []string{escapeTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x", test.paid) + addressABIWord(withdrawalTestDestination)}}}
@@ -355,19 +394,12 @@ func TestARelayedEscapePayoutAfterARaiseIsMatched(t *testing.T) {
 }
 
 // Design §6.7: with --exit-rpc-url set, the escape transaction is sent
-// through the owner's exit RPC, not the pinned one.
+// through the owner's exit RPC, not the pinned one, and its reads go there
+// first.
 func TestEscapesAreSentThroughTheExitRPC(t *testing.T) {
 	f := newWithdrawalFixture(t, true)
 	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
-	var exitMethods []string
-	exit := httptestTLS(t, func(method string) any {
-		exitMethods = append(exitMethods, method)
-		if method == "eth_chainId" {
-			return "0x1"
-		}
-		return "0x" + strings.Repeat("ab", 32)
-	})
-	f.h.client.config.ExitRPCURL = exit
+	f.h.client.config.ExitRPCURL = f.exitRPC
 	ctx := context.Background()
 	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
 		t.Fatal(err)
@@ -376,19 +408,130 @@ func TestEscapesAreSentThroughTheExitRPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pinnedBefore := len(f.submitted)
+	f.mu.Lock()
+	f.rpcCalls = nil
+	f.mu.Unlock()
 	if _, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.submitted) != pinnedBefore {
-		t.Fatal("the escape went through the pinned RPC")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, method := range f.rpcCalls {
+		if method == "eth_sendRawTransaction" {
+			t.Fatal("the escape went through the pinned RPC")
+		}
 	}
 	sent := false
-	for _, method := range exitMethods {
+	for _, method := range f.exitCalls {
 		sent = sent || method == "eth_sendRawTransaction"
 	}
-	if !sent {
-		t.Fatalf("the escape was not sent through the exit RPC: %v", exitMethods)
+	if !sent || len(f.rpcCalls) != 0 {
+		t.Fatalf("the escape was not read and sent through the exit RPC: exit %v, pinned %v", f.exitCalls, f.rpcCalls)
+	}
+}
+
+// Design §6.4 E4 step 5: an escape's simulation is advisory. An RPC that
+// refuses to simulate it (or to estimate its gas) does not block the exit:
+// the quote carries a warning and a fixed gas limit. A mutual close still
+// needs its simulation.
+func TestAnEscapeWhoseSimulationIsRefusedIsQuotedWithAWarning(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	ctx := context.Background()
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.refuseSimulation = true
+	f.mu.Unlock()
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.GasLimit != escapeGasLimits["escape"] || len(quote.Warnings) != 1 || !strings.Contains(quote.Warnings[0], "simulation") {
+		t.Fatalf("no advisory quote: %+v", quote)
+	}
+	status, err := f.h.ApproveAddressEscape(ctx, quote.ID)
+	if err != nil || status.Phase != "escape_pending" {
+		t.Fatalf("the escape was not signed: %+v %v", status, err)
+	}
+	if tx := f.accepted[f.journal(t).Pending.Hash]; tx.Gas() != escapeGasLimits["escape"] {
+		t.Fatalf("signed with gas %d", tx.Gas())
+	}
+	// A mutual close is not an exit without the operator: it is refused.
+	g := newWithdrawalFixture(t, true)
+	g.mu.Lock()
+	g.refuseSimulation = true
+	g.mu.Unlock()
+	if _, err := g.h.QuoteAddressWithdrawal(ctx, withdrawalTestDestination, g.noteID, "", false); err == nil || !strings.Contains(err.Error(), "simulation failed") {
+		t.Fatalf("a mutual close without its simulation: %v", err)
+	}
+}
+
+// A mutual close mined after its valid_until reverts (ProofExpired), and so
+// does one held back by an owner's pause. Once the revert is final it can
+// never pay, so the escape may proceed from the same note; until then the
+// signed close may still land and the escape waits for it.
+func TestAnEscapeProceedsAfterAFinallyRevertedClose(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	ctx := context.Background()
+	close := f.withdraw(t)
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err == nil || !strings.Contains(err.Error(), "mutual close is pending") {
+		t.Fatalf("an escape beside a live close: %v", err)
+	}
+	f.mineWithdrawal(t, close, withdrawalTestDestination, true)
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_decision" || status.Mode != "escape" {
+		t.Fatalf("no escape after the reverted close: %+v %v", status, err)
+	}
+	record := f.journal(t)
+	if record.Pending != nil || len(record.History) == 0 || !strings.EqualFold(record.History[len(record.History)-1].Hash, close) || !record.History[len(record.History)-1].FinalizedRevert {
+		t.Fatalf("the reverted close was not retired to the history: %+v", record)
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	if escape := f.accepted[f.journal(t).Pending.Hash]; escape.Nonce() != f.accepted[close].Nonce()+1 {
+		t.Fatal("the escape did not take the next nonce")
+	}
+}
+
+// Design §6.4 E6: an escape that released no exit proof (its decision was
+// only shown) is cancelled: the companion drops its lock and the saved
+// decision is cleared. Once an escape is signed it is not.
+func TestAnEscapeDecisionIsCancelledButASignedEscapeIsNot(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	ctx := context.Background()
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.h.CancelAddressEscape(ctx)
+	if err != nil || status.Phase != "cancelled" || f.escape.cancels != 1 {
+		t.Fatalf("not cancelled: %+v %v", status, err)
+	}
+	record := f.journal(t)
+	if record.Withdrawal != nil || record.Phase != "active" {
+		t.Fatalf("the escape decision was kept: %+v", record)
+	}
+	// A new escape, signed this time.
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.CancelAddressEscape(ctx); err == nil || f.escape.cancels != 1 {
+		t.Fatal("a signed escape was cancelled")
 	}
 }
 

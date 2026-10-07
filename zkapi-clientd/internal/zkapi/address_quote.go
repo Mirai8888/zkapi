@@ -47,6 +47,9 @@ type AddressPaymentQuote struct {
 	Binding    string `json:"binding,omitempty"`
 	Nonce      uint64 `json:"nonce"`
 	RetryHash  string `json:"retry_hash,omitempty"`
+	// Warnings are advisory findings the owner sees before approving, such
+	// as an escape whose simulation failed (design §6.4 E4 step 5).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type addressQuoteContextKey struct{}
@@ -274,7 +277,7 @@ func positiveDifference(left, right *big.Int) *big.Int {
 	}
 	return n
 }
-func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string) (AddressPaymentQuote, error) {
+func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string, warnings ...string) (AddressPaymentQuote, error) {
 	nonceBytes := make([]byte, 32)
 	if _, err := rand.Read(nonceBytes); err != nil {
 		return AddressPaymentQuote{}, err
@@ -291,6 +294,7 @@ func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to
 	if kind == "deposit" {
 		q.InputMicroUSD = record.DepositMicroUSD
 	}
+	q.Warnings = warnings
 	if (kind == "withdrawal" || escapeKinds[kind]) && record.Withdrawal != nil {
 		q.NoteID = record.Withdrawal.NoteID
 		q.Amount = record.Withdrawal.Amount

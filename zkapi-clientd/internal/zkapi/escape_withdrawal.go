@@ -32,6 +32,11 @@ const finalizeEscapeSelector = "ff8f5585"
 // escapeKinds are the signed transaction kinds of an escape.
 var escapeKinds = map[string]bool{"escape": true, "escape_finalize": true, "escape_claim": true}
 
+// escapeGasLimits sign an escape transaction whose simulation failed (E4
+// step 5: advisory): above each entry point's measured cost (initiation
+// about 0.6M gas, finalization at most about 0.2M, a credit claim far less).
+var escapeGasLimits = map[string]uint64{"escape": 900_000, "escape_finalize": 350_000, "escape_claim": 150_000}
+
 // escapePlan is the companion's /oa/v1/withdraw/escape/prepare answer.
 type escapePlan struct {
 	Status       string           `json:"status"`
@@ -175,7 +180,7 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	config, record, wallet, status, err := h.withdrawalSnapshot(ctx)
+	config, record, wallet, status, err := h.withdrawalSnapshotFor(ctx, true)
 	if err != nil {
 		return status, err
 	}
@@ -217,9 +222,25 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		}
 	case w.Mode != "escape":
 		// A mutual close the companion could not complete turns into an
-		// escape to the same destination, unless its close was signed.
+		// escape to the same destination, unless its signed close may still
+		// land. A close whose revert is final (for example one mined after
+		// its valid_until, ProofExpired, or behind an owner's pause) can
+		// no longer pay: it moves to the history and the escape proceeds.
 		if record.Pending != nil && record.Pending.Kind == "withdrawal" {
-			return update(), errors.New("a signed mutual close is pending; finish it with zkapi-clientd withdraw --resume")
+			receipt, final, err := h.addressFinalReceipt(ctx, config, record.Pending.Hash, true)
+			if err != nil {
+				return update(), err
+			}
+			if !final || receipt == nil || receipt.Status != "0x0" {
+				return update(), errors.New("a signed mutual close is pending; finish it with zkapi-clientd withdraw --resume")
+			}
+			if err := recordAddressActualFee(record.Pending, receipt); err != nil {
+				return update(), err
+			}
+			retired := *record.Pending
+			retired.FinalizedRevert = true
+			record.History = append(record.History, retired)
+			record.Pending = nil
 		}
 		if !strings.EqualFold(w.Destination, destination) {
 			return update(), errors.New("a withdrawal destination is already saved; escape to that same destination")
@@ -338,6 +359,46 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		h.reportEscapeSubmission(ctx, record.Pending.Hash)
 	}
 	return update(), nil
+}
+
+// CancelAddressEscape cancels an escape that released no exit proof (design
+// §6.4 E6, "no kind-0 or kind-1 proof was released and the user cancels"):
+// the companion removes its exit lock, so chats resume (except from a state
+// whose ownership proof was sent), and the saved escape decision is
+// cleared. It is refused once an escape transaction is signed, and by the
+// companion while a released proof may still land; that lock is released
+// only when the proof is dead or the note closes.
+func (h *FundingHandler) CancelAddressEscape(ctx context.Context) (AddressWithdrawalStatus, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, record, _, status, err := h.withdrawalSnapshotFor(ctx, true)
+	if err != nil {
+		return status, err
+	}
+	w := record.Withdrawal
+	if record.Pending != nil && escapeKinds[record.Pending.Kind] {
+		return status, errors.New("an escape transaction is signed; it cannot be cancelled, only followed with zkapi-clientd withdraw --escape")
+	}
+	if w != nil && w.Mode == "escape" {
+		switch w.Phase {
+		case "escape_pending", "escape_initiated", "finalize_pending", "complete", "defeated":
+			return status, errors.New("this escape is on chain; it cannot be cancelled")
+		}
+	}
+	if _, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/escape/cancel", []byte("{}")); err != nil {
+		return status, err
+	}
+	if w != nil && w.Mode == "escape" {
+		record.Withdrawal = nil
+		if record.Phase == "withdrawal_pending" {
+			record.Phase = "active"
+		}
+		if err := h.saveAddress(record); err != nil {
+			return status, err
+		}
+	}
+	status.Phase, status.Mode, status.Message = "cancelled", "", "The escape was cancelled; no exit proof was released. Chats can resume from this note."
+	return status, nil
 }
 
 // latestBlock is the latest block number, 0 when it cannot be read; raises
@@ -639,7 +700,7 @@ func (h *FundingHandler) ClaimEscapePayout(ctx context.Context, destination stri
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	config, record, _, status, err := h.withdrawalSnapshot(ctx)
+	config, record, _, status, err := h.withdrawalSnapshotFor(ctx, true)
 	if err != nil {
 		return status, err
 	}

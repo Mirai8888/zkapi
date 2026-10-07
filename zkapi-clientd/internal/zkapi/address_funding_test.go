@@ -80,6 +80,15 @@ type addressFixture struct {
 	creditReads   int
 	// codeTamper makes the RPC serve other runtime code at the vault.
 	codeTamper bool
+	// pinnedDown makes the pinned RPC refuse every call; exitRPC serves the
+	// same chain as the owner's exit RPC (--exit-rpc-url), and exitCalls
+	// lists the methods it answered.
+	pinnedDown bool
+	exitRPC    string
+	exitCalls  []string
+	// refuseSimulation makes the RPCs refuse the eth_call simulation and the
+	// gas estimate of a signed vault call.
+	refuseSimulation bool
 	// logs are the vault logs eth_getLogs serves, filtered by topics.
 	logs []map[string]any
 }
@@ -165,9 +174,13 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		_ = json.NewEncoder(w).Encode(body)
 	}))
 	t.Cleanup(f.indexer.Close)
-	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	chainRPC := func(w http.ResponseWriter, r *http.Request, exit bool) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if !exit && f.pinnedDown {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 			t.Error("identity reached payment RPC")
 		}
@@ -183,7 +196,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Error("invalid RPC request")
 			return
 		}
-		f.rpcCalls = append(f.rpcCalls, request.Method)
+		if exit {
+			f.exitCalls = append(f.exitCalls, request.Method)
+		} else {
+			f.rpcCalls = append(f.rpcCalls, request.Method)
+		}
 		var result any
 		// The deployment checks before a deposit read the fixture vault's
 		// code and getters.
@@ -216,6 +233,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			result = map[string]any{"oldestBlock": "0xd", "baseFeePerGas": bases, "reward": rewards, "gasUsedRatio": ratios}
 		case "eth_estimateGas":
+			if f.refuseSimulation {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if len(request.Params) == 3 {
 				f.overrideReads++
 			}
@@ -252,6 +273,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				Data string `json:"data"`
 			}
 			_ = json.Unmarshal(request.Params[0], &call)
+			if call.From != "" && f.refuseSimulation && strings.EqualFold(call.To, addressTestVault) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if call.From != "" {
 				result = "0x"
 				if len(request.Params) == 3 {
@@ -361,8 +386,12 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Errorf("unexpected RPC %s", request.Method)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
-	}))
+	}
+	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, false) }))
 	t.Cleanup(rpc.Close)
+	exitRPC := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, true) }))
+	t.Cleanup(exitRPC.Close)
+	f.exitRPC = exitRPC.URL
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()

@@ -141,7 +141,7 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			return withdrawalJSONResponse(r, 200, map[string]any{}), nil
 		case "/oa/v1/withdraw/status":
 			return withdrawalJSONResponse(r, 200, w.bridgeStatus()), nil
-		case "/oa/v1/withdraw/escape/prepare", "/oa/v1/withdraw/escape/submit", "/oa/v1/withdraw/escape/status", "/oa/v1/withdraw/escape/finalize":
+		case "/oa/v1/withdraw/escape/prepare", "/oa/v1/withdraw/escape/submit", "/oa/v1/withdraw/escape/status", "/oa/v1/withdraw/escape/finalize", "/oa/v1/withdraw/escape/cancel":
 			if w.escape == nil {
 				return withdrawalJSONResponse(r, 404, map[string]any{}), nil
 			}

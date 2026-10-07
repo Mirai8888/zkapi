@@ -270,6 +270,9 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		if warning := zkapi.LegacyWalletWarning(filepath.Join(dir, "zkapi"), c.ZKAPI.Network); warning != "" {
 			logger.Print(warning)
 		}
+		if warning := zkapi.LegacyFundingWarning(filepath.Join(dir, "funding"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
 		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password, ExitRPCURL: c.ZKAPI.ExitRPCURL})
 		if err != nil {
 			return err

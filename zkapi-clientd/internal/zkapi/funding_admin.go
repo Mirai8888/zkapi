@@ -49,6 +49,11 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 				result, err = h.EscapeAddress(ctx, body.Destination, *body.NoteID, body.Conceded, body.EarlyExit)
 			}
 		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/escape/cancel":
+		var body struct{}
+		if err = decode(&body); err == nil {
+			result, err = h.CancelAddressEscape(ctx)
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/admin/escape/claim/quote":
 		var body struct {
 			Destination string `json:"destination"`

@@ -354,7 +354,13 @@ func (h *FundingHandler) AddressWithdrawal(ctx context.Context) (AddressWithdraw
 }
 
 func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
-	config, record, payment, err := h.addressSnapshot(ctx)
+	return h.withdrawalSnapshotFor(ctx, false)
+}
+
+// withdrawalSnapshotFor is withdrawalSnapshot; with exit set (an escape), the
+// chain is read through the owner's exit RPC first (exitConfig).
+func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
+	config, record, payment, err := h.addressSnapshotFor(ctx, exit)
 	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits}
 	var wallet withdrawalWallet
 	if err != nil {

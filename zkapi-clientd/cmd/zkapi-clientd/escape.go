@@ -89,6 +89,22 @@ func runEscape(ctx context.Context, c config.Config, o escapeOptions, out io.Wri
 	return nil
 }
 
+// runEscapeCancel cancels an escape that released no exit proof (design
+// §6.4 E6): the decision was only shown, or the escape waits for a request
+// to settle. Requests from the note resume.
+func runEscapeCancel(ctx context.Context, c config.Config, out io.Writer) error {
+	c, err := activeFundingConfig(ctx, c)
+	if err != nil {
+		return err
+	}
+	state, err := requestWithdrawalPath(ctx, c, http.MethodPost, "/admin/escape/cancel", map[string]any{})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, state.Message)
+	return nil
+}
+
 func printEscapeStatus(out io.Writer, state zkapi.AddressWithdrawalStatus) {
 	fmt.Fprintf(out, "Escape to %s\n", state.Destination)
 	if state.StateBalance != 0 {

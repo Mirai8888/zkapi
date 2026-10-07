@@ -40,10 +40,26 @@ type fundingConfig struct {
 	RPC             string `json:"rpc_url"`
 	Indexer         string `json:"indexer_url"`
 	DemoMintEnabled bool   `json:"demo_mint_enabled"`
-	// ExitRPC is the owner's own RPC (--exit-rpc-url): escape transactions
-	// are sent through it when it is set.
+	// ExitRPC is the owner's own RPC (--exit-rpc-url): an escape reads the
+	// chain and sends its transactions through it when it is set.
 	ExitRPC string `json:"-"`
+	// FallbackRPC is asked when RPC fails: the pinned RPC behind an escape's
+	// exit RPC (see exitConfig).
+	FallbackRPC string `json:"-"`
 }
+
+// exitConfig is config for an escape (design §1.2(6), §6.7): every read and
+// send goes through the owner's exit RPC when one is configured, and through
+// the pinned RPC, which the operator may run or influence (§2.1), only when
+// the exit RPC fails. An escape then never waits on the pinned RPC.
+func (c fundingConfig) exitConfig() fundingConfig {
+	if c.ExitRPC == "" || c.ExitRPC == c.RPC {
+		return c
+	}
+	c.FallbackRPC, c.RPC = c.RPC, c.ExitRPC
+	return c
+}
+
 type depositRecord struct {
 	DeploymentID    string   `json:"deployment_id,omitempty"`
 	BillingAsset    string   `json:"billing_asset,omitempty"`
@@ -114,7 +130,10 @@ func NewFundingHandler(client *Client, publicOrigin, stateDir string) (*FundingH
 	if stateDir == "" {
 		return nil, errors.New("funding needs a private state directory")
 	}
-	stateDir = filepath.Join(stateDir, client.config.Network)
+	stateDir, err := fundingStateDir(stateDir, client.config.Network)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
@@ -125,6 +144,54 @@ func NewFundingHandler(client *Client, publicOrigin, stateDir string) (*FundingH
 		return nil, errors.New("cannot sync private funding directory")
 	}
 	return &FundingHandler{client: client, statePath: filepath.Join(stateDir, "pending-deposit.json")}, nil
+}
+
+// fundingStateDir is the payment state directory of this release's packaged
+// deployment: <root>/<network>/<deployment_id>. Design §10.5: state
+// directories are per deployment ID, so this release and the earlier
+// (legacy) one never share a payment address, its key or a pending deposit.
+// The legacy release kept them in <root>/<network>/, which this release
+// never opens (LegacyFundingWarning names them).
+func fundingStateDir(root, network string) (string, error) {
+	if network == "" {
+		network = "mainnet"
+	}
+	identity, _, err := pinnedDeployment(network)
+	if err != nil {
+		return "", err
+	}
+	if !safePathComponent(identity.ID) {
+		return "", errors.New("invalid packaged deployment ID")
+	}
+	return filepath.Join(root, network, identity.ID), nil
+}
+
+func safePathComponent(value string) bool {
+	if value == "" || value == "." || value == ".." || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// LegacyFundingWarning reports the earlier release's payment files in the
+// funding root (its payment address, key and any pending deposit, kept per
+// network), which this release leaves untouched; "" when there are none.
+func LegacyFundingWarning(root, network string) string {
+	if network == "" {
+		network = "mainnet"
+	}
+	dir := filepath.Join(root, network)
+	for _, name := range []string{"address-funding.json", "pending-deposit.json"} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return fmt.Sprintf("The earlier zkapi-clientd release's payment address and deposit recovery files are in %s. They belong to the earlier vault's note: this release keeps its own payment state per deployment and never reads or changes them. Keep them for the earlier release (the legacy release line, release/v2-note-bound), which withdraws that note.", dir)
+		}
+	}
+	return ""
 }
 
 func decodeJSON(r io.Reader, v any) error {

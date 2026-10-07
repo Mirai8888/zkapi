@@ -339,13 +339,14 @@ func (c *Client) Check(ctx context.Context) error {
 		// the companion's keys belong to.
 		ExitConcession int    `json:"exit_concession"`
 		SetupID        string `json:"setup_id"`
-		EscapeRoutes   int    `json:"escape_routes_version"`
+		// 2: the escape routes, and /oa/v1/withdraw/escape/cancel.
+		EscapeRoutes int `json:"escape_routes_version"`
 	}
 	if json.Unmarshal(data, &result) != nil {
 		return &Error{http.StatusBadGateway, "invalid_companion_response"}
 	}
 	expected, _ := ChainID(c.config.Network)
-	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != CompanionBridgeVersion || result.ExitConcession != 1 || result.EscapeRoutes < 1 {
+	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != CompanionBridgeVersion || result.ExitConcession != 1 || result.EscapeRoutes < 2 {
 		return &Error{http.StatusBadGateway, "companion_policy_mismatch"}
 	}
 	deployment, _, err := deployedDeployment(c.config.Network)

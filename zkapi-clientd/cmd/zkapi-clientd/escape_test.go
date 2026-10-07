@@ -93,3 +93,39 @@ func TestWithdrawEscapeShowsTheDecisionThenQuotesTheConfirmedConcession(t *testi
 		}
 	}
 }
+
+// --escape --cancel cancels an escape that released no exit proof (design
+// §6.4 E6) through the escape route, and takes no other option.
+func TestWithdrawEscapeCancel(t *testing.T) {
+	var sequence []string
+	s := fundingCLITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sequence = append(sequence, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /admin/escape/cancel":
+			state := withdrawalTestStatus("cancelled")
+			state["message"] = "The escape was cancelled; no exit proof was released."
+			_ = json.NewEncoder(w).Encode(state)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer s.Close()
+	c := withdrawalTestConfig(s)
+	var out bytes.Buffer
+	if err := runWithdrawal(context.Background(), c, []string{"--escape", "--cancel"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(sequence, ",") != "POST /admin/escape/cancel" || !strings.Contains(out.String(), "cancelled") {
+		t.Fatalf("not cancelled through the escape route: %v %s", sequence, out.String())
+	}
+	for _, args := range [][]string{
+		{"--cancel"},
+		{"--escape", "--cancel", "--to", withdrawalTestDestination},
+		{"--escape", "--cancel", "--conceded", "0"},
+		{"--escape", "--cancel", "--claim"},
+	} {
+		if err := runWithdrawal(context.Background(), c, args, &bytes.Buffer{}); err == nil {
+			t.Fatalf("accepted %v", args)
+		}
+	}
+}

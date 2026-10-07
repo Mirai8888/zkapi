@@ -3296,8 +3296,10 @@ impl RequestProcessor {
     /// requests (which may stay deferred for `challengePeriod + 3600` s), or
     /// requests that keep failing to sign, therefore never starve a newly
     /// settled request, and every deferred request is re-checked within
-    /// `⌈deferred / SIGN_BATCH⌉ + 1` passes.
+    /// `⌈deferred / SIGN_BATCH⌉ + 1` passes. A request the first page just
+    /// deferred is not read again by the second.
     pub async fn sign_settled_successors(&self) {
+        let mut handled = std::collections::HashSet::new();
         for (class, deferred) in [(0, false), (1, true)] {
             let after = match self.signing_cursors.lock() {
                 Ok(cursors) => cursors[class].clone(),
@@ -3322,6 +3324,10 @@ impl RequestProcessor {
             if let Ok(mut cursors) = self.signing_cursors.lock() {
                 cursors[class] = next;
             }
+            let records = records
+                .into_iter()
+                .filter(|record| handled.insert(record.nullifier))
+                .collect();
             self.sign_settled_page(records).await;
         }
     }

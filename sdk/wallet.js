@@ -237,8 +237,16 @@ function encodeWithdrawal(plan, expectedMode, expectedDestination, expectedVault
   if (destination !== String(expectedDestination || "").toLowerCase()) {
     throw new Error("The proof destination does not match the requested withdrawal address.");
   }
-  if (expectedVault && String(inputs.contract_address).toLowerCase() !== String(expectedVault).toLowerCase()) {
-    throw new Error("The withdrawal proof is bound to a different vault contract.");
+  // The statement's contract_address is a field element, serialized without
+  // leading zeros (0x0f12… becomes 0xf12…): compare it as a number.
+  const contract = uintWord(String(inputs.contract_address || ""), 160, "vault address");
+  if (expectedVault) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(String(expectedVault))) {
+      throw new Error("The expected vault is not a contract address.");
+    }
+    if (contract !== uintWord(String(expectedVault), 160, "expected vault")) {
+      throw new Error("The withdrawal proof is bound to a different vault contract.");
+    }
   }
   if (inputs.kind !== WITHDRAWAL_KIND[mode]) {
     throw new Error(mode === "escape"
@@ -260,7 +268,6 @@ function encodeWithdrawal(plan, expectedMode, expectedDestination, expectedVault
   }
   const validUntil = uintWord(inputs.valid_until, 64, "valid_until");
   if (validUntil === ZERO_WORD) throw new Error("The withdrawal proof has no valid_until.");
-  const contract = uintWord(String(inputs.contract_address || ""), 160, "vault address");
   const proof = decodeBase64(plan.proof.proof);
   if (proof.length !== 256) {
     throw new Error("The Groth16 withdrawal proof must contain exactly 256 bytes.");

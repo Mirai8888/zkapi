@@ -226,6 +226,30 @@ test("the withdrawal encoder refuses another kind, destination, vault or concess
   assert.throws(() => encode(short), /256 bytes/);
 });
 
+test("a vault address with leading zero nibbles matches its field-element form in the proof", () => {
+  // The WebAssembly serializes contract_address as a Felt252 (zkapi-types
+  // felt.rs to_hex), which drops leading zeros: 0x0f12… arrives as 0xf12….
+  const feltHex = (address) => `0x${address.slice(2).replace(/^0+/, "") || "0"}`;
+  for (const vault of ["0x0f12345678901234567890123456789012345678", "0x00ab45678901234567890123456789012345678e",
+    "0x0000000000000000000000000000000000000001"]) {
+    const plan = escapePlan({ contract_address: feltHex(vault) });
+    assert.notEqual(plan.public_inputs.contract_address.length, 42, "the fixture really is shorter");
+    for (const expected of [vault, vault.toUpperCase().replace("0X", "0x")]) {
+      const encoded = wallet.encodeWithdrawal(plan, "escape", ESCAPE_DESTINATION, expected, { conceded: 100n });
+      assert.equal(encoded.slice(10 + 2 * 64, 10 + 3 * 64), wallet.abiWord(BigInt(vault)), "word 2 is the vault");
+      assert.equal(encoded, wallet.encodeWithdrawal(escapePlan({ contract_address: vault }), "escape",
+        ESCAPE_DESTINATION, vault, { conceded: 100n }));
+    }
+    const close = mutualPlan({ contract_address: feltHex(vault) });
+    assert.equal((wallet.encodeWithdrawal(close, "mutual", MUTUAL_DESTINATION, vault).length - 2) / 2, 836);
+  }
+  // Another vault, or a vault that is not an address, is still refused.
+  assert.throws(() => wallet.encodeWithdrawal(escapePlan({ contract_address: "0xf12345678901234567890123456789012345678" }),
+    "escape", ESCAPE_DESTINATION, "0x1f12345678901234567890123456789012345678"), /different vault/);
+  assert.throws(() => wallet.encodeWithdrawal(escapePlan({ contract_address: "0xf1" }), "escape", ESCAPE_DESTINATION, "0xf1"),
+    /not a contract address/);
+});
+
 test("pendingWithdrawals and pendingConcessions decode only their exact shapes", () => {
   const words = (...values) => `0x${values.map((value) => wallet.abiWord(value)).join("")}`;
   assert.equal(wallet.encodePendingConcessions(21), `0xf8ffe6e0${wallet.abiWord(21n)}`);

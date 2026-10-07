@@ -573,7 +573,6 @@ async function main() {
     const toolEnv = () => Object.fromEntries(['HOME', 'SVM_HOME', 'FOUNDRY_DIR', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME']
         .filter(name => process.env[name]).map(name => [name, process.env[name]]));
 
-    const companions = [];
     const sdkAgents = [];
     try {
         log('Starting the local concession-exit acceptance: real contracts, proofs, daemons, signer, SDK and companion; mock provider and price feed.');
@@ -813,7 +812,7 @@ async function main() {
 
         const signerPort = await freePort();
         const signerUrl = `http://127.0.0.1:${signerPort}`;
-        const signer = launch(process.execPath, [path.join(ROOT, 'docker/aws/signer/server.mjs')], 'signer.log', { env: {
+        launch(process.execPath, [path.join(ROOT, 'docker/aws/signer/server.mjs')], 'signer.log', { env: {
             ZKAPI_CHALLENGE_CHAIN_ID: String(CHAIN_ID), ZKAPI_CHALLENGE_PRIVATE_KEY: ANVIL_KEYS[1], ZKAPI_CHALLENGE_VAULT: vaultAddress,
             ZKAPI_CHALLENGE_RPC_URL: rpcUrl, ZKAPI_CHALLENGE_PORT: String(signerPort),
             ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: String(CHALLENGE_MAX_FEE_PER_GAS),
@@ -1388,9 +1387,7 @@ async function main() {
             await waitFor('companion ready', async () => (await call('GET', '/health')).status === 200, 60_000);
             const unauthenticated = await request(`${base}/oa/v1/status`);
             assert.equal(unauthenticated.status, 401, 'the companion answers only its bridge token');
-            const companion = { child, call, stateDir, proxy, name };
-            companions.push(companion);
-            return companion;
+            return { child, call, stateDir, proxy, name };
         }
         stopAfter('clients');
 

@@ -3832,7 +3832,19 @@ class BrowserWalletRuntime extends EventTarget {
      */
     async rebuildExitPath(state, { signal = null, walletRequest = null } = {}) {
         const exit = this.exitRpc();
-        const requests = exit ? [exit] : [walletRequest, this.pinnedRpc()].filter(Boolean);
+        // The wallet provider's calls get E0's per-call bound too (the exit
+        // and pinned RPCs have their own), so a silent wallet leaves the
+        // pinned RPC time to answer.
+        const perCall = this.exitTiming().callTimeoutMs;
+        const bounded = request => async payload => {
+            try {
+                return await abortable(request(payload), AbortSignal.timeout(perCall));
+            } catch (error) {
+                if (error?.name === 'TimeoutError') throw new Error('The wallet provider did not answer in time.');
+                throw error;
+            }
+        };
+        const requests = exit ? [exit] : [walletRequest && bounded(walletRequest), this.pinnedRpc()].filter(Boolean);
         const deadline = Date.now() + this.exitTiming().rebuildBudgetMs;
         const trusted = this.browserConfig?.trusted_deployment || {};
         let failure = null;

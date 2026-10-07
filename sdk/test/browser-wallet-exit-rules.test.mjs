@@ -901,6 +901,18 @@ test('E4.1 and §6.6: without an exit RPC the wallet provider is read before the
         assert.equal(logReads[0], 'wallet');
         assert.equal(logReads.includes('pinned'), refuseLogs, `pinned RPC read: ${refuseLogs}`);
     }
+    // A wallet that never answers a log read gives way to the pinned RPC
+    // after E0's per-call bound, within the same rebuild budget.
+    const silent = await freshWallet();
+    silent.runtime.treePath = () => { throw new Error('indexer down'); };
+    silent.runtime.exitTimingOverrides = { callTimeoutMs: 30 };
+    const silentCalls = [];
+    silent.runtime.pinnedRpc = () => logsVia(silentCalls, 'pinned');
+    const fromPinned = await within(5_000, silent.runtime.prepareWithdrawal('escape', DESTINATION, {
+        walletRequest: async request => request.method === 'eth_getLogs' ? new Promise(() => {}) : logsVia([], 'wallet')(request)
+    }), 'a silent wallet');
+    assert.equal(fromPinned.pathSource, 'rebuild');
+    assert.ok(silentCalls.some(([, method]) => method === 'eth_getLogs'));
     // A wallet on another chain is not used for either read.
     const otherChain = await freshWallet();
     otherChain.runtime.treePath = () => { throw new Error('indexer down'); };

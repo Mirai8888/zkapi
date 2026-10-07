@@ -52,6 +52,7 @@ async function scenario({ state = noteState(), liveRequest = false } = {}) {
     storage.clear();
     for (const name of ['exitRpc', 'pinnedRpc']) delete runtime[name];
     runtime.activeLease = null;
+    runtime.exitGasPrice = null;
     const h = createHarness(function SharedRuntime() { return runtime; });
     // The encoder takes 256-byte Groth16 proofs.
     h.worker.mutate = plan => { plan.proof.proof = Buffer.alloc(256, h.worker.proofs).toString('base64'); };

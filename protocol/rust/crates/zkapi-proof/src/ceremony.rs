@@ -10,15 +10,32 @@
 //! It is the circuit half of `snarkjs zkey verify`; the contribution chain
 //! (who changed `δ`, with proofs of knowledge) is not checked here.
 //!
-//! The binding is only as good as the powers of tau: [`Ptau::open`] hashes the
-//! file so that the importer compares it with the pinned public transcript.
+//! The binding is only as good as the powers of tau. Whoever knows its `τ` can
+//! forge proofs whatever the phase-2 contributors do, and a powers of tau one
+//! party made alone passes every consistency check, `snarkjs powersoftau
+//! verify` included. So:
+//! * [`Ptau::open`] hashes the file (SHA-256 for the pin, Blake2b-512 as its
+//!   publisher lists it), and [`Ptau::public_transcript`] names the public
+//!   phase-1 transcript of [`PUBLIC_PTAU`] it is, if any: an `mpc-1` import
+//!   refuses any other file;
+//! * [`Ptau::lagrange_bases`] checks that the points it returns form one
+//!   structured reference string: the Lagrange sections the keys are built
+//!   from are the inverse FFT of the `τ`-power sections, and those are powers
+//!   of one `τ` scaled by `α` and `β`.
 //!
 //! Formats (iden3 binary files, snarkjs 0.7): every point is little-endian
 //! Montgomery `x ‖ y` (G2: `x.c0 ‖ x.c1 ‖ y.c0 ‖ y.c1`), `(0, 0)` for
 //! infinity. A prepared powers of tau of power `p` holds, in sections 12-15,
 //! the Lagrange bases `L_j(τ)·G1`, `L_j(τ)·G2`, `α·L_j(τ)·G1` and
 //! `β·L_j(τ)·G1` for every domain size `2^k`, `k = 0..=p` (section 12 also
-//! `k = p + 1`), the block of size `d` starting at point `d - 1`.
+//! `k = p + 1`), the block of size `d` starting at point `d - 1`. They are
+//! the inverse FFT of sections 2-5 (`τ^i·G1` for `i < 2^(p+1) - 1`, and
+//! `τ^i·G2`, `α·τ^i·G1`, `β·τ^i·G1` for `i < 2^p`; section 6 is `β·G2`). The
+//! file lacks `τ^(2^(p+1) - 1)·G1`, which section 12's block of size
+//! `2^(p+1)` needs: `snarkjs powersoftau prepare phase2` takes it as zero,
+//! while a file truncated from a larger prepared one (`snarkjs powersoftau
+//! truncate`, as Hermez's `powersOfTau28_hez_final_<p>.ptau`) keeps the
+//! block computed with it.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -31,7 +48,9 @@ use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, VariableBaseMSM};
 use ark_ff::{BigInt, PrimeField, UniformRand, Zero};
 use ark_groth16::ProvingKey;
+use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_relations::r1cs::ConstraintMatrices;
+use blake2::Blake2b512;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -41,6 +60,8 @@ const G2_BYTES: u64 = 128;
 const MAX_POWER: u32 = 28;
 
 const PTAU_HEADER: u32 = 1;
+const PTAU_TAU_G1: u32 = 2;
+const PTAU_TAU_G2: u32 = 3;
 const PTAU_ALPHA_TAU_G1: u32 = 4;
 const PTAU_BETA_TAU_G1: u32 = 5;
 const PTAU_BETA_G2: u32 = 6;
@@ -114,24 +135,111 @@ fn magic_name(magic: &[u8; 4]) -> String {
     String::from_utf8_lossy(magic).into_owned()
 }
 
+/// A public phase-1 transcript, named by the Blake2b-512 its publisher lists
+/// for the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicPtau {
+    /// The file name as published.
+    pub name: &'static str,
+    /// The power in the file's header (`log2` of its largest domain).
+    pub power: u32,
+    /// The published Blake2b-512 of the file (lowercase hex).
+    pub blake2b512: &'static str,
+}
+
+/// The powers of tau an `mpc-1` setup may be built on: the Hermez phase-1
+/// transcripts prepared for phase 2, `powersOfTau28_hez_final_<p>.ptau` for
+/// `p` = 16 (the withdrawal circuit's domain) to 27, with the Blake2b-512 the
+/// snarkjs README lists for each ("Prepare phase 2"; the snarkjs 0.7.5 and
+/// current READMEs list the same hashes). The power-16 file, downloaded from
+/// the listed source, has this hash and passes [`Ptau::lagrange_bases`].
+///
+/// Adding a transcript is a reviewed change to this list, and only with the
+/// hash its publisher lists: an import never trusts a powers of tau because
+/// the coordinator pinned it.
+pub const PUBLIC_PTAU: &[PublicPtau] = &[
+    PublicPtau {
+        name: "powersOfTau28_hez_final_16.ptau",
+        power: 16,
+        blake2b512: "6a6277a2f74e1073601b4f9fed6e1e55226917efb0f0db8a07d98ab01df1ccf43eb0e8c3159432acd4960e2f29fe84a4198501fa54c8dad9e43297453efec125",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_17.ptau",
+        power: 17,
+        blake2b512: "6247a3433948b35fbfae414fa5a9355bfb45f56efa7ab4929e669264a0258976741dfbe3288bfb49828e5df02c2e633df38d2245e30162ae7e3bcca5b8b49345",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_18.ptau",
+        power: 18,
+        blake2b512: "7e6a9c2e5f05179ddfc923f38f917c9e6831d16922a902b0b4758b8e79c2ab8a81bb5f29952e16ee6c5067ed044d7857b5de120a90704c1d3b637fd94b95b13e",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_19.ptau",
+        power: 19,
+        blake2b512: "bca9d8b04242f175189872c42ceaa21e2951e0f0f272a0cc54fc37193ff6648600eaf1c555c70cdedfaf9fb74927de7aa1d33dc1e2a7f1a50619484989da0887",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_20.ptau",
+        power: 20,
+        blake2b512: "89a66eb5590a1c94e3f1ee0e72acf49b1669e050bb5f93c73b066b564dca4e0c7556a52b323178269d64af325d8fdddb33da3a27c34409b821de82aa2bf1a27b",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_21.ptau",
+        power: 21,
+        blake2b512: "9aef0573cef4ded9c4a75f148709056bf989f80dad96876aadeb6f1c6d062391f07a394a9e756d16f7eb233198d5b69407cca44594c763ab4a5b67ae73254678",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_22.ptau",
+        power: 22,
+        blake2b512: "0d64f63dba1a6f11139df765cb690da69d9b2f469a1ddd0de5e4aa628abb28f787f04c6a5fb84a235ec5ea7f41d0548746653ecab0559add658a83502d1cb21b",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_23.ptau",
+        power: 23,
+        blake2b512: "3063a0bd81d68711197c8820a92466d51aeac93e915f5136d74f63c394ee6d88c5e8016231ea6580bec02e25d491f319d92e77f5c7f46a9caa8f3b53c0ea544f",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_24.ptau",
+        power: 24,
+        blake2b512: "fa404d140d5819d39984833ca5ec3632cd4995f81e82db402371a4de7c2eae8687c62bc632a95b0c6aadba3fb02680a94e09174b7233ccd26d78baca2647c733",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_25.ptau",
+        power: 25,
+        blake2b512: "0377d860cdb09a8a31ea1b0b8c04335614c8206357181573bf294c25d5ca7dff72387224fbd868897e6769f7805b3dab02854aec6d69d7492883b5e4e5f35eeb",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_26.ptau",
+        power: 26,
+        blake2b512: "418dee4a74b9592198bd8fd02ad1aea76f9cf3085f206dfd7d594c9e264ae919611b1459a1cc920c2f143417744ba9edd7b8d51e44be9452344a225ff7eead19",
+    },
+    PublicPtau {
+        name: "powersOfTau28_hez_final_27.ptau",
+        power: 27,
+        blake2b512: "10ffd99837c512ef99752436a54b9810d1ac8878d368fb4b806267bdd664b4abf276c9cd3c4b9039a1fa4315a0c326c0e8e9e8fe0eb588ffd4f9021bf7eae1a1",
+    },
+];
+
 /// A prepared (phase-2 ready) BN254 powers-of-tau file.
 #[derive(Debug)]
 pub struct Ptau {
     path: PathBuf,
     sha256: [u8; 32],
+    blake2b512: [u8; 64],
     power: u32,
     sections: BTreeMap<u32, Section>,
 }
 
 impl Ptau {
     /// Hash the whole file and read its section table and header. Requires
-    /// the BN254 base field, a power of at most 28 and the four Lagrange
-    /// sections of `snarkjs powersoftau prepare phase2`, each of the exact
-    /// size its power implies.
+    /// the BN254 base field, a power of at most 28, and sections 2-6 and the
+    /// four Lagrange sections of `snarkjs powersoftau prepare phase2`, each of
+    /// the exact size its power implies.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let mut hasher = Sha256::new();
+        let mut sha256 = Sha256::new();
+        let mut blake2b512 = Blake2b512::new();
         let mut buffer = vec![0u8; 1 << 20];
         loop {
             let read = file
@@ -140,9 +248,11 @@ impl Ptau {
             if read == 0 {
                 break;
             }
-            hasher.update(&buffer[..read]);
+            sha256.update(&buffer[..read]);
+            blake2b512.update(&buffer[..read]);
         }
-        let sha256 = hasher.finalize().into();
+        let sha256 = sha256.finalize().into();
+        let blake2b512 = blake2b512.finalize().into();
         let mut reader = BufReader::new(file);
         let sections = binfile_sections(&mut reader, b"ptau")
             .with_context(|| format!("read {}", path.display()))?;
@@ -168,11 +278,19 @@ impl Ptau {
         let ptau = Self {
             path,
             sha256,
+            blake2b512,
             power,
             sections,
         };
+        // 2^(top + 1) - 1: all blocks up to size 2^top, or 2^(top + 1) - 1 powers.
         let block_points = |top: u32| (1u64 << (top + 1)) - 1;
+        let powers = 1u64 << power;
         for (id, size) in [
+            (PTAU_TAU_G1, block_points(power) * G1_BYTES),
+            (PTAU_TAU_G2, powers * G2_BYTES),
+            (PTAU_ALPHA_TAU_G1, powers * G1_BYTES),
+            (PTAU_BETA_TAU_G1, powers * G1_BYTES),
+            (PTAU_BETA_G2, G2_BYTES),
             (PTAU_LAGRANGE_TAU_G1, block_points(power + 1) * G1_BYTES),
             (PTAU_LAGRANGE_TAU_G2, block_points(power) * G2_BYTES),
             (PTAU_LAGRANGE_ALPHA_TAU_G1, block_points(power) * G1_BYTES),
@@ -187,23 +305,27 @@ impl Ptau {
                 section.size
             );
         }
-        for (id, size) in [
-            (PTAU_ALPHA_TAU_G1, G1_BYTES),
-            (PTAU_BETA_TAU_G1, G1_BYTES),
-            (PTAU_BETA_G2, G2_BYTES),
-        ] {
-            ensure!(
-                ptau.section(id)?.size >= size,
-                "{}: section {id} is empty",
-                ptau.path.display()
-            );
-        }
         Ok(ptau)
     }
 
-    /// SHA-256 of the file.
+    /// SHA-256 of the file (the `ptau_sha256` pin and manifest entry).
     pub fn sha256(&self) -> [u8; 32] {
         self.sha256
+    }
+
+    /// Blake2b-512 of the file, the hash the snarkjs README lists for the
+    /// public transcripts.
+    pub fn blake2b512(&self) -> [u8; 64] {
+        self.blake2b512
+    }
+
+    /// The transcript of `known` (normally [`PUBLIC_PTAU`]) this file is: the
+    /// same power and Blake2b-512.
+    pub fn public_transcript<'a>(&self, known: &'a [PublicPtau]) -> Option<&'a PublicPtau> {
+        let digest = hex::encode(self.blake2b512);
+        known
+            .iter()
+            .find(|entry| entry.power == self.power && entry.blake2b512 == digest)
     }
 
     /// `log2` of the largest domain the file supports.
@@ -235,56 +357,242 @@ impl Ptau {
         Ok(bytes)
     }
 
-    fn g1_block(&self, id: u32, size: usize) -> Result<Vec<G1Affine>> {
-        let bytes = self.read(id, (size as u64 - 1) * G1_BYTES, size as u64 * G1_BYTES)?;
+    /// Points `start..start + count` of a G1 section.
+    fn g1_points(&self, id: u32, start: usize, count: usize) -> Result<Vec<G1Affine>> {
+        let bytes = self.read(id, start as u64 * G1_BYTES, count as u64 * G1_BYTES)?;
         bytes.as_chunks::<64>().0.iter().map(g1_from_lem).collect()
+    }
+
+    /// Points `start..start + count` of a G2 section.
+    fn g2_points(&self, id: u32, start: usize, count: usize) -> Result<Vec<G2Affine>> {
+        let bytes = self.read(id, start as u64 * G2_BYTES, count as u64 * G2_BYTES)?;
+        bytes.as_chunks::<128>().0.iter().map(g2_from_lem).collect()
     }
 
     /// The bases snarkjs uses for a circuit whose QAP domain has
     /// `domain_size` points: the size-`n` blocks of sections 12-15, the odd
     /// points of section 12's size-`2n` block (the H query), and `α·G1`,
     /// `β·G1`, `β·G2`.
+    ///
+    /// Before returning them it checks, by random linear combinations, that
+    /// they and the `τ`-power points they come from form one structured
+    /// reference string ([`check_reference_string`]), so a file whose
+    /// Lagrange sections were replaced (for example only the H points) is
+    /// refused. A file one party made alone passes: only its hash
+    /// ([`Ptau::public_transcript`]) shows where it comes from.
     pub fn lagrange_bases(&self, domain_size: usize) -> Result<LagrangeBases> {
         ensure!(
-            domain_size.is_power_of_two() && domain_size as u64 <= 1u64 << self.power,
-            "{}: a powers of tau of power {} has no domain of {domain_size} points",
+            domain_size.is_power_of_two()
+                && domain_size as u64 <= 1u64 << self.power
+                && domain_size < 1 << MAX_POWER,
+            "{}: a powers of tau of power {} has no domain of {domain_size} points \
+             (the H query needs a radix-2 domain of twice that size)",
             self.path.display(),
             self.power
         );
-        let n = domain_size as u64;
-        let tau_g2 = self
-            .read(PTAU_LAGRANGE_TAU_G2, (n - 1) * G2_BYTES, n * G2_BYTES)?
-            .as_chunks::<128>()
-            .0
-            .iter()
-            .map(g2_from_lem)
-            .collect::<Result<Vec<_>>>()?;
-        let double = self.read(
-            PTAU_LAGRANGE_TAU_G1,
-            (2 * n - 1) * G1_BYTES,
-            2 * n * G1_BYTES,
-        )?;
-        let h_g1 = double
-            .as_chunks::<64>()
-            .0
-            .iter()
-            .skip(1)
-            .step_by(2)
-            .map(g1_from_lem)
-            .collect::<Result<Vec<_>>>()?;
-        let first_g1 =
-            |id| -> Result<G1Affine> { g1_from_lem(&self.read(id, 0, G1_BYTES)?.as_chunks().0[0]) };
+        let n = domain_size;
+        let double = self.g1_points(PTAU_LAGRANGE_TAU_G1, 2 * n - 1, 2 * n)?;
+        // The file holds τ^i·G1 for i < 2^(power + 1) - 1, so the top block
+        // (2n = 2^(power + 1)) lacks the last power.
+        let g1_powers = (2 * n).min((1 << (self.power + 1)) - 1);
+        let points = ReferenceString {
+            tau_g1: self.g1_points(PTAU_TAU_G1, 0, g1_powers)?,
+            tau_g2: self.g2_points(PTAU_TAU_G2, 0, n.max(2))?,
+            alpha_tau_g1: self.g1_points(PTAU_ALPHA_TAU_G1, 0, n)?,
+            beta_tau_g1: self.g1_points(PTAU_BETA_TAU_G1, 0, n)?,
+            beta_g2: self.g2_points(PTAU_BETA_G2, 0, 1)?[0],
+            lagrange_tau_g1: self.g1_points(PTAU_LAGRANGE_TAU_G1, n - 1, n)?,
+            lagrange_double_tau_g1: double,
+            lagrange_tau_g2: self.g2_points(PTAU_LAGRANGE_TAU_G2, n - 1, n)?,
+            lagrange_alpha_tau_g1: self.g1_points(PTAU_LAGRANGE_ALPHA_TAU_G1, n - 1, n)?,
+            lagrange_beta_tau_g1: self.g1_points(PTAU_LAGRANGE_BETA_TAU_G1, n - 1, n)?,
+        };
+        check_reference_string(&points)
+            .with_context(|| format!("{}: inconsistent powers of tau", self.path.display()))?;
         Ok(LagrangeBases {
-            tau_g1: self.g1_block(PTAU_LAGRANGE_TAU_G1, domain_size)?,
-            tau_g2,
-            alpha_tau_g1: self.g1_block(PTAU_LAGRANGE_ALPHA_TAU_G1, domain_size)?,
-            beta_tau_g1: self.g1_block(PTAU_LAGRANGE_BETA_TAU_G1, domain_size)?,
-            h_g1,
-            alpha_g1: first_g1(PTAU_ALPHA_TAU_G1)?,
-            beta_g1: first_g1(PTAU_BETA_TAU_G1)?,
-            beta_g2: g2_from_lem(&self.read(PTAU_BETA_G2, 0, G2_BYTES)?.as_chunks().0[0])?,
+            h_g1: points
+                .lagrange_double_tau_g1
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .copied()
+                .collect(),
+            alpha_g1: points.alpha_tau_g1[0],
+            beta_g1: points.beta_tau_g1[0],
+            beta_g2: points.beta_g2,
+            tau_g1: points.lagrange_tau_g1,
+            tau_g2: points.lagrange_tau_g2,
+            alpha_tau_g1: points.lagrange_alpha_tau_g1,
+            beta_tau_g1: points.lagrange_beta_tau_g1,
         })
     }
+}
+
+/// The points of a prepared powers of tau that one QAP domain of `n` points
+/// uses (sections in parentheses).
+#[derive(Clone, Debug)]
+pub struct ReferenceString {
+    /// `τ^i·G1` (2), `i < min(2n, 2^(power + 1) - 1)`.
+    pub tau_g1: Vec<G1Affine>,
+    /// `τ^i·G2` (3), `i < max(n, 2)`.
+    pub tau_g2: Vec<G2Affine>,
+    /// `α·τ^i·G1` (4), `i < n`.
+    pub alpha_tau_g1: Vec<G1Affine>,
+    /// `β·τ^i·G1` (5), `i < n`.
+    pub beta_tau_g1: Vec<G1Affine>,
+    /// `β·G2` (6).
+    pub beta_g2: G2Affine,
+    /// The size-`n` block of section 12, `L_j(τ)·G1`.
+    pub lagrange_tau_g1: Vec<G1Affine>,
+    /// The size-`2n` block of section 12.
+    pub lagrange_double_tau_g1: Vec<G1Affine>,
+    /// The size-`n` blocks of sections 13, 14 and 15.
+    pub lagrange_tau_g2: Vec<G2Affine>,
+    pub lagrange_alpha_tau_g1: Vec<G1Affine>,
+    pub lagrange_beta_tau_g1: Vec<G1Affine>,
+}
+
+/// Check that `points` are one structured reference string, as `snarkjs
+/// powersoftau verify` does for a whole file (without its contribution
+/// chain), each vector equation as one random linear combination:
+/// * `τ^0·G1` and `τ^0·G2` are the generators;
+/// * sections 2 and 3 are powers of the same `τ`: `P_(i+1) = τ·P_i`, by
+///   pairing with `τ·G1` and `τ·G2`;
+/// * sections 4 and 5 are powers of that `τ` too, and `β·G2` matches `β·G1`;
+/// * each Lagrange block is the inverse FFT of its power section over its
+///   domain: for random coefficients `c`, `Σ c_i·P_i = Σ_j FFT(c)_j·L_j`.
+///   Section 12's top block (`2n = 2^(power + 1)`) needs the power
+///   `τ^(2n - 1)·G1` the file lacks; it may be computed with zero there
+///   (`prepare phase2`) or with that power (`truncate`), and with nothing
+///   else (`snarkjs powersoftau verify` leaves it free).
+pub fn check_reference_string(points: &ReferenceString) -> Result<()> {
+    let n = points.lagrange_tau_g1.len();
+    ensure!(
+        n.is_power_of_two()
+            && n < 1 << MAX_POWER
+            && points.lagrange_double_tau_g1.len() == 2 * n
+            && points.lagrange_tau_g2.len() == n
+            && points.lagrange_alpha_tau_g1.len() == n
+            && points.lagrange_beta_tau_g1.len() == n
+            && points.alpha_tau_g1.len() == n
+            && points.beta_tau_g1.len() == n
+            && points.tau_g2.len() == n.max(2)
+            && (2..=2 * n).contains(&points.tau_g1.len()),
+        "the powers of tau points do not describe a domain of {n} points"
+    );
+    let g1 = G1Affine::generator();
+    let g2 = G2Affine::generator();
+    ensure!(
+        points.tau_g1[0] == g1 && points.tau_g2[0] == g2,
+        "sections 2 and 3 do not start with the generators"
+    );
+    let tau_g1 = points.tau_g1[1];
+    let tau_g2 = points.tau_g2[1];
+    let msm1 = |points: &[G1Affine], scalars: &[Fr]| G1Projective::msm_unchecked(points, scalars);
+    let msm2 = |points: &[G2Affine], scalars: &[Fr]| G2Projective::msm_unchecked(points, scalars);
+    // Σ r_i·P_(i+1) and Σ r_i·P_i for one fresh r.
+    let shifted1 = |points: &[G1Affine]| {
+        let r = random_scalars(points.len() - 1);
+        (
+            msm1(&points[1..], &r),
+            msm1(&points[..points.len() - 1], &r),
+        )
+    };
+    let (next, previous) = shifted1(&points.tau_g1);
+    ensure!(
+        Bn254::pairing(next, g2) == Bn254::pairing(previous, tau_g2),
+        "section 2 does not hold the powers τ^i·G1 of section 3's τ"
+    );
+    let r = random_scalars(points.tau_g2.len() - 1);
+    let (next, previous) = (
+        msm2(&points.tau_g2[1..], &r),
+        msm2(&points.tau_g2[..points.tau_g2.len() - 1], &r),
+    );
+    ensure!(
+        Bn254::pairing(g1, next) == Bn254::pairing(tau_g1, previous),
+        "section 3 does not hold the powers τ^i·G2 of section 2's τ"
+    );
+    for (id, section) in [
+        (PTAU_ALPHA_TAU_G1, &points.alpha_tau_g1),
+        (PTAU_BETA_TAU_G1, &points.beta_tau_g1),
+    ] {
+        if section.len() > 1 {
+            let (next, previous) = shifted1(section);
+            ensure!(
+                Bn254::pairing(next, g2) == Bn254::pairing(previous, tau_g2),
+                "section {id} does not hold a multiple of the powers of τ"
+            );
+        }
+    }
+    ensure!(
+        Bn254::pairing(points.beta_tau_g1[0], g2) == Bn254::pairing(g1, points.beta_g2),
+        "β·G2 (section 6) does not match β·G1 (section 5)"
+    );
+    // Σ c_i·P_i = Σ_j FFT(c)_j·L_j.
+    let lagrange_g1 = |id: u32, block: &[G1Affine], powers: &[G1Affine]| -> Result<()> {
+        let size = block.len();
+        let (c, evaluations) = random_fft(size);
+        let k = powers.len().min(size);
+        let rest = msm1(block, &evaluations) - msm1(&powers[..k], &c[..k]);
+        let matches = if k == size {
+            rest.is_zero()
+        } else {
+            // The top block, without τ^(size - 1)·G1 = τ·P_(k - 1): the rest
+            // is c_(size - 1) times zero or that power.
+            k == size - 1
+                && (rest.is_zero()
+                    || Bn254::pairing(rest, g2)
+                        == Bn254::pairing(powers[k - 1] * c[size - 1], tau_g2))
+        };
+        ensure!(
+            matches,
+            "the size-{size} block of section {id} is not the Lagrange basis of the powers of τ"
+        );
+        Ok(())
+    };
+    lagrange_g1(
+        PTAU_LAGRANGE_TAU_G1,
+        &points.lagrange_tau_g1,
+        &points.tau_g1,
+    )?;
+    lagrange_g1(
+        PTAU_LAGRANGE_TAU_G1,
+        &points.lagrange_double_tau_g1,
+        &points.tau_g1,
+    )?;
+    lagrange_g1(
+        PTAU_LAGRANGE_ALPHA_TAU_G1,
+        &points.lagrange_alpha_tau_g1,
+        &points.alpha_tau_g1,
+    )?;
+    lagrange_g1(
+        PTAU_LAGRANGE_BETA_TAU_G1,
+        &points.lagrange_beta_tau_g1,
+        &points.beta_tau_g1,
+    )?;
+    let (c, evaluations) = random_fft(n);
+    ensure!(
+        msm2(&points.lagrange_tau_g2, &evaluations) == msm2(&points.tau_g2[..n], &c),
+        "the size-{n} block of section {PTAU_LAGRANGE_TAU_G2} is not the Lagrange basis of the \
+         powers of τ"
+    );
+    Ok(())
+}
+
+fn random_scalars(count: usize) -> Vec<Fr> {
+    let mut rng = OsRng;
+    (0..count).map(|_| Fr::rand(&mut rng)).collect()
+}
+
+/// Random coefficients `c` of a polynomial of degree below `size` and its
+/// evaluations on the radix-2 domain of `size` points (`size` a power of two
+/// of at most 2^28).
+fn random_fft(size: usize) -> (Vec<Fr>, Vec<Fr>) {
+    let c = random_scalars(size);
+    let evaluations = Radix2EvaluationDomain::<Fr>::new(size)
+        .expect("a radix-2 domain of at most 2^28 points")
+        .fft(&c);
+    (c, evaluations)
 }
 
 /// The powers-of-tau points a key for one QAP domain of `n` points is built
@@ -603,6 +911,29 @@ mod tests {
         let mut big = [0xffu8; 64];
         big[32..].copy_from_slice(&g1_to_lem(&G1Affine::generator())[32..]);
         assert!(g1_from_lem(&big).is_err());
+    }
+
+    #[test]
+    fn public_transcripts_are_listed_by_power_and_published_hash() {
+        let mut powers = Vec::new();
+        for entry in PUBLIC_PTAU {
+            assert_eq!(
+                entry.name,
+                format!("powersOfTau28_hez_final_{:02}.ptau", entry.power)
+            );
+            assert!(
+                entry.blake2b512.len() == 128
+                    && entry
+                        .blake2b512
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{}",
+                entry.name
+            );
+            powers.push(entry.power);
+        }
+        // Every power from the withdrawal domain (2^16) up, once each.
+        assert_eq!(powers, (16..=27).collect::<Vec<_>>());
     }
 
     #[test]

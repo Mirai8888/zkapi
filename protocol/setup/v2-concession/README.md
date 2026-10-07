@@ -16,13 +16,27 @@ profile and every deployment manifest pin these keys.
 
 Groth16 is sound only if nobody knows the setup's toxic waste. A trapdoor
 holder can forge any proof, including defeat evidence against an honest
-user's escape. The ceremony makes this assumption hold if **at least one**
-phase-2 contributor (or the public phase-1 transcript) is honest and outside
-the attacker's control, **and** the keys are keys of this circuit. Users can
-audit both through the published transcript, the VK hashes in the adapter
-and the codehash pins in the client profiles.
+user's escape. The toxic waste has a phase-1 part and a phase-2 part, and
+**both** must be unknown. So the setup is sound only if all three of these
+hold:
 
-The second condition is not implied by the first. Contributions only
+1. **Phase 1.** At least one contributor to the public powers-of-tau
+   transcript was honest, **and** the file the ceremony used is that public
+   transcript. Whoever knows its `τ` can forge proofs however honest the
+   phase-2 contributors are: every H point is then a known multiple of
+   `1/δ·G1`. A powers of tau that one party made alone passes
+   `snarkjs powersoftau verify`, `snarkjs zkey verify` and every consistency
+   check of the import. Only its hash shows where it comes from (steps 3, 5
+   and 6).
+2. **Phase 2.** At least one phase-2 contributor was honest and outside the
+   attacker's control.
+3. **Binding.** The keys are keys of this circuit.
+
+Users can audit all three through the powers-of-tau hash in `manifest.json`,
+the published transcript, the VK hashes in the adapter and the codehash pins
+in the client profiles.
+
+The third condition is not implied by the first two. Contributions only
 re-randomize `δ`; they cannot repair a ceremony that the coordinator set up
 from another R1CS. For example, the R1CS could keep the A and B matrices but
 change C so that `enforce_equal` rows become vacuous. Steps 2(c), 5 and 6 check
@@ -91,14 +105,36 @@ All commands run from `protocol/rust` at the frozen circuit revision
    ```
 
 3. **Powers of tau.** Use a public BN254 phase-1 transcript prepared for
-   phase 2 (`snarkjs powersoftau prepare phase2`), of at least 2^16 (the
-   withdrawal circuit's domain). An example is Hermez
+   phase 2, of at least 2^16 (the withdrawal circuit's domain): one of the
+   Hermez files in `zkapi_proof::ceremony::PUBLIC_PTAU`, for example
    `powersOfTau28_hez_final_16.ptau`.
+   - Download it from the source the snarkjs README lists. Check its
+     Blake2b-512 against the hash listed there (`b2sum`, or
+     `openssl dgst -blake2b512` with OpenSSL 1.1 or later). `PUBLIC_PTAU`
+     holds the same hashes, and an `mpc-1` import refuses any file not on
+     it. Using another public transcript is a reviewed change to that list,
+     with the hash its publisher lists.
+   - For reference: the power-16 file from circom.info (October 2026) has
+     the listed Blake2b-512 `6a6277a2…3efec125` and SHA-256
+     `1c401abb57c9ce531370f3015c3e75c0892e0f32b8b1e94ace0f6682d9695922`.
    - Pin its SHA-256 before the ceremony starts and record it as
-     `ptau_sha256`.
-   - Anyone can check the file itself with `snarkjs powersoftau verify`.
-   - The binding check is only as good as this file, so import with
-     `--ptau-sha256 <pin>`.
+     `ptau_sha256`. Import with `--ptau-sha256 <pin>`.
+   - Check it with the import's own checks:
+
+     ```text
+     ZKAPI_PTAU=pot.ptau cargo test --release -p zkapi-proof --test zkey_import \
+       public_powers_of_tau_passes_the_import_checks -- --ignored
+     ```
+
+     This confirms that the file is on `PUBLIC_PTAU`, and that the points
+     the import uses form one reference string. The Lagrange sections must
+     be the inverse FFT of the `τ`-power sections, and those must be powers
+     of one `τ`, scaled by `α` and `β`. So a file whose Lagrange sections
+     alone were replaced (for example its H points) is refused.
+   - `snarkjs powersoftau verify` checks the file's internal consistency and
+     its contribution chain. It does not show where the file comes from: it
+     accepts a file that one party made alone. It never replaces the hash
+     check.
 
 4. **Contributions.** For each circuit:
 
@@ -129,9 +165,15 @@ All commands run from `protocol/rust` at the frozen circuit revision
    - The coordinator's own `snarkjs zkey verify` output is evidence only for
      the `.r1cs` it was run on.
    - So **each external reviewer** must, at the frozen revision:
-     1. export the R1CS themselves (step 1);
-     2. check its SHA-256 against `r1cs-manifest.json`;
-     3. run `snarkjs zkey verify <own export> <pinned ptau> <circuit>_final.zkey`
+     1. download the powers of tau themselves from its public source, not
+        from the coordinator. Check its Blake2b-512 against the hash its
+        publisher lists (for Hermez, the snarkjs README), and its SHA-256
+        against `ptau_sha256` in `manifest.json`. Neither
+        `snarkjs powersoftau verify` nor `snarkjs zkey verify` can replace
+        this check (Trust assumption, condition 1);
+     2. export the R1CS themselves (step 1);
+     3. check its SHA-256 against `r1cs-manifest.json`;
+     4. run `snarkjs zkey verify <own export> <own ptau> <circuit>_final.zkey`
         for both circuits.
    - That run checks the contribution chain (each `δ` update and its proof
      of knowledge), which `import_zkey` does not check. It also checks the
@@ -152,7 +194,10 @@ All commands run from `protocol/rust` at the frozen circuit revision
    The import runs every gate before it writes anything:
    - the `.r1cs` files the ceremony used must be byte for byte this build's
      export;
-   - the powers of tau must hash to the pin;
+   - the powers of tau must hash to the pin and, for `mpc-1`, be a public
+     transcript of `PUBLIC_PTAU` (by its published Blake2b-512);
+   - the points of the powers of tau that the keys are checked against must
+     form one reference string (step 3);
    - each zkey must record at least three contributions followed by a beacon
      (`mpc-1` only);
    - each zkey must pass the coefficient and binding checks of 2(c);
@@ -213,7 +258,7 @@ All commands run from `protocol/rust` at the frozen circuit revision
 ## Rehearsals
 
 Dry runs of this pipeline must use `--setup-id rehearsal`. Examples are a
-throwaway powers of tau, or a single contribution. Rehearsal keys load only
+throwaway powers of tau (which `mpc-1` refuses), or a single contribution. Rehearsal keys load only
 in `dev-setup` builds. Never label a dry run `mpc-1`. Its toxic waste is
 known to whoever ran it.
 

@@ -4645,6 +4645,7 @@ dependencies = [
  "ark-snark",
  "ark-std",
  "base64",
+ "blake2",
  "hex",
  "rand",
  "serde",

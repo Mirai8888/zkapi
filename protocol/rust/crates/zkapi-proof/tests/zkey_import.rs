@@ -31,7 +31,9 @@ use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use common::*;
 use import_zkey::{check_coefficients, check_proving, check_shape, check_zkey, import, ImportArgs};
-use zkapi_proof::ceremony::{check_key_binding, g1_to_lem, g2_to_lem, LagrangeBases, Ptau};
+use zkapi_proof::ceremony::{
+    check_key_binding, g1_to_lem, g2_to_lem, LagrangeBases, Ptau, PublicPtau, PUBLIC_PTAU,
+};
 use zkapi_proof::compact::{
     circuit_shape, decode_compressed, decode_compressed_for, sha256, write_setup_directory,
     KeyKind, RequestProver, RequestVerifier, SetupManifest, SetupProvenance, WithdrawalProver,
@@ -162,45 +164,160 @@ fn write_zkey(
     out
 }
 
-/// The sections of a prepared powers of tau of `power` (snarkjs `prepare
-/// phase2` layout) in which the blocks of `bases` hold their points and every
-/// other Lagrange point is zero (the import reads only its circuits' blocks).
-fn ptau_sections(power: u32, bases: &[&LagrangeBases]) -> Vec<(u32, Vec<u8>)> {
-    let points = |top: u32| (1usize << (top + 1)) - 1;
-    let mut tau_g1 = vec![0u8; points(power + 1) * 64];
-    let mut tau_g2 = vec![0u8; points(power) * 128];
-    let mut alpha = vec![0u8; points(power) * 64];
-    let mut beta = vec![0u8; points(power) * 64];
-    let put = |section: &mut Vec<u8>, size: usize, at: usize, bytes: &[u8]| {
-        let start = (size - 1 + at) * bytes.len();
-        section[start..start + bytes.len()].copy_from_slice(bytes);
-    };
-    for base in bases {
-        let n = base.domain_size();
-        for (j, point) in base.h_g1.iter().enumerate() {
-            put(&mut tau_g1, 2 * n, 2 * j + 1, &g1_to_lem(point));
-        }
-        for j in 0..n {
-            put(&mut tau_g1, n, j, &g1_to_lem(&base.tau_g1[j]));
-            put(&mut tau_g2, n, j, &g2_to_lem(&base.tau_g2[j]));
-            put(&mut alpha, n, j, &g1_to_lem(&base.alpha_tau_g1[j]));
-            put(&mut beta, n, j, &g1_to_lem(&base.beta_tau_g1[j]));
+/// The scalars behind sections 2-6 of a powers of tau of `power`: the file
+/// holds `x·G1` (or `x·G2`) for each.
+#[derive(Clone)]
+struct PtauScalars {
+    power: u32,
+    /// Section 2: `τ^i`, `i < 2^(power + 1) - 1`.
+    tau_g1: Vec<Fr>,
+    /// Section 3: `τ^i`, `i < 2^power`.
+    tau_g2: Vec<Fr>,
+    /// Sections 4 and 5: `α·τ^i` and `β·τ^i`, `i < 2^power`.
+    alpha_tau_g1: Vec<Fr>,
+    beta_tau_g1: Vec<Fr>,
+    /// Section 6: `β`.
+    beta_g2: Fr,
+    /// What section 12's top block (`2^(power + 1)` points) takes for the
+    /// power `τ^(2^(power + 1) - 1)` the file lacks: zero (`snarkjs
+    /// powersoftau prepare phase2`) or that power (a file truncated from a
+    /// larger prepared one, as Hermez's).
+    top: Fr,
+}
+
+impl PtauScalars {
+    /// As `snarkjs powersoftau new`, `contribute` and `prepare phase2`
+    /// produce it.
+    fn honest(power: u32, secrets: &Secrets) -> Self {
+        let powers = |count: usize, first: Fr| {
+            let mut value = first;
+            (0..count)
+                .map(|_| {
+                    let current = value;
+                    value *= secrets.tau;
+                    current
+                })
+                .collect::<Vec<_>>()
+        };
+        let half = 1usize << power;
+        Self {
+            power,
+            tau_g1: powers(2 * half - 1, Fr::ONE),
+            tau_g2: powers(half, Fr::ONE),
+            alpha_tau_g1: powers(half, secrets.alpha),
+            beta_tau_g1: powers(half, secrets.beta),
+            beta_g2: secrets.beta,
+            top: Fr::zero(),
         }
     }
-    let zero1 = G1Affine::zero();
-    let zero2 = G2Affine::zero();
-    let first = bases.first().copied();
+
+    /// As Hermez's public files: prepared at a larger power, then truncated
+    /// to `power` (section 12's top block keeps the power the file lacks).
+    fn truncated(power: u32, secrets: &Secrets) -> Self {
+        Self {
+            top: secrets.tau.pow([(1u64 << (power + 1)) - 1]),
+            ..Self::honest(power, secrets)
+        }
+    }
+
+    /// The block of `size` points of a Lagrange section computed from
+    /// `powers`: their inverse FFT. Only section 12's top block runs past the
+    /// powers, by one, which takes `top`.
+    fn block(powers: &[Fr], size: usize, top: Fr) -> Vec<Fr> {
+        let mut values = powers[..powers.len().min(size)].to_vec();
+        if values.len() < size {
+            values.push(top);
+        }
+        assert_eq!(values.len(), size);
+        Radix2EvaluationDomain::<Fr>::new(size)
+            .unwrap()
+            .ifft(&values)
+    }
+
+    /// `L_j(τ)` of the domain of `n` points, from section 12.
+    fn lagrange(&self, n: usize) -> Vec<Fr> {
+        Self::block(&self.tau_g1, n, self.top)
+    }
+
+    /// The odd points of section 12's block of `2n`: the H query before `δ`.
+    fn h(&self, n: usize) -> Vec<Fr> {
+        odd(Self::block(&self.tau_g1, 2 * n, self.top))
+    }
+
+    /// What `Ptau::lagrange_bases(n)` reads from a file of these scalars.
+    fn bases(&self, n: usize) -> LagrangeBases {
+        LagrangeBases {
+            tau_g1: g1_batch(&self.lagrange(n)),
+            tau_g2: g2_batch(&Self::block(&self.tau_g2, n, self.top)),
+            alpha_tau_g1: g1_batch(&Self::block(&self.alpha_tau_g1, n, self.top)),
+            beta_tau_g1: g1_batch(&Self::block(&self.beta_tau_g1, n, self.top)),
+            h_g1: g1_batch(&self.h(n)),
+            alpha_g1: g1_batch(&self.alpha_tau_g1[..1])[0],
+            beta_g1: g1_batch(&self.beta_tau_g1[..1])[0],
+            beta_g2: g2_batch(&[self.beta_g2])[0],
+        }
+    }
+}
+
+/// A prepared powers of tau (snarkjs `prepare phase2` layout): sections 2-6
+/// from `scalars`, and the Lagrange blocks the import reads for each domain
+/// size `n` of `domains` computed from `lagrange` (normally the same
+/// scalars): the size-`n` blocks of sections 12-15 and section 12's
+/// size-`2n` block. Every other Lagrange point is zero.
+fn ptau_sections(
+    scalars: &PtauScalars,
+    lagrange: &PtauScalars,
+    domains: &[usize],
+) -> Vec<(u32, Vec<u8>)> {
+    let power = scalars.power;
+    let points = |top: u32| (1usize << (top + 1)) - 1;
+    let mut sections = [
+        (12u32, &lagrange.tau_g1, vec![0u8; points(power + 1) * 64]),
+        (14, &lagrange.alpha_tau_g1, vec![0u8; points(power) * 64]),
+        (15, &lagrange.beta_tau_g1, vec![0u8; points(power) * 64]),
+    ];
+    let mut lagrange_g2 = vec![0u8; points(power) * 128];
+    for &n in domains {
+        for (id, powers, section) in sections.iter_mut() {
+            for size in if *id == 12 { vec![n, 2 * n] } else { vec![n] } {
+                let block = g1_batch(&PtauScalars::block(powers, size, lagrange.top));
+                for (j, point) in block.iter().enumerate() {
+                    let at = (size - 1 + j) * 64;
+                    section[at..at + 64].copy_from_slice(&g1_to_lem(point));
+                }
+            }
+        }
+        let block = g2_batch(&PtauScalars::block(&lagrange.tau_g2, n, lagrange.top));
+        for (j, point) in block.iter().enumerate() {
+            let at = (n - 1 + j) * 128;
+            lagrange_g2[at..at + 128].copy_from_slice(&g2_to_lem(point));
+        }
+    }
+    let g1_section = |scalars: &[Fr]| {
+        let mut body = Vec::new();
+        g1_batch(scalars)
+            .iter()
+            .for_each(|point| body.extend_from_slice(&g1_to_lem(point)));
+        body
+    };
+    let mut tau_powers_g2 = Vec::new();
+    g2_batch(&scalars.tau_g2)
+        .iter()
+        .for_each(|point| tau_powers_g2.extend_from_slice(&g2_to_lem(point)));
     let mut header = 32u32.to_le_bytes().to_vec();
     Fq::MODULUS.serialize_uncompressed(&mut header).unwrap();
     header.extend_from_slice(&power.to_le_bytes());
     header.extend_from_slice(&power.to_le_bytes());
+    let [(_, _, tau_g1), (_, _, alpha), (_, _, beta)] = sections;
     vec![
         (1, header),
-        (4, g1_to_lem(first.map_or(&zero1, |b| &b.alpha_g1)).to_vec()),
-        (5, g1_to_lem(first.map_or(&zero1, |b| &b.beta_g1)).to_vec()),
-        (6, g2_to_lem(first.map_or(&zero2, |b| &b.beta_g2)).to_vec()),
+        (2, g1_section(&scalars.tau_g1)),
+        (3, tau_powers_g2),
+        (4, g1_section(&scalars.alpha_tau_g1)),
+        (5, g1_section(&scalars.beta_tau_g1)),
+        (6, g2_to_lem(&g2_batch(&[scalars.beta_g2])[0]).to_vec()),
         (12, tau_g1),
-        (13, tau_g2),
+        (13, lagrange_g2),
         (14, alpha),
         (15, beta),
     ]
@@ -216,8 +333,8 @@ fn binfile(magic: &[u8; 4], sections: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
     out
 }
 
-fn write_ptau(power: u32, bases: &[&LagrangeBases]) -> Vec<u8> {
-    binfile(b"ptau", ptau_sections(power, bases))
+fn write_ptau(scalars: &PtauScalars, domains: &[usize]) -> Vec<u8> {
+    binfile(b"ptau", ptau_sections(scalars, scalars, domains))
 }
 
 // ---- the toy ceremony ----
@@ -237,8 +354,15 @@ struct ToyCircuit {
     pk: ProvingKey<Bn254>,
 }
 
+/// The toy ceremony's powers of tau is shaped like Hermez's smallest public
+/// file that fits the circuits (power 16, truncated from a larger one): the
+/// withdrawal circuit's H query uses section 12's top block, computed with
+/// the power the file lacks.
+const TOY_POWER: u32 = 16;
+
 struct Toy {
     secrets: Secrets,
+    scalars: PtauScalars,
     request: ToyCircuit,
     withdrawal: ToyCircuit,
 }
@@ -250,12 +374,6 @@ impl Toy {
             KeyKind::Withdrawal => &self.withdrawal,
         }
     }
-}
-
-fn lagrange(tau: Fr, size: usize) -> Vec<Fr> {
-    Radix2EvaluationDomain::<Fr>::new(size)
-        .unwrap()
-        .evaluate_all_lagrange_coefficients(tau)
 }
 
 fn g1_batch(scalars: &[Fr]) -> Vec<G1Affine> {
@@ -274,26 +392,16 @@ fn odd(scalars: Vec<Fr>) -> Vec<Fr> {
     scalars.into_iter().skip(1).step_by(2).collect()
 }
 
-fn toy_bases(secrets: &Secrets, n: usize) -> LagrangeBases {
-    let l = lagrange(secrets.tau, n);
-    let g1 = G1Projective::generator();
-    let g2 = G2Projective::generator();
-    LagrangeBases {
-        tau_g1: g1_batch(&l),
-        tau_g2: g2_batch(&l),
-        alpha_tau_g1: g1_batch(&scaled(&l, secrets.alpha)),
-        beta_tau_g1: g1_batch(&scaled(&l, secrets.beta)),
-        h_g1: g1_batch(&odd(lagrange(secrets.tau, 2 * n))),
-        alpha_g1: (g1 * secrets.alpha).into_affine(),
-        beta_g1: (g1 * secrets.beta).into_affine(),
-        beta_g2: (g2 * secrets.beta).into_affine(),
-    }
-}
-
 /// The key `snarkjs groth16 setup` derives for `matrices` (with the
-/// instance rows it adds), after a contribution that set `δ`.
-fn toy_key(secrets: &Secrets, matrices: &ConstraintMatrices<Fr>, n: usize) -> ProvingKey<Bn254> {
-    let l = lagrange(secrets.tau, n);
+/// instance rows it adds) over the powers of tau of `scalars`, after a
+/// contribution that set `δ`.
+fn toy_key(
+    secrets: &Secrets,
+    scalars: &PtauScalars,
+    matrices: &ConstraintMatrices<Fr>,
+    n: usize,
+) -> ProvingKey<Bn254> {
+    let l = scalars.lagrange(n);
     let instance = matrices.num_instance_variables;
     let wires = instance + matrices.num_witness_variables;
     let evaluate = |matrix: &[Vec<(Fr, usize)>]| {
@@ -330,7 +438,7 @@ fn toy_key(secrets: &Secrets, matrices: &ConstraintMatrices<Fr>, n: usize) -> Pr
         a_query: g1_batch(&a),
         b_g1_query: g1_batch(&b),
         b_g2_query: g2_batch(&b),
-        h_query: g1_batch(&scaled(&odd(lagrange(secrets.tau, 2 * n)), delta_inverse)),
+        h_query: g1_batch(&scaled(&scalars.h(n), delta_inverse)),
         l_query: g1_batch(&scaled(&k[instance..], delta_inverse)),
     }
 }
@@ -345,12 +453,13 @@ fn toy() -> &'static Toy {
             beta: Fr::rand(&mut rng),
             delta: Fr::rand(&mut rng),
         };
+        let scalars = PtauScalars::truncated(TOY_POWER, &secrets);
         let circuit = |kind| {
             let matrices = circuit_matrices(kind).unwrap();
             let n = circuit_shape(kind).unwrap().domain_size;
             ToyCircuit {
-                bases: toy_bases(&secrets, n),
-                pk: toy_key(&secrets, &matrices, n),
+                bases: scalars.bases(n),
+                pk: toy_key(&secrets, &scalars, &matrices, n),
                 matrices,
             }
         };
@@ -358,6 +467,7 @@ fn toy() -> &'static Toy {
             request: circuit(KeyKind::Request),
             withdrawal: circuit(KeyKind::Withdrawal),
             secrets,
+            scalars,
         }
     })
 }
@@ -426,7 +536,7 @@ fn keys_set_up_from_another_c_matrix_are_refused() {
         assert!(changed > 0, "{kind}");
         assert_eq!((&weak.a, &weak.b), (&honest.matrices.a, &honest.matrices.b));
         let n = honest.bases.domain_size();
-        let pk = toy_key(&toy.secrets, &weak, n);
+        let pk = toy_key(&toy.secrets, &toy.scalars, &weak, n);
         // The zkey's coefficient section is the honest one (A and B agree).
         let zkey = write_zkey(&pk, &honest.matrices, Some(CEREMONY_CONTRIBUTIONS));
         let (read, coefficients) = ark_circom::read_zkey(&mut std::io::Cursor::new(&zkey)).unwrap();
@@ -545,7 +655,13 @@ fn toy_ceremony_imports_end_to_end() {
         std::fs::write(&path, bytes).unwrap();
         path
     };
-    let ptau_bytes = write_ptau(16, &[&toy.request.bases, &toy.withdrawal.bases]);
+    let ptau_bytes = write_ptau(
+        &toy.scalars,
+        &[
+            toy.request.bases.domain_size(),
+            toy.withdrawal.bases.domain_size(),
+        ],
+    );
     let ptau_sha256 = hex::encode(sha256(&ptau_bytes));
     let ptau = write("toy.ptau", &ptau_bytes);
     drop(ptau_bytes);
@@ -557,6 +673,31 @@ fn toy_ceremony_imports_end_to_end() {
         opened.lagrange_bases(1 << 15).unwrap(),
         toy.request.bases,
         "request bases"
+    );
+    // The withdrawal H query comes from section 12's top block.
+    assert_eq!(
+        opened.lagrange_bases(1 << 16).unwrap(),
+        toy.withdrawal.bases,
+        "withdrawal bases"
+    );
+    // A toy file is no public transcript.
+    assert_eq!(opened.public_transcript(PUBLIC_PTAU), None);
+    let toy_transcript = PublicPtau {
+        name: "toy.ptau",
+        power: 16,
+        blake2b512: Box::leak(hex::encode(opened.blake2b512()).into_boxed_str()),
+    };
+    assert_eq!(
+        opened.public_transcript(&[toy_transcript]),
+        Some(&toy_transcript)
+    );
+    assert_eq!(
+        opened.public_transcript(&[PublicPtau {
+            power: 17,
+            ..toy_transcript
+        }]),
+        None,
+        "the power must match too"
     );
     let request_r1cs = write("request.r1cs", &r1cs_bytes(KeyKind::Request).unwrap());
     let withdrawal_r1cs = write("withdrawal.r1cs", &r1cs_bytes(KeyKind::Withdrawal).unwrap());
@@ -580,6 +721,7 @@ fn toy_ceremony_imports_end_to_end() {
         setup_id: REHEARSAL_SETUP_ID.to_string(),
         ptau: ptau.clone(),
         expected_ptau_sha256: None,
+        public_ptau: PUBLIC_PTAU.to_vec(),
         request_r1cs: request_r1cs.clone(),
         withdrawal_r1cs: withdrawal_r1cs.clone(),
         request_zkey: request_zkey.clone(),
@@ -680,7 +822,12 @@ fn toy_ceremony_imports_end_to_end() {
     );
     // A key set up from a weakened R1CS is refused by the import too.
     let (weak, _) = weaken(&toy.request.matrices, usize::MAX);
-    let weak_pk = toy_key(&toy.secrets, &weak, toy.request.bases.domain_size());
+    let weak_pk = toy_key(
+        &toy.secrets,
+        &toy.scalars,
+        &weak,
+        toy.request.bases.domain_size(),
+    );
     let weak_zkey = write(
         "weak.zkey",
         &write_zkey(
@@ -696,14 +843,25 @@ fn toy_ceremony_imports_end_to_end() {
         },
         "does not match the circuit",
     );
-    // The ceremony setup id needs the pinned powers of tau, the transcript
-    // and zkeys that record the ceremony's contributions.
+    // The ceremony setup id needs the pinned powers of tau, which must be a
+    // public transcript, the ceremony transcript and zkeys that record the
+    // ceremony's contributions.
     let ceremony = |name: &str| ImportArgs {
         setup_id: CEREMONY_SETUP_ID.to_string(),
         expected_ptau_sha256: Some(ptau_sha256.clone()),
+        public_ptau: vec![toy_transcript],
         transcript_sha256: Some("ab".repeat(32)),
         ..fresh(name)
     };
+    // The toy powers of tau is not on the real list: a file the coordinator
+    // made (and pinned) is refused however consistent it is.
+    refused(
+        &ImportArgs {
+            public_ptau: PUBLIC_PTAU.to_vec(),
+            ..ceremony("not-public")
+        },
+        "is not a public phase-1 transcript",
+    );
     refused(
         &ImportArgs {
             transcript_sha256: None,
@@ -758,10 +916,14 @@ fn malformed_powers_of_tau_are_refused() {
         std::fs::write(&path, bytes).unwrap();
         Ptau::open(&path).map_err(|error| format!("{error:#}"))
     };
-    let small = write_ptau(3, &[]);
+    let scalars = PtauScalars::honest(3, &small_secrets(3));
+    let domains = [1, 2, 4, 8];
+    let small = write_ptau(&scalars, &domains);
     let ptau = open(&small).unwrap();
     assert_eq!(ptau.power(), 3);
-    assert!(ptau.lagrange_bases(8).is_ok());
+    for size in domains {
+        assert_eq!(ptau.lagrange_bases(size).unwrap(), scalars.bases(size));
+    }
     for size in [16, 6] {
         assert!(ptau.lagrange_bases(size).is_err(), "{size}");
     }
@@ -773,16 +935,143 @@ fn malformed_powers_of_tau_are_refused() {
     let mut other_curve = small.clone();
     other_curve[12 + 12 + 4] ^= 1;
     assert!(open(&other_curve).unwrap_err().contains("not a BN254"));
-    // A Lagrange section of the wrong size (another power), or missing (a
-    // powers of tau not prepared for phase 2).
-    let mut sections = ptau_sections(3, &[]);
-    sections.last_mut().unwrap().1.truncate(64 * 14);
-    let error = open(&binfile(b"ptau", sections)).unwrap_err();
-    assert!(error.contains("section 15 has"), "{error}");
-    let mut sections = ptau_sections(3, &[]);
+    // A section of the wrong size (another power), or a Lagrange section
+    // missing (a powers of tau not prepared for phase 2).
+    for (id, size) in [(2, 64 * 14), (3, 128 * 7), (6, 0), (15, 64 * 14)] {
+        let mut sections = ptau_sections(&scalars, &scalars, &[]);
+        sections
+            .iter_mut()
+            .find(|(section, _)| *section == id)
+            .unwrap()
+            .1
+            .truncate(size);
+        let error = open(&binfile(b"ptau", sections)).unwrap_err();
+        assert!(error.contains(&format!("section {id} has")), "{error}");
+    }
+    let mut sections = ptau_sections(&scalars, &scalars, &[]);
     sections.retain(|(id, _)| *id != 13);
     let error = open(&binfile(b"ptau", sections)).unwrap_err();
     assert!(error.contains("no section 13"), "{error}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn small_secrets(seed: u64) -> Secrets {
+    let mut rng = StdRng::seed_from_u64(seed);
+    Secrets {
+        tau: Fr::rand(&mut rng),
+        alpha: Fr::rand(&mut rng),
+        beta: Fr::rand(&mut rng),
+        delta: Fr::rand(&mut rng),
+    }
+}
+
+/// The binding gate trusts the Lagrange points of the powers of tau, so they
+/// must be what `snarkjs powersoftau prepare phase2` computes from the
+/// `τ`-power sections, and those must be powers of one `τ` (scaled by `α`
+/// and `β`). A file whose Lagrange sections alone were replaced (for
+/// example only its H points) is refused; a file one party made from its own
+/// `τ` is consistent, so only its hash ([`PUBLIC_PTAU`]) can refuse it.
+#[test]
+fn powers_of_tau_must_be_one_reference_string() {
+    let dir = scratch("srs");
+    let bases = |sections: Vec<(u32, Vec<u8>)>, size: usize| {
+        let path = dir.join("srs.ptau");
+        std::fs::write(&path, binfile(b"ptau", sections)).unwrap();
+        Ptau::open(&path)
+            .unwrap()
+            .lagrange_bases(size)
+            .map_err(|error| format!("{error:#}"))
+    };
+    let honest = PtauScalars::honest(4, &small_secrets(4));
+    let other = PtauScalars::honest(4, &small_secrets(5));
+    // Every domain, the largest using section 12's top block (32 points from
+    // 31 powers), as `prepare phase2` and as `truncate` leave it.
+    let domains = [1, 2, 4, 8, 16];
+    for scalars in [honest.clone(), PtauScalars::truncated(4, &small_secrets(4))] {
+        let sections = ptau_sections(&scalars, &scalars, &domains);
+        for size in domains {
+            assert_eq!(
+                bases(sections.clone(), size).unwrap(),
+                scalars.bases(size),
+                "{size}"
+            );
+        }
+    }
+    // Any other value for the missing power is refused.
+    let wrong_top = PtauScalars {
+        top: Fr::from(7u64),
+        ..honest.clone()
+    };
+    let error = bases(ptau_sections(&honest, &wrong_top, &[16]), 16).unwrap_err();
+    assert!(
+        error.contains("size-32 block of section 12 is not the Lagrange basis"),
+        "{error}"
+    );
+    let n = 8;
+    assert!(bases(ptau_sections(&other, &other, &[n]), n).is_ok());
+
+    // Lagrange points from another τ than sections 2-5, one block at a time.
+    let honest_sections = ptau_sections(&honest, &honest, &[n]);
+    let forged_sections = ptau_sections(&honest, &other, &[n]);
+    let splice = |id: u32, points: &[usize], width: usize| {
+        let mut sections = honest_sections.clone();
+        let forged = &forged_sections.iter().find(|(i, _)| *i == id).unwrap().1;
+        let body = &mut sections.iter_mut().find(|(i, _)| *i == id).unwrap().1;
+        for point in points {
+            let range = point * width..(point + 1) * width;
+            body[range.clone()].copy_from_slice(&forged[range]);
+        }
+        sections
+    };
+    let block = |size: usize| (size - 1..2 * size - 1).collect::<Vec<_>>();
+    let h_points: Vec<usize> = block(2 * n).into_iter().skip(1).step_by(2).collect();
+    for (what, sections, expected) in [
+        (
+            "the H points",
+            splice(12, &h_points, 64),
+            "size-16 block of section 12",
+        ),
+        (
+            "L(τ)·G1",
+            splice(12, &block(n), 64),
+            "size-8 block of section 12",
+        ),
+        ("L(τ)·G2", splice(13, &block(n), 128), "section 13"),
+        ("α·L(τ)·G1", splice(14, &block(n), 64), "section 14"),
+        ("β·L(τ)·G1", splice(15, &block(n), 64), "section 15"),
+    ] {
+        let error = bases(sections, n).unwrap_err();
+        assert!(
+            error.contains(expected) && error.contains("is not the Lagrange basis"),
+            "{what}: {error}"
+        );
+    }
+
+    // Power sections that are not powers of one τ, with Lagrange sections
+    // computed from them.
+    type Tamper = fn(&mut PtauScalars, &PtauScalars);
+    let cases: [(&str, Tamper); 7] = [
+        ("generators", |s, _| s.tau_g1[0] = Fr::from(2u64)),
+        ("section 2 does not hold", |s, _| s.tau_g1[5] += Fr::ONE),
+        ("section 3 does not hold", |s, _| s.tau_g2[3] += Fr::ONE),
+        ("section 4 does not hold", |s, _| {
+            s.alpha_tau_g1[2] += Fr::ONE
+        }),
+        ("section 5 does not hold", |s, _| {
+            s.beta_tau_g1[6] += Fr::ONE
+        }),
+        ("β·G2 (section 6)", |s, _| s.beta_g2 += Fr::ONE),
+        // G2 powers of another τ.
+        ("section 2 does not hold", |s, other| {
+            s.tau_g2 = other.tau_g2.clone()
+        }),
+    ];
+    for (expected, tamper) in cases {
+        let mut scalars = honest.clone();
+        tamper(&mut scalars, &other);
+        let error = bases(ptau_sections(&scalars, &scalars, &[n]), n).unwrap_err();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -840,7 +1129,13 @@ fn development_keys_round_trip_through_zkeys() {
 fn ceremony_zkeys_pass_the_import_gates() {
     let variable = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
     let ptau = Ptau::open(variable("ZKAPI_PTAU")).unwrap();
-    println!("ptau sha256 {}", hex::encode(ptau.sha256()));
+    println!(
+        "ptau sha256 {}, blake2b512 {}, public transcript {:?}",
+        hex::encode(ptau.sha256()),
+        hex::encode(ptau.blake2b512()),
+        ptau.public_transcript(PUBLIC_PTAU)
+            .map(|public| public.name)
+    );
     for (name, kind) in [
         ("ZKAPI_REQUEST_ZKEY", KeyKind::Request),
         ("ZKAPI_WITHDRAWAL_ZKEY", KeyKind::Withdrawal),
@@ -851,5 +1146,34 @@ fn ceremony_zkeys_pass_the_import_gates() {
         import_zkey::read_checked_zkey(Path::new(&variable(name)), kind, &bases)
             .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
         println!("{kind} zkey passes the import gates");
+    }
+}
+
+/// README steps 3 and 5: the powers of tau is a public transcript of
+/// [`PUBLIC_PTAU`] and passes the reference-string checks for both circuits'
+/// domains: `ZKAPI_PTAU=powersOfTau28_hez_final_16.ptau cargo test --release
+/// -p zkapi-proof --test zkey_import public_powers_of_tau_passes_the_import_checks
+/// -- --ignored`.
+#[test]
+#[ignore = "needs a public powers of tau in ZKAPI_PTAU"]
+fn public_powers_of_tau_passes_the_import_checks() {
+    let path = std::env::var("ZKAPI_PTAU").expect("set ZKAPI_PTAU");
+    let ptau = Ptau::open(&path).unwrap();
+    let public = ptau.public_transcript(PUBLIC_PTAU).unwrap_or_else(|| {
+        panic!(
+            "{path} (blake2b512 {}) is not a transcript of PUBLIC_PTAU",
+            hex::encode(ptau.blake2b512())
+        )
+    });
+    println!(
+        "{path} is {} (sha256 {})",
+        public.name,
+        hex::encode(ptau.sha256())
+    );
+    for kind in [KeyKind::Request, KeyKind::Withdrawal] {
+        let n = circuit_shape(kind).unwrap().domain_size;
+        ptau.lagrange_bases(n)
+            .unwrap_or_else(|error| panic!("{kind}: {error:#}"));
+        println!("{kind}: the domain of {n} points passes the reference-string checks");
     }
 }

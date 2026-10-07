@@ -12,14 +12,20 @@
 //!
 //! `--setup-id` is `mpc-1` for the ceremony and `rehearsal` for a dry run
 //! (which only `dev-setup` builds load). An `mpc-1` import also needs the
-//! pinned `--ptau-sha256`, the `--transcript-sha256`, and zkeys that record at
-//! least three contributions followed by a beacon.
+//! pinned `--ptau-sha256`, the `--transcript-sha256`, a powers of tau that is
+//! a public phase-1 transcript of `ceremony::PUBLIC_PTAU`, and zkeys that
+//! record at least three contributions followed by a beacon.
 //!
 //! Gates, all before anything is written:
 //! 1. the `.r1cs` files the ceremony used are byte for byte this build's
 //!    export (`r1cs::r1cs_bytes`), and the powers of tau hashes to
 //!    `--ptau-sha256` when given;
-//! 2. for each zkey (read with `ark_circom::read_zkey`):
+//! 2. the powers of tau: for `mpc-1`, its Blake2b-512 is the published hash
+//!    of a transcript of `ceremony::PUBLIC_PTAU` (a file the coordinator
+//!    made could hold a known `τ`, which forges every proof); and the points
+//!    the keys are checked against form one reference string
+//!    (`Ptau::lagrange_bases`);
+//! 3. for each zkey (read with `ark_circom::read_zkey`):
 //!    * coefficients: the A and B coefficient lists of zkey section 4, the
 //!      constraint count and the variable counts equal the synthesized
 //!      circuit. Our prover never reads section 4 (snarkjs's does), so this
@@ -49,7 +55,8 @@ use ark_bn254::{Bn254, Fr};
 use ark_groth16::ProvingKey;
 use ark_relations::r1cs::ConstraintMatrices;
 use zkapi_proof::ceremony::{
-    check_key_binding, zkey_contributions, Contribution, LagrangeBases, Ptau,
+    check_key_binding, zkey_contributions, Contribution, LagrangeBases, Ptau, PublicPtau,
+    PUBLIC_PTAU,
 };
 use zkapi_proof::compact::{
     circuit_shape, request_circuit, sha256, withdrawal_circuit, write_setup_directory, KeyKind,
@@ -74,6 +81,9 @@ pub struct ImportArgs {
     pub ptau: PathBuf,
     /// The pinned SHA-256 (hex) of `ptau`, required for `mpc-1`.
     pub expected_ptau_sha256: Option<String>,
+    /// The public transcripts an `mpc-1` powers of tau must be one of:
+    /// [`PUBLIC_PTAU`] (tests substitute their toy file).
+    pub public_ptau: Vec<PublicPtau>,
     /// The `.r1cs` files `snarkjs groth16 setup` and `zkey verify` used.
     pub request_r1cs: PathBuf,
     pub withdrawal_r1cs: PathBuf,
@@ -313,6 +323,7 @@ pub fn import(args: &ImportArgs) -> Result<SetupManifest> {
     }
     let ptau = Ptau::open(&args.ptau)?;
     let ptau_sha256 = hex::encode(ptau.sha256());
+    let ptau_blake2b512 = hex::encode(ptau.blake2b512());
     if let Some(expected) = &args.expected_ptau_sha256 {
         ensure!(
             *expected == ptau_sha256,
@@ -320,6 +331,26 @@ pub fn import(args: &ImportArgs) -> Result<SetupManifest> {
             args.ptau.display()
         );
     }
+    let public = ptau.public_transcript(&args.public_ptau);
+    if ceremony {
+        ensure!(
+            public.is_some(),
+            "{} (power {}, blake2b512 {ptau_blake2b512}) is not a public phase-1 transcript of \
+             ceremony::PUBLIC_PTAU: whoever made a powers of tau alone can forge every proof of \
+             a {CEREMONY_SETUP_ID} setup built on it. Use a listed file as its publisher \
+             published it",
+            args.ptau.display(),
+            ptau.power()
+        );
+    }
+    println!(
+        "powers of tau {}: power {}, sha256 {ptau_sha256}, blake2b512 {ptau_blake2b512}, {}",
+        args.ptau.display(),
+        ptau.power(),
+        public.map_or("not a listed public transcript".to_string(), |public| {
+            format!("the public transcript {}", public.name)
+        })
+    );
     check_r1cs_file(&args.request_r1cs, KeyKind::Request)?;
     check_r1cs_file(&args.withdrawal_r1cs, KeyKind::Withdrawal)?;
 
@@ -389,6 +420,7 @@ fn parse_args() -> Result<ImportArgs> {
         setup_id: setup_id.context("--setup-id (mpc-1 or rehearsal) is required")?,
         ptau: ptau.context("--ptau FILE is required")?,
         expected_ptau_sha256,
+        public_ptau: PUBLIC_PTAU.to_vec(),
         request_r1cs: request_r1cs.context("--request-r1cs FILE is required")?,
         withdrawal_r1cs: withdrawal_r1cs.context("--withdrawal-r1cs FILE is required")?,
         request_zkey: request.context("--request ZKEY is required")?,

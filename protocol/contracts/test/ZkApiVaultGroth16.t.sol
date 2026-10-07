@@ -6,6 +6,7 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
+import {Events} from "../src/libraries/Events.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 
@@ -375,11 +376,51 @@ contract ZkApiVaultGroth16Test is Test {
         assertNotEq(vault.currentRoot(), rootA);
         assertGt(vm.getBlockTimestamp(), uint256(vault.rootRetiredAt(rootA)) + vault.ROOT_HISTORY_WINDOW());
 
-        (Types.WithdrawalPublicInputs memory escape,) = _initiate("escape_a2_at_root_a");
+        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2_at_root_a");
         assertEq(escape.activeRoot, rootA);
+        // The event's root word is the live root, not the proof's.
+        _expectInitiated(escape, vault.currentRoot());
+        _initiate("escape_a2_at_root_a");
         vm.warp(_deadline(0));
         vault.finalizeEscapeWithdrawal(0);
         assertEq(USER.balance, 6 * uint256(DEPOSIT) * 1 gwei + uint256(DEPOSIT + B2) * 1 gwei);
+    }
+
+    /// The events of an escape at A's deposit-time root report the root live when each lands: at
+    /// initiation (after B's deposit) and at the defeat by R3 (after C's deposit), never the
+    /// proof's root, which the indexer and the clients' log rebuild would reject.
+    function test_realDepositTimeRootEscapeEventsReportTheLiveRoot() public {
+        _depositA();
+        uint256 rootA = vault.currentRoot();
+        _depositB();
+        uint256 rootAtInitiation = vault.currentRoot();
+        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2_at_root_a");
+        assertEq(escape.activeRoot, rootA);
+        assertNotEq(rootAtInitiation, rootA);
+        _expectInitiated(escape, rootAtInitiation);
+        _initiate("escape_a2_at_root_a");
+        (, uint256 pendingRoot,,,,) = vault.pendingWithdrawals(0);
+        assertEq(pendingRoot, rootA);
+
+        _depositOther(2, 0x1234);
+        uint256 rootAtDefeat = vault.currentRoot();
+        assertNotEq(rootAtDefeat, rootAtInitiation);
+        vm.expectEmit(address(vault));
+        emit Events.EscapeWithdrawalChallenged(0, escape.withdrawalNullifier, rootAtDefeat);
+        _defeat("request_a3");
+        assertEq(vault.currentRoot(), rootAtDefeat);
+    }
+
+    function _expectInitiated(Types.WithdrawalPublicInputs memory escape, uint256 liveRoot) private {
+        vm.expectEmit(address(vault));
+        emit Events.EscapeWithdrawalInitiated(
+            escape.noteId,
+            escape.withdrawalNullifier,
+            escape.finalBalance,
+            escape.destination,
+            uint64(vm.getBlockTimestamp()) + vault.challengePeriod(),
+            liveRoot
+        );
     }
 
     /// The close uses B's deposit-time root (A and B) after C's and D's deposits, A's escape and

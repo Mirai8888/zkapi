@@ -76,8 +76,11 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
-    /// The escape's root word is the proof's root, not the live one, and an unrelated deposit
-    /// mined first changes nothing about the escape.
+    /// An unrelated deposit mined first changes nothing about the escape. The pending record keeps
+    /// the proof's root, but the events report the live root: the indexer and the clients' log
+    /// rebuild require every root-bearing event other than NoteDeposited and ClosedLeafRetired to
+    /// carry the current computed root. A defeat after a further deposit reports the root live at
+    /// the defeat, neither the proof's root nor the one live at initiation.
     function test_depositLandingFirstDoesNotInvalidateTheEscape() public {
         uint32 id = _deposit(42);
         Types.WithdrawalPublicInputs memory inputs = _escapeFrom(id, 2, B2, 0);
@@ -86,10 +89,24 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         _deposit(44);
         assertNotEq(vault.currentRoot(), proofRoot);
         uint256 liveRoot = vault.currentRoot();
+        uint64 deadline = uint64(vm.getBlockTimestamp()) + CHALLENGE_PERIOD;
+        vm.expectEmit(address(vault));
+        emit Events.EscapeWithdrawalInitiated(id, N(2), B2, user, deadline, liveRoot);
         _initiate(inputs);
         (, uint256 activeRoot,,,,) = vault.pendingWithdrawals(id);
         assertEq(activeRoot, proofRoot);
         assertEq(vault.currentRoot(), liveRoot);
+
+        _deposit(45);
+        uint256 defeatRoot = vault.currentRoot();
+        assertNotEq(defeatRoot, liveRoot);
+        assertNotEq(defeatRoot, proofRoot);
+        Types.RequestPublicInputs memory request = _evidence(N(3), SB2);
+        vm.expectEmit(address(vault));
+        emit Events.EscapeWithdrawalChallenged(id, N(2), defeatRoot);
+        vm.prank(challenger);
+        vault.challengeEscapeWithdrawal(id, request, PROOF);
+        assertEq(vault.currentRoot(), defeatRoot);
     }
 
     function test_escapeAcceptsOnlyKindZero() public {

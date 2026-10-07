@@ -167,7 +167,7 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 		return fundingConfig{}, errors.New("invalid funding network or contract")
 	}
 	if wire.BillingAsset == "native_eth" {
-		deployment, _, deploymentErr := pinnedDeployment(h.client.config.Network)
+		deployment, _, deploymentErr := deployedDeployment(h.client.config.Network)
 		if deploymentErr != nil || wire.DeploymentID != deployment.ID || wire.ChainID != deployment.ChainID || !strings.EqualFold(wire.Contract, deployment.Contract) || wire.BillingAsset != deployment.Asset || wire.BillingUnit != deployment.Unit {
 			return fundingConfig{}, errors.New("native funding configuration does not match the packaged deployment")
 		}

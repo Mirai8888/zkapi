@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -183,7 +184,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		if !strings.EqualFold(tx.To().Hex(), expected) {
 			return nil, errors.New("payment transaction recovery destination is invalid; preserve the file")
 		}
-		if entry.Kind == "withdrawal" && (len(tx.Data()) != 4+56*32 || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
+		if entry.Kind == "withdrawal" && (len(tx.Data()) != withdrawalCalldataLength || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
 			return nil, errors.New("withdrawal transaction recovery call is invalid; preserve the file")
 		}
 		if entry.Kind == "withdrawal" {
@@ -192,7 +193,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 				return nil, errors.New("pending withdrawal authorization is invalid; preserve the file")
 			}
 			if pending || (record.Withdrawal != nil && strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash)) {
-				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal); err != nil {
+				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal, time.Time{}); err != nil {
 					return nil, err
 				}
 			}

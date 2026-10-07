@@ -707,6 +707,14 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 	if err := h.assertAddressChain(ctx, config); err != nil {
 		return err
 	}
+	// Design §6.7: before every deposit, the deployment on chain must be the
+	// pinned one (codehashes, adapter, getters), through the pinned RPC and
+	// the owner's exit RPC. Exits are never refused this way.
+	if kind == "deposit" {
+		if err := h.client.CheckDeployment(ctx); err != nil {
+			return err
+		}
+	}
 	nonce, err := h.addressQuantity(ctx, config, "eth_getTransactionCount", []any{record.Address, "pending"})
 	if err != nil {
 		return err

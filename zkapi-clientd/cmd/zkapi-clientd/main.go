@@ -162,7 +162,7 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, ExitRPCURL: c.ZKAPI.ExitRPCURL}
 }
 
 type zkInference struct{ *zkapi.Client }
@@ -267,7 +267,10 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			return err
 		}
 		defer proxy.Close()
-		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password})
+		if warning := zkapi.LegacyWalletWarning(filepath.Join(dir, "zkapi"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
+		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password, ExitRPCURL: c.ZKAPI.ExitRPCURL})
 		if err != nil {
 			return err
 		}
@@ -297,6 +300,15 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	if err != nil {
 		return err
 	}
+	// Design §6.7: check the deployment on chain at startup (deposits check
+	// again before signing). A mismatch refuses deposits; exits stay open.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(life, 2*time.Minute)
+		defer cancel()
+		if err := wallet.CheckDeployment(checkCtx); err != nil {
+			logger.Printf("zkAPI deployment check: %v", err)
+		}
+	}()
 	api, err := server.New(backend, c.APIKey, c.Concurrency)
 	if err != nil {
 		return err

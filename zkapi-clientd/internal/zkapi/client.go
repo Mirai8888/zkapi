@@ -38,6 +38,9 @@ type Config struct {
 	InferenceBaseURL string        `json:"inference_base_url"`
 	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
 	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
+	// ExitRPCURL is the user's own Ethereum RPC (--exit-rpc-url): deployment
+	// checks also run through it, and exit transactions are sent through it.
+	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
 }
 
 type Client struct {
@@ -68,7 +71,7 @@ func (c *Client) packagedEndpoints() (chainEndpoints, error) {
 	if c.endpoints != nil {
 		return *c.endpoints, nil
 	}
-	deployment, _, err := pinnedDeployment(c.config.Network)
+	deployment, _, err := deployedDeployment(c.config.Network)
 	if err != nil {
 		return chainEndpoints{}, err
 	}
@@ -79,7 +82,7 @@ func (c *Client) clearanceOwnershipRequired() (bool, error) {
 	if c.capabilities != nil {
 		return c.capabilities.requiresClearanceOwnershipProof(), nil
 	}
-	deployment, _, err := pinnedDeployment(c.config.Network)
+	deployment, _, err := deployedDeployment(c.config.Network)
 	if err != nil {
 		return false, err
 	}
@@ -314,20 +317,29 @@ func (c *Client) Check(ctx context.Context) error {
 		BillingAsset  string `json:"billing_asset"`
 		BillingUnit   string `json:"billing_unit"`
 		CircuitID     string `json:"circuit_id"`
+		// Bridge 5: the concession exit, its escape routes and the setup
+		// the companion's keys belong to.
+		ExitConcession int    `json:"exit_concession"`
+		SetupID        string `json:"setup_id"`
+		EscapeRoutes   int    `json:"escape_routes_version"`
 	}
 	if json.Unmarshal(data, &result) != nil {
 		return &Error{http.StatusBadGateway, "invalid_companion_response"}
 	}
 	expected, _ := ChainID(c.config.Network)
-	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != 4 {
+	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != CompanionBridgeVersion || result.ExitConcession != 1 || result.EscapeRoutes < 1 {
 		return &Error{http.StatusBadGateway, "companion_policy_mismatch"}
 	}
-	deployment, _, err := pinnedDeployment(c.config.Network)
-	if err != nil || result.DeploymentID != deployment.ID || !strings.EqualFold(result.Contract, deployment.Contract) || result.BillingAsset != deployment.Asset || result.BillingUnit != deployment.Unit || result.CircuitID != deployment.Proof.Circuit {
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil || result.DeploymentID != deployment.ID || !strings.EqualFold(result.Contract, deployment.Contract) || result.BillingAsset != deployment.Asset || result.BillingUnit != deployment.Unit || result.CircuitID != deployment.Proof.Circuit || result.SetupID != deployment.Proof.SetupID {
 		return &Error{http.StatusBadGateway, "companion_deployment_mismatch"}
 	}
 	return nil
 }
+
+// CompanionBridgeVersion is the bridge the companion must speak: 5 is circuit
+// zkapi-v2-concession-v1 with the escape routes.
+const CompanionBridgeVersion = 5
 
 // Complete passes the caller's JSON unchanged over the anonymous HTTP client.
 // Raw SSE bytes remain available to the gateway immediately; no fake streaming

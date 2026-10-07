@@ -19,7 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-const addressTestVault = "0x4386fdbda35d995beb3bf8625118ec5982ec81fe"
+const addressTestVault = "0xc0c0000000000000000000000000000000000001"
 const addressTestToken = "0x2222222222222222222222222222222222222222"
 
 // addressTestBlock is the hash of the fixture's canonical block 0x20, whose
@@ -76,6 +76,8 @@ type addressFixture struct {
 	// lowercase destination address; a missing destination reads zero.
 	escapeCredits map[string]string
 	creditReads   int
+	// codeTamper makes the RPC serve other runtime code at the vault.
+	codeTamper bool
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -179,6 +181,15 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		}
 		f.rpcCalls = append(f.rpcCalls, request.Method)
 		var result any
+		// The deployment checks before a deposit read the fixture vault's
+		// code and getters.
+		if answer, ok := deploymentCheckAnswer("mainnet", request.Method, request.Params); ok {
+			if f.codeTamper && request.Method == "eth_getCode" && answer == fixtureCode["vault"] {
+				answer = "0x60016001"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": answer})
+			return
+		}
 		switch request.Method {
 		case "eth_chainId":
 			result = f.chain

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -92,6 +93,8 @@ type withdrawalBridgeStatus struct {
 	EscapePayoutCredited bool `json:"escape_payout_credited"`
 }
 
+// withdrawalInputs is the 16-field statement of circuit
+// zkapi-v2-concession-v1 (WithdrawalPublicInputsV2C), in public-input order.
 type withdrawalInputs struct {
 	ProtocolVersion uint64  `json:"protocol_version"`
 	ChainID         uint64  `json:"chain_id"`
@@ -105,9 +108,24 @@ type withdrawalInputs struct {
 	FinalBalance    uint64  `json:"final_balance"`
 	Destination     []uint8 `json:"destination"`
 	Nullifier       string  `json:"withdrawal_nullifier"`
-	HasClearance    bool    `json:"has_clearance"`
-	WithdrawalTag   string  `json:"withdrawal_tag"`
+	Kind            uint64  `json:"kind"`
+	NextNullifier   string  `json:"next_nullifier"`
+	Conceded        uint64  `json:"conceded"`
+	ValidUntil      uint64  `json:"valid_until"`
 }
+
+// withdrawalTuple is the vault's WithdrawalPublicInputs tuple.
+const withdrawalTuple = "(uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,uint8,uint256,uint128,uint64)"
+
+// exitProofValidity is how long the vault accepts an escape or close proof;
+// a proof is signed only while its valid_until is within this (plus a small
+// clock allowance) of now.
+const exitProofValidity = 10_800
+const exitProofClockAllowance = 300
+
+// withdrawalCalldataLength is selector | 16 tuple words | offset | length |
+// 8 proof words: 836 bytes.
+const withdrawalCalldataLength = 4 + 26*32
 
 type withdrawalPlan struct {
 	Mode         string           `json:"mode"`
@@ -119,7 +137,7 @@ type withdrawalPlan struct {
 	} `json:"proof"`
 }
 
-var withdrawalSelector = hex.EncodeToString(crypto.Keccak256([]byte("mutualClose((uint16,uint64,address,uint256,uint256,uint256,uint256,uint256,uint32,uint128,address,uint256,bool,uint256),bytes,uint256[32])"))[:4])
+var withdrawalSelector = hex.EncodeToString(crypto.Keccak256([]byte("mutualClose(" + withdrawalTuple + ",bytes)"))[:4])
 var withdrawalEventTopic = crypto.Keccak256Hash([]byte("MutualClose(uint32,uint256,uint128,address)")).Hex()
 
 // A finalized escape of the same reservation pays the same nullifier, final
@@ -271,7 +289,7 @@ func CheckWithdrawalDestination(chainID uint64, destination string) error {
 		if chain, _ := ChainID(network); chain != chainID {
 			continue
 		}
-		deployment, _, err := pinnedDeployment(network)
+		deployment, _, err := deployedDeployment(network)
 		if err == nil && isHex(destination, 20) && common.HexToAddress(destination) == common.HexToAddress(deployment.Contract) {
 			return errWithdrawalToVault
 		}
@@ -748,37 +766,53 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
-	if plan.Mode != "mutual" || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || !p.HasClearance || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.Destination) || p.FinalBalance > previousBalance || len(plan.Siblings) != 32 || plan.Proof.Backend != "groth16_bn254" {
+	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.Destination) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
 		return "", "", invalid
 	}
-	proof, err := base64.StdEncoding.DecodeString(plan.Proof.Proof)
-	if err != nil || len(proof) != 256 {
+	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.Destination)
+	if err != nil {
 		return "", "", invalid
 	}
-	fields := []string{p.ActiveRoot, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.WithdrawalTag}
-	for _, field := range append(fields, plan.Siblings...) {
-		if !isField(field) {
-			return "", "", invalid
-		}
-	}
-	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.ActiveRoot), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(saved.Destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", 1), addressABIWord(p.WithdrawalTag)}
-	for i := range words {
-		words[i] = strings.ToLower(words[i])
-	}
-	// Roots/path may change while a transaction waits; all other public
-	// inputs must remain identical after the first proof was authorized.
-	bound := append([]string{}, words...)
-	bound[3] = ""
-	binding := crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex()
+	binding := withdrawalBinding(words)
 	if saved.Binding != "" && (saved.Binding != binding || saved.Amount != p.FinalBalance || !strings.EqualFold(addressABIWord(saved.Nullifier), addressABIWord(p.Nullifier))) {
 		return "", "", invalid
 	}
-	words = append(words, fmt.Sprintf("%064x", 47*32))
-	for _, sibling := range plan.Siblings {
-		words = append(words, addressABIWord(sibling))
+	data := "0x" + withdrawalSelector + strings.Join(words, "") + fmt.Sprintf("%064x%064x", 17*32, len(proof)) + hex.EncodeToString(proof)
+	raw, _ := hex.DecodeString(data[2:])
+	expected := *saved
+	expected.Amount, expected.Nullifier, expected.Binding = p.FinalBalance, "0x"+addressABIWord(p.Nullifier), binding
+	if err := validateSignedWithdrawal(raw, config, &expected, time.Now()); err != nil {
+		return "", "", invalid
 	}
-	words = append(words, fmt.Sprintf("%064x", len(proof)), hex.EncodeToString(proof))
-	return "0x" + withdrawalSelector + strings.Join(words, ""), binding, nil
+	return data, binding, nil
+}
+
+// withdrawalWords is the 16 tuple words of p, with destination as the
+// payout address, and the 256 proof bytes.
+func withdrawalWords(p withdrawalInputs, encodedProof, destination string) ([]string, []byte, error) {
+	proof, err := base64.StdEncoding.DecodeString(encodedProof)
+	if err != nil || len(proof) != 256 {
+		return nil, nil, errors.New("invalid proof")
+	}
+	for _, field := range []string{p.ActiveRoot, p.StateKeyX, p.StateKeyY, p.ClearanceKeyX, p.ClearanceKeyY, p.Nullifier, p.NextNullifier} {
+		if !isField(field) {
+			return nil, nil, errors.New("invalid field")
+		}
+	}
+	words := []string{fmt.Sprintf("%064x", p.ProtocolVersion), fmt.Sprintf("%064x", p.ChainID), addressABIWord(p.Contract), addressABIWord(p.ActiveRoot), addressABIWord(p.StateKeyX), addressABIWord(p.StateKeyY), addressABIWord(p.ClearanceKeyX), addressABIWord(p.ClearanceKeyY), fmt.Sprintf("%064x", p.NoteID), fmt.Sprintf("%064x", p.FinalBalance), addressABIWord(destination), addressABIWord(p.Nullifier), fmt.Sprintf("%064x", p.Kind), addressABIWord(p.NextNullifier), fmt.Sprintf("%064x", p.Conceded), fmt.Sprintf("%064x", p.ValidUntil)}
+	for i := range words {
+		words[i] = strings.ToLower(words[i])
+	}
+	return words, proof, nil
+}
+
+// withdrawalBinding is the keccak of the 16 tuple words with the root (word
+// 3) and valid_until (word 15) blanked: a re-proof at another root or with a
+// fresh lifetime keeps every other public input of the authorized exit.
+func withdrawalBinding(words []string) string {
+	bound := append([]string{}, words[:16]...)
+	bound[3], bound[15] = "", ""
+	return crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex()
 }
 
 // withdrawalPayout is what a matching payout receipt shows.
@@ -827,27 +861,43 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 	return withdrawalPayout{}, errors.New("finalized receipt does not match the saved withdrawal; preserve recovery files")
 }
 
-func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord) error {
+// validateSignedWithdrawal checks signed mutualClose calldata against the
+// saved authorization: 836 bytes; the fixed words 0, 1, 2, 8, 9, 10 and 11;
+// kind 1 with no successor nullifier and no concession; the bytes offset and
+// length; and the binding over the 16 tuple words with words 3 and 15
+// blanked. With a nonzero now (before signing), valid_until (word 15) must
+// also lie in [now, now + 10,800 + 300].
+func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) error {
 	invalid := errors.New("signed withdrawal does not match its saved authorization; preserve recovery files")
-	if saved == nil || len(data) != 4+56*32 || hex.EncodeToString(data[:4]) != withdrawalSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) {
+	if saved == nil || len(data) != withdrawalCalldataLength || hex.EncodeToString(data[:4]) != withdrawalSelector || saved.Binding == "" || !isHex(saved.Nullifier, 32) {
 		return invalid
 	}
-	words := make([]string, 48)
+	words := make([]string, 18)
 	for i := range words {
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.Destination), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 14: fmt.Sprintf("%064x", 47*32), 47: fmt.Sprintf("%064x", 256)}
+	zero := strings.Repeat("0", 64)
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.Destination), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
 		}
 	}
-	bound := words[:14]
-	bound[3] = ""
-	if crypto.Keccak256Hash([]byte(strings.Join(bound, ""))).Hex() != saved.Binding {
+	if !now.IsZero() && !validUntilInWindow(words[15], now) {
+		return invalid
+	}
+	if withdrawalBinding(words) != saved.Binding {
 		return invalid
 	}
 	return nil
+}
+
+// validUntilInWindow reports whether the valid_until word lies in
+// [now, now + 10,800 + 300].
+func validUntilInWindow(word string, now time.Time) bool {
+	validUntil, ok := new(big.Int).SetString(word, 16)
+	current := now.Unix()
+	return ok && validUntil.IsInt64() && validUntil.Int64() >= current && validUntil.Int64() <= current+exitProofValidity+exitProofClockAllowance
 }
 
 func (h *FundingHandler) archiveWithdrawnDeposit(config fundingConfig, record *addressFundingRecord) error {

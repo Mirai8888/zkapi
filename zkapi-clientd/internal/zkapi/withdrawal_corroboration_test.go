@@ -14,16 +14,17 @@ import (
 )
 
 func TestWithdrawalRequiresClearanceOwnershipCapability(t *testing.T) {
-	t.Run("shipped manifest keeps the gate inactive", func(t *testing.T) {
+	t.Run("the concession deployment requires the capability", func(t *testing.T) {
 		f := newWithdrawalFixture(t)
-		f.withdraw(t) // The companion reports no clearance_ownership_proof_version.
+		f.withdraw(t) // The companion reports clearance_ownership_proof_version 1.
 		if f.prepareCalls != 1 {
-			t.Fatal("an absent capability blocked a legacy deployment's withdrawal")
+			t.Fatal("a capable companion could not withdraw")
 		}
 	})
-	for _, capability := range []deploymentCapabilities{{VaultRevision: 2}, {ClearanceOwnershipProof: "required"}, {ClearanceOwnershipProof: "optional"}} {
+	for _, capability := range []deploymentCapabilities{{VaultRevision: 3, ClearanceOwnershipProof: "required"}, {VaultRevision: 2}, {ClearanceOwnershipProof: "optional"}} {
 		t.Run(fmt.Sprintf("%+v", capability), func(t *testing.T) {
 			f := newWithdrawalFixture(t)
+			f.ownershipProofVersion = 0
 			f.h.client.capabilities = &capability
 			before := f.journal(t)
 			if _, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID); err == nil || !strings.Contains(err.Error(), "ownership proofs") {

@@ -775,7 +775,7 @@ func plausibleExpiries(from, now int64, ttl uint64) []uint64 {
 }
 
 func (h *FundingHandler) noteTTL() (uint64, error) {
-	deployment, _, err := pinnedDeployment(h.client.config.Network)
+	deployment, _, err := deployedDeployment(h.client.config.Network)
 	if err != nil {
 		return 0, err
 	}

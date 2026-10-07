@@ -64,6 +64,12 @@ type addressTransaction struct {
 	Nonce             uint64 `json:"nonce"`
 	FinalizedRevert   bool   `json:"finalized_revert,omitempty"`
 	ApprovedFeeWei    string `json:"approved_fee_wei,omitempty"`
+	// SignedAt is when the transaction was signed (Unix seconds; 0 in
+	// records of earlier builds).
+	SignedAt int64 `json:"signed_at,omitempty"`
+	// Unmined marks an escape transaction retired without a receipt once
+	// it could no longer be included (deadEscapeTransaction).
+	Unmined bool `json:"unmined,omitempty"`
 }
 
 func (h *FundingHandler) addressStatePath() string {
@@ -120,8 +126,13 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 	} else if record.Version != 1 || record.BillingAsset == "native_eth" {
 		return nil, errors.New("native payment recovery cannot be used for token funding; preserve the recovery file")
 	}
-	if record.Pending != nil && record.Pending.FinalizedRevert {
+	if record.Pending != nil && (record.Pending.FinalizedRevert || record.Pending.Unmined) {
 		return nil, errors.New("pending payment is incorrectly marked as retired; preserve the recovery file")
+	}
+	for _, entry := range record.History {
+		if entry.Unmined && (entry.FinalizedRevert || entry.ActualFeeWei != "" || !escapeKinds[entry.Kind]) {
+			return nil, errors.New("an unmined payment record is invalid; preserve the recovery file")
+		}
 	}
 	for _, entry := range append(append([]addressTransaction{}, record.History...), pendingAddressTransaction(record.Pending)...) {
 		encoded, decodeErr := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))

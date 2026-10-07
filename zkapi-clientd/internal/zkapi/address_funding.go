@@ -66,9 +66,9 @@ func (h *FundingHandler) addressSnapshot(ctx context.Context) (fundingConfig, *a
 	return h.addressSnapshotFor(ctx, false)
 }
 
-// addressSnapshotFor is addressSnapshot, read through the owner's exit RPC
-// first (exitConfig) for an escape: when exit is set, or when the saved
-// withdrawal is an escape.
+// addressSnapshotFor is addressSnapshot, read only through the owner's exit
+// RPC when one is configured (exitConfig) for an escape: when exit is set,
+// or when the saved withdrawal is an escape.
 func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, AddressFundingStatus, error) {
 	config, err := h.config(ctx)
 	if err != nil {
@@ -650,12 +650,38 @@ func addressABIWord(value string) string {
 	return strings.Repeat("0", 64-len(value)) + value
 }
 
+// errAddressRPCUnavailable is a payment RPC that did not answer: a transport
+// failure, or an HTTP status other than 200 (a 429 rate limit, a 5xx).
+var errAddressRPCUnavailable = errors.New("payment RPC unavailable; retry the saved funding attempt")
+
+// errExitRPCUnavailable is the owner's exit RPC failing after its retries.
+var errExitRPCUnavailable = errors.New("the exit RPC (--exit-rpc-url) did not answer; nothing was read from or sent through another RPC in its place. Retry, or configure another exit RPC")
+
+// exitRPCRetryDelays are the waits before each retry of an exit RPC call
+// that did not answer (exitConfig).
+var exitRPCRetryDelays = []time.Duration{time.Second, 3 * time.Second}
+
 func (h *FundingHandler) addressRPC(ctx context.Context, config fundingConfig, method string, params []any, result any) error {
-	err := h.addressRPCAt(ctx, config.RPC, method, params, result)
-	if err != nil && config.FallbackRPC != "" {
-		return h.addressRPCAt(ctx, config.FallbackRPC, method, params, result)
+	if !config.exitOnly {
+		return h.addressRPCAt(ctx, config.RPC, method, params, result)
 	}
-	return err
+	// An escape through the owner's exit RPC: a call it did not answer is
+	// retried there, never asked of the pinned RPC (exitConfig). An answer
+	// it refused (a JSON-RPC error) is final, as for any RPC.
+	for attempt := 0; ; attempt++ {
+		err := h.addressRPCAt(ctx, config.RPC, method, params, result)
+		if !errors.Is(err, errAddressRPCUnavailable) {
+			return err
+		}
+		if attempt == len(exitRPCRetryDelays) {
+			return errExitRPCUnavailable
+		}
+		select {
+		case <-ctx.Done():
+			return errExitRPCUnavailable
+		case <-time.After(exitRPCRetryDelays[attempt]):
+		}
+	}
 }
 
 func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, params []any, result any) error {
@@ -671,12 +697,12 @@ func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, p
 	// and never reflect RPC errors, request bodies, or signed bytes to callers.
 	response, err := h.client.inference.Do(req)
 	if err != nil {
-		return errors.New("payment RPC unavailable; retry the saved funding attempt")
+		return errAddressRPCUnavailable
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil || len(raw) > 1<<20 || response.StatusCode != http.StatusOK {
-		return errors.New("payment RPC unavailable; retry the saved funding attempt")
+		return errAddressRPCUnavailable
 	}
 	var envelope struct {
 		Version string          `json:"jsonrpc"`
@@ -755,10 +781,17 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		return err
 	}
 	if confirmedNonce.Cmp(nonce) != 0 {
-		return errors.New("an unsettled public transaction exists; recover it before signing another")
+		// The one unsettled transaction may be an escape this client
+		// retired unmined (its proof expired before inclusion, design §6.4
+		// E4 step 7): the next escape transaction replaces it at its nonce.
+		if !escapeKinds[kind] || !confirmedNonce.IsUint64() || nonce.Uint64() != confirmedNonce.Uint64()+1 || unminedEscapeFees(record, confirmedNonce.Uint64()) == nil {
+			return errors.New("an unsettled public transaction exists; recover it before signing another")
+		}
+		nonce = confirmedNonce
 	}
 	for _, previous := range record.History {
-		if previous.Nonce >= nonce.Uint64() {
+		// An escape retired unmined never took its nonce.
+		if previous.Nonce >= nonce.Uint64() && !previous.Unmined {
 			return errors.New("the payment RPC has not caught up with saved transactions; no new transaction was sent")
 		}
 	}
@@ -820,6 +853,12 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		if err != nil {
 			return err
 		}
+		// An escape transaction is never signed below its entry point's
+		// measured cost, whatever the estimate: one that runs out of gas
+		// reverts, and a reverted escape costs another proof release.
+		if escapeKinds[kind] && gasLimit < escapeGasLimits[kind] {
+			gasLimit = escapeGasLimits[kind]
+		}
 	} else if escapeKinds[kind] {
 		// Design §6.4 E4 step 5: for an exit the simulation is advisory. A
 		// failed or refused simulation is shown, and the owner may sign at
@@ -841,6 +880,19 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 	fees, err := h.addressLowFees(ctx, config, gasLimit)
 	if err != nil {
 		return err
+	}
+	// Replacing an escape retired unmined at this nonce, which a mempool
+	// may still hold: its fee cap and tip are raised by more than the 10%
+	// a node requires to accept the replacement.
+	if floor := unminedEscapeFees(record, nonce.Uint64()); floor != nil {
+		for _, fee := range []*big.Int{fees.Max, fees.Minimum} {
+			if fee.Cmp(floor.Max) < 0 {
+				fee.Set(floor.Max)
+			}
+		}
+		if fees.Tip.Cmp(floor.Tip) < 0 {
+			fees.Tip.Set(floor.Tip)
+		}
 	}
 	balance, err := h.addressQuantity(ctx, config, "eth_getBalance", []any{record.Address, "pending"})
 	if err != nil {
@@ -923,7 +975,7 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 	if err != nil {
 		return errors.New("cannot encode payment transaction")
 	}
-	record.Pending = &addressTransaction{Kind: kind, Raw: "0x" + hex.EncodeToString(raw), Hash: signed.Hash().Hex(), Nonce: nonce.Uint64()}
+	record.Pending = &addressTransaction{Kind: kind, Raw: "0x" + hex.EncodeToString(raw), Hash: signed.Hash().Hex(), Nonce: nonce.Uint64(), SignedAt: time.Now().Unix()}
 	if kind == "return" {
 		record.Pending.ReturnDestination = to
 		record.Pending.ReturnValueWei = value.String()

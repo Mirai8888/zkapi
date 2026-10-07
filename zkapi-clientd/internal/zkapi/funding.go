@@ -41,22 +41,25 @@ type fundingConfig struct {
 	Indexer         string `json:"indexer_url"`
 	DemoMintEnabled bool   `json:"demo_mint_enabled"`
 	// ExitRPC is the owner's own RPC (--exit-rpc-url): an escape reads the
-	// chain and sends its transactions through it when it is set.
+	// chain and sends its transactions only through it when it is set.
 	ExitRPC string `json:"-"`
-	// FallbackRPC is asked when RPC fails: the pinned RPC behind an escape's
-	// exit RPC (see exitConfig).
-	FallbackRPC string `json:"-"`
+	// exitOnly marks an escape's config whose RPC is the owner's exit RPC
+	// (see exitConfig): its failures are retried, never answered elsewhere.
+	exitOnly bool
 }
 
-// exitConfig is config for an escape (design §1.2(6), §6.7): every read and
-// send goes through the owner's exit RPC when one is configured, and through
-// the pinned RPC, which the operator may run or influence (§2.1), only when
-// the exit RPC fails. An escape then never waits on the pinned RPC.
+// exitConfig is config for an escape (design §1.2(6), §6.7): when the owner
+// configured an exit RPC, every read and send goes through it alone. The
+// pinned RPC, which the operator may run or influence (§2.1), is never
+// asked in its place: an answer it gave while the exit RPC failed (a nonce,
+// a gas estimate, a receipt, the chain ID) would decide what is signed and
+// what the escape's state is. A failing exit RPC is retried a few times
+// (addressRPC), then reported; the owner retries, or configures another.
 func (c fundingConfig) exitConfig() fundingConfig {
-	if c.ExitRPC == "" || c.ExitRPC == c.RPC {
+	if c.ExitRPC == "" {
 		return c
 	}
-	c.FallbackRPC, c.RPC = c.RPC, c.ExitRPC
+	c.RPC, c.exitOnly = c.ExitRPC, true
 	return c
 }
 

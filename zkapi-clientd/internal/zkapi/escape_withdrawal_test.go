@@ -3,9 +3,11 @@ package zkapi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -14,9 +16,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -536,9 +540,11 @@ func TestAnEscapeDecisionIsCancelledButASignedEscapeIsNot(t *testing.T) {
 	}
 }
 
-// With --exit-rpc-url set, an exit RPC that fails falls back to the pinned
-// RPC: an escape is never blocked by either one alone.
-func TestAnEscapeFallsBackToThePinnedRPCWhenTheExitRPCFails(t *testing.T) {
+// Design §1.2(6), §6.7, §2.1: with --exit-rpc-url set, an exit RPC that
+// does not answer is never replaced by the pinned RPC, which the operator may
+// run: the escape stops with an error naming the exit RPC, and the pinned
+// RPC is asked nothing.
+func TestAnEscapeAsksThePinnedRPCNothingWhenTheExitRPCFails(t *testing.T) {
 	f := newWithdrawalFixture(t, true)
 	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
 	down := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -546,17 +552,278 @@ func TestAnEscapeFallsBackToThePinnedRPCWhenTheExitRPCFails(t *testing.T) {
 	}))
 	t.Cleanup(down.Close)
 	f.h.client.config.ExitRPCURL = down.URL
+	f.mu.Lock()
+	f.rpcCalls = nil
+	f.mu.Unlock()
+	if _, err := f.h.EscapeAddress(context.Background(), withdrawalTestDestination, f.noteID, nil, ""); !errors.Is(err, errExitRPCUnavailable) {
+		t.Fatalf("an escape without its exit RPC: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.rpcCalls) != 0 {
+		t.Fatalf("the pinned RPC answered for the exit RPC: %v", f.rpcCalls)
+	}
+}
+
+// exitRPCProxy serves the fixture's exit RPC through a proxy that answers
+// HTTP 429 to the nth eth_getTransactionCount call (from 0) when refuse(n).
+func exitRPCProxy(t *testing.T, f *withdrawalFixture, refuse func(n int) bool) string {
+	t.Helper()
+	var mu sync.Mutex
+	calls := 0
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	proxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "eth_getTransactionCount") {
+			mu.Lock()
+			n := calls
+			calls++
+			mu.Unlock()
+			if refuse(n) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+		}
+		forwarded, _ := http.NewRequest(http.MethodPost, f.exitRPC, bytes.NewReader(body))
+		forwarded.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(forwarded)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer response.Body.Close()
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy.URL
+}
+
+// The nonce an escape is signed at comes from the exit RPC alone: while it
+// rate-limits the nonce reads, a pinned RPC that answers a nonce five ahead
+// (which would leave the escape unmined) is never asked, and nothing is
+// signed; a rate limit that passes is retried, and the escape is signed at
+// the exit RPC's nonce.
+func TestAnEscapeIsSignedOnlyAtTheExitRPCsNonce(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	var mu sync.Mutex
+	refused := 1 << 30
+	f.h.client.config.ExitRPCURL = exitRPCProxy(t, f, func(n int) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return n < refused
+	})
+	f.mu.Lock()
+	f.pinnedNonce, f.rpcCalls = "0x5", nil
+	nonce, _ := new(big.Int).SetString(strings.TrimPrefix(f.nonce, "0x"), 16)
+	f.mu.Unlock()
 	ctx := context.Background()
 	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
 		t.Fatal(err)
+	}
+	accepted := len(f.accepted)
+	if _, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], ""); !errors.Is(err, errExitRPCUnavailable) {
+		t.Fatalf("quoted without the exit RPC's nonce: %v", err)
+	}
+	// Two refusals, then answers: the first read is retried.
+	mu.Lock()
+	refused = 0
+	mu.Unlock()
+	f.h.client.config.ExitRPCURL = exitRPCProxy(t, f, func(n int) bool { return n < 2 })
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil || quote.Nonce != nonce.Uint64() {
+		t.Fatalf("not quoted at the exit RPC's nonce %d: %+v %v", nonce, quote, err)
+	}
+	status, err := f.h.ApproveAddressEscape(ctx, quote.ID)
+	if err != nil || status.Phase != "escape_pending" || len(f.accepted) != accepted+1 {
+		t.Fatalf("the escape was not signed: %+v %v", status, err)
+	}
+	if tx := f.accepted[f.journal(t).Pending.Hash]; tx.Nonce() != nonce.Uint64() {
+		t.Fatalf("signed at nonce %d, not the exit RPC's %d", tx.Nonce(), nonce)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.rpcCalls) != 0 {
+		t.Fatalf("the pinned RPC was asked: %v", f.rpcCalls)
+	}
+}
+
+// An escape transaction is never signed below its entry point's measured
+// cost, whatever gas estimate an RPC answers: one that ran out of gas would
+// revert and need another proof.
+func TestAnEscapeIsNeverSignedBelowItsGasFloor(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	ctx := context.Background()
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.gas = "0x5208"
+	f.mu.Unlock()
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil || quote.GasLimit != escapeGasLimits["escape"] || len(quote.Warnings) != 0 {
+		t.Fatalf("an escape quoted below its gas floor: %+v %v", quote, err)
+	}
+	if _, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	if tx := f.accepted[f.journal(t).Pending.Hash]; tx.Gas() != escapeGasLimits["escape"] {
+		t.Fatalf("signed with gas %d", tx.Gas())
+	}
+}
+
+// signEscape decides, quotes and approves an escape conceding nothing, and
+// returns the signed initiation.
+func (f *withdrawalFixture) signEscape(t *testing.T) *types.Transaction {
+	t.Helper()
+	ctx := context.Background()
+	if status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_decision" {
+		t.Fatalf("no escape decision: %+v %v", status, err)
 	}
 	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil || status.Phase != "escape_pending" {
-		t.Fatalf("the escape was not signed through the pinned RPC: %+v %v", status, err)
+	status, err := f.h.ApproveAddressEscape(ctx, quote.ID)
+	if err != nil || status.Phase != "escape_pending" {
+		t.Fatalf("the escape was not signed: %+v %v", status, err)
 	}
+	return f.accepted[f.journal(t).Pending.Hash]
+}
+
+// follow follows the saved escape once.
+func (f *withdrawalFixture) follow(t *testing.T) AddressWithdrawalStatus {
+	t.Helper()
+	status, err := f.h.EscapeAddress(context.Background(), withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+// editJournal rewrites the saved payment record.
+func (f *withdrawalFixture) editJournal(t *testing.T, edit func(*addressFundingRecord)) {
+	t.Helper()
+	record := f.journal(t)
+	edit(&record)
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.h.addressStatePath(), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Design §6.4 E4 step 7: a signed escape that can no longer be included is
+// retired unmined and signed again, never followed forever: its nonce was
+// taken by another transaction in a finalized block; its nonce lies beyond
+// the account's pending nonce (signed at a nonce some RPC answered wrongly)
+// past a grace period; or its proof expired while it waited in a mempool,
+// where the new escape replaces it at its nonce with higher fees. One mined
+// while this was checked is followed, never retired.
+func TestAStuckEscapeIsRetiredAndSignedAgain(t *testing.T) {
+	retired := func(t *testing.T, f *withdrawalFixture, stuck *types.Transaction) {
+		t.Helper()
+		status := f.follow(t)
+		record := f.journal(t)
+		last := record.History[len(record.History)-1]
+		if status.Phase != "escape_expired" || record.Pending != nil || !last.Unmined || last.Hash != stuck.Hash().Hex() || !strings.Contains(status.Message, "retired unmined") {
+			t.Fatalf("the stuck escape was not retired: %+v %+v", status, record)
+		}
+	}
+	t.Run("nonce gap", func(t *testing.T) {
+		f := newWithdrawalFixture(t, true)
+		f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+		f.mu.Lock()
+		f.nonce = "0x5"
+		f.mu.Unlock()
+		stuck := f.signEscape(t)
+		f.mu.Lock()
+		f.nonce = "0x1"
+		f.mu.Unlock()
+		// Within the grace period the gap may still fill.
+		if status := f.follow(t); status.Phase != "escape_pending" {
+			t.Fatalf("retired within the grace period: %+v", status)
+		}
+		f.editJournal(t, func(record *addressFundingRecord) { record.Pending.SignedAt -= 3600 })
+		retired(t, f, stuck)
+		if again := f.signEscape(t); again.Nonce() != 1 || !bytes.Equal(again.Data(), stuck.Data()) {
+			t.Fatalf("the escape was signed again at nonce %d", again.Nonce())
+		}
+	})
+	t.Run("nonce taken", func(t *testing.T) {
+		f := newWithdrawalFixture(t, true)
+		f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+		stuck := f.signEscape(t)
+		f.mu.Lock()
+		f.nonce, f.finalizedNonce = fmt.Sprintf("0x%x", stuck.Nonce()+1), fmt.Sprintf("0x%x", stuck.Nonce()+1)
+		f.mu.Unlock()
+		retired(t, f, stuck)
+		if again := f.signEscape(t); again.Nonce() != stuck.Nonce()+1 {
+			t.Fatalf("the escape was signed again at nonce %d", again.Nonce())
+		}
+	})
+	t.Run("mined meanwhile", func(t *testing.T) {
+		f := newWithdrawalFixture(t, true)
+		f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+		landed := f.signEscape(t)
+		f.mine(t, landed.Hash().Hex(), false)
+		f.mu.Lock()
+		f.nonce, f.finalizedNonce = fmt.Sprintf("0x%x", landed.Nonce()+1), fmt.Sprintf("0x%x", landed.Nonce()+1)
+		f.hideReceipts = 1
+		f.mu.Unlock()
+		if status := f.follow(t); status.Phase != "escape_pending" {
+			t.Fatalf("a mined escape was retired: %+v", status)
+		}
+		f.escape.deadline = uint64(time.Now().Unix()) + 3600
+		if status := f.follow(t); status.Phase != "escape_initiated" {
+			t.Fatalf("the mined escape was not followed: %+v", status)
+		}
+		for _, entry := range f.journal(t).History {
+			if entry.Unmined {
+				t.Fatal("a mined escape was recorded as unmined")
+			}
+		}
+	})
+	t.Run("expired in a mempool", func(t *testing.T) {
+		f := newWithdrawalFixture(t, true)
+		f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+		// A proof that expires in five seconds.
+		plan := testEscapePlan(0, f.planBalance, withdrawalTestDestination)
+		plan.BoundAtState = "0"
+		plan.PublicInputs.ValidUntil = uint64(time.Now().Unix()) + 5
+		encoded, _ := json.Marshal(plan)
+		_ = json.Unmarshal(encoded, &f.escape.plan)
+		stuck := f.signEscape(t)
+		f.mu.Lock()
+		// It waits in the mempool (pending nonce one higher) while the
+		// chain moves past its valid_until.
+		f.pendingNonce = fmt.Sprintf("0x%x", stuck.Nonce()+1)
+		f.mu.Unlock()
+		if status := f.follow(t); status.Phase != "escape_pending" {
+			t.Fatalf("retired while its proof is valid: %+v", status)
+		}
+		f.mu.Lock()
+		f.latestTime = time.Now().Unix() + 10
+		f.mu.Unlock()
+		retired(t, f, stuck)
+		// A fresh proof, signed at the same nonce with higher fees.
+		f.escape.plan = nil
+		prepares := len(f.escape.prepares)
+		again := f.signEscape(t)
+		raised := func(fee *big.Int) *big.Int {
+			return new(big.Int).Add(new(big.Int).Add(fee, new(big.Int).Quo(fee, big.NewInt(8))), big.NewInt(1))
+		}
+		if again.Nonce() != stuck.Nonce() || again.GasFeeCap().Cmp(raised(stuck.GasFeeCap())) < 0 || again.GasTipCap().Cmp(raised(stuck.GasTipCap())) < 0 {
+			t.Fatalf("no replacement: nonce %d, fees %s/%s after %s/%s", again.Nonce(), again.GasFeeCap(), again.GasTipCap(), stuck.GasFeeCap(), stuck.GasTipCap())
+		}
+		if bytes.Equal(again.Data(), stuck.Data()) || len(f.escape.prepares) <= prepares {
+			t.Fatal("the expired proof was signed again")
+		}
+	})
 }
 
 // httptestTLS serves JSON-RPC answers from answer(method) over the test TLS

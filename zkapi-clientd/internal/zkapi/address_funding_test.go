@@ -89,6 +89,15 @@ type addressFixture struct {
 	// refuseSimulation makes the RPCs refuse the eth_call simulation and the
 	// gas estimate of a signed vault call.
 	refuseSimulation bool
+	// pinnedNonce, when set, is the nonce the pinned RPC alone answers (a
+	// lying pinned RPC). pendingNonce and finalizedNonce, when set, answer
+	// eth_getTransactionCount at the "pending" and "finalized" tags (a
+	// mempool transaction, a nonce taken by another transaction).
+	pinnedNonce, pendingNonce, finalizedNonce string
+	// latestTime, when set, is the timestamp of every block served.
+	latestTime int64
+	// hideReceipts makes this many receipt reads answer null first.
+	hideReceipts int
 	// logs are the vault logs eth_getLogs serves, filtered by topics.
 	logs []map[string]any
 }
@@ -217,7 +226,19 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		case "eth_getBalance":
 			result = f.eth
 		case "eth_getTransactionCount":
+			var tag string
+			if len(request.Params) == 2 {
+				_ = json.Unmarshal(request.Params[1], &tag)
+			}
 			result = f.nonce
+			switch {
+			case !exit && f.pinnedNonce != "":
+				result = f.pinnedNonce
+			case tag == "pending" && f.pendingNonce != "":
+				result = f.pendingNonce
+			case tag == "finalized" && f.finalizedNonce != "":
+				result = f.finalizedNonce
+			}
 		case "eth_getCode":
 			result = "0x"
 		case "eth_feeHistory":
@@ -326,8 +347,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		case "eth_getTransactionReceipt":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
-			if found, ok := f.receipts[hash]; ok {
+			if found, ok := f.receipts[hash]; ok && f.hideReceipts == 0 {
 				result = found
+			}
+			if f.hideReceipts > 0 {
+				f.hideReceipts--
 			}
 		case "eth_getBlockByNumber":
 			var number string
@@ -338,7 +362,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			if number == "latest" {
 				number = "0x20"
 			}
-			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", time.Now().Unix()), "baseFeePerGas": f.gasPrice}
+			timestamp := time.Now().Unix()
+			if f.latestTime != 0 {
+				timestamp = f.latestTime
+			}
+			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", timestamp), "baseFeePerGas": f.gasPrice}
 		case "eth_getBlockByHash":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)

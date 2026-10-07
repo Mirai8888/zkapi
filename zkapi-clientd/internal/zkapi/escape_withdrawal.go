@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -418,8 +419,107 @@ func (h *FundingHandler) reportEscapeSubmission(ctx context.Context, hash string
 	_, _ = h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/escape/submit", body)
 }
 
+// stuckEscapeGrace is how long a signed escape transaction whose nonce lies
+// beyond the account's pending nonce may wait for that gap to fill.
+var stuckEscapeGrace = 15 * time.Minute
+
+// deadEscapeTransaction reports why the pending escape transaction, which
+// has no receipt, can no longer be included, or "" while it still may be
+// (design §6.4 E4 step 7: "If valid_until passes before inclusion,
+// re-prove"). It reads the escape's RPC (the exit RPC when one is set):
+//   - nonce_consumed: another transaction took its nonce in a finalized
+//     block;
+//   - nonce_gap: its nonce lies beyond the account's pending nonce (nothing
+//     this client signed fills the gap; for example an RPC answered a wrong
+//     nonce when it was signed) for stuckEscapeGrace;
+//   - expired: an initiation whose valid_until is behind the latest block.
+//
+// The receipt is read again after the nonces, so a transaction mined in
+// between is followed, never retired. A read that fails decides nothing.
+func (h *FundingHandler) deadEscapeTransaction(ctx context.Context, config fundingConfig, record *addressFundingRecord) string {
+	pending, w := record.Pending, record.Withdrawal
+	finalized, e1 := h.addressQuantity(ctx, config, "eth_getTransactionCount", []any{record.Address, "finalized"})
+	next, e2 := h.addressQuantity(ctx, config, "eth_getTransactionCount", []any{record.Address, "pending"})
+	var latest struct {
+		Timestamp string `json:"timestamp"`
+	}
+	e3 := h.addressRPC(ctx, config, "eth_getBlockByNumber", []any{"latest", false}, &latest)
+	reason := ""
+	switch {
+	case e1 == nil && finalized.IsUint64() && finalized.Uint64() > pending.Nonce:
+		reason = "nonce_consumed"
+	case e2 == nil && next.IsUint64() && next.Uint64() < pending.Nonce && time.Since(time.Unix(pending.SignedAt, 0)) >= stuckEscapeGrace:
+		reason = "nonce_gap"
+	case e3 == nil && pending.Kind == "escape" && w != nil && w.ValidUntil != 0:
+		if timestamp, err := addressHexUint(latest.Timestamp); err == nil && timestamp.IsUint64() && timestamp.Uint64() > w.ValidUntil {
+			reason = "expired"
+		}
+	}
+	if reason == "" {
+		return ""
+	}
+	if receipt, _, err := h.addressFinalReceipt(ctx, config, pending.Hash, true); err != nil || receipt != nil {
+		return ""
+	}
+	return reason
+}
+
+// retireUnminedEscape moves a pending escape transaction that can no longer
+// be included to the history, marked unmined, so the next one is signed: an
+// initiation is decided and proved again (phase escape_expired), a
+// finalization or a claim is quoted again.
+func (h *FundingHandler) retireUnminedEscape(record *addressFundingRecord, reason string, update func() AddressWithdrawalStatus) (AddressWithdrawalStatus, error) {
+	w, pending := record.Withdrawal, record.Pending
+	retired := *pending
+	retired.Unmined = true
+	record.History = append(record.History, retired)
+	record.Pending = nil
+	switch pending.Kind {
+	case "escape":
+		w.Phase, w.Binding = "escape_expired", ""
+	case "escape_finalize":
+		w.Phase = "escape_initiated"
+	}
+	if err := h.saveAddress(record); err != nil {
+		return update(), err
+	}
+	status := update()
+	status.Message = fmt.Sprintf("The signed %s transaction %s can no longer be included (%s); it was retired unmined and nothing was paid by it. %s", strings.ReplaceAll(pending.Kind, "_", " "), pending.Hash, strings.ReplaceAll(reason, "_", " "), status.Message)
+	return status, nil
+}
+
+// unminedEscapeFees is the fee cap and tip a transaction at nonce must
+// exceed to replace an escape transaction retired unmined at that nonce:
+// each raised by an eighth, plus one wei. Nil when there is none.
+func unminedEscapeFees(record *addressFundingRecord, nonce uint64) *addressFees {
+	var floor *addressFees
+	for _, entry := range record.History {
+		if !entry.Unmined || entry.Nonce != nonce {
+			continue
+		}
+		raw, err := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))
+		var tx types.Transaction
+		if err != nil || tx.UnmarshalBinary(raw) != nil {
+			continue
+		}
+		raise := func(fee *big.Int) *big.Int {
+			return new(big.Int).Add(new(big.Int).Add(fee, new(big.Int).Quo(fee, big.NewInt(8))), big.NewInt(1))
+		}
+		if floor == nil {
+			floor = &addressFees{Max: new(big.Int), Tip: new(big.Int)}
+		}
+		if raised := raise(tx.GasFeeCap()); raised.Cmp(floor.Max) > 0 {
+			floor.Max = raised
+		}
+		if raised := raise(tx.GasTipCap()); raised.Cmp(floor.Tip) > 0 {
+			floor.Tip = raised
+		}
+	}
+	return floor
+}
+
 // followEscapeTransaction follows the pending escape transaction to
-// finality.
+// finality, and retires one that can no longer be included.
 func (h *FundingHandler) followEscapeTransaction(ctx context.Context, config fundingConfig, record *addressFundingRecord, update func() AddressWithdrawalStatus) (AddressWithdrawalStatus, error) {
 	w, pending := record.Withdrawal, record.Pending
 	receipt, final, err := h.addressFinalReceipt(ctx, config, pending.Hash, true)
@@ -428,6 +528,9 @@ func (h *FundingHandler) followEscapeTransaction(ctx context.Context, config fun
 	}
 	if !final {
 		if receipt == nil {
+			if reason := h.deadEscapeTransaction(ctx, config, record); reason != "" {
+				return h.retireUnminedEscape(record, reason, update)
+			}
 			h.broadcastAddress(ctx, config, pending)
 		}
 		if pending.Kind == "escape" {

@@ -358,7 +358,8 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 }
 
 // withdrawalSnapshotFor is withdrawalSnapshot; with exit set (an escape), the
-// chain is read through the owner's exit RPC first (exitConfig).
+// chain is read only through the owner's exit RPC when one is configured
+// (exitConfig).
 func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (fundingConfig, *addressFundingRecord, withdrawalWallet, AddressWithdrawalStatus, error) {
 	config, record, payment, err := h.addressSnapshotFor(ctx, exit)
 	status := AddressWithdrawalStatus{Address: payment.Address, ChainID: payment.ChainID, TokenAddress: payment.TokenAddress, TokenDecimals: payment.TokenDecimals, DeploymentID: payment.DeploymentID, BillingAsset: payment.BillingAsset, BillingUnit: payment.BillingUnit, WeiPerUnit: payment.WeiPerUnit, ETHBalance: payment.ETHBalance, EscapePayoutCredits: payment.EscapePayoutCredits}
@@ -450,6 +451,8 @@ func setEscapeMessage(status *AddressWithdrawalStatus) {
 		status.Message = "finalizeEscapeWithdrawal is signed and awaiting Ethereum finality."
 	case "reverted":
 		status.Message = "The escape transaction reverted (for example its proof expired before inclusion). Rerun the same command to review a fresh escape."
+	case "escape_expired":
+		status.Message = "The signed escape transaction never reached a block and can no longer be included (its proof expired, or its nonce was taken or skipped); nothing was paid. Rerun the same command to review a fresh escape: it is proved and signed again."
 	case "defeated":
 		status.Message = "device_not_newest: the escape was defeated with a request from a newer state of this note; another device or backup holds that state. Restore the newest backup."
 	case "complete":

@@ -84,8 +84,25 @@ jobs:
       - name: Test protocol Rust workspace
         run: cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace -- --test-threads=1
 
-      # Built on its own so that no dev-dependency turns on `dev-setup`: the
-      # library as production binaries see it must refuse development keys.
+  # Its own job, so that a failing step elsewhere never skips it. The binary
+  # is built on its own, so no dev-dependency turns on `dev-setup`: the
+  # library as production binaries see it must refuse development keys. It
+  # also resolves (without compiling) the features of the production builds
+  # in docker/Dockerfile and scripts/build-browser-client.sh, and checks the
+  # committed ceremony setup against the pins in compact.rs.
+  release-key-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protocol/rust
+
       - name: Release builds refuse development keys
         run: cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --bin release_policy_check
 

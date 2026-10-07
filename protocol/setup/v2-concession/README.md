@@ -247,10 +247,12 @@ All commands run from `protocol/rust` at the frozen circuit revision
    The fixtures feed the same statements to the adapter deployed on Anvil
    (the contract tests).
 
-   Then replace the pins:
+   Then replace the pins, in the same change that commits the keys:
    - set `CEREMONY_VK_KECCAK256` in `zkapi-proof/src/compact.rs` to the two
      VK hashes and run
-     `cargo run --release -p zkapi-proof --bin release_policy_check`;
+     `cargo run --release -p zkapi-proof --bin release_policy_check`. It
+     fails while this directory holds keys and no pins, or pins and keys
+     that a release build does not load;
    - update the adapter, the fixtures, the SDK assets and hashes, and the
      deployment profiles;
    - rebuild the WebAssembly reproducibly.
@@ -278,10 +280,18 @@ Only accepting keys needs the feature. Generating development keys
 enable `dev-setup` on a dependency of a production binary: Cargo unifies
 features across the packages of one build.
 
-`cargo run --release -p zkapi-proof --bin release_policy_check` (run in CI)
-builds the library as production binaries see it. It fails unless the build
-refuses the committed development setup and development keys relabelled
-`rehearsal` or `mpc-1`.
+`cargo run --release -p zkapi-proof --bin release_policy_check` runs in CI in
+its own job (`release-key-policy`). It fails unless all of these hold:
+- the library, built as production binaries see it, refuses the committed
+  development setup and development keys relabelled `rehearsal` or `mpc-1`;
+- no production build gives `zkapi-proof` the `dev-setup` feature. It
+  resolves the features (with `cargo tree`, without compiling) of the
+  packages that `docker/Dockerfile` builds together in the root workspace,
+  and of the WebAssembly client that `scripts/build-browser-client.sh`
+  builds. It reads both package lists from those files;
+- this directory agrees with the pins: no keys while `CEREMONY_VK_KECCAK256`
+  is `None`, and once it is set, keys that each loader of a release build
+  loads, with a `manifest.json` naming the pinned VK hashes.
 
 Every key file names its circuit, setup and kind. So a request key cannot be
 loaded as a withdrawal key, and a key of another circuit (including

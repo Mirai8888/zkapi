@@ -38,8 +38,10 @@ blake2 = { workspace = true }
 # `rehearsal`) and unpinned `mpc-1` keys. Only tests, CI and the drill vault
 # enable it. Never enable it on a dependency of a production binary: Cargo
 # unifies features across the packages of one build. Release builds leave it
-# off and accept only the pinned `mpc-1` keys (`compact::CEREMONY_VK_KECCAK256`;
-# `cargo run -p zkapi-proof --bin release_policy_check` checks this).
+# off and accept only the pinned `mpc-1` keys (`compact::CEREMONY_VK_KECCAK256`).
+# `cargo run -p zkapi-proof --bin release_policy_check` checks this, and that
+# the builds of docker/Dockerfile and scripts/build-browser-client.sh do not
+# enable it.
 dev-setup = []
 # The `dev` fixtures (published development signing keys, notes and state
 # chains). Changes no acceptance policy. Key generation (`compact::setup`)

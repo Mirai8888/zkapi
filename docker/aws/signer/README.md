@@ -322,8 +322,9 @@ challenger bids within the lower of its own
 The read-only passthrough allows `eth_chainId`, `eth_blockNumber`,
 `eth_getBlockByNumber`, `eth_getLogs`, `eth_getTransactionReceipt`,
 `eth_getTransactionByHash`, `eth_getTransactionCount`, `eth_call`,
-`eth_estimateGas`, `eth_getBalance` and `eth_feeHistory`. Every other method
-returns -32601.
+`eth_estimateGas`, `eth_getBalance`, `eth_feeHistory` and `eth_getCode` (the
+challenger checks the vault's, adapter's and Poseidon library's codehashes
+through it at startup). Every other method returns -32601.
 
 ## Replacing a pending challenge
 

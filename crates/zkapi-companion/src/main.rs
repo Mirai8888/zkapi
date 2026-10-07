@@ -565,11 +565,17 @@ fn validate_deployment_manifest(manifest: &DeploymentManifest) -> anyhow::Result
             zkapi_proof::compact::CIRCUIT_ID
         );
     }
-    if manifest.deployment_status.as_deref() == Some("not_deployed") {
-        anyhow::bail!(
+    match manifest.deployment_status.as_deref() {
+        None | Some("deployed") => {}
+        Some("not_deployed") => anyhow::bail!(
             "deployment_not_deployed: deployment {} is a placeholder; its vault is not deployed yet",
             manifest.deployment_id
-        );
+        ),
+        // Deploy.s.sol's provisional output is never a deployment to use.
+        Some(status) => anyhow::bail!(
+            "deployment {} has deployment_status {status:?}; only a finalized deployment (\"deployed\") is served",
+            manifest.deployment_id
+        ),
     }
     if manifest.exit_concession != 1 || manifest.vault_revision < 3 {
         anyhow::bail!(
@@ -942,6 +948,16 @@ mod tests {
                 "deployment_status",
                 serde_json::json!("not_deployed"),
                 "deployment_not_deployed",
+            ),
+            (
+                "deployment_status",
+                serde_json::json!("pending"),
+                "only a finalized deployment",
+            ),
+            (
+                "deployment_status",
+                serde_json::json!("simulated"),
+                "only a finalized deployment",
             ),
             ("exit_concession", serde_json::json!(0), "concession exit"),
             ("vault_revision", serde_json::json!(2), "concession exit"),

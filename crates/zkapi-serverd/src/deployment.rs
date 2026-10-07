@@ -127,11 +127,21 @@ impl DeploymentManifest {
         } else {
             serde_json::from_value(value).context("invalid deployment manifest")?
         };
-        if manifest.deployment_status.as_deref() == Some(NOT_DEPLOYED) {
-            bail!(
+        match manifest.deployment_status.as_deref() {
+            None | Some("deployed") => {}
+            Some(NOT_DEPLOYED) => bail!(
                 "the deployment manifest is a placeholder (deployment_status \"not_deployed\"): \
                  its vault is not deployed, so there is nothing to serve"
-            );
+            ),
+            // Deploy.s.sol's provisional output: only the manifest that
+            // expected-codehashes.mjs --finalize checked on chain is final.
+            Some(status @ ("pending" | "simulated")) => bail!(
+                "the deployment manifest is provisional (deployment_status {status:?}): pin a \
+                 vault only from the manifest `scripts/expected-codehashes.mjs --finalize` wrote"
+            ),
+            Some(status) => {
+                bail!("the deployment manifest has an unknown deployment_status {status:?}")
+            }
         }
         ensure!(
             manifest.circuit_id == CIRCUIT_ID,
@@ -650,6 +660,17 @@ pub(crate) mod tests {
         placeholder["deployment_status"] = "not_deployed".into();
         let error = DeploymentManifest::parse(&placeholder.to_string()).unwrap_err();
         assert!(error.to_string().contains("not_deployed"), "{error}");
+        // Only a finalized deployment is served: Deploy.s.sol's provisional
+        // statuses and unknown ones are refused; "deployed" is accepted.
+        for status in ["pending", "simulated", "drill"] {
+            let mut provisional = bare.clone();
+            provisional["deployment_status"] = status.into();
+            let error = DeploymentManifest::parse(&provisional.to_string()).unwrap_err();
+            assert!(error.to_string().contains(status), "{error}");
+        }
+        let mut deployed = bare.clone();
+        deployed["deployment_status"] = "deployed".into();
+        assert!(DeploymentManifest::parse(&deployed.to_string()).is_ok());
         let mut legacy = bare.clone();
         legacy["circuit_id"] = "zkapi-v2-note-bound-v1".into();
         let error = DeploymentManifest::parse(&legacy.to_string()).unwrap_err();

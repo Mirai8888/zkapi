@@ -172,6 +172,37 @@ test('a pending escape shows a raise: its payout and concession follow pendingWi
     assert.equal(pendingRead.params[1], concessionRead.params[1], 'both read at the same block');
 });
 
+test('E5: after a raise the escape\'s start receipt still matches its start, on every later sync', async () => {
+    const START_HASH = `0x${'5a'.repeat(32)}`;
+    const deadline = Math.floor(Date.now() / 1_000) + 86_400;
+    const { chain, client, saved } = await scenario(escapeRecord({
+        challengeDeadline: deadline, transactionHash: START_HASH, startRecoveryPending: true
+    }));
+    // The start receipt: initiated at B with nothing conceded.
+    chain.receipts.set(START_HASH, { transactionHash: START_HASH, blockNumber: hex(START_BLOCK), status: '0x1', logs: [
+        { address: VAULT, topics: [ABI.escapeInitiatedEvent, `0x${word(NOTE_ID)}`],
+            data: `0x${[NULLIFIER, B, DESTINATION, deadline, 0x77].map(word).join('')}`, removed: false },
+        { address: VAULT, topics: [ABI.escapeConcessionRecordedEvent, `0x${word(NOTE_ID)}`],
+            data: `0x${[0x5099, B, 0].map(word).join('')}`, removed: false }
+    ] });
+    chain.noteStatus = 2;
+    chain.pending = { finalBalance: B - 200_000, conceded: 200_000 };
+    await client.syncEscapeWithdrawals(() => {});
+    let record = await saved();
+    assert.equal(record.finalBalance, B - 200_000, 'the record follows the raise');
+    assert.equal(record.startRecoveryPending, false);
+    assert.equal(record.startSubmissionOutcome, 'resolved');
+    await client.syncEscapeWithdrawals(() => {});
+    // A defeat after the raise is a challenge of a started escape, not a
+    // start the client must still look for.
+    chain.noteStatus = 1;
+    const [result] = await client.syncEscapeWithdrawals(() => {});
+    record = await saved();
+    assert.notEqual(result.status, 'submitted_unconfirmed');
+    assert.equal(record.phase, 'challenged_unconfirmed');
+    assert.equal(record.startSubmissionOutcome, 'resolved');
+});
+
 test('raise then finalize: the finalize action accepts B − c_final and the record reaches closed', async () => {
     const { chain, client, saved } = await scenario();
     // The raise landed after the last sync: the record still says B.

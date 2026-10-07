@@ -268,6 +268,24 @@ function walletNonceNumber(value, depth = 0) {
     return Number(quantity);
 }
 
+/**
+ * The payout a withdrawal started with, as its start receipt states it. An
+ * escape's record follows raises (its finalBalance is the vault's current
+ * pendingWithdrawals amount), so its start is B − concededAtInit (E5); a
+ * record without B and c_init (or a close) started at its finalBalance.
+ */
+function startFinalBalance(record) {
+    if (record?.mode !== 'mutual' && record?.stateBalance != null && record?.concededAtInit != null) {
+        try {
+            const started = BigInt(record.stateBalance) - BigInt(record.concededAtInit);
+            if (started >= 0n) return started;
+        } catch {
+            // A malformed record falls back to its finalBalance.
+        }
+    }
+    return BigInt(record.finalBalance);
+}
+
 // Refusals of an exit that a new proof can cure: valid_until passed (E4.7) or
 // the vault does not know the proof's root (E4.1).
 const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
@@ -4293,7 +4311,7 @@ class ZkapiClient extends EventTarget {
                         );
                         if (!event || event.noteId !== BigInt(record.noteId)
                             || event.destination.toLowerCase() !== record.destination.toLowerCase()
-                            || event.finalBalance !== BigInt(record.finalBalance)) {
+                            || event.finalBalance !== startFinalBalance(record)) {
                             // Keep the recovery record, but do not let one bad
                             // audit hash suppress canonical status recovery.
                             startReceipt = null;

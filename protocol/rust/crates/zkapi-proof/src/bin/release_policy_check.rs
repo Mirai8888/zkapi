@@ -21,7 +21,9 @@
 //!    on `zkapi-proof`, and building this crate alone cannot see that. So
 //!    the check resolves the features of each production build with
 //!    `cargo tree`: the packages that `docker/Dockerfile` builds together in
-//!    the root workspace, and the WebAssembly client that
+//!    the root workspace, the companion (`zkapi-walletd`) that
+//!    `zkapi-clientd/scripts/build-native.sh` builds for every clientd
+//!    release, and the WebAssembly client that
 //!    `scripts/build-browser-client.sh` builds. It reads the package lists
 //!    from those files, and fails if `zkapi-proof` has `dev-setup` in any of
 //!    these builds. `cargo tree` resolves without compiling, so this works
@@ -72,6 +74,14 @@ const PRODUCTION_BUILDS: &[ProductionBuild] = &[
         manifest: "protocol/rust/Cargo.toml",
         script: "scripts/build-browser-client.sh",
         target: Some("wasm32-unknown-unknown"),
+    },
+    // The companion every zkapi-clientd release bundles (zkapi-walletd),
+    // which loads the proving keys of each clientd escape and close. The
+    // release builds it in the root workspace of a prepared tree.
+    ProductionBuild {
+        manifest: "Cargo.toml",
+        script: "zkapi-clientd/scripts/build-native.sh",
+        target: Some("all"),
     },
 ];
 
@@ -429,10 +439,12 @@ mod tests {
         // The repository's own production builds name at least the packages
         // that depend on zkapi-proof today.
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
-        for (build, expected) in PRODUCTION_BUILDS
-            .iter()
-            .zip([&["zkapi-cli", "zkapi-serverd"][..], &["zkapi-browser"][..]])
-        {
+        assert_eq!(PRODUCTION_BUILDS.len(), 3);
+        for (build, expected) in PRODUCTION_BUILDS.iter().zip([
+            &["zkapi-cli", "zkapi-serverd"][..],
+            &["zkapi-browser"][..],
+            &["zkapi-companion"][..],
+        ]) {
             let script = std::fs::read_to_string(repository.join(build.script)).unwrap();
             let packages = cargo_build_packages(&script);
             for package in expected {
@@ -522,6 +534,14 @@ mod tests {
             error.contains("gives zkapi-proof the features [\"dev-setup\"]"),
             "{error}"
         );
+        // A build of one binary of a package, as zkapi-clientd's release
+        // builds the companion.
+        let error = check("cargo build --release --locked -p helper --bin helper\n").unwrap_err();
+        assert!(
+            error.contains("gives zkapi-proof the features [\"dev-setup\"]"),
+            "{error}"
+        );
+        check("cargo build --release --locked -p tests-only --bin tests-only\n").unwrap();
         let error = check("cargo test -p daemon\n").unwrap_err();
         assert!(error.contains("no `cargo build -p ...` command"), "{error}");
         let _ = std::fs::remove_dir_all(dir);

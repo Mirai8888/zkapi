@@ -2,20 +2,34 @@
 pragma solidity ^0.8.28;
 
 import {Script} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {console2} from "forge-std/console2.sol";
 
 import {ZkApiVault} from "zkapi-contracts/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.sol";
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
+import {SetupPolicy} from "./SetupPolicy.sol";
 
 /// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
 ///         verifier and the native ETH ZkApiVault with its 11 constructor arguments, checks the
 ///         adapter's circuit and verifying-key hashes against the setup manifest and the vault's
-///         getters against the inputs, then writes the deployment manifest, including the actual
-///         linked addresses and the three runtime codehashes, to $OUTPUT_PATH.
-///         scripts/expected-codehashes.mjs recomputes those codehashes from the compiler output.
-/// @dev    The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
+///         getters against the inputs, then writes the provisional deployment manifest, including
+///         the linked addresses and the three runtime codehashes, to $OUTPUT_PATH.pending.
+/// @dev    forge runs run() locally before it sends any transaction, so every check here and the
+///         provisional manifest describe the simulated deployment: its addresses assume the
+///         deployer's nonces at simulation time, and deployBlockLowerBound is the chain head the
+///         simulation ran on, which precedes every creation. Nothing here proves the broadcast
+///         landed. After --broadcast, finalize the manifest against the chain:
+///           node scripts/expected-codehashes.mjs --deployment $OUTPUT_PATH.pending \
+///             --rpc $RPC_URL --finalize $OUTPUT_PATH
+///         It reads the creation receipts from forge's broadcast log, requires each creation to
+///         have succeeded at the manifest's address and the runtime codehashes, owner and treasury
+///         on chain to be the expected ones, and only then writes $OUTPUT_PATH with deployBlock
+///         (the block that created the vault) and deploymentStatus "deployed". Profiles take their
+///         pins and deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes
+///         deploymentStatus "simulated", which finalize refuses.
+///         The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
 ///         with the library placeholder replaced), so forge never links it.
 ///         Reads these environment variables:
 ///           PRIVATE_KEY – deployer key (also the vault owner on local chains
@@ -26,7 +40,8 @@ import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 ///                         directly; later transfers are two-step (transferOwnership
 ///                         nominates, the new owner calls acceptOwnership).
 ///           TREASURY    – operator payout address.
-///           OUTPUT_PATH – absolute path for the deployment manifest JSON.
+///           OUTPUT_PATH – absolute path of the final deployment manifest JSON; the
+///                         script writes the provisional one to OUTPUT_PATH.pending.
 ///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key (`zkapi signing-keys`).
 ///           CLEARANCE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key.
 ///                         Both keys must be points of Baby-JubJub's prime-order subgroup
@@ -41,15 +56,21 @@ import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 ///           REQUEST_CHARGE_CAP – positive per-request gwei limit; defaults to 1,000,000.
 ///           SETUP_MANIFEST – the setup's manifest.json; the adapter's CIRCUIT_ID_HASH and VK hashes
 ///                         must match it. Required except on local chains (default
-///                         protocol/setup/v2-concession-dev). Mainnet refuses the dev and
-///                         rehearsal setups.
+///                         protocol/setup/v2-concession-dev). SetupPolicy decides which setups
+///                         may deploy: off local chains the single-party dev and rehearsal
+///                         setups need ALLOW_DEV_SETUP=1 and mainnet refuses them, and an
+///                         mpc-1 setup must have the verifying keys of the committed
+///                         protocol/setup/v2-concession/manifest.json.
+///           ALLOW_DEV_SETUP – 1 deploys a dev or rehearsal setup off local chains (the
+///                         Sepolia drill vault only; never mainnet); recorded in the
+///                         manifest as allowDevSetup. Default 0.
 ///           POSEIDON_ADDRESS – an already deployed Bn254Poseidon to link; its runtime codehash
 ///                         must equal the compiled library's at that address. Unset deploys a
 ///                         fresh library.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
 ///         Every JSON number in the manifest is a safe integer (at most 2^53 - 1, so JavaScript
 ///         reads it exactly); the four signing-key coordinates are decimal strings.
-contract DeployScript is Script, SigningKeyChecks {
+contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
     uint256 internal constant VAULT_REVISION = 3;
@@ -76,6 +97,7 @@ contract DeployScript is Script, SigningKeyChecks {
         string setupId;
         bytes32 requestVkHash;
         bytes32 withdrawalVkHash;
+        bool allowDevSetup;
     }
 
     struct Deployed {
@@ -135,7 +157,10 @@ contract DeployScript is Script, SigningKeyChecks {
         require(d.poseidon.codehash == _libraryCodehash(poseidonRuntime, d.poseidon), "linked library codehash");
         _checkAdapter(d.adapter, setup);
         _checkVault(d, p);
-        _writeManifest(outputPath, d, p, setup);
+        bool broadcast =
+            vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume);
+        string memory pendingPath = string.concat(outputPath, ".pending");
+        _writeManifest(pendingPath, d, p, setup, broadcast ? "pending" : "simulated");
 
         console2.log("vault        ", address(d.vault));
         console2.log("treasury     ", p.treasury);
@@ -146,13 +171,27 @@ contract DeployScript is Script, SigningKeyChecks {
         console2.log("proofAdapter ", address(d.adapter));
         console2.log("poseidon     ", d.poseidon, d.poseidonReused ? "(reused)" : "(deployed)");
         console2.log("setup        ", setup.circuitId, setup.setupId);
+        if (setup.allowDevSetup && !local) {
+            console2.log("WARNING: single-party setup deployed under ALLOW_DEV_SETUP=1 (drill vault only)");
+        }
         console2.log("vault codehash");
         console2.logBytes32(address(d.vault).codehash);
         console2.log("adapter codehash");
         console2.logBytes32(address(d.adapter).codehash);
         console2.log("poseidon codehash");
         console2.logBytes32(d.poseidon.codehash);
-        console2.log("manifest     ", outputPath);
+        console2.log("provisional manifest", pendingPath);
+        if (broadcast) {
+            console2.log("Not final until checked on chain. After the broadcast, run from the repository root:");
+            console2.log(
+                string.concat(
+                    "  node scripts/expected-codehashes.mjs --deployment ",
+                    pendingPath,
+                    " --rpc <RPC_URL> --finalize ",
+                    outputPath
+                )
+            );
+        }
     }
 
     function _params(address deployer, bool local) internal view returns (Params memory p) {
@@ -197,12 +236,27 @@ contract DeployScript is Script, SigningKeyChecks {
         setup.setupId = vm.parseJsonString(manifest, ".setup_id");
         setup.requestVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.request");
         setup.withdrawalVkHash = vm.parseJsonBytes32(manifest, ".vk_keccak256.withdrawal");
-        if (block.chainid == 1) {
+        uint256 allowDev = vm.envOr("ALLOW_DEV_SETUP", uint256(0));
+        require(allowDev <= 1, "ALLOW_DEV_SETUP must be 0 or 1");
+        setup.allowDevSetup = allowDev == 1;
+
+        SetupFacts memory facts;
+        facts.circuitId = setup.circuitId;
+        facts.setupId = setup.setupId;
+        facts.requestVkHash = setup.requestVkHash;
+        facts.withdrawalVkHash = setup.withdrawalVkHash;
+        facts.ceremonyPinned = vm.exists(CEREMONY_MANIFEST);
+        if (facts.ceremonyPinned) {
+            string memory ceremony = vm.readFile(CEREMONY_MANIFEST);
             require(
-                !_eq(setup.setupId, "dev") && !_eq(setup.setupId, "rehearsal"),
-                "mainnet needs the ceremony setup (mpc-1)"
+                _eq(vm.parseJsonString(ceremony, ".circuit_id"), CIRCUIT_ID)
+                    && _eq(vm.parseJsonString(ceremony, ".setup_id"), CEREMONY_SETUP_ID),
+                "protocol/setup/v2-concession/manifest.json is not the zkapi-v2-concession-v1 mpc-1 setup"
             );
+            facts.ceremonyRequestVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.request");
+            facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
         }
+        _checkSetupPolicy(facts, block.chainid, local, setup.allowDevSetup);
     }
 
     /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST.
@@ -233,16 +287,28 @@ contract DeployScript is Script, SigningKeyChecks {
         require(vault.isKnownRoot(vault.currentRoot()), "empty root not recorded");
     }
 
-    function _writeManifest(string memory outputPath, Deployed memory d, Params memory p, Setup memory setup) internal {
+    /// Writes the provisional manifest. `status` is "pending" (broadcast: the transactions are
+    /// about to be sent) or "simulated" (dry run: nothing is sent). deployBlockLowerBound is the
+    /// head of the chain the simulation ran on: every creation lands in a later block, and the
+    /// finalize step records the vault's actual creation block as deployBlock.
+    function _writeManifest(
+        string memory path,
+        Deployed memory d,
+        Params memory p,
+        Setup memory setup,
+        string memory status
+    ) internal {
         ZkApiVault vault = d.vault;
         string memory m = "deployment";
+        vm.serializeString(m, "deploymentStatus", status);
         vm.serializeUint(m, "chainId", block.chainid);
-        vm.serializeUint(m, "deployBlock", block.number);
+        vm.serializeUint(m, "deployBlockLowerBound", block.number);
         vm.serializeUint(m, "protocolVersion", vault.PROTOCOL_VERSION());
         vm.serializeUint(m, "vaultRevision", VAULT_REVISION);
         vm.serializeUint(m, "concessionEscapeVersion", vault.CONCESSION_ESCAPE_VERSION());
         vm.serializeString(m, "circuitId", setup.circuitId);
         vm.serializeString(m, "setupId", setup.setupId);
+        vm.serializeBool(m, "allowDevSetup", setup.allowDevSetup);
         vm.serializeBytes32(m, "circuitIdHash", d.adapter.CIRCUIT_ID_HASH());
         vm.serializeBytes32(m, "requestVkKeccak256", d.adapter.REQUEST_VK_HASH());
         vm.serializeBytes32(m, "withdrawalVkKeccak256", d.adapter.WITHDRAWAL_VK_HASH());
@@ -273,7 +339,7 @@ contract DeployScript is Script, SigningKeyChecks {
         vm.serializeString(m, "clearanceSigningKeyX", vm.toString(p.clearanceKeyX));
         vm.serializeString(m, "clearanceSigningKeyY", vm.toString(p.clearanceKeyY));
         string memory serialized = vm.serializeUint(m, "noteTtl", uint256(p.noteTtl));
-        vm.writeJson(serialized, outputPath);
+        vm.writeJson(serialized, path);
     }
 
     /// ZkApiVault's creation code with every Bn254Poseidon placeholder replaced by `poseidon`.
@@ -336,9 +402,5 @@ contract DeployScript is Script, SigningKeyChecks {
         // casting to 'uint64' is safe because value is at most MAX_SAFE_INTEGER
         // forge-lint: disable-next-line(unsafe-typecast)
         return uint64(value);
-    }
-
-    function _eq(string memory a, string memory b) internal pure returns (bool) {
-        return keccak256(bytes(a)) == keccak256(bytes(b));
     }
 }

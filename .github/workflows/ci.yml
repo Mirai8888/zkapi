@@ -165,15 +165,21 @@ jobs:
           forge test -vvv
           node --test test/*.test.mjs
 
-      # No RPC: local chain-31337 dry runs with the public Anvil development
-      # key. The script checks the signing keys, links Bn254Poseidon itself
-      # and checks the adapter against the setup manifest and the vault's
-      # getters against its inputs; the expected codehashes are then
-      # recomputed from both projects' artifacts (the compiler settings match,
-      # so they agree). The first run pins the development keys (seeds 0x1
-      # and 0x2, allowed only on local chains), the second keys with a
-      # coordinate between 2^63 and 2^64, which the manifest must carry as a
-      # decimal string, and the third keys off the curve, which it must refuse.
+      # No RPC: dry runs with the public Anvil development key. The script
+      # checks the signing keys and the setup policy, links Bn254Poseidon
+      # itself and checks the adapter against the setup manifest and the
+      # vault's getters against its inputs, and writes the provisional
+      # manifest OUTPUT_PATH.pending ("simulated", deployBlockLowerBound, no
+      # deployBlock); the expected codehashes are then recomputed from both
+      # projects' artifacts (the compiler settings match, so they agree). On
+      # chain 31337 the first run pins the development keys (seeds 0x1 and
+      # 0x2, allowed only on local chains), the second keys with a coordinate
+      # between 2^63 and 2^64, which the manifest must carry as a decimal
+      # string, and the third keys off the curve, which it must refuse. On
+      # Sepolia's and mainnet's chain IDs the single-party dev setup needs
+      # ALLOW_DEV_SETUP=1 (the drill vault), mainnet refuses it even then, and
+      # an mpc-1 label is refused until protocol/setup/v2-concession pins the
+      # ceremony keys (and then needs their verifying keys).
       - name: Simulate the demo deployment script and check its codehashes
         working-directory: demo/contracts
         run: |
@@ -181,25 +187,81 @@ jobs:
           simulate() {
             PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
               OUTPUT_PATH="$PWD/../../.demo/$1" \
-              SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
-              STATE_SIGNING_KEY_X="$2" STATE_SIGNING_KEY_Y="$3" CLEARANCE_SIGNING_KEY_X="$4" CLEARANCE_SIGNING_KEY_Y="$5" \
-              forge script script/Deploy.s.sol
+              SETUP_MANIFEST="${SETUP_MANIFEST:-$ZKAPI_SETUP_DIR/manifest.json}" \
+              STATE_SIGNING_KEY_X="$3" STATE_SIGNING_KEY_Y="$4" CLEARANCE_SIGNING_KEY_X="$5" CLEARANCE_SIGNING_KEY_Y="$6" \
+              forge script script/Deploy.s.sol --chain-id "$2"
           }
           check() {
-            node -e 'const m = require(process.argv[1]); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== process.argv.slice(2).map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1" "$2" "$3" "$4" "$5"
-            node ../../scripts/expected-codehashes.mjs --artifacts out --deployment "../../.demo/$1" --check
-            node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment "../../.demo/$1" --check
+            node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const [chain, allowDev, ...want] = process.argv.slice(2); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.deploymentStatus !== "simulated" || "deployBlock" in m || !Number.isSafeInteger(m.deployBlockLowerBound) || m.chainId !== Number(chain) || m.allowDevSetup !== (allowDev === "1") || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || m.setupId !== "dev" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== want.map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1.pending" "$2" "$3" "$4" "$5" "$6" "$7"
+            node ../../scripts/expected-codehashes.mjs --artifacts out --deployment "../../.demo/$1.pending" --check
+            node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment "../../.demo/$1.pending" --check
+          }
+          refuses() {
+            if "${@:2}" > "$RUNNER_TEMP/refused.log" 2>&1; then
+              echo "Deploy.s.sol accepted: ${*:2}"; exit 1
+            fi
+            grep -qE "$1" "$RUNNER_TEMP/refused.log" || { cat "$RUNNER_TEMP/refused.log"; exit 1; }
           }
           DEV_KEYS="0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f 0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6"
           WIDE_KEYS="0x05503c73ffee28fcacc324d533595173a637420b99492265bf57c2c286f59cd7 9223372036854775867 9223372036854775849 0x2f46a27130a593f9edcbdaf446ca1029bb5c18d0c9a12ac3c7e9be74b61444f1"
-          simulate deployment.json $DEV_KEYS
-          check deployment.json $DEV_KEYS
-          simulate deployment-wide-keys.json $WIDE_KEYS
-          check deployment-wide-keys.json $WIDE_KEYS
-          if simulate deployment-bad-keys.json 11 12 13 14 > "$RUNNER_TEMP/bad-keys.log" 2>&1; then
-            echo "Deploy.s.sol accepted signing keys off the curve"; exit 1
-          fi
-          grep -q "STATE_SIGNING_KEY_X/Y is not a Baby-JubJub point" "$RUNNER_TEMP/bad-keys.log" || { cat "$RUNNER_TEMP/bad-keys.log"; exit 1; }
+          simulate deployment.json 31337 $DEV_KEYS
+          check deployment.json 31337 0 $DEV_KEYS
+          simulate deployment-wide-keys.json 31337 $WIDE_KEYS
+          check deployment-wide-keys.json 31337 0 $WIDE_KEYS
+          refuses "STATE_SIGNING_KEY_X/Y is not a Baby-JubJub point" simulate deployment-bad-keys.json 31337 11 12 13 14
+          (
+            export OWNER=0x000000000000000000000000000000000000dEaD TREASURY=0x000000000000000000000000000000000000bEEF MAX_PAUSE_DURATION_SECONDS=604800
+            refuses "setup dev is single-party: off local chains it deploys only the drill vault, with ALLOW_DEV_SETUP=1" \
+              simulate deployment-sepolia.json 11155111 $WIDE_KEYS
+            ALLOW_DEV_SETUP=1 simulate deployment-sepolia-drill.json 11155111 $WIDE_KEYS
+            check deployment-sepolia-drill.json 11155111 1 $WIDE_KEYS
+            ALLOW_DEV_SETUP=1 refuses "mainnet needs the ceremony setup \(mpc-1\)" simulate deployment-mainnet.json 1 $WIDE_KEYS
+            sed 's/"setup_id": "dev"/"setup_id": "mpc-1"/' "$ZKAPI_SETUP_DIR/manifest.json" > ../../.demo/relabelled-mpc-1.json
+            for chain in 11155111 1; do
+              SETUP_MANIFEST="$PWD/../../.demo/relabelled-mpc-1.json" \
+                refuses "mpc-1 is not pinned yet|mpc-1 verifying keys are not the ceremony's" \
+                simulate deployment-relabelled.json "$chain" $WIDE_KEYS
+            done
+          )
+
+      # Broadcast to a local Anvil (after 5 empty blocks) and finalize. The
+      # provisional manifest is "pending" with deployBlockLowerBound 5, the
+      # simulated head; finalize checks the creation receipts, the runtime
+      # codehashes, owner and treasury on chain, and only then writes the
+      # manifest with deployBlock, the block whose state first holds the vault's
+      # code. A provisional manifest the chain contradicts, and a dry run's, are
+      # refused, and nothing is written.
+      - name: Broadcast the demo deployment to Anvil and finalize its manifest
+        working-directory: demo/contracts
+        run: |
+          RPC=http://127.0.0.1:8546
+          anvil --port 8546 --silent &
+          trap 'kill $!' EXIT
+          for _ in $(seq 100); do cast block-number --rpc-url "$RPC" > /dev/null 2>&1 && break; sleep 0.1; done
+          cast rpc anvil_mine 5 --rpc-url "$RPC" > /dev/null
+          PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            OUTPUT_PATH="$PWD/../../.demo/anvil.json" \
+            SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
+            STATE_SIGNING_KEY_X=0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 \
+            STATE_SIGNING_KEY_Y=0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f \
+            CLEARANCE_SIGNING_KEY_X=0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 \
+            CLEARANCE_SIGNING_KEY_Y=0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6 \
+            forge script script/Deploy.s.sol --rpc-url "$RPC" --broadcast
+          test ! -e ../../.demo/anvil.json
+          node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (m.deploymentStatus !== "pending" || m.deployBlockLowerBound !== 5 || "deployBlock" in m) { console.error(m); process.exit(1); }' ../../.demo/anvil.json.pending
+          node ../../scripts/expected-codehashes.mjs --deployment ../../.demo/anvil.json.pending --rpc "$RPC" --finalize ../../.demo/anvil.json
+          VAULT=$(node -p 'require("../../.demo/anvil.json").vault')
+          BLOCK=$(node -p 'const m = require("../../.demo/anvil.json"); if (m.deploymentStatus !== "deployed" || !(m.deployBlock > 5)) process.exit(1); m.deployBlock')
+          test "$(cast code "$VAULT" --block $((BLOCK - 1)) --rpc-url "$RPC")" = 0x
+          test "$(cast code "$VAULT" --block "$BLOCK" --rpc-url "$RPC")" != 0x
+          node ../../scripts/expected-codehashes.mjs --deployment ../../.demo/anvil.json --check --rpc "$RPC" > /dev/null
+          node -e 'const fs = require("fs"); const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); m.treasury = "0x000000000000000000000000000000000000bEEF"; fs.writeFileSync(process.argv[2], JSON.stringify(m));' ../../.demo/anvil.json.pending ../../.demo/tampered.json.pending
+          for pending in tampered deployment; do
+            if node ../../scripts/expected-codehashes.mjs --deployment "../../.demo/$pending.json.pending" --rpc "$RPC" --finalize "../../.demo/$pending-final.json"; then
+              echo "finalized $pending.json.pending"; exit 1
+            fi
+            test ! -e "../../.demo/$pending-final.json"
+          done
 
       - name: Test challenge signer against Anvil
         run: |

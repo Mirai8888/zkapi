@@ -4,15 +4,17 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {Types} from "../src/libraries/Types.sol";
+import {Errors} from "../src/libraries/Errors.sol";
 import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
 import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "./mocks/MockProofAdapters.sol";
 import {ToggleableDestination} from "./NativeEthVault.t.sol";
 
 /// @dev Drives a vault (mock adapter) through random deposits, escapes with concessions, raises,
-///      defeats, finalizations, closes, expiry claims, payout claims, retirements, pauses and time,
-///      and keeps the ghost accounting the invariants check. Note n's states have nullifiers
-///      N(n, i) = 1 + n * 1000 + i; an escape from S_i names N(n, i + 1) as its successor.
+///      defeats, finalizations, closes, expiry claims, payout claims, retirements, pauses, time and
+///      attempts to exit Closed notes again, and keeps the ghost accounting the invariants check.
+///      Note n's states have nullifiers N(n, i) = 1 + n * 1000 + i; an escape from S_i names
+///      N(n, i + 1) as its successor.
 contract VaultHandler is Test {
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
     uint32 public constant MAX_NOTES = 8;
@@ -32,8 +34,8 @@ contract VaultHandler is Test {
     uint256 public ghostCreditsClaimed;
     uint256 public calls;
     /// Successful operations, by kind: deposit, escape, raise, defeat, finalize, close, claim
-    /// expired, claim payout, retire.
-    uint256[9] public done;
+    /// expired, claim payout, retire, and refused exits of a Closed note.
+    uint256[10] public done;
     /// Every root the vault set: the empty tree's, then each deposit's and retirement's.
     uint256[] public roots;
 
@@ -166,6 +168,48 @@ contract VaultHandler is Test {
         } catch {}
     }
 
+    /// An escape or a close of a Closed note, from any of its states, at any root the vault ever
+    /// held (Amendment A1 keeps them all valid, so a closed note's leaf stays provable). It must
+    /// revert: NoteNotActive, or for an escape ChallengedNullifier or SupersededState when a defeat
+    /// flagged its state or the successor. A success is recorded as a second payout of the note,
+    /// which invariant_onePayoutPerNoteSplittingItsDeposit refuses.
+    function exitClosed(uint32 noteSeed, uint256 stateSeed, uint256 rootSeed, bool asClose, uint128 balanceSeed)
+        external
+    {
+        (bool ok, uint32 id, uint128 deposit_) = _note(noteSeed, Types.NoteStatus.Closed);
+        if (!ok) return;
+        uint256 i = stateSeed % STATES;
+        uint128 balance = uint128(bound(balanceSeed, 0, deposit_));
+        Types.WithdrawalPublicInputs memory inputs =
+            _withdrawal(asClose ? 1 : 0, id, _n(id, i), asClose ? 0 : _n(id, i + 1), balance);
+        inputs.activeRoot = roots[rootSeed % roots.length];
+        bytes4 expected = Errors.NoteNotActive.selector;
+        if (vault.paused() && vm.getBlockTimestamp() < uint256(vault.pausedAt()) + vault.maxPauseDuration()) {
+            expected = Errors.Paused.selector;
+        } else if (!asClose && vault.challengedNullifiers(inputs.withdrawalNullifier)) {
+            expected = Errors.ChallengedNullifier.selector;
+        } else if (!asClose && vault.challengedNullifiers(inputs.nextNullifier)) {
+            expected = Errors.SupersededState.selector;
+        }
+        bytes memory reason;
+        if (asClose) {
+            try vault.mutualClose(inputs, "") {
+                ++payouts[id];
+            } catch (bytes memory r) {
+                reason = r;
+            }
+        } else {
+            try vault.initiateEscapeWithdrawal(inputs, "") {
+                ++payouts[id];
+            } catch (bytes memory r) {
+                reason = r;
+            }
+        }
+        if (payouts[id] > 1) return;
+        assertEq(reason, abi.encodeWithSelector(expected), "a closed note's exit failed for another reason");
+        ++done[9];
+    }
+
     function retire(uint32 noteSeed) external {
         (bool ok, uint32 id,) = _note(noteSeed, Types.NoteStatus.Closed);
         if (!ok || retired[id]) return;
@@ -294,8 +338,10 @@ contract VaultHandler is Test {
 ///        arrears and the credited escape payouts, nothing more or less;
 ///      - every pending escape has finalBalance + conceded == stateBalance <= its deposit and a
 ///        nonzero successor nullifier, and no other note has a pending record;
-///      - each note pays out at most once, and each exit splits its deposit exactly between the
-///        owner (pushed or credited) and the treasury (pushed or in arrears);
+///      - each note pays out at most once (an escape or close that a Closed note gets through,
+///        at any root the vault held, counts as a second payout), and each exit splits its
+///        deposit exactly between the owner (pushed or credited) and the treasury (pushed or in
+///        arrears);
 ///      - every root the vault held stays known.
 ///      The handler expects every call it makes outside try/catch to succeed (and asserts each
 ///      exit's split as it happens), so a revert fails the campaign.

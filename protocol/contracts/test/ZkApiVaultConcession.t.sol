@@ -757,6 +757,96 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         _assertUntouched(id);
     }
 
+    // ========================================= closed notes stay closed (Amendment A1)
+
+    uint256 constant CLOSED_BY_MUTUAL_CLOSE = 0;
+    uint256 constant CLOSED_BY_FINALIZED_ESCAPE = 1;
+    uint256 constant CLOSED_BY_EXPIRY_CLAIM = 2;
+
+    /// Under Amendment A1 a Closed note's leaf stays provable for good: in every root the vault
+    /// held before the leaf is retired, and in every root if it never is. The Active check of
+    /// initiateEscapeWithdrawal and mutualClose is then the only barrier to a second payout. For
+    /// each way a note closes, an escape and a close from an older unconsumed state (S_0), from
+    /// the closing state (S_2) and from a newer unconsumed state (S_4) revert NoteNotActive at the
+    /// note's deposit-time root and at the root live when it closed, before and after its leaf
+    /// is retired, and at the root after the retirement.
+    function test_closedNoteNeverExitsAgain() public {
+        for (uint256 route = 0; route < 3; ++route) {
+            uint256 snapshot = vm.snapshotState();
+            uint32 id = _deposit(42);
+            uint256 depositRoot = vault.currentRoot();
+            _deposit(43);
+            _closeBy(route, id);
+            uint256 closedRoot = vault.currentRoot();
+            assertNotEq(closedRoot, depositRoot);
+            uint256 held = address(vault).balance;
+
+            _assertNeverExitsAgain(id, depositRoot);
+            _assertNeverExitsAgain(id, closedRoot);
+            _retire(id);
+            assertTrue(vault.isKnownRoot(depositRoot));
+            assertTrue(vault.isKnownRoot(closedRoot));
+            _assertNeverExitsAgain(id, depositRoot);
+            _assertNeverExitsAgain(id, closedRoot);
+            _assertNeverExitsAgain(id, vault.currentRoot());
+
+            assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
+            assertEq(address(vault).balance, held);
+            // The refused exits consumed nothing.
+            uint256[4] memory fresh = [N(0), N(1), N(4), N(5)];
+            for (uint256 i = 0; i < fresh.length; ++i) {
+                assertFalse(vault.usedNullifiers(fresh[i]));
+            }
+            vm.revertToState(snapshot);
+        }
+    }
+
+    /// A note id never deposited has no leaf, but the mock adapter accepts any statement: an escape
+    /// or a close of it (zero balance, the only one its zero deposit admits) reverts NoteNotActive
+    /// rather than recording a pending escape that the later deposit at that id would inherit.
+    function test_exitsOfANoteNeverDepositedRevert() public {
+        _deposit(42);
+        uint32 future = vault.nextNoteId();
+        _escapeReverts(_escape(future, N(0), N(1), 0, 0), Errors.NoteNotActive.selector);
+        _closeReverts(_close(future, N(0), 0), Errors.NoteNotActive.selector);
+        (bool exists,,,,,) = vault.pendingWithdrawals(future);
+        assertFalse(exists);
+        assertFalse(vault.usedNullifiers(N(0)));
+        assertEq(uint256(_status(future)), uint256(Types.NoteStatus.Uninitialized));
+    }
+
+    function _closeBy(uint256 route, uint32 id) internal {
+        if (route == CLOSED_BY_MUTUAL_CLOSE) {
+            vault.mutualClose(_close(id, N(2), B2), PROOF);
+        } else if (route == CLOSED_BY_FINALIZED_ESCAPE) {
+            _initiate(_escapeFrom(id, 2, B2, SB2));
+            vm.warp(_deadline(id));
+            vault.finalizeEscapeWithdrawal(id);
+        } else {
+            vm.warp(vault.effectiveExpiry(id));
+            vault.claimExpired(id);
+        }
+        assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
+    }
+
+    /// Escapes and closes of Closed note `id` from S_0, S_2 and S_4 at `root` (a fresh proof:
+    /// validUntil is in the future) revert NoteNotActive.
+    function _assertNeverExitsAgain(uint32 id, uint256 root) internal {
+        uint256[3] memory states = [uint256(0), 2, 4];
+        uint128[3] memory balances = [DEPOSIT, B2, 600_000];
+        for (uint256 i = 0; i < states.length; ++i) {
+            Types.WithdrawalPublicInputs memory escape = _escapeFrom(id, states[i], balances[i], 0);
+            escape.activeRoot = root;
+            _escapeReverts(escape, Errors.NoteNotActive.selector);
+            escape = _escapeFrom(id, states[i], balances[i], balances[i] / 2);
+            escape.activeRoot = root;
+            _escapeReverts(escape, Errors.NoteNotActive.selector);
+            Types.WithdrawalPublicInputs memory close = _close(id, N(states[i]), balances[i]);
+            close.activeRoot = root;
+            _closeReverts(close, Errors.NoteNotActive.selector);
+        }
+    }
+
     // ============================================================ separate notes
 
     /// Escapes of two notes run side by side; a defeat of one leaves the other pending and

@@ -348,13 +348,118 @@ contract ZkApiVaultGroth16Test is Test {
     }
 
     function _addScalarModulus(bytes memory words, uint256 index) private pure {
-        uint256 value;
+        uint256 value = _word(words, index);
+        require(value < SCALAR_MODULUS, "fixture word is not canonical");
+        _setWord(words, index, value + SCALAR_MODULUS);
+    }
+
+    function _word(bytes memory words, uint256 index) private pure returns (uint256 value) {
+        require(words.length >= 32 * (index + 1), "word index");
         assembly ("memory-safe") {
             value := mload(add(add(words, 0x20), mul(index, 0x20)))
         }
-        require(value < SCALAR_MODULUS, "fixture word is not canonical");
+    }
+
+    function _setWord(bytes memory words, uint256 index, uint256 value) private pure {
+        require(words.length >= 32 * (index + 1), "word index");
         assembly ("memory-safe") {
-            mstore(add(add(words, 0x20), mul(index, 0x20)), add(value, SCALAR_MODULUS))
+            mstore(add(add(words, 0x20), mul(index, 0x20)), value)
+        }
+    }
+
+    // ============================================== tampered withdrawal statements
+
+    /// The vault relies on the withdrawal proof for every word of an escape or a close that it
+    /// does not check itself. Each such word of escape_a2 and close_a2, changed to another
+    /// canonical value that passes every check made before verification, reverts InvalidProof:
+    /// the note id (to B, also Active), the payout, the destination, the nullifier, the successor
+    /// nullifier, the concession and validUntil, each increased by one, and the root replaced by
+    /// another root the vault held (A's deposit-time root). The note stays Active and neither
+    /// nullifier is consumed. Without verification, each would pay out or record an escape.
+    function test_realWithdrawalsRefuseTamperedStatements() public {
+        _depositAB();
+        uint256 rootA = vm.parseJsonUint(fixtures, ".root_a");
+        assertTrue(vault.isKnownRoot(rootA));
+        string[2] memory names = ["escape_a2", "close_a2"];
+        // noteId, finalBalance, destination, withdrawalNullifier, nextNullifier, conceded, validUntil
+        uint256[7] memory proofOnly = [uint256(8), 9, 10, 11, 13, 14, 15];
+        for (uint256 n = 0; n < names.length; ++n) {
+            bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", names[n], ".inputs_abi"));
+            for (uint256 i = 0; i < proofOnly.length; ++i) {
+                _tamperedWithdrawalReverts(names[n], proofOnly[i], _word(words, proofOnly[i]) + 1);
+            }
+            _tamperedWithdrawalReverts(names[n], 3, rootA);
+        }
+        (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2");
+        for (uint32 id = 0; id < 2; ++id) {
+            assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Active));
+        }
+        assertFalse(vault.usedNullifiers(escape.withdrawalNullifier));
+        assertFalse(vault.usedNullifiers(escape.nextNullifier));
+        assertFalse(vault.usedNullifiers(escape.withdrawalNullifier + 1));
+        assertFalse(vault.usedNullifiers(escape.nextNullifier + 1));
+        assertEq(address(vault).balance, 2 * uint256(DEPOSIT) * 1 gwei);
+        // The untampered statements go through.
+        _initiate("escape_a2");
+    }
+
+    /// Submits fixture `name` (an escape or a close, by its kind) with ABI word `index` set to the
+    /// canonical `value`, as the user, expecting InvalidProof.
+    function _tamperedWithdrawalReverts(string memory name, uint256 index, uint256 value) private {
+        bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi"));
+        require(value < SCALAR_MODULUS && value != _word(words, index), "not a canonical change");
+        _setWord(words, index, value);
+        Types.WithdrawalPublicInputs memory inputs = abi.decode(words, (Types.WithdrawalPublicInputs));
+        bytes memory proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
+        vm.prank(USER);
+        vm.expectRevert(Errors.InvalidProof.selector);
+        if (inputs.kind == 1) vault.mutualClose(inputs, proof);
+        else vault.initiateEscapeWithdrawal(inputs, proof);
+    }
+
+    // ========================================= closed notes stay closed (Amendment A1)
+
+    /// Under Amendment A1 a closed note's leaf stays in every root the vault held, A's deposit-time
+    /// root among them, so the Active check is the only barrier to a second payout. After close_a2,
+    /// and after a finalized escape_a2, every exit proof of A reverts NoteNotActive, before and
+    /// after A's leaf is retired: escapes from the older states a0 and a1 (a0's nullifiers are
+    /// unconsumed), from a2, and from a2 at A's deposit-time root, and close_a2.
+    function test_realClosedNoteNeverExitsAgain() public {
+        for (uint256 route = 0; route < 2; ++route) {
+            uint256 snapshot = vm.snapshotState();
+            _depositAB();
+            if (route == 0) {
+                (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a2");
+                vault.mutualClose(close, closeProof);
+            } else {
+                _initiate("escape_a2");
+                vm.warp(_deadline(0));
+                vault.finalizeEscapeWithdrawal(0);
+            }
+            assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Closed));
+            uint256 held = address(vault).balance;
+            _assertRealNeverExitsAgain();
+            _retire(0);
+            _assertRealNeverExitsAgain();
+            assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Closed));
+            assertEq(address(vault).balance, held);
+            (Types.WithdrawalPublicInputs memory a0,) = _withdrawal("escape_a0");
+            assertFalse(vault.usedNullifiers(a0.withdrawalNullifier));
+            assertFalse(vault.usedNullifiers(a0.nextNullifier));
+            vm.revertToState(snapshot);
+        }
+    }
+
+    function _assertRealNeverExitsAgain() private {
+        string[6] memory names =
+            ["escape_a0", "escape_a1", "escape_a2", "escape_a2_concede", "escape_a2_at_root_a", "close_a2"];
+        for (uint256 i = 0; i < names.length; ++i) {
+            (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal(names[i]);
+            assertTrue(vault.isKnownRoot(inputs.activeRoot));
+            vm.prank(USER);
+            vm.expectRevert(Errors.NoteNotActive.selector);
+            if (inputs.kind == 1) vault.mutualClose(inputs, proof);
+            else vault.initiateEscapeWithdrawal(inputs, proof);
         }
     }
 

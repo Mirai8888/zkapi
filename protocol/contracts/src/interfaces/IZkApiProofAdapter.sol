@@ -17,11 +17,14 @@ interface IZkApiProofAdapter {
     function WITHDRAWAL_VK_HASH() external view returns (bytes32);
 
     /// @notice Assert that a request proof is valid for the given public inputs.
-    /// @dev Must revert if the proof is invalid.
+    /// @dev Must revert if the proof is invalid, and for any public input at or above the BN254
+    ///      scalar field order: the vault matches nullifiers by their raw words, so an input must
+    ///      never verify in a non-canonical form (value + r).
     function assertValidRequest(Types.RequestPublicInputs calldata inputs, bytes calldata proofEnvelope) external view;
 
     /// @notice Assert that a withdrawal proof is valid for the given public inputs.
-    /// @dev Must revert if the proof is invalid.
+    /// @dev Must revert if the proof is invalid, and for any public input at or above the BN254
+    ///      scalar field order.
     function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proofEnvelope)
         external
         view;

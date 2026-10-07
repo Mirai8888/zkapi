@@ -14,6 +14,8 @@ import {MockProofAdapter} from "../mocks/MockProofAdapters.sol";
 ///      may reuse a block.timestamp read from before a warp.
 abstract contract VaultTestBase is Test {
     uint256 internal constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465; // "zkapi.v2.node"
+    uint256 internal constant SCALAR_MODULUS =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint128 internal constant DEPOSIT = 1_000_000;
     uint256 internal constant STATE_X = 11;
     uint256 internal constant STATE_Y = 12;

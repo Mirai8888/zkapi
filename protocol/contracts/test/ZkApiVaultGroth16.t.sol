@@ -23,6 +23,7 @@ contract ZkApiVaultGroth16Test is Test {
     uint128 constant B2 = 790_000;
     uint128 constant SB2 = 100_000;
     uint128 constant CHARGE2 = 40_000;
+    uint256 constant SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     address constant DEPLOYER = address(0xf00d);
     address constant USER = 0x1111111111111111111111111111111111111111;
     address constant TREASURY = address(0xbeef);
@@ -264,6 +265,96 @@ contract ZkApiVaultGroth16Test is Test {
         vault.finalizeEscapeWithdrawal(1);
         assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
         assertEq(uint256(_status(1)), uint256(Types.NoteStatus.Closed));
+    }
+
+    // ================================================= non-canonical public inputs
+
+    /// Each field-element word of an escape and a close, written as value + r (the same scalar to
+    /// the ecMul precompile), is refused. The nullifiers reach the real adapter, which must revert
+    /// InvalidProof: the vault keys its nullifier bookkeeping on the raw words, so an escape naming
+    /// N_{k+1} + r could not be defeated by the real successor request (NotSuccessorEvidence), and
+    /// one naming N_k + r would slip past ChallengedNullifier after a defeat, or N_{k+1} + r past
+    /// SupersededState. The root and the keys are refused by the vault's own checks first.
+    function test_realWithdrawalsRefuseNonCanonicalFieldInputs() public {
+        _depositAB();
+        string[2] memory names = ["escape_a2", "close_a2"];
+        for (uint256 n = 0; n < names.length; ++n) {
+            _withdrawalWordReverts(names[n], 3, Errors.UnknownRoot.selector);
+            for (uint256 key = 4; key < 8; ++key) {
+                _withdrawalWordReverts(names[n], key, Errors.InvalidDeploymentBinding.selector);
+            }
+            _withdrawalWordReverts(names[n], 11, Errors.InvalidProof.selector);
+            _withdrawalWordReverts(names[n], 13, Errors.InvalidProof.selector);
+        }
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
+
+        // After R3 defeats the escape from a2, renaming a2's nullifier, or a1's successor
+        // nullifier (a2's), does not get around ChallengedNullifier or SupersededState.
+        _initiate("escape_a2");
+        _defeat("request_a3");
+        _withdrawalWordReverts("escape_a2", 11, Errors.InvalidProof.selector);
+        _withdrawalWordReverts("escape_a1", 13, Errors.InvalidProof.selector);
+        _escapeReverts("escape_a2", Errors.ChallengedNullifier.selector);
+        _escapeReverts("escape_a1", Errors.SupersededState.selector);
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
+    }
+
+    /// Each field-element word of the defeat and raise evidence, written as value + r, is refused:
+    /// the request nullifier by the vault's match against the stored canonical nullifiers, the keys
+    /// by the binding check, and the root, tag and anonymous commitment by the real adapter.
+    function test_realEvidenceRefusesNonCanonicalFieldInputs() public {
+        _depositAB();
+        _initiate("escape_a2");
+        uint256[4] memory adapterChecked = [uint256(3), 9, 10, 11];
+        for (uint256 i = 0; i < adapterChecked.length; ++i) {
+            _evidenceWordReverts(false, "request_a3", adapterChecked[i], Errors.InvalidProof.selector);
+            _evidenceWordReverts(true, "request_a2", adapterChecked[i], Errors.InvalidProof.selector);
+        }
+        for (uint256 key = 4; key < 6; ++key) {
+            _evidenceWordReverts(false, "request_a3", key, Errors.InvalidDeploymentBinding.selector);
+            _evidenceWordReverts(true, "request_a2", key, Errors.InvalidDeploymentBinding.selector);
+        }
+        _evidenceWordReverts(false, "request_a3", 8, Errors.NotSuccessorEvidence.selector);
+        _evidenceWordReverts(true, "request_a2", 8, Errors.NotStateEvidence.selector);
+        assertEq(_finalBalance(0), B2);
+        _defeat("request_a3");
+    }
+
+    /// Initiates (or closes with) fixture `name` with ABI word `index` increased by r, as the user,
+    /// expecting `err`.
+    function _withdrawalWordReverts(string memory name, uint256 index, bytes4 err) private {
+        bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi"));
+        _addScalarModulus(words, index);
+        Types.WithdrawalPublicInputs memory inputs = abi.decode(words, (Types.WithdrawalPublicInputs));
+        bytes memory proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
+        vm.prank(USER);
+        vm.expectRevert(err);
+        if (inputs.kind == 1) vault.mutualClose(inputs, proof);
+        else vault.initiateEscapeWithdrawal(inputs, proof);
+    }
+
+    /// Defeats (or raises, to the request's bound) note 0's escape with fixture `name`, ABI word
+    /// `index` increased by r, as the operator, expecting `err`.
+    function _evidenceWordReverts(bool raise, string memory name, uint256 index, bytes4 err) private {
+        bytes memory words = vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi"));
+        _addScalarModulus(words, index);
+        Types.RequestPublicInputs memory inputs = abi.decode(words, (Types.RequestPublicInputs));
+        bytes memory proof = vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"));
+        vm.prank(OPERATOR);
+        vm.expectRevert(err);
+        if (raise) vault.raiseEscapeConcession(0, inputs, proof, inputs.solvencyBound);
+        else vault.challengeEscapeWithdrawal(0, inputs, proof);
+    }
+
+    function _addScalarModulus(bytes memory words, uint256 index) private pure {
+        uint256 value;
+        assembly ("memory-safe") {
+            value := mload(add(add(words, 0x20), mul(index, 0x20)))
+        }
+        require(value < SCALAR_MODULUS, "fixture word is not canonical");
+        assembly ("memory-safe") {
+            mstore(add(add(words, 0x20), mul(index, 0x20)), add(value, SCALAR_MODULUS))
+        }
     }
 
     // ===================================================== known roots (Amendment A1)

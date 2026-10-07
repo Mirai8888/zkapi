@@ -524,7 +524,13 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
         if (destination == address(0) || destination == address(this)) revert Errors.InvalidDestination();
     }
 
+    /// @dev Only canonical field elements are consumed, whatever the adapter accepts: usedNullifiers,
+    ///      challengedNullifiers and pendingConcessions are keyed on the raw word, so N + r (the same
+    ///      scalar to a verifier that reduced it) would otherwise slip past ChallengedNullifier,
+    ///      SupersededState and ReplayedNullifier, or name a successor no defeat can match. Every
+    ///      nullifier those mappings hold was consumed here first.
     function _consumeNullifier(uint256 nullifier) private {
+        _requireField(nullifier);
         if (usedNullifiers[nullifier]) revert Errors.ReplayedNullifier();
         usedNullifiers[nullifier] = true;
     }

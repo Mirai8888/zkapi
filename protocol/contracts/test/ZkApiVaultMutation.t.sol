@@ -12,8 +12,15 @@ import {Errors} from "../src/libraries/Errors.sol";
 ///      So does every one of the 8 proof words. The inputs are mutated as ABI words, in
 ///      public-input order, so an adapter that skipped, reordered or misencoded an input fails
 ///      here even if the Rust side is right.
+///      Each field-element input (the 256-bit words) is also given its non-canonical form
+///      value + r, which the ecMul precompile would reduce to the same scalar, and each proof word
+///      value + q. The adapter must refuse both: the vault keys usedNullifiers,
+///      challengedNullifiers and pendingConcessions on the raw words, so an adapter that reduced
+///      N + r or N_{k+1} + r to a valid proof would let an escape slip past ChallengedNullifier,
+///      SupersededState and ReplayedNullifier, or name a successor no defeat can match.
 contract ZkApiVaultMutationTest is Test {
     uint256 constant SCALAR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    uint256 constant BASE_MODULUS = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
     /// Gas for each verification. A proof word off the curve makes a precompile fail, which burns
     /// all the gas the adapter forwards to it; the cap keeps the loop from running dry.
     uint256 constant VERIFY_GAS = 1_000_000;
@@ -68,12 +75,18 @@ contract ZkApiVaultMutationTest is Test {
             Types.RequestPublicInputs memory inputs = abi.decode(mutated, (Types.RequestPublicInputs));
             vm.expectRevert(Errors.InvalidProof.selector);
             adapter.assertValidRequest{gas: VERIFY_GAS}(inputs, proof);
+            if (REQUEST_BITS[i] != 256) continue;
+            inputs = abi.decode(_addToWord(words, i, SCALAR_MODULUS), (Types.RequestPublicInputs));
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidRequest{gas: VERIFY_GAS}(inputs, proof);
         }
         Types.RequestPublicInputs memory original = abi.decode(words, (Types.RequestPublicInputs));
         for (uint256 i = 0; i < 8; ++i) {
             bytes memory mutatedProof = _mutateWord(proof, i, 256);
             vm.expectRevert(Errors.InvalidProof.selector);
             adapter.assertValidRequest{gas: VERIFY_GAS}(original, mutatedProof);
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidRequest{gas: VERIFY_GAS}(original, _addToWord(proof, i, BASE_MODULUS));
         }
     }
 
@@ -86,12 +99,18 @@ contract ZkApiVaultMutationTest is Test {
             Types.WithdrawalPublicInputs memory inputs = abi.decode(mutated, (Types.WithdrawalPublicInputs));
             vm.expectRevert(Errors.InvalidProof.selector);
             adapter.assertValidWithdrawal{gas: VERIFY_GAS}(inputs, proof);
+            if (WITHDRAWAL_BITS[i] != 256) continue;
+            inputs = abi.decode(_addToWord(words, i, SCALAR_MODULUS), (Types.WithdrawalPublicInputs));
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidWithdrawal{gas: VERIFY_GAS}(inputs, proof);
         }
         Types.WithdrawalPublicInputs memory original = abi.decode(words, (Types.WithdrawalPublicInputs));
         for (uint256 i = 0; i < 8; ++i) {
             bytes memory mutatedProof = _mutateWord(proof, i, 256);
             vm.expectRevert(Errors.InvalidProof.selector);
             adapter.assertValidWithdrawal{gas: VERIFY_GAS}(original, mutatedProof);
+            vm.expectRevert(Errors.InvalidProof.selector);
+            adapter.assertValidWithdrawal{gas: VERIFY_GAS}(original, _addToWord(proof, i, BASE_MODULUS));
         }
     }
 
@@ -107,6 +126,20 @@ contract ZkApiVaultMutationTest is Test {
         uint256 next = value < limit ? value + 1 : value - 1;
         assembly ("memory-safe") {
             mstore(add(add(out, 0x20), mul(index, 0x20)), next)
+        }
+    }
+
+    /// A copy of `data` whose word `index` is increased by `modulus`: the same residue, written
+    /// non-canonically. Every fixture word is below the modulus, so the sum cannot overflow.
+    function _addToWord(bytes memory data, uint256 index, uint256 modulus) private pure returns (bytes memory out) {
+        out = bytes.concat(data);
+        uint256 value;
+        assembly ("memory-safe") {
+            value := mload(add(add(out, 0x20), mul(index, 0x20)))
+        }
+        require(value < modulus, "fixture word is not canonical");
+        assembly ("memory-safe") {
+            mstore(add(add(out, 0x20), mul(index, 0x20)), add(value, modulus))
         }
     }
 

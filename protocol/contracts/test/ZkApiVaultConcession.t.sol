@@ -234,6 +234,32 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         vault.initiateEscapeWithdrawal(unknownRoot, PROOF);
     }
 
+    /// The vault consumes only canonical nullifiers, even behind an adapter that accepts anything
+    /// (the mock): N + r is the same scalar to a verifier that reduced it, and would otherwise slip
+    /// past ChallengedNullifier, SupersededState and ReplayedNullifier, or record a successor that
+    /// the real successor request cannot match. The real adapter refuses them too
+    /// (ZkApiVaultGroth16Test, ZkApiVaultMutationTest).
+    function test_withdrawalsConsumeOnlyCanonicalNullifiers() public {
+        uint256 r = SCALAR_MODULUS;
+        uint32 id = _deposit(42);
+        _escapeReverts(_escape(id, N(2) + r, N(3), B2, 0), Errors.InvalidFelt.selector);
+        _escapeReverts(_escape(id, N(2), N(3) + r, B2, 0), Errors.InvalidFelt.selector);
+        _escapeReverts(_escape(id, type(uint256).max, N(3), B2, 0), Errors.InvalidFelt.selector);
+        _closeReverts(_close(id, N(2) + r, B2), Errors.InvalidFelt.selector);
+        _assertUntouched(id);
+
+        _initiate(_escapeFrom(id, 2, B2, 0));
+        _escapeReverts(_escape(id, N(5) + r, N(6), 1, 0), Errors.NoteNotActive.selector);
+        _defeat(id, N(3));
+        // The defeated state renamed, and the state below it naming the renamed successor.
+        _escapeReverts(_escape(id, N(2) + r, N(3), B2, 0), Errors.InvalidFelt.selector);
+        _escapeReverts(_escape(id, N(1), N(2) + r, 940_000, 0), Errors.InvalidFelt.selector);
+        _closeReverts(_close(id, N(2) + r, B2), Errors.InvalidFelt.selector);
+        _assertUntouched(id);
+        assertFalse(vault.usedNullifiers(N(2) + r));
+        assertFalse(vault.usedNullifiers(N(3) + r));
+    }
+
     // ====================================================================== defeat
 
     /// Only a request proof at the successor nullifier defeats: a request at the escaped

@@ -3310,10 +3310,39 @@ pub(crate) mod settlement_route_tests {
         .unwrap();
         let (status, _) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // Rows of other requests at N: a 'rebind' row before the reservation,
+        // and a 'rebind' and another 'reserve' row after it. Only the
+        // earliest 'reserve' row is served.
+        let other_row = |source: &str, fill: u8| {
+            let mut inputs = request.public_inputs.clone();
+            inputs.solvency_bound = 11 + fill as u128;
+            processor.store().execute_for_test(
+                "INSERT INTO request_evidence (nullifier, client_request_id, solvency_bound,
+                    request_inputs_json, proof_blob, source, created_at)
+                 VALUES ('0x99', ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    format!("other-{source}-{fill}"),
+                    inputs.solvency_bound.to_string(),
+                    serde_json::to_string(&inputs).unwrap(),
+                    vec![fill; 256],
+                    source,
+                    fill as i64
+                ],
+            );
+        };
+        other_row("rebind", 1);
+        let (status, _) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a 'rebind' row is not served"
+        );
         processor
             .store()
             .reserve_openrouter_lease(&request)
             .unwrap();
+        other_row("rebind", 2);
+        other_row("reserve", 3);
         let (status, body) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(

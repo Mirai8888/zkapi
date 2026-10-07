@@ -748,11 +748,11 @@ where
     Ok(evidence)
 }
 
-/// E5 for a reservation closed by an escape: `paid` must be the escape
-/// record's `B − c_final`, with `c_final` the largest of its initial
-/// concession and every `EscapeConcessionRaised` since it was prepared. With
-/// no escape record of the reserved state (another device escaped), only an
-/// escape conceding nothing is accepted.
+/// E5 for a reservation closed by an escape: `paid` must be `B − c_final`,
+/// with `c_final` the largest of the initial concession and every
+/// `EscapeConcessionRaised` since. B and the initial concession come from
+/// the escape record, or, for an escape this companion did not prepare,
+/// from the note's latest `EscapeConcessionRecorded`.
 async fn check_escape_payout<F, Fut>(
     config: &AuthConfig,
     record: &Reservation,
@@ -772,18 +772,71 @@ where
     let escape = crate::service::exit::load_record(config)?.filter(|escape| {
         escape.note_id == record.snapshot.note_id && escape.withdrawal_nullifier == record.nullifier
     });
-    let Some(escape) = escape else {
-        return (paid == record.snapshot.current_balance)
-            .then_some(())
-            .ok_or_else(mismatch);
+    let vault = hex(&record.snapshot.contract_address.as_bytes()[12..]);
+    let note_topic = format!("0x{:064x}", record.snapshot.note_id);
+    // Without an escape record of the reserved state (another device or an
+    // exit kit escaped), the latest EscapeConcessionRecorded of the note gives
+    // the state balance, which must be the reserved one, and the initial
+    // concession.
+    let (state_balance, conceded_at_init, from_block, bound) = match escape {
+        Some(escape) => (
+            escape.state_balance(),
+            escape.conceded_at_init(),
+            escape.start_block,
+            Some(escape.bound()),
+        ),
+        None => {
+            if paid == record.snapshot.current_balance {
+                return Ok(());
+            }
+            let recorded = request(
+                "eth_getLogs",
+                json!([{
+                    "address": vault,
+                    "fromBlock": format!("0x{:x}", config.deploy_block),
+                    "toBlock": format!("0x{block:x}"),
+                    "topics": [crate::chain::topic("EscapeConcessionRecorded(uint32,uint256,uint128,uint128)"), note_topic],
+                }]),
+            )
+            .await?;
+            let latest = recorded
+                .as_array()
+                .ok_or_else(storage_error)?
+                .iter()
+                .rev()
+                .filter(|log| log["removed"] != true)
+                .filter_map(|log| {
+                    log["data"]
+                        .as_str()
+                        .and_then(|value| value.strip_prefix("0x"))
+                        .filter(|value| value.len() == 192)
+                        .map(str::to_string)
+                })
+                .next()
+                .ok_or_else(mismatch)?;
+            let word = |range: std::ops::Range<usize>| {
+                latest[range.clone()][..32]
+                    .bytes()
+                    .all(|byte| byte == b'0')
+                    .then(|| u128::from_str_radix(&latest[range][32..], 16).ok())
+                    .flatten()
+            };
+            let (Some(state_balance), Some(conceded)) = (word(64..128), word(128..192)) else {
+                return Err(mismatch());
+            };
+            if state_balance != record.snapshot.current_balance {
+                return Err(mismatch());
+            }
+            (state_balance, conceded, config.deploy_block, None)
+        }
     };
     let logs = request(
         "eth_getLogs",
         json!([{
-            "address": hex(&record.snapshot.contract_address.as_bytes()[12..]),
-            "fromBlock": format!("0x{:x}", escape.start_block),
+            "address": vault,
+            "fromBlock": format!("0x{from_block:x}"),
             "toBlock": format!("0x{block:x}"),
-            "topics": [crate::chain::escape_concession_raised_topic(), format!("0x{:064x}", record.snapshot.note_id)],
+            "topics": [crate::chain::escape_concession_raised_topic(), note_topic],
         }]),
     )
     .await?;
@@ -806,10 +859,10 @@ where
     }
     match zkapi_client::exit_policy::match_escape_payout(
         paid,
-        escape.state_balance(),
-        escape.conceded_at_init(),
+        state_balance,
+        conceded_at_init,
         &raises,
-        Some(escape.bound()),
+        bound,
     ) {
         zkapi_client::exit_policy::PayoutMatch::Matches { .. } => Ok(()),
         zkapi_client::exit_policy::PayoutMatch::Mismatch => Err(mismatch()),
@@ -1131,6 +1184,51 @@ pub(crate) mod tests {
         assert_eq!(status["phase"], "complete");
         assert_eq!(status["transaction_hash"], hash);
         assert!(!config.state_dir.join("note_state.json").exists());
+    }
+
+    /// E5 for an escape of the reserved state that this companion did not
+    /// prepare (an exit kit, another device): the payout must be the
+    /// reserved balance less the concession recorded at initiation, raised
+    /// to its largest raise; anything else is refused.
+    #[tokio::test]
+    async fn an_escape_payout_after_a_raise_matches_the_recorded_concession() {
+        let (_directory, config, note) = fixture();
+        let record = reserve(&config, &note, [1; 20]).unwrap();
+        let hash = hex(&[4; 32]);
+        let balance = record.snapshot.current_balance;
+        for (paid, accepted) in [
+            (balance - 900, true),
+            (balance - 901, false),
+            (balance, true),
+        ] {
+            let mut receipt = escape_finalized(&record, &hash);
+            receipt["logs"][0]["data"] = json!(format!(
+                "{}{:064x}{}{}",
+                hex(record.nullifier.as_bytes()),
+                paid,
+                "0".repeat(24),
+                &hex(&record.destination)[2..]
+            ));
+            let outcome = confirm_receipt_using(&config, &record, &hash, |method, params| {
+                let receipt = receipt.clone();
+                let recorded = crate::chain::topic("EscapeConcessionRecorded(uint32,uint256,uint128,uint128)");
+                std::future::ready(Ok(match method {
+                    "eth_chainId" => json!(format!("0x{:x}", config.chain_id)),
+                    "eth_getTransactionReceipt" => receipt,
+                    "eth_getLogs" if params[0]["topics"][0] == recorded => json!([{
+                        "data": format!("0x{}{:064x}{:064x}", "00".repeat(32), balance, 100),
+                    }]),
+                    "eth_getLogs" => json!([{
+                        "data": format!("{}{:064x}{:064x}", hex(record.nullifier.as_bytes()), 900, balance - 900),
+                    }]),
+                    "eth_getBlockByNumber" if params[0] == "finalized" => json!({"number": "0x64"}),
+                    "eth_getBlockByNumber" => json!({"number": "0x64", "hash": hex(&[3; 32])}),
+                    other => panic!("unexpected RPC {other}"),
+                }))
+            })
+            .await;
+            assert_eq!(outcome.is_ok(), accepted, "{paid}: {outcome:?}");
+        }
     }
 
     pub(crate) fn escape_payout_deferred(record: &Reservation) -> Value {

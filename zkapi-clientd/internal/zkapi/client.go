@@ -118,6 +118,22 @@ func (e *Error) Error() string {
 	if e.Code == "clearance_reserved_state" {
 		return "zkAPI note state is reserved for withdrawal: the server holds a withdrawal clearance for the note's current state (for example because the zkAPI operator released it) and refuses every chat request from it, so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance"
 	}
+	switch e.Code {
+	case "escape_required":
+		return "zkAPI withdrawal needs an escape: the server cannot or will not clear a mutual close of the note's current state. Run zkapi-clientd withdraw --escape --to ADDRESS to review the escape and the amount it concedes"
+	case "conceded_mismatch":
+		return "zkAPI escape: the confirmed concession is not the one the exit rules allow now; review the escape again with zkapi-clientd withdraw --escape --to ADDRESS"
+	case "device_not_newest":
+		return "zkAPI device_not_newest: another device or backup spent the note's current state, so an escape from it would be defeated; restore the newest backup before exiting"
+	case "exit_locked":
+		return "zkAPI exit in progress: a withdrawal of this note is under way, so no chat request is made; finish it with zkapi-clientd withdraw"
+	case "note_near_expiry":
+		return "zkAPI note_near_expiry: the note is too close to the latest time to start an exit for a new request to settle first; withdraw the private balance"
+	case "bound_fixed_at_state":
+		return "zkAPI bound_fixed_at_state: every request from the note's current state carries the bound of the first; choose a cheaper model, or wait for the earlier request to settle"
+	case "invalid_successor":
+		return "zkAPI invalid_successor: the server signed a note state that fails the wallet's checks; it is treated as withheld. Withdraw with zkapi-clientd withdraw --escape --to ADDRESS"
+	}
 	if e.Status == http.StatusPaymentRequired {
 		return "zkAPI private balance needs funding; run zkapi-clientd config to add funding"
 	}
@@ -287,7 +303,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			}
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
-				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent":
+				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent",
+					// Circuit zkapi-v2-concession-v1 (design §6.3, §6.4).
+					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict":
 					return nil, &Error{response.StatusCode, code}
 				}
 			}

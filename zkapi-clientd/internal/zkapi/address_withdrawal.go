@@ -51,6 +51,18 @@ type AddressWithdrawalStatus struct {
 	// EscapePayoutCredits lists credited escape payouts of earlier notes
 	// that the vault still holds (see EscapePayoutCredit).
 	EscapePayoutCredits []EscapePayoutCredit `json:"escape_payout_credits,omitempty"`
+	// Mode is "escape" for an escape withdrawal (design §6.4 E4); its
+	// decision and progress follow. Amount is then the payout, which a raise
+	// may lower until finalization.
+	Mode                    string `json:"mode,omitempty"`
+	StateBalance            uint64 `json:"state_balance,omitempty"`
+	Conceded                uint64 `json:"conceded,omitempty"`
+	BoundAtState            uint64 `json:"bound_at_state,omitempty"`
+	Reason                  string `json:"reason,omitempty"`
+	WaitUntil               uint64 `json:"wait_until,omitempty"`
+	ChallengeDeadline       uint64 `json:"challenge_deadline,omitempty"`
+	ValidUntil              uint64 `json:"valid_until,omitempty"`
+	ConcessionExceededBound bool   `json:"concession_exceeded_bound,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -69,6 +81,25 @@ type addressWithdrawalRecord struct {
 	// receipt): the note is closed, and the vault holds its balance for
 	// Destination until claimEscapePayout(Destination) delivers it.
 	PayoutCredited bool `json:"payout_credited,omitempty"`
+	// Mode "escape" (design §6.4 E4): the fields below. Amount is the
+	// payout B − c at initiation, and the finalized payout once complete.
+	Mode          string `json:"mode,omitempty"`
+	StateBalance  uint64 `json:"state_balance,omitempty"`
+	Conceded      uint64 `json:"conceded,omitempty"`
+	Bound         uint64 `json:"bound_at_state,omitempty"`
+	NextNullifier string `json:"next_nullifier,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	StartBlock    uint64 `json:"start_block,omitempty"`
+	ValidUntil    uint64 `json:"valid_until,omitempty"`
+	WaitUntil     uint64 `json:"wait_until,omitempty"`
+	Deadline      uint64 `json:"challenge_deadline,omitempty"`
+	Payout        uint64 `json:"payout,omitempty"`
+	InitiateHash  string `json:"initiate_hash,omitempty"`
+	FinalizeHash  string `json:"finalize_hash,omitempty"`
+	ClaimHash     string `json:"claim_hash,omitempty"`
+	// ConcessionExceededBound is E5's alert: the escape paid less than the
+	// state balance less the state's bound.
+	ConcessionExceededBound bool `json:"concession_exceeded_bound,omitempty"`
 }
 
 type withdrawalWallet struct {
@@ -184,7 +215,11 @@ func retireWithdrawal(record *addressFundingRecord) {
 			listed = listed || strings.EqualFold(credit.SettlementHash, w.SettlementHash)
 		}
 		if !listed {
-			record.CreditedPayouts = append(record.CreditedPayouts, addressCreditedPayout{NoteID: w.NoteID, Destination: w.Destination, Amount: w.Amount, SettlementHash: strings.ToLower(w.SettlementHash)})
+			amount := w.Amount
+			if w.Payout != 0 {
+				amount = w.Payout
+			}
+			record.CreditedPayouts = append(record.CreditedPayouts, addressCreditedPayout{NoteID: w.NoteID, Destination: w.Destination, Amount: amount, SettlementHash: strings.ToLower(w.SettlementHash)})
 		}
 	}
 	record.Withdrawal = nil
@@ -375,8 +410,50 @@ func (h *FundingHandler) withdrawalSnapshot(ctx context.Context) (fundingConfig,
 			}
 		}
 	}
+	if record.Withdrawal != nil && record.Withdrawal.Mode == "escape" && status.Phase != "recovery_required" {
+		return config, record, wallet, escapeStatus(status, record, config), nil
+	}
 	setWithdrawalMessage(&status)
 	return config, record, wallet, status, nil
+}
+
+func setEscapeMessage(status *AddressWithdrawalStatus) {
+	if status.Phase == "complete" && status.PayoutCredited {
+		status.Message = fmt.Sprintf("The escape finalized and closed the note, but the vault could not deliver the payout to %[1]s and holds it as an escape payout credit. Once %[1]s accepts a plain ETH transfer, deliver it with zkapi-clientd withdraw --claim --to %[1]s (claimEscapePayout, selector 0x%[2]s, on the vault %[3]s; data %[4]s).", status.Destination, claimEscapePayoutSelector, status.VaultAddress, status.ClaimCalldata)
+		return
+	}
+	payout := fmt.Sprintf("%d", status.Amount)
+	switch status.Phase {
+	case "escape_decision":
+		status.Message = fmt.Sprintf("Escape decision (%s): the escape pays %s of the %d private balance and concedes %d (at most the state's bound %d). Review it, then confirm the concession: zkapi-clientd withdraw --escape --to %s --conceded %d.", status.Reason, payout, status.StateBalance, status.Conceded, status.BoundAtState, status.Destination, status.Conceded)
+	case "escape_wait":
+		status.Message = fmt.Sprintf("A request sent from the note's current state may still settle; the escape waits until %s (Unix %d). Rerun then, or exit early with --early-exit concede_nothing (the operator can raise the concession to the request's actual charge) or --early-exit concede_bound.", time.Unix(int64(status.WaitUntil), 0).UTC().Format(time.RFC3339), status.WaitUntil)
+	case "quoted":
+		status.Message = "The escape is proved and checked; review the fee quote and approve it to sign initiateEscapeWithdrawal."
+	case "waiting_funds":
+		status.Message = "The escape is proved. Send ETH for network fees to the local payment address, then rerun the same command."
+	case "escape_pending":
+		status.Message = "initiateEscapeWithdrawal is signed and awaiting Ethereum finality; new inference is paused."
+	case "escape_initiated":
+		if status.ChallengeDeadline != 0 && time.Now().Unix() > int64(status.ChallengeDeadline) {
+			status.Message = fmt.Sprintf("The challenge period is over: request a fee quote for finalizeEscapeWithdrawal with zkapi-clientd withdraw --escape --to %s, then approve it. The payout is %s.", status.Destination, payout)
+			break
+		}
+		status.Message = fmt.Sprintf("The escape is on chain. After the challenge deadline (Unix %d) rerun the same command to finalize it; the payout is %s unless the operator raises the concession, never by more than the state's bound.", status.ChallengeDeadline, payout)
+	case "finalize_pending":
+		status.Message = "finalizeEscapeWithdrawal is signed and awaiting Ethereum finality."
+	case "reverted":
+		status.Message = "The escape transaction reverted (for example its proof expired before inclusion). Rerun the same command to review a fresh escape."
+	case "defeated":
+		status.Message = "device_not_newest: the escape was defeated with a request from a newer state of this note; another device or backup holds that state. Restore the newest backup."
+	case "complete":
+		status.Message = fmt.Sprintf("The escape finalized and paid %s; the private note is closed.", payout)
+		if status.ConcessionExceededBound {
+			status.Message += " concession_exceeded_bound: the payout is below the state balance less the state's bound."
+		}
+	default:
+		status.Message = "Escape recovery is required. Preserve the local payment and private-note files."
+	}
 }
 
 // setEscapePayoutCredit reports a complete withdrawal whose escape payout the
@@ -392,6 +469,10 @@ func setEscapePayoutCredit(status *AddressWithdrawalStatus, w *addressWithdrawal
 }
 
 func setWithdrawalMessage(status *AddressWithdrawalStatus) {
+	if status.Mode == "escape" {
+		setEscapeMessage(status)
+		return
+	}
 	if status.Phase == "complete" && status.PayoutCredited {
 		status.Message = fmt.Sprintf("An escape of this note finalized and closed it, but the vault could not deliver the payout to %[1]s: that address rejected the ETH or needed more than 100,000 gas to receive it. The vault holds the balance for that address as an escape payout credit, so nothing has arrived there yet. Once %[1]s accepts a plain ETH transfer, anyone can deliver the credit, even while the vault is paused, by calling claimEscapePayout(%[1]s) (selector 0x%[2]s) on the vault %[3]s; the transaction's data is %[4]s.", status.Destination, claimEscapePayoutSelector, status.VaultAddress, status.ClaimCalldata)
 		return
@@ -483,6 +564,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		}
 		if record.Withdrawal.Phase == "complete" {
 			return status, nil
+		}
+		if record.Withdrawal.Mode == "escape" {
+			return status, errors.New("an escape of this note is under way; follow it with zkapi-clientd withdraw --escape --to " + record.Withdrawal.Destination)
 		}
 	} else {
 		if retryHash != "" || confirmationHash != "" {
@@ -583,6 +667,12 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			payout, err := validateWithdrawalReceipt(alternate, config, w, true)
 			if err != nil {
 				return update(), err
+			}
+			if payout.EscapePaid != nil {
+				if err := h.checkRelayedEscapePayout(ctx, config, w, *payout.EscapePaid, alternate); err != nil {
+					return update(), err
+				}
+				w.Payout = *payout.EscapePaid
 			}
 			if err := h.corroborateWithdrawalClosed(ctx, config, w.NoteID, alternate); err != nil {
 				return closeUnconfirmed(err)
@@ -822,15 +912,21 @@ type withdrawalPayout struct {
 	// escapePayoutCredits(destination) instead (EscapePayoutDeferred for
 	// this note and destination). Nothing reached the destination yet.
 	Credited bool
+	// EscapePaid is the amount a relayed escape paid, which the caller
+	// matches (checkRelayedEscapePayout).
+	EscapePaid *uint64
 }
 
 func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, saved *addressWithdrawalRecord, relayed bool) (withdrawalPayout, error) {
 	// An independently relayed payout can call the vault through a wrapper.
 	// Its exact authenticated vault event is the payout evidence; the outer
 	// recipient remains bound to the vault for our own signed transaction.
-	// Only a relayed payout may be a finalized escape of the same reservation.
+	// Only a relayed payout may be a finalized escape of the same reserved
+	// state, which pays the reserved balance less its concession, possibly
+	// raised (design §6.4 E5): its amount is returned for the caller to match.
 	if receipt.Status == "0x1" && (relayed || strings.EqualFold(receipt.To, config.Contract)) {
 		matches, credited := 0, false
+		var escapePaid *uint64
 		noteTopic := fmt.Sprintf("0x%064x", saved.NoteID)
 		for _, log := range receipt.Logs {
 			if log.Removed || !strings.EqualFold(log.Address, config.Contract) {
@@ -843,22 +939,83 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 				credited = relayed
 				continue
 			}
-			if len(log.Topics) != 2 || !(strings.EqualFold(log.Topics[0], withdrawalEventTopic) || (relayed && strings.EqualFold(log.Topics[0], escapeFinalizedEventTopic))) {
+			mutual := len(log.Topics) == 2 && strings.EqualFold(log.Topics[0], withdrawalEventTopic)
+			escape := len(log.Topics) == 2 && relayed && strings.EqualFold(log.Topics[0], escapeFinalizedEventTopic)
+			if !(mutual || escape) || !strings.EqualFold(log.Topics[1], noteTopic) || !isHex(log.Data, 96) {
 				continue
 			}
-			if !strings.EqualFold(log.Topics[1], noteTopic) || !isHex(log.Data, 96) {
+			data := strings.TrimPrefix(log.Data, "0x")
+			if !strings.EqualFold(data[:64], addressABIWord(saved.Nullifier)) || !strings.EqualFold(data[128:], addressABIWord(saved.Destination)) {
 				continue
 			}
-			expected := "0x" + addressABIWord(saved.Nullifier) + fmt.Sprintf("%064x", saved.Amount) + addressABIWord(saved.Destination)
-			if strings.EqualFold(log.Data, expected) {
+			amount, ok := new(big.Int).SetString(data[64:128], 16)
+			if !ok || !amount.IsUint64() {
+				continue
+			}
+			if mutual && amount.Uint64() == saved.Amount {
+				matches++
+			} else if escape && amount.Uint64() <= saved.Amount {
+				paid := amount.Uint64()
+				escapePaid = &paid
 				matches++
 			}
 		}
 		if matches == 1 {
-			return withdrawalPayout{Credited: credited}, nil
+			return withdrawalPayout{Credited: credited, EscapePaid: escapePaid}, nil
 		}
 	}
 	return withdrawalPayout{}, errors.New("finalized receipt does not match the saved withdrawal; preserve recovery files")
+}
+
+var escapeConcessionRecordedTopic = crypto.Keccak256Hash([]byte("EscapeConcessionRecorded(uint32,uint256,uint128,uint128)")).Hex()
+
+// checkRelayedEscapePayout matches a relayed escape's payout of the reserved
+// state (E5): the latest EscapeConcessionRecorded of the note gives its state
+// balance, which must be the reserved balance, and its initial concession;
+// EscapeConcessionRaised logs give every raise.
+func (h *FundingHandler) checkRelayedEscapePayout(ctx context.Context, config fundingConfig, w *addressWithdrawalRecord, paid uint64, receipt *addressReceipt) error {
+	if paid == w.Amount {
+		return nil
+	}
+	mismatch := errors.New("the relayed escape payout matches neither the reserved balance nor its recorded concession and raises; preserve recovery files")
+	block, err := addressHexUint(receipt.BlockNumber)
+	if err != nil || !block.IsUint64() {
+		return mismatch
+	}
+	deployment, _, err := deployedDeployment(h.client.config.Network)
+	if err != nil {
+		return err
+	}
+	var logs []struct {
+		Address string   `json:"address"`
+		Topics  []string `json:"topics"`
+		Data    string   `json:"data"`
+		Removed bool     `json:"removed"`
+	}
+	filter := map[string]any{"address": config.Contract, "fromBlock": fmt.Sprintf("0x%x", deployment.DeployBlock), "toBlock": receipt.BlockNumber, "topics": []string{escapeConcessionRecordedTopic, fmt.Sprintf("0x%064x", w.NoteID)}}
+	if err := h.addressRPC(ctx, config, "eth_getLogs", []any{filter}, &logs); err != nil {
+		return err
+	}
+	var stateBalance, concededAtInit *big.Int
+	for _, log := range logs {
+		if log.Removed || !strings.EqualFold(log.Address, config.Contract) || !isHex(log.Data, 96) {
+			continue
+		}
+		data := strings.TrimPrefix(log.Data, "0x")
+		stateBalance, _ = new(big.Int).SetString(data[64:128], 16)
+		concededAtInit, _ = new(big.Int).SetString(data[128:192], 16)
+	}
+	if stateBalance == nil || concededAtInit == nil || !stateBalance.IsUint64() || !concededAtInit.IsUint64() || stateBalance.Uint64() != w.Amount {
+		return mismatch
+	}
+	raises, err := h.escapeRaises(ctx, config, w.NoteID, w.Nullifier, deployment.DeployBlock, block.Uint64())
+	if err != nil {
+		return err
+	}
+	if !matchEscapePayout(paid, stateBalance.Uint64(), concededAtInit.Uint64(), raises, nil).Matches {
+		return mismatch
+	}
+	return nil
 }
 
 // validateSignedWithdrawal checks signed mutualClose calldata against the

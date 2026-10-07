@@ -40,6 +40,9 @@ type fundingConfig struct {
 	RPC             string `json:"rpc_url"`
 	Indexer         string `json:"indexer_url"`
 	DemoMintEnabled bool   `json:"demo_mint_enabled"`
+	// ExitRPC is the owner's own RPC (--exit-rpc-url): escape transactions
+	// are sent through it when it is set.
+	ExitRPC string `json:"-"`
 }
 type depositRecord struct {
 	DeploymentID    string   `json:"deployment_id,omitempty"`
@@ -188,6 +191,7 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 		DeploymentID: wire.DeploymentID, BillingAsset: wire.BillingAsset, BillingUnit: wire.BillingUnit, WeiPerUnit: wire.WeiPerUnit,
 		ChainID: wire.ChainID, Contract: wire.Contract, Token: wire.Token, RPC: pins.RPC, Indexer: pins.Indexer,
 		DemoMintEnabled: wire.DemoMintEnabled && wire.ChainID == 11155111 && wire.BillingAsset != "native_eth",
+		ExitRPC:         h.client.config.ExitRPCURL,
 	}, nil
 }
 

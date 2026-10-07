@@ -151,7 +151,7 @@ func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command strin
 		fmt.Fprintf(out, "Selected USD value: $%s (converted once to the fixed ETH principal below)\n", fundingUnits(fmt.Sprint(q.InputMicroUSD), 6))
 	}
 	principal := q.PrincipalWei
-	if q.Kind == "withdrawal" {
+	if q.Kind == "withdrawal" || strings.HasPrefix(q.Kind, "escape") {
 		principal = new(big.Int).Mul(new(big.Int).SetUint64(q.Amount), big.NewInt(1_000_000_000)).String()
 	}
 	fmt.Fprintf(out, "Fixed amount: %s ETH\n", fundingUnits(principal, 18))

@@ -291,7 +291,7 @@ func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to
 	if kind == "deposit" {
 		q.InputMicroUSD = record.DepositMicroUSD
 	}
-	if kind == "withdrawal" && record.Withdrawal != nil {
+	if (kind == "withdrawal" || escapeKinds[kind]) && record.Withdrawal != nil {
 		q.NoteID = record.Withdrawal.NoteID
 		q.Amount = record.Withdrawal.Amount
 		q.Destination = record.Withdrawal.Destination
@@ -322,7 +322,29 @@ func validatePaymentApproval(record *addressFundingRecord, q *AddressPaymentQuot
 	if kind == "return" && !strings.EqualFold(q.Destination, to) {
 		return errAddressQuoteChanged
 	}
+	if escapeKinds[kind] && (record.Withdrawal == nil || record.Withdrawal.Mode != "escape" || q.NoteID != record.Withdrawal.NoteID || q.Amount != record.Withdrawal.Amount || q.Binding != record.Withdrawal.Binding || !strings.EqualFold(q.Destination, record.Withdrawal.Destination) || !strings.EqualFold(to, record.Contract)) {
+		return errAddressQuoteChanged
+	}
 	return nil
+}
+
+// SavedEscapeQuote is the saved quote of an escape transaction, if any.
+func (h *FundingHandler) SavedEscapeQuote(ctx context.Context) (*AddressPaymentQuote, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	config, err := h.config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	record, err := h.loadAddress(config)
+	if err != nil {
+		return nil, err
+	}
+	if record.Quote == nil || !escapeKinds[record.Quote.Kind] {
+		return nil, nil
+	}
+	copy := *record.Quote
+	return &copy, nil
 }
 
 // SavedAddressQuote is read-only; an expired quote remains inspectable but can

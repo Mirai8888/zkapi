@@ -69,6 +69,13 @@ func guidedWithdrawal(ctx context.Context, service guidedWithdrawalService, ui s
 		clearSetupProgress(ui)
 		ui.Printf("Unclaimed escape payout: %s\n", credit.Message)
 	}
+	if initial.Mode == "escape" {
+		// An escape is under way: it is reviewed, confirmed and approved
+		// with the escape command, never by the mutual close.
+		clearSetupProgress(ui)
+		ui.Printf("%s\nFollow the escape with: zkapi-clientd withdraw --escape --to %s\n", initial.Message, initial.Destination)
+		return nil
+	}
 	switch initial.Phase {
 	case "no_note":
 		ui.Printf("There is no open private balance to withdraw.\n")
@@ -165,6 +172,16 @@ func waitAndWithdraw(ctx context.Context, service guidedWithdrawalService, initi
 		if managementErrorCode(err) == "receipt_journal_missing" {
 			// Waiting cannot help; the message names the nullifier the
 			// operator needs.
+			return err
+		}
+		if code := managementErrorCode(err); code == "escape_required" || code == "device_not_newest" {
+			// Design §6.4 E2: the operator refused or could not be reached
+			// for a mutual close (or a released request makes one
+			// impossible); the escape needs no operator. Its decision and
+			// concession are reviewed before anything is signed.
+			if code == "escape_required" {
+				ui.Printf("A mutual close is not possible from this note's current state. The private balance can still be withdrawn without the operator by an escape: review its decision with\n  zkapi-clientd withdraw --escape --to %s\nNothing was signed.\n", destination)
+			}
 			return err
 		}
 		if code := managementErrorCode(err); err != nil && (code == "unsettled_request_state" || code == "unsettled_clearance_reserved") {

@@ -698,3 +698,20 @@ func TestGuidedWithdrawalStopsAtAMissingReceiptJournal(t *testing.T) {
 		t.Fatalf("%v %+v", err, f)
 	}
 }
+
+// Design §6.4 E2: when the mutual close is impossible the menu explains the
+// escape and names its command; nothing is signed.
+func TestGuidedWithdrawalPointsAtTheEscapeWhenAMutualCloseIsImpossible(t *testing.T) {
+	f := &withdrawalWizardFixture{}
+	f.quote = func(int, string, uint64, string) (zkapi.AddressPaymentQuote, error) {
+		return zkapi.AddressPaymentQuote{}, &managementError{message: "zkAPI withdrawal needs an escape", code: "escape_required"}
+	}
+	u := &fundingWizardUI{answers: []string{withdrawalTestDestination}}
+	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error { return errors.New("waited") })
+	if managementErrorCode(err) != "escape_required" || f.quoteCalls != 1 {
+		t.Fatalf("%v %+v", err, f)
+	}
+	if !strings.Contains(u.String(), "zkapi-clientd withdraw --escape --to "+withdrawalTestDestination) {
+		t.Fatalf("no escape instructions: %s", u.String())
+	}
+}

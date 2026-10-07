@@ -770,7 +770,7 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		// Override only this signer's balance; contract state and exact payable
 		// calldata stay real. Unsupported state overrides must fail closed.
 		simulationBalance := new(big.Int).Set(addressUint256Max)
-		if config.nativeETH() && kind == "withdrawal" {
+		if config.nativeETH() && (kind == "withdrawal" || kind == "escape_finalize" || kind == "escape_claim") {
 			if record.Withdrawal == nil {
 				return errors.New("withdrawal intent is missing; no transaction was sent")
 			}
@@ -905,6 +905,22 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		}
 		record.Withdrawal.Phase, record.Withdrawal.TransactionHash = "withdrawal_pending", signed.Hash().Hex()
 	}
+	if escapeKinds[kind] {
+		if record.Withdrawal == nil || record.Withdrawal.Mode != "escape" {
+			return errors.New("escape intent is missing; no transaction was sent")
+		}
+		switch kind {
+		case "escape":
+			record.Phase = "withdrawal_pending"
+			record.Withdrawal.Phase, record.Withdrawal.TransactionHash = "escape_pending", signed.Hash().Hex()
+		case "escape_finalize":
+			record.Phase = "withdrawal_pending"
+			record.Withdrawal.Phase = "finalize_pending"
+		case "escape_claim":
+			// The note is closed already; a claim only delivers its credit.
+			record.Phase = "ready"
+		}
+	}
 	if kind == "return" {
 		record.Phase = "return_pending"
 		record.Return.Phase = "return_pending"
@@ -920,6 +936,10 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 }
 
 func (h *FundingHandler) broadcastAddress(ctx context.Context, config fundingConfig, tx *addressTransaction) {
+	// Design §6.7: exits are sent through the owner's exit RPC when set.
+	if escapeKinds[tx.Kind] && config.ExitRPC != "" {
+		config.RPC = config.ExitRPC
+	}
 	if h.assertAddressChain(ctx, config) != nil {
 		return
 	}

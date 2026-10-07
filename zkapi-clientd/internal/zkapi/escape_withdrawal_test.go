@@ -1,0 +1,395 @@
+package zkapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/crypto"
+)
+
+// The shared vectors of the exit rules (design §6.4), which the companion's
+// Rust wallet and the browser SDK reproduce too.
+func TestEscapePayoutMatcherFollowsTheSharedVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "protocol", "rust", "crates", "zkapi-client", "tests", "vectors", "exit-policy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Payout []struct {
+			Paid           uint64   `json:"paid"`
+			StateBalance   uint64   `json:"state_balance"`
+			ConcededAtInit uint64   `json:"conceded_at_init"`
+			Raises         []uint64 `json:"raises"`
+			Bound          *uint64  `json:"bound_at_state"`
+			Expected       struct {
+				Result        string `json:"result"`
+				ConcededFinal uint64 `json:"conceded_final"`
+				Exceeded      bool   `json:"concession_exceeded_bound"`
+			} `json:"expected"`
+		} `json:"payout"`
+		Constants map[string]uint64 `json:"constants"`
+	}
+	if err := json.Unmarshal(raw, &vectors); err != nil || len(vectors.Payout) == 0 {
+		t.Fatalf("invalid vectors: %v", err)
+	}
+	if vectors.Constants["exit_proof_validity_seconds"] != exitProofValidity {
+		t.Fatal("the exit proof lifetime differs from the shared vectors")
+	}
+	for i, vector := range vectors.Payout {
+		got := matchEscapePayout(vector.Paid, vector.StateBalance, vector.ConcededAtInit, vector.Raises, vector.Bound)
+		want := vector.Expected.Result == "matches"
+		if got.Matches != want || (want && (got.ConcededFinal != vector.Expected.ConcededFinal || got.ExceededBound != vector.Expected.Exceeded)) {
+			t.Errorf("vector %d: got %+v, want %+v", i, got, vector.Expected)
+		}
+	}
+}
+
+func testEscapePlan(conceded, stateBalance uint64, destination string) escapePlan {
+	decoded, _ := hex.DecodeString(strings.TrimPrefix(destination, "0x"))
+	var plan escapePlan
+	plan.Status, plan.Action, plan.NoteID = "prepared", "escape", 12
+	plan.StateBalance, plan.Conceded, plan.BoundAtState = fmt.Sprint(stateBalance), fmt.Sprint(conceded), "1000"
+	plan.PublicInputs = withdrawalInputs{ProtocolVersion: 2, ChainID: 1, Contract: addressTestVault, ActiveRoot: "0x9", StateKeyX: "0x1", StateKeyY: "0x2", ClearanceKeyX: "0x3", ClearanceKeyY: "0x4", NoteID: 12, FinalBalance: stateBalance - conceded, Destination: decoded, Nullifier: "0x123", Kind: 0, NextNullifier: "0x456", Conceded: conceded, ValidUntil: uint64(time.Now().Unix()) + exitProofValidity}
+	plan.Proof.Backend = "groth16_bn254"
+	plan.Proof.Proof = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 256))
+	return plan
+}
+
+// Design §6.7: the escape calldata is the 16-word tuple (836 bytes); kind
+// 0; a successor nullifier that is set and differs from the nullifier;
+// word 9 + word 14 equal to the companion-reported state balance; word 14
+// equal to the concession the owner confirmed, at most the bound unless
+// zero; valid_until in the signing window; and the binding over words[:16].
+func TestEscapeCalldataChecksEveryWord(t *testing.T) {
+	config := fundingConfig{ChainID: 1, Contract: addressTestVault}
+	saved := func(conceded uint64) *addressWithdrawalRecord {
+		return &addressWithdrawalRecord{Mode: "escape", NoteID: 12, Destination: withdrawalTestDestination, StateBalance: 99999, Conceded: conceded, Bound: 1000}
+	}
+	data, expected, err := escapeCalldata(testEscapePlan(700, 99999, withdrawalTestDestination), config, saved(700), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := hex.DecodeString(data[2:])
+	if len(raw) != 836 || hex.EncodeToString(raw[:4]) != "a38d62aa" || escapeSelector != "a38d62aa" {
+		t.Fatalf("escape calldata is %d bytes with selector %x", len(raw), raw[:4])
+	}
+	word := func(i int) *big.Int { return new(big.Int).SetBytes(raw[4+i*32 : 4+(i+1)*32]) }
+	if word(9).Uint64()+word(14).Uint64() != 99999 || word(14).Uint64() != 700 || word(12).Sign() != 0 || word(16).Uint64() != 17*32 || word(17).Uint64() != 256 {
+		t.Fatal("wrong escape words")
+	}
+	if err := validateSignedEscape(raw, config, expected, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*escapePlan){
+		"close kind":             func(p *escapePlan) { p.PublicInputs.Kind = 1 },
+		"no successor":           func(p *escapePlan) { p.PublicInputs.NextNullifier = "0x0" },
+		"successor is nullifier": func(p *escapePlan) { p.PublicInputs.NextNullifier = p.PublicInputs.Nullifier },
+		"other concession":       func(p *escapePlan) { p.PublicInputs.Conceded = 699; p.PublicInputs.FinalBalance = 99300 },
+		"payout plus concession": func(p *escapePlan) { p.PublicInputs.FinalBalance = 99000 },
+		"other state balance":    func(p *escapePlan) { p.StateBalance = "100000" },
+		"other destination":      func(p *escapePlan) { p.PublicInputs.Destination = bytes.Repeat([]byte{7}, 20) },
+		"other chain":            func(p *escapePlan) { p.PublicInputs.ChainID = 11155111 },
+		"other vault":            func(p *escapePlan) { p.PublicInputs.Contract = addressTestToken },
+		"other note":             func(p *escapePlan) { p.PublicInputs.NoteID = 13 },
+		"expired":                func(p *escapePlan) { p.PublicInputs.ValidUntil = uint64(time.Now().Unix()) - 1 },
+		"too far in the future":  func(p *escapePlan) { p.PublicInputs.ValidUntil += exitProofClockAllowance + 60 },
+		"short proof":            func(p *escapePlan) { p.Proof.Proof = "AA==" },
+		"not prepared":           func(p *escapePlan) { p.Status = "decision" },
+	} {
+		plan := testEscapePlan(700, 99999, withdrawalTestDestination)
+		mutate(&plan)
+		if _, _, err := escapeCalldata(plan, config, saved(700), time.Now()); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// More than the bound is never conceded; zero always may be.
+	if _, _, err := escapeCalldata(testEscapePlan(1001, 99999, withdrawalTestDestination), config, saved(1001), time.Now()); err == nil {
+		t.Error("a concession above the bound accepted")
+	}
+	if _, _, err := escapeCalldata(testEscapePlan(0, 99999, withdrawalTestDestination), config, saved(0), time.Now()); err != nil {
+		t.Errorf("a zero concession refused: %v", err)
+	}
+	// A re-proof keeps the binding unless another bound input changed.
+	reproof := testEscapePlan(700, 99999, withdrawalTestDestination)
+	reproof.PublicInputs.ActiveRoot, reproof.PublicInputs.ValidUntil = "0xb", reproof.PublicInputs.ValidUntil+5
+	if _, again, err := escapeCalldata(reproof, config, expected, time.Now()); err != nil || again.Binding != expected.Binding {
+		t.Fatalf("a re-proof at another root changed the binding: %v", err)
+	}
+	other := testEscapePlan(700, 99999, withdrawalTestDestination)
+	other.PublicInputs.StateKeyX = "0x77"
+	if _, _, err := escapeCalldata(other, config, expected, time.Now()); err == nil {
+		t.Fatal("a changed signing key kept the binding")
+	}
+	// Every word of the signed bytes is checked.
+	for _, index := range []int{0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 16, 17, 4, 15} {
+		tampered := append([]byte(nil), raw...)
+		tampered[4+index*32+31] ^= 1
+		if validateSignedEscape(tampered, config, expected, time.Now()) == nil {
+			t.Errorf("word %d tampering accepted", index)
+		}
+	}
+}
+
+// escapeCompanion serves the companion's escape routes for the withdrawal
+// fixture: a decision, the plan of the confirmed concession, the chain view
+// and the finalization check.
+type escapeCompanion struct {
+	conceded, bound uint64
+	plan            map[string]any
+	submitted       []string
+	finalized       []string
+	chainPhase      string
+	deadline        uint64
+	payout          uint64
+	prepares        []map[string]any
+}
+
+func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixture) *http.Response {
+	raw, _ := io.ReadAll(r.Body)
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	switch r.URL.Path {
+	case "/oa/v1/withdraw/escape/prepare":
+		e.prepares = append(e.prepares, body)
+		balance := w.planBalance
+		if body["conceded"] == nil {
+			return withdrawalJSONResponse(r, 200, map[string]any{"status": "decision", "action": "escape", "note_id": w.noteID, "state_balance": fmt.Sprint(balance), "conceded": fmt.Sprint(e.conceded), "bound_at_state": fmt.Sprint(e.bound), "payout": fmt.Sprint(balance - e.conceded), "reason": "mutual_refused"})
+		}
+		if body["conceded"] != fmt.Sprint(e.conceded) {
+			return withdrawalJSONResponse(r, 409, map[string]any{"error": map[string]any{"code": "conceded_mismatch"}})
+		}
+		if e.plan == nil {
+			plan := testEscapePlan(e.conceded, balance, fmt.Sprint(body["destination"]))
+			plan.BoundAtState = fmt.Sprint(e.bound)
+			encoded, _ := json.Marshal(plan)
+			_ = json.Unmarshal(encoded, &e.plan)
+		}
+		return withdrawalJSONResponse(r, 200, e.plan)
+	case "/oa/v1/withdraw/escape/submit":
+		e.submitted = append(e.submitted, fmt.Sprint(body["transaction_hash"]))
+		return withdrawalJSONResponse(r, 200, map[string]any{"status": "submitted"})
+	case "/oa/v1/withdraw/escape/status":
+		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout)})
+	case "/oa/v1/withdraw/escape/finalize":
+		e.finalized = append(e.finalized, fmt.Sprint(body["transaction_hash"]))
+		w.active = false
+		return withdrawalJSONResponse(r, 200, map[string]any{"status": "complete"})
+	}
+	t.Errorf("unexpected escape route %s", r.URL.Path)
+	return withdrawalJSONResponse(r, 404, map[string]any{})
+}
+
+// The escape end to end through the address-withdrawal signing path: the
+// decision for review, the owner-confirmed concession, a fee quote and its
+// approval for initiateEscapeWithdrawal (reported to the companion), the
+// challenge period, a raise by the operator, a quoted and approved
+// finalizeEscapeWithdrawal whose payout the E5 matcher follows, a credited
+// payout, and a quoted and approved claimEscapePayout.
+func TestTheEscapeIsSignedFinalizedMatchedAndClaimed(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 700, bound: 1000, chainPhase: "pending"}
+	ctx := context.Background()
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_decision" || status.Conceded != 700 || status.Amount != 99999-700 || status.Mode != "escape" || !strings.Contains(status.Message, "--conceded 700") {
+		t.Fatalf("no escape decision: %+v %v", status, err)
+	}
+	// No proof is released without an approved fee quote, nor for another
+	// concession than the decision's.
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, &[]uint64{700}[0], ""); err == nil {
+		t.Fatal("an escape was signed without a quote")
+	}
+	if _, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], ""); err == nil {
+		t.Fatal("an unconfirmed concession was quoted")
+	}
+	for _, prepare := range f.escape.prepares {
+		if prepare["conceded"] != nil {
+			t.Fatal("a concession reached the companion before a quote")
+		}
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{700}[0], "")
+	if err != nil || quote.Kind != "escape" || quote.Amount != 99999-700 || quote.Binding == "" {
+		t.Fatalf("no escape quote: %+v %v", quote, err)
+	}
+	before := len(f.accepted)
+	status, err = f.h.ApproveAddressEscape(ctx, quote.ID)
+	if err != nil || status.Phase != "escape_pending" || len(f.accepted) != before+1 {
+		t.Fatalf("the escape was not signed: %+v %v", status, err)
+	}
+	record := f.journal(t)
+	initiate := f.accepted[record.Pending.Hash]
+	if hex.EncodeToString(initiate.Data()[:4]) != "a38d62aa" || len(initiate.Data()) != 836 || initiate.Value().Sign() != 0 {
+		t.Fatal("not an initiateEscapeWithdrawal call")
+	}
+	if len(f.escape.submitted) != 1 || !strings.EqualFold(f.escape.submitted[0], record.Pending.Hash) {
+		t.Fatal("the companion was not told the escape transaction")
+	}
+	// Restart: the saved signed escape survives a reload.
+	f.h = &FundingHandler{client: f.h.client, statePath: f.h.statePath}
+	f.mine(t, record.Pending.Hash, false)
+	f.escape.deadline = uint64(time.Now().Unix()) + 3600
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_initiated" || status.ChallengeDeadline != f.escape.deadline {
+		t.Fatalf("the initiated escape was not followed: %+v %v", status, err)
+	}
+	if _, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, ""); err == nil {
+		t.Fatal("finalization was quoted before the challenge deadline")
+	}
+	// The operator raises the concession to 900 (at most the bound).
+	nullifier := "0x123"
+	f.mu.Lock()
+	f.logs = append(f.logs, map[string]any{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord(nullifier) + fmt.Sprintf("%064x%064x", 900, 99999-900), "removed": false})
+	f.mu.Unlock()
+	f.escape.deadline, f.escape.payout = uint64(time.Now().Unix())-1, 99999-900
+	quote, err = f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || quote.Kind != "escape_finalize" {
+		t.Fatalf("no finalize quote: %+v %v", quote, err)
+	}
+	status, err = f.h.ApproveAddressEscape(ctx, quote.ID)
+	if err != nil || status.Phase != "finalize_pending" {
+		t.Fatalf("finalization was not signed: %+v %v", status, err)
+	}
+	record = f.journal(t)
+	finalize := f.accepted[record.Pending.Hash]
+	if "0x"+hex.EncodeToString(finalize.Data()) != finalizeEscapeCalldata(f.noteID) {
+		t.Fatal("not a finalizeEscapeWithdrawal call")
+	}
+	// Finalized: the vault paid B − 900 but could not push it, so it
+	// credited the destination.
+	deferred := map[string]any{"address": addressTestVault, "topics": []string{escapePayoutDeferredEventTopic, fmt.Sprintf("0x%064x", f.noteID), "0x" + addressABIWord(strings.ToLower(withdrawalTestDestination))}, "data": fmt.Sprintf("0x%064x", 99999-900)}
+	finalized := map[string]any{"address": addressTestVault, "topics": []string{escapeFinalizedEventTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord(nullifier) + fmt.Sprintf("%064x", 99999-900) + addressABIWord(withdrawalTestDestination)}
+	f.mu.Lock()
+	f.receipts[record.Pending.Hash] = map[string]any{"transactionHash": record.Pending.Hash, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestVault, "logs": []map[string]any{deferred, finalized}}
+	f.nonce = fmt.Sprintf("0x%x", finalize.Nonce()+1)
+	f.mu.Unlock()
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "complete" || status.Amount != 99999-900 || !status.PayoutCredited || status.ConcessionExceededBound || !strings.HasPrefix(status.ClaimCalldata, "0x88c10aee") {
+		t.Fatalf("the finalized escape was not matched and closed: %+v %v", status, err)
+	}
+	if len(f.escape.finalized) != 1 || f.active {
+		t.Fatal("the companion did not close the note")
+	}
+	// Deliver the credit.
+	f.mu.Lock()
+	f.escapeCredits = map[string]string{strings.ToLower(withdrawalTestDestination): fmt.Sprintf("0x%x", 99999-900)}
+	f.mu.Unlock()
+	quote, err = f.h.QuoteEscapeClaim(ctx, withdrawalTestDestination)
+	if err != nil || quote.Kind != "escape_claim" {
+		t.Fatalf("no claim quote: %+v %v", quote, err)
+	}
+	if _, err = f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	record = f.journal(t)
+	claim := f.accepted[record.Pending.Hash]
+	if "0x"+hex.EncodeToString(claim.Data()) != strings.ToLower(claimEscapeCalldata(withdrawalTestDestination)) {
+		t.Fatal("not a claimEscapePayout call")
+	}
+}
+
+// E5 for a relayed escape of the reserved state (made outside this client,
+// for example from an exit kit): the payout is B − c_final with the
+// concession recorded at initiation and every raise; anything else is
+// refused.
+func TestARelayedEscapePayoutAfterARaiseIsMatched(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		paid     uint64
+		accepted bool
+	}{{"raised", 99999 - 900, true}, {"unexplained", 99999 - 901, false}} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newWithdrawalFixture(t)
+			original := f.withdraw(t)
+			f.mineWithdrawal(t, original, withdrawalTestDestination, true)
+			if status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID); err != nil || status.Phase != "reverted" {
+				t.Fatalf("revert not reported: %+v %v", status, err)
+			}
+			other := "0x" + strings.Repeat("c", 64)
+			escapeTopic := crypto.Keccak256Hash([]byte("EscapeWithdrawalFinalized(uint32,uint256,uint128,address)")).Hex()
+			f.mu.Lock()
+			f.logs = []map[string]any{
+				{"address": addressTestVault, "topics": []string{escapeConcessionRecordedTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord("0x999") + fmt.Sprintf("%064x%064x", f.reservedBalance, 100)},
+				{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x%064x", 900, f.reservedBalance-900)},
+			}
+			f.receipts[other] = map[string]any{"transactionHash": other, "status": "0x1", "blockNumber": "0x10", "blockHash": addressTestBlock, "to": addressTestToken, "logs": []map[string]any{{"address": addressTestVault, "topics": []string{escapeTopic, fmt.Sprintf("0x%064x", f.reservedNoteID)}, "data": "0x" + addressABIWord(f.reservedNullifier) + fmt.Sprintf("%064x", test.paid) + addressABIWord(withdrawalTestDestination)}}}
+			f.closeNote(12)
+			f.mu.Unlock()
+			status, err := f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID, "", other)
+			if !test.accepted {
+				if err == nil || f.confirmCalls != 0 {
+					t.Fatal("an unexplained escape payout was accepted")
+				}
+				return
+			}
+			if err != nil || status.Phase != "complete" || f.journal(t).Withdrawal.Payout != test.paid {
+				t.Fatalf("the raised escape payout was not accepted: %+v %v", status, err)
+			}
+		})
+	}
+}
+
+// Design §6.7: with --exit-rpc-url set, the escape transaction is sent
+// through the owner's exit RPC, not the pinned one.
+func TestEscapesAreSentThroughTheExitRPC(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	var exitMethods []string
+	exit := httptestTLS(t, func(method string) any {
+		exitMethods = append(exitMethods, method)
+		if method == "eth_chainId" {
+			return "0x1"
+		}
+		return "0x" + strings.Repeat("ab", 32)
+	})
+	f.h.client.config.ExitRPCURL = exit
+	ctx := context.Background()
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedBefore := len(f.submitted)
+	if _, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.submitted) != pinnedBefore {
+		t.Fatal("the escape went through the pinned RPC")
+	}
+	sent := false
+	for _, method := range exitMethods {
+		sent = sent || method == "eth_sendRawTransaction"
+	}
+	if !sent {
+		t.Fatalf("the escape was not sent through the exit RPC: %v", exitMethods)
+	}
+}
+
+// httptestTLS serves JSON-RPC answers from answer(method) over the test TLS
+// certificate the fixtures' clients trust.
+func httptestTLS(t *testing.T, answer func(method string) any) string {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": answer(request.Method)})
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}

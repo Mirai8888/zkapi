@@ -78,6 +78,8 @@ type addressFixture struct {
 	creditReads   int
 	// codeTamper makes the RPC serve other runtime code at the vault.
 	codeTamper bool
+	// logs are the vault logs eth_getLogs serves, filtered by topics.
+	logs []map[string]any
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -221,6 +223,26 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			result = f.gas
 		case "eth_gasPrice":
 			result = f.gasPrice
+		case "eth_blockNumber":
+			result = "0x20"
+		case "eth_getLogs":
+			var filter struct {
+				Address string   `json:"address"`
+				Topics  []string `json:"topics"`
+			}
+			_ = json.Unmarshal(request.Params[0], &filter)
+			found := []map[string]any{}
+			for _, log := range f.logs {
+				topics, _ := log["topics"].([]string)
+				matches := strings.EqualFold(fmt.Sprint(log["address"]), filter.Address)
+				for i, topic := range filter.Topics {
+					matches = matches && i < len(topics) && strings.EqualFold(topics[i], topic)
+				}
+				if matches {
+					found = append(found, log)
+				}
+			}
+			result = found
 		case "eth_call":
 			var call struct {
 				From string `json:"from"`

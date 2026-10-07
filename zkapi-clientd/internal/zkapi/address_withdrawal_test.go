@@ -57,6 +57,8 @@ type withdrawalFixture struct {
 	reservedNoteID        uint64
 	reservedNullifier     string
 	ownershipProofVersion int
+	// The companion's escape routes (escape_withdrawal_test.go).
+	escape *escapeCompanion
 }
 
 func withdrawalJSONResponse(r *http.Request, status int, value any) *http.Response {
@@ -139,6 +141,11 @@ func newWithdrawalFixture(t *testing.T, native ...bool) *withdrawalFixture {
 			return withdrawalJSONResponse(r, 200, map[string]any{}), nil
 		case "/oa/v1/withdraw/status":
 			return withdrawalJSONResponse(r, 200, w.bridgeStatus()), nil
+		case "/oa/v1/withdraw/escape/prepare", "/oa/v1/withdraw/escape/submit", "/oa/v1/withdraw/escape/status", "/oa/v1/withdraw/escape/finalize":
+			if w.escape == nil {
+				return withdrawalJSONResponse(r, 404, map[string]any{}), nil
+			}
+			return w.escape.serve(t, r, w), nil
 		case "/oa/v1/withdraw/prepare":
 			raw, _ := io.ReadAll(r.Body)
 			var recorded map[string]any

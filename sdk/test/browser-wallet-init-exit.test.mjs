@@ -166,14 +166,28 @@ function reloadedPage(timing = FAST) {
 }
 
 const elapsed = started => Date.now() - started;
+
+/**
+ * `promise`, or a failed assertion once `ms` passes: a property broken into
+ * a hang fails its test instead of stalling the suite.
+ */
+function within(ms, promise, label) {
+    let timer;
+    const deadline = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new assert.AssertionError({ message: `${label} did not end within ${ms} ms` })), ms);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
 const lastWithdrawalProof = () => proofLog.calls.filter(call => call.operation === 'prepareWithdrawal').at(-1);
 
 test('an operator holding every connection open cannot stall initialization or an escape from a live request', async () => {
-    await savedWallet();
+    await within(5_000, savedWallet(), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
-    const runtime = reloadedPage();
+    // Long bounds on the startup recovery (its pass and each of its non-exit
+    // calls): only the escape stopping it frees the wallet lock in time.
+    const runtime = reloadedPage({ ...FAST, recoveryBudgetMs: 10_000, operatorCallTimeoutMs: 10_000 });
     const started = Date.now();
-    const snapshot = await runtime.init();
+    const snapshot = await within(1_000, runtime.init(), 'initialization');
     assert.ok(elapsed(started) < 1_000, `initialization took ${elapsed(started)} ms`);
     assert.equal(snapshot.config.service.available, true);
     // The startup recovery of the live journal now waits on the operator
@@ -181,7 +195,7 @@ test('an operator holding every connection open cannot stall initialization or a
     assert.ok(runtime.startupRecoveryController, 'the startup recovery is running');
     while (!net.calls.some(url => url.includes('/v2/openrouter/leases/'))) await new Promise(resolve => setTimeout(resolve, 5));
     // ...and the escape stops it, then decides within E0's budgets.
-    const plan = await runtime.prepareWithdrawal('escape', DESTINATION);
+    const plan = await within(3_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
     assert.ok(elapsed(started) < 3_000, `the escape took ${elapsed(started)} ms`);
     assert.equal(plan.mode, 'escape');
     assert.equal(plan.public_inputs.kind, 0);
@@ -189,34 +203,35 @@ test('an operator holding every connection open cannot stall initialization or a
     assert.equal(plan.decision.rule, 'E3.forced');
     assert.equal(plan.public_inputs.conceded, 0);
     assert.equal(plan.pathSource, 'deposit');
-    assert.equal(await runtime.startupRecovery, false);
+    assert.equal(await within(1_000, runtime.startupRecovery, 'the stopped startup recovery'), false);
     const saved = await store.readBrowserWallet();
     assert.deepEqual(saved.exitLock.released.map(entry => entry.kind), [0]);
     assert.equal(saved.journal, null, 'the live journal moved to the archive (abandoned_for_escape)');
 });
 
 test('without an exit, the startup recovery of a hanging operator still ends within the E1 budget', async () => {
-    await savedWallet();
+    await within(5_000, savedWallet(), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
-    const runtime = reloadedPage();
+    // Each non-exit call of the pass may take 5 s: only RECOVERY_BUDGET ends it in time.
+    const runtime = reloadedPage({ ...FAST, operatorCallTimeoutMs: 5_000 });
     const started = Date.now();
-    await runtime.init();
-    assert.equal(await runtime.startupRecovery, false);
+    await within(1_000, runtime.init(), 'initialization');
+    assert.equal(await within(FAST.recoveryBudgetMs + 600, runtime.startupRecovery, 'the startup recovery'), false);
     assert.ok(elapsed(started) < FAST.recoveryBudgetMs + 600, `the recovery took ${elapsed(started)} ms`);
     // The lock is free again: another tab's exit runs at once.
     const other = reloadedPage();
-    const plan = await other.prepareWithdrawal('escape', DESTINATION);
+    const plan = await within(3_000, other.prepareWithdrawal('escape', DESTINATION), 'the other tab\'s escape');
     assert.equal(plan.mode, 'escape');
 });
 
 test('a missing, slow, changed or legacy manifest leaves exits to the pins and refuses deposits and chats', async () => {
     for (const [manifest, code] of [['missing', 'deployment_manifest_unavailable'], ['hang', 'deployment_manifest_unavailable'],
         ['changed', 'deployment_manifest_mismatch'], ['legacy', 'incompatible_proof_circuit']]) {
-        await savedWallet();
+        await within(5_000, savedWallet(), 'the saved wallet');
         Object.assign(net, { browserConfig: 'ok', manifest, rpc: 'ok', operator: 'hang' });
         const runtime = reloadedPage();
         const started = Date.now();
-        const snapshot = await runtime.init();
+        const snapshot = await within(1_000, runtime.init(), 'initialization');
         assert.ok(elapsed(started) < 1_000, `${manifest}: initialization took ${elapsed(started)} ms`);
         assert.equal(snapshot.config.service.available, false, manifest);
         assert.equal(snapshot.config.service.code, code, manifest);
@@ -226,30 +241,30 @@ test('a missing, slow, changed or legacy manifest leaves exits to the pins and r
         assert.deepEqual(runtime.config.wallet_core.state_signing_key, TRUSTED.state_signing_key);
         assert.equal(runtime.config.funding.protocol_server_url, TRUSTED.protocol_server_url);
 
-        const plan = await runtime.prepareWithdrawal('escape', DESTINATION);
+        const plan = await within(3_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
         assert.equal(plan.mode, 'escape', manifest);
         assert.deepEqual(lastWithdrawalProof().payload.config.state_signing_key, TRUSTED.state_signing_key,
             'the proof binds the pinned keys');
         assert.ok(elapsed(started) < 3_000, `${manifest}: the escape took ${elapsed(started)} ms`);
 
         // Deposits and chats need the operator's manifest to match the pins.
-        await assert.rejects(runtime.prepareDepositQuote(1_000_000, null), { code });
-        await assert.rejects(runtime.prepareDeposit(1_000_000), { code });
-        await assert.rejects(runtime.issueLease('chat'), { code });
-        await assert.rejects(runtime.verifyDeploymentForDeposit({ walletRequest: async () => assert.fail('not reached'),
-            depositWei: 1n }), { code });
+        await assert.rejects(within(3_000, runtime.prepareDepositQuote(1_000_000, null), 'the refusal'), { code });
+        await assert.rejects(within(3_000, runtime.prepareDeposit(1_000_000), 'the refusal'), { code });
+        await assert.rejects(within(3_000, runtime.issueLease('chat'), 'the refusal'), { code });
+        await assert.rejects(within(3_000, runtime.verifyDeploymentForDeposit({
+            walletRequest: async () => assert.fail('not reached'), depositWei: 1n }), 'the refusal'), { code });
     }
 });
 
 test('exit-only mode ends when the operator serves the pinned manifest again', async () => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'missing', rpc: 'ok', operator: 'hang' });
     const runtime = reloadedPage();
-    await runtime.init();
+    await within(1_000, runtime.init(), 'initialization');
     assert.equal(runtime.snapshot().config.service.available, false);
     assert.deepEqual(runtime.config.funding.models, [], 'the pins carry no model list');
     net.manifest = 'ok';
-    await runtime.assertServiceAvailable();
+    await within(1_000, runtime.assertServiceAvailable(), 'the service check');
     assert.equal(runtime.snapshot().config.service.available, true);
     assert.deepEqual(runtime.config.funding.models, ['model-a'], 'the served manifest configures requests again');
     assert.equal(storage.get('zkapi-browser-deployment'), 'https://protocol.example/config.json');
@@ -257,35 +272,36 @@ test('exit-only mode ends when the operator serves the pinned manifest again', a
 
 test('a down or hanging pinned RPC never blocks initialization or an escape, and refuses deposits', async () => {
     for (const rpc of ['down', 'hang']) {
-        await savedWallet({ liveRequest: false });
+        await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
         Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc, operator: 'hang' });
         const runtime = reloadedPage();
         const started = Date.now();
-        const snapshot = await runtime.init();
+        const snapshot = await within(1_000, runtime.init(), 'initialization');
         assert.ok(elapsed(started) < 1_000, `${rpc}: initialization took ${elapsed(started)} ms`);
         assert.equal(snapshot.config.service.available, true, 'the manifest matched');
-        const plan = await runtime.prepareWithdrawal('escape', DESTINATION);
+        const plan = await within(3_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
         assert.equal(plan.mode, 'escape', rpc);
         assert.equal(plan.decision.rule, 'E2.escape');
         assert.ok(elapsed(started) < 3_000, `${rpc}: the escape took ${elapsed(started)} ms`);
         // A deposit (or chat) needs the pinned RPC to confirm a native-ETH vault.
-        await assert.rejects(runtime.prepareDepositQuote(1_000_000, null), { code: 'native_vault_unverified' });
+        await assert.rejects(within(3_000, runtime.prepareDepositQuote(1_000_000, null), 'the refusal'),
+            { code: 'native_vault_unverified' });
     }
 });
 
 test('a failed initialization is not kept: the next call initializes again', async () => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     Object.assign(net, { browserConfig: 'down', manifest: 'ok', rpc: 'ok', operator: 'hang' });
     const runtime = reloadedPage();
-    await assert.rejects(runtime.init(), /browser-config\.json \(503\)/);
+    await assert.rejects(within(1_000, runtime.init(), 'initialization'), /browser-config\.json \(503\)/);
     net.browserConfig = 'ok';
-    const snapshot = await runtime.init();
+    const snapshot = await within(1_000, runtime.init(), 'initialization');
     assert.equal(snapshot.config.service.available, true);
     assert.equal(runtime.initialized, true);
 });
 
 test('a healthy operator still finishes an interrupted request after initialization', async () => {
-    const seed = await savedWallet();
+    const seed = await within(5_000, savedWallet(), 'the saved wallet');
     const journal = (await store.readBrowserWallet()).journal;
     const receipt = seed.receiptFor(journal, { charge: 25_000, nextAnchor: '0x9999' });
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'answer' });
@@ -296,8 +312,8 @@ test('a healthy operator still finishes an interrupted request after initializat
         return json({ error: { code: 'not_found' } }, 404);
     };
     const runtime = reloadedPage();
-    await runtime.init();
-    assert.equal(await runtime.startupRecovery, true);
+    await within(1_000, runtime.init(), 'initialization');
+    assert.equal(await within(1_000, runtime.startupRecovery, 'the startup recovery'), true);
     const saved = await store.readBrowserWallet();
     assert.equal(saved.journal, null);
     assert.equal(saved.state.current_anchor, '0x9999');
@@ -305,26 +321,27 @@ test('a healthy operator still finishes an interrupted request after initializat
 });
 
 test('a hung non-exit call in another tab holds an exit only until its own timeout', async () => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
     const chatTab = reloadedPage();
     const exitTab = reloadedPage();
-    await chatTab.init();
-    await exitTab.init();
+    await within(1_000, chatTab.init(), 'initialization');
+    await within(1_000, exitTab.init(), 'initialization');
     // The chat tab prepares a request under the wallet lock; the indexer
     // (the operator) never answers.
     const chat = chatTab.issueLease('chat').then(() => assert.fail('the chat cannot start'), error => error);
     await new Promise(resolve => setTimeout(resolve, 20));
     const started = Date.now();
-    const plan = await exitTab.prepareWithdrawal('escape', DESTINATION);
+    const plan = await within(FAST.operatorCallTimeoutMs + 2_000, exitTab.prepareWithdrawal('escape', DESTINATION),
+        'the escape');
     assert.equal(plan.mode, 'escape');
     assert.ok(elapsed(started) < FAST.operatorCallTimeoutMs + 2_000, `the exit waited ${elapsed(started)} ms`);
-    const error = await chat;
+    const error = await within(FAST.operatorCallTimeoutMs + 1_000, chat, 'the chat');
     assert.equal(error.name, 'TimeoutError', String(error));
 });
 
 test('the client does not keep a failed start either', async () => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     globalThis.zkapiWallet ||= (await import('../wallet.js')).default;
     const { ZkapiClient } = await import('../services/zkapiClient.js');
     const { default: pageRuntime } = await import('../services/browserWalletRuntime.js');
@@ -332,9 +349,9 @@ test('the client does not keep a failed start either', async () => {
     Object.assign(net, { browserConfig: 'down', manifest: 'ok', rpc: 'ok', operator: 'hang' });
     Object.assign(window, { setInterval, clearInterval });
     const client = new ZkapiClient();
-    await assert.rejects(client.init(), /browser-config\.json \(503\)/);
+    await assert.rejects(within(1_000, client.init(), 'initialization'), /browser-config\.json \(503\)/);
     net.browserConfig = 'ok';
-    const snapshot = await client.init();
+    const snapshot = await within(1_000, client.init(), 'initialization');
     assert.equal(client.initialized, true);
     assert.equal(snapshot.config.service.available, true);
     clearInterval(client.refreshTimer);
@@ -342,30 +359,46 @@ test('the client does not keep a failed start either', async () => {
 });
 
 test('an untrusted ?zkapiDeployment link leaves exits to the pins instead of stopping the wallet', async t => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
     globalThis.location = new URL('https://host.example/app/?zkapiDeployment=https://evil.example/config.json');
     t.after(() => { globalThis.location = new URL('https://host.example/app/'); });
     const runtime = reloadedPage();
-    const snapshot = await runtime.init();
+    const snapshot = await within(1_000, runtime.init(), 'initialization');
     assert.equal(snapshot.config.service.code, 'deployment_manifest_untrusted');
     assert.ok(!net.calls.some(url => url.includes('evil.example')), 'the untrusted manifest is never fetched');
-    assert.equal((await runtime.prepareWithdrawal('escape', DESTINATION)).mode, 'escape');
-    await assert.rejects(runtime.prepareDepositQuote(1_000_000, null), { code: 'deployment_manifest_untrusted' });
+    assert.equal((await within(3_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape')).mode, 'escape');
+    await assert.rejects(within(3_000, runtime.prepareDepositQuote(1_000_000, null), 'the refusal'),
+        { code: 'deployment_manifest_untrusted' });
 });
 
 test('a withdrawal in the same tab stops a private key still being issued instead of waiting for it', async () => {
-    await savedWallet({ liveRequest: false });
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
     Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
     // A long non-exit bound: only the preemption can free the lock in time.
-    const runtime = reloadedPage({ ...FAST, operatorCallTimeoutMs: 60_000 });
-    await runtime.init();
+    const runtime = reloadedPage({ ...FAST, operatorCallTimeoutMs: 10_000 });
+    await within(1_000, runtime.init(), 'initialization');
     const chat = runtime.ensureLease('chat').then(() => assert.fail('the chat cannot start'), error => error);
     await new Promise(resolve => setTimeout(resolve, 20));
     const started = Date.now();
-    const plan = await runtime.prepareWithdrawal('escape', DESTINATION);
+    const plan = await within(2_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
     assert.equal(plan.mode, 'escape');
     assert.ok(elapsed(started) < 2_000, `the exit waited ${elapsed(started)} ms`);
-    const error = await chat;
+    const error = await within(1_000, chat, 'the stopped chat');
     assert.equal(error.name, 'AbortError', String(error));
+});
+
+test('an exit RPC that hangs and ignores its abort signal still ends at E0\'s call timeout', async () => {
+    await within(5_000, savedWallet({ liveRequest: false }), 'the saved wallet');
+    Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
+    const runtime = reloadedPage();
+    await within(1_000, runtime.init(), 'initialization');
+    // The user's own RPC (net.operator 'hang' answers every other URL).
+    runtime.setExitRpcUrl('https://exit-rpc.example/');
+    const started = Date.now();
+    const plan = await within(3_000, runtime.prepareWithdrawal('escape', DESTINATION), 'the escape');
+    assert.equal(plan.mode, 'escape');
+    assert.equal(plan.decision.rule, 'E2.escape');
+    assert.ok(elapsed(started) < 3_000, `the escape took ${elapsed(started)} ms`);
+    assert.ok(net.calls.some(url => url.startsWith('https://exit-rpc.example/')), 'the escape read the exit RPC');
 });

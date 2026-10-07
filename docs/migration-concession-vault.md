@@ -510,9 +510,12 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    ```
 
    `zkapi db init` creates the schema, the append-only `request_evidence`
-   table and the `deployment_binding` row, and refuses a database bound to
-   anything else; the challenger refuses a database without it ("run
-   `zkapi db init` first"). Each daemon refuses a placeholder or provisional
+   table and the `deployment_binding` row; the challenger refuses a database
+   without it ("run `zkapi db init` first"). Use a fresh data directory, never
+   a copy of the legacy one: `zkapi db init` and serverd read the recorded
+   binding before they migrate anything, and refuse a database bound to
+   another deployment, including the legacy vault's, and one whose binding
+   cannot be read. Each daemon refuses a placeholder or provisional
    manifest, and checks the vault, the adapter and the library against it.
    **The challenger must be healthy, with its alerting armed, before the
    first deposit.**

@@ -360,7 +360,15 @@ The drill vault tests the adversarial cases with short timings. It uses the
 
    Point their proof setup at `protocol/setup/v2-concession-dev`. Never ship
    these builds: release binaries and the Docker image load only the ceremony
-   keys and reject `--adversary`.
+   keys and reject `--adversary`. The server's mode is chosen at start,
+   `zkapi --adversary <mode> serverd ...`: `withhold` (settles every request
+   but never signs its successor), `born-spent` (signs successors at anchor 1),
+   `reuse-anchor`, `random-anchor`, `overcharge` (one unit above the bound),
+   `lie-expired` (answers every expiry check `expired_unaccepted`) and `hang`
+   (holds every connection, drips a byte every 5 seconds for up to 600
+   seconds, then answers 429 or 503 with `Retry-After: 86400`). Clients give
+   up on each call after 20 seconds, so under `hang` an escape must still land
+   before `must_initiate_by`.
 3. Run the drills of design §10.7 B on it, each asserting the client's final
    state as well as balances: the honest flow; a withholding server
    (`--adversary withhold`) and the concession at `T`; `hang`, with the

@@ -786,7 +786,7 @@ test('E4.1: an exit uses the deposit-time path, then the indexer checked against
     }
 });
 
-test('E4.1: with an exit RPC the indexer root is checked against it, and after UnknownRoot only the vault logs are used', async () => {
+test('E4.1: with an exit RPC the indexer root is checked against it, and after UnknownRoot any source but the refused root is used', async () => {
     const logs = (h, calls, source) => async ({ method, params }) => {
         calls.push([source, method, params?.[0]?.data ?? null]);
         if (method === 'eth_chainId') return '0xaa36a7';
@@ -818,29 +818,124 @@ test('E4.1: with an exit RPC the indexer root is checked against it, and after U
     assert.equal(fromIndexer.public_inputs.active_root, '0x88');
 
     // After the vault refused a proof's root, the re-proof skips the saved
-    // deposit path and the indexer.
+    // deposit path: the indexer at the vault's current root first.
     const refused = await freshWallet({}, noteState({ deposit_path: depositPath('0x51') }));
-    refused.runtime.treePath = () => assert.fail('no indexer after UnknownRoot');
     const calls = [];
     refused.runtime.pinnedRpc = () => logs(refused, calls, 'pinned');
     const first = await refused.runtime.prepareWithdrawal('escape', DESTINATION);
     assert.equal(first.pathSource, 'deposit');
-    const again = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, pathSource: 'rebuild' });
-    assert.equal(again.pathSource, 'rebuild');
-    assert.equal(BigInt(again.public_inputs.active_root), 0x6161n);
-    await assert.rejects(refused.runtime.prepareWithdrawal('escape', DESTINATION, { pathSource: 'indexer' }), /path source/);
-    // A mutual close re-proved after UnknownRoot also takes the logs' path.
+    const again = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x51' });
+    assert.equal(again.pathSource, 'indexer');
+    assert.equal(again.public_inputs.active_root, refused.chain.root);
+    // An indexer that is down, or whose root is the refused one, gives way
+    // to the vault's logs.
+    refused.runtime.treePath = () => { throw new Error('indexer down'); };
+    const fromRefusedLogs = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x51' });
+    assert.equal(fromRefusedLogs.pathSource, 'rebuild');
+    assert.equal(BigInt(fromRefusedLogs.public_inputs.active_root), 0x6161n);
+    // Without a saved path the snapshot asks for an exit RPC.
+    assert.equal(refused.runtime.snapshot().config.exit.exit_rpc_recommended, false, 'a saved path');
+    const unsaved = await freshWallet();
+    assert.equal(unsaved.runtime.snapshot().config.exit.deposit_path_saved, false);
+    assert.equal(unsaved.runtime.snapshot().config.exit.exit_rpc_recommended, true);
+    unsaved.runtime.setExitRpcUrl('https://exit.example/rpc');
+    assert.equal(unsaved.runtime.snapshot().config.exit.exit_rpc_recommended, false, 'an exit RPC is set');
+    unsaved.runtime.setExitRpcUrl(null);
+    const sameRoot = await freshWallet({}, noteState({ deposit_path: depositPath('0x77') }));
+    sameRoot.runtime.pinnedRpc = () => logs(sameRoot, [], 'pinned');
+    sameRoot.runtime.treePath = () => assert.fail('no indexer path at the refused root');
+    const skipped = await sameRoot.runtime.prepareWithdrawal('escape', DESTINATION, { refusedRoot: '0x77' });
+    assert.equal(skipped.pathSource, 'rebuild');
+    // Logs that end at the refused root are a path failure the caller may
+    // answer by submitting the proof it has.
+    await assert.rejects(sameRoot.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, refusedRoot: '0x6161' }),
+        error => error.code === 'tree_root_refused' && error.data.exit_path_unavailable === true);
+    await assert.rejects(refused.runtime.prepareWithdrawal('escape', DESTINATION, { refusedRoot: 'not-a-root' }), /refused Merkle root/);
+    // A mutual close re-proved after UnknownRoot also takes a path at another root.
     const close = await freshWallet();
     close.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
     close.runtime.pinnedRpc = () => logs(close, [], 'pinned');
     const closed = await close.runtime.prepareWithdrawal('mutual', DESTINATION);
     assert.equal(closed.pathSource, 'indexer');
-    close.runtime.treePath = () => assert.fail('no indexer after UnknownRoot');
-    const reclosed = await close.runtime.prepareWithdrawal('mutual', DESTINATION, { reprove: true, pathSource: 'rebuild' });
+    close.runtime.treePath = () => assert.fail('no indexer path at the refused root');
+    const reclosed = await close.runtime.prepareWithdrawal('mutual', DESTINATION, { reprove: true,
+        refusedRoot: closed.public_inputs.active_root });
     assert.equal(reclosed.mode, 'mutual');
     assert.equal(reclosed.pathSource, 'rebuild');
     assert.equal(BigInt(reclosed.public_inputs.active_root), 0x6161n);
     assert.equal(proofsOf(close, 'ownership').length, 1, 'the saved clearance is reused');
+});
+
+test('E4.1 and §6.6: without an exit RPC the wallet provider is read before the pinned RPC, and a stalled rebuild ends by its budget', async () => {
+    const logsVia = (calls, source, { refuseLogs = false } = {}) => async ({ method, params }) => {
+        calls.push([source, method]);
+        if (method === 'eth_chainId') return '0xaa36a7';
+        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
+        if (method === 'eth_call') return `0x${(0x99).toString(16).padStart(64, '0')}`;
+        assert.equal(method, 'eth_getLogs');
+        if (refuseLogs) throw new Error('eth_getLogs is not supported');
+        return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
+            topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
+            data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
+    };
+    // The indexer's root is checked through the wallet provider: the pinned
+    // RPC's root (0x77) is not asked.
+    const viaWallet = await freshWallet();
+    const calls = [];
+    viaWallet.runtime.treePath = async (noteId, _existing, root) => ({ active_root: `0x${BigInt(root).toString(16)}`, note_id: noteId,
+        siblings: Array.from({ length: 32 }, (_, index) => `0x99${index.toString(16)}`) });
+    const indexed = await viaWallet.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia(calls, 'wallet') });
+    assert.equal(indexed.pathSource, 'indexer');
+    assert.equal(BigInt(indexed.public_inputs.active_root), 0x99n);
+    assert.equal(viaWallet.chain.reads.filter(read => read === '0xfdab463d').length, 0, 'the pinned RPC root is not read');
+    // The rebuild reads the wallet's logs, and the pinned RPC only when the
+    // wallet refuses them.
+    for (const refuseLogs of [false, true]) {
+        const h = await freshWallet();
+        h.runtime.treePath = () => { throw new Error('indexer down'); };
+        const seen = [];
+        h.runtime.pinnedRpc = () => logsVia(seen, 'pinned');
+        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: logsVia(seen, 'wallet', { refuseLogs }) });
+        assert.equal(plan.pathSource, 'rebuild');
+        const logReads = seen.filter(([, method]) => method === 'eth_getLogs').map(([source]) => source);
+        assert.equal(logReads[0], 'wallet');
+        assert.equal(logReads.includes('pinned'), refuseLogs, `pinned RPC read: ${refuseLogs}`);
+    }
+    // A wallet on another chain is not used for either read.
+    const otherChain = await freshWallet();
+    otherChain.runtime.treePath = () => { throw new Error('indexer down'); };
+    const pinnedCalls = [];
+    otherChain.runtime.pinnedRpc = () => logsVia(pinnedCalls, 'pinned');
+    const walletCalls = [];
+    const plan = await otherChain.runtime.prepareWithdrawal('escape', DESTINATION, { walletRequest: async request => {
+        walletCalls.push(request.method);
+        if (request.method === 'eth_chainId') return '0x1';
+        throw new Error(`a wallet on another chain is never asked for ${request.method}`);
+    } });
+    assert.equal(plan.pathSource, 'rebuild');
+    assert.ok(pinnedCalls.some(([, method]) => method === 'eth_getLogs'));
+    assert.ok(walletCalls.every(method => method === 'eth_chainId'));
+
+    // A pinned RPC that answers every log range just inside the per-call
+    // timeout cannot stretch the rebuild past its budget.
+    const stalled = await freshWallet();
+    stalled.runtime.treePath = () => { throw new Error('indexer down'); };
+    stalled.runtime.browserConfig.trusted_deployment = { ...stalled.runtime.browserConfig.trusted_deployment, deploy_block: 0 };
+    stalled.runtime.exitTimingOverrides = { rebuildBudgetMs: 150 };
+    let ranges = 0;
+    stalled.runtime.pinnedRpc = () => async ({ method }) => {
+        if (method === 'eth_chainId') return '0xaa36a7';
+        if (method === 'eth_getBlockByNumber') return { number: '0x989680' };
+        ranges += 1;
+        await new Promise(resolve => setTimeout(resolve, 40));
+        return [];
+    };
+    const started = Date.now();
+    await within(2_000, assert.rejects(stalled.runtime.prepareWithdrawal('escape', DESTINATION),
+        error => error.code === 'tree_rebuild_timeout' && error.data.exit_path_unavailable === true), 'a stalled rebuild');
+    assert.ok(Date.now() - started < 1_000);
+    assert.ok(ranges >= 2 && ranges <= 6, `ranges ${ranges}`);
+    assert.equal((await saved()).exitLock, null, 'nothing was released');
 });
 
 test('the deposit-time path is saved only when it leads to the root the deposit set (Amendment A1)', async () => {

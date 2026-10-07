@@ -134,7 +134,7 @@ test('a rebuilt path equals the vault tree, with retirements and every root chec
     assert.equal(await execute('notePathMatches', { state: notes[2].state, path: saved }), false);
 });
 
-test('log ranges start at 2,000 blocks and halve on a range error, down to 100', async () => {
+test('log ranges start at 2,000 blocks, halve on a range error down to 100, and grow back after accepted ranges', async () => {
     const { logs } = await history();
     const rpc = scriptedRpc(logs, { maxRange: 500 });
     const progress = [];
@@ -143,7 +143,9 @@ test('log ranges start at 2,000 blocks and halve on a range error, down to 100',
     const sizes = rpc.calls.filter(call => call.method === 'eth_getLogs')
         .map(call => Number(BigInt(call.params[0].toBlock)) - Number(BigInt(call.params[0].fromBlock)) + 1);
     assert.deepEqual(sizes.slice(0, 3), [2_000, 1_000, 500], 'halved until the RPC accepts the range');
-    assert.ok(sizes.slice(2).every(size => size <= 500));
+    assert.ok(fetched.ranges.every(([from, to]) => to - from + 1 <= 500), 'only accepted ranges are kept');
+    // After REBUILD_REGROW_AFTER accepted ranges the range doubles again.
+    assert.deepEqual(sizes.slice(2, 8), [500, 500, 500, 500, 1_000, 500]);
     assert.deepEqual(fetched.ranges[0], [900, 1_399]);
     assert.equal(fetched.ranges.at(-1)[1], 10_000, 'up to the finalized block, not beyond');
     assert.equal(fetched.logs.length, logs.length);
@@ -157,6 +159,49 @@ test('log ranges start at 2,000 blocks and halve on a range error, down to 100',
         deployBlock: 900, noteId: 2, worker });
     assert.equal(late.finalizedBlock, 6_000);
     assert.ok(late.events < logs.length);
+});
+
+test('a dense stretch narrows the ranges only while it lasts, and a rebuild ends by its deadline', async () => {
+    const { logs } = await history();
+    // The RPC limits ranges to 200 blocks only up to block 2,000.
+    const calls = [];
+    const dense = async ({ method, params }) => {
+        if (method === 'eth_chainId') return hex(31337);
+        if (method === 'eth_getBlockByNumber') return { number: hex(40_000) };
+        const from = Number(BigInt(params[0].fromBlock));
+        const to = Number(BigInt(params[0].toBlock));
+        calls.push(to - from + 1);
+        if (from < 2_000 && to - from + 1 > 200) throw new Error('query returned more than 10000 results');
+        return logs.filter(log => {
+            const block = Number(BigInt(log.blockNumber));
+            return block >= from && block <= to;
+        });
+    };
+    const fetched = await fetchVaultTreeLogs({ request: dense, vault: VAULT, fromBlock: 900, toBlock: 40_000 });
+    assert.equal(fetched.logs.length, logs.length);
+    assert.equal(Math.max(...fetched.ranges.map(([from, to]) => to - from + 1)), 2_000, 'back to full ranges');
+    assert.ok(calls.length < 60, `${calls.length} calls; without regrowth about 200`);
+
+    // An RPC that answers each range slowly, or never, ends at the deadline.
+    for (const [label, delay] of [['slow', 25], ['silent', null]]) {
+        let reads = 0;
+        const stalling = async ({ method }) => {
+            if (method === 'eth_chainId') return hex(31337);
+            if (method === 'eth_getBlockByNumber') return { number: hex(10_000_000) };
+            reads += 1;
+            if (delay == null) return new Promise(() => {});
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return [];
+        };
+        const started = Date.now();
+        await assert.rejects(rebuildNotePath({ request: stalling, vault: VAULT, deployBlock: 0, noteId: 0, chainId: 31337, worker,
+            deadline: Date.now() + 120 }), { code: 'tree_rebuild_timeout' }, label);
+        assert.ok(Date.now() - started < 1_000, label);
+        assert.ok(reads >= 1 && reads <= 8, `${label}: ${reads} reads`);
+    }
+    // A deadline already past fails before any read.
+    await assert.rejects(fetchVaultTreeLogs({ request: () => assert.fail('no read'), vault: VAULT, fromBlock: 0, toBlock: 10,
+        deadline: Date.now() - 1 }), { code: 'tree_rebuild_timeout' });
 });
 
 test('any log whose root differs from the rebuilt tree stops the rebuild', async () => {

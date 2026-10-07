@@ -423,15 +423,21 @@ Before proving an escape, the wallet does the following:
 1. It takes the Merkle path from the first source that works:
    - the deposit, saved at deposit time and checked against the
      `NoteDeposited` root, which the vault accepts for good;
-   - the indexer, checked against the vault's current root (read through the
-     exit RPC when one is set);
+   - the indexer, checked against the vault's current root;
    - a rebuild from the vault's logs, in adaptively sized chunks with every
-     event's root checked. The rebuild uses the user's exit RPC
-     (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it) or
-     the pinned RPC.
+     event's root checked. Ranges halve on an RPC limit and double again after
+     four accepted ranges. The whole rebuild ends within 5 minutes
+     (`tree_rebuild_timeout`).
 
-   After the vault refuses a proof's root (`unknown_root`), the proof is made
-   again from the rebuild only.
+   The vault's root and logs are read through the user's exit RPC
+   (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it)
+   when one is set. Otherwise they are read through the wallet provider, when
+   it is on the vault's chain, and then through the pinned RPC.
+
+   After the wallet's simulation refuses a proof's root (`unknown_root`), the
+   proof is made again from the indexer or the rebuild, at any root except
+   the refused one. If neither gives a path, the existing proof is submitted
+   anyway, as for any other simulation refusal.
 2. It asks the server for a request proof at the successor state
    (`GET /v2/nullifiers/{successor}/evidence`). A proof that verifies locally
    refuses the escape with `device_not_newest`: another device is newer. Any
@@ -553,7 +559,11 @@ cannot be read.
   - `lock` (`mode`, `since`, `released`, `exit_proofs_released`,
     `releasable_after`);
   - `exit_kit` (`state_seq`, `exported_seq`, `out_of_date`);
-  - `deposit_path_saved` and `exit_rpc_url`;
+  - `deposit_path_saved`, `exit_rpc_url` and `exit_rpc_recommended`. The
+    last is true when no deposit-time path is saved and no exit RPC is set:
+    an escape's path would then come from the operator's indexer or the
+    pinned RPC's logs, so ask the user to set an exit RPC or keep an exit kit
+    from the depositing device;
 - `unresolved_requests`, one entry per request at the selected state, with no
   proofs: `client_request_id`, `kind`, `disposition`, `class` (`terminal`,
   `resolved_unreserved`, `unresolved`), `created_at`, `server_status`,
@@ -574,7 +584,7 @@ Each of these errors carries a `shortMessage` for display.
 | Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
 | Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
-| Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `wrong_network` |
+| Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `tree_rebuild_timeout`, `tree_root_refused`, `wrong_network` (each with `error.data.exit_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
 
 ## Credited escape payouts

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
     DEPLOYMENT, DESTINATION, VAULT, createHarness, depositPath, derivedAnchor, memoryIndexedDb, noteState, nullifierFor,
-    selectorOf
+    selectorOf, within
 } from './helpers/request-archive-harness.mjs';
 
 const storage = new Map();
@@ -161,7 +161,7 @@ test('E4.5: with an exit RPC set, its estimate replaces a refused wallet simulat
     assert.ok(statuses.some(message => /your exit RPC accepts it/.test(message)));
 });
 
-test('E4.1: an UnknownRoot simulation re-proves once from the vault logs, and a second one only warns', async () => {
+test('E4.1: an UnknownRoot simulation re-proves once at another root, and a second one only warns', async () => {
     for (const secondAnswer of ['accepts', 'refuses']) {
         const { h, wallet, withdraw } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
         runtime.pinnedRpc = () => logsRpc;
@@ -172,10 +172,43 @@ test('E4.1: an UnknownRoot simulation re-proves once from the vault logs, and a 
         await assert.rejects(withdraw('escape'), refusedInWallet, secondAnswer);
         const [first, second, third] = escapeProofs(h);
         assert.equal(first.payload.args.active_root, '0x51', 'the saved deposit path first');
-        assert.equal(BigInt(second.payload.args.active_root), LOG_ROOT, 'then the vault logs, not the same path');
+        assert.equal(second.payload.args.active_root, h.chain.root, 'then the indexer at the vault\'s current root');
         assert.equal(third, undefined, 'one re-proof per refusal');
         assert.equal(wallet.estimates.length, 2);
         assert.equal(wallet.sent.length, 1);
         assert.equal(wallet.sent[0].gas, secondAnswer === 'accepts' ? bufferedGasLimit(0x9c40n) : FIXED_EXIT_GAS);
+    }
+});
+
+test('E4.1: after UnknownRoot the vault logs replace a missing indexer, the indexer replaces refused logs, and with neither the existing proof is still submitted', async () => {
+    const refusingLogs = async ({ method }) => {
+        if (method === 'eth_chainId') return '0xaa36a7';
+        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
+        throw new Error('eth_getLogs is not supported');
+    };
+    for (const [label, indexerUp, logs, expected] of [
+        ['indexer down, logs readable', false, logsRpc, 'logs'],
+        ['logs refused, indexer up', true, refusingLogs, 'indexer'],
+        ['both unavailable', false, refusingLogs, 'existing']
+    ]) {
+        const { h, wallet, statuses, withdraw } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+        runtime.pinnedRpc = () => logs;
+        if (!indexerUp) runtime.treePath = async () => { throw new Error('indexer down'); };
+        // The wallet's RPC keeps refusing the root it does not know.
+        wallet.estimate = (_transaction, count) => {
+            if (count === 1 || expected === 'existing') throw revert(UNKNOWN_ROOT);
+            return '0x9c40';
+        };
+        await assert.rejects(within(5_000, withdraw('escape'), label), refusedInWallet, label);
+        const roots = escapeProofs(h).map(call => call.payload.args.active_root);
+        assert.equal(roots[0], '0x51', label);
+        if (expected === 'logs') assert.deepEqual(roots.slice(1).map(root => BigInt(root)), [LOG_ROOT], label);
+        if (expected === 'indexer') assert.deepEqual(roots.slice(1), [h.chain.root], label);
+        if (expected === 'existing') {
+            assert.deepEqual(roots, ['0x51'], `${label}: no other proof`);
+            assert.ok(statuses.some(message => /No Merkle path at another root was found/.test(message)), label);
+            assert.equal(wallet.sent[0].gas, FIXED_EXIT_GAS, `${label}: the refusal only warns`);
+        }
+        assert.equal(wallet.sent.length, 1, `${label}: the escape reached the wallet`);
     }
 });

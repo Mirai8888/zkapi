@@ -99,6 +99,9 @@ const WITHDRAWAL_RESTART = Symbol('withdrawal-restart');
 // E4.1's path sources in order: the deposit-time path (Amendment A1), the
 // operator's indexer checked against the vault, the vault's own logs (§6.6).
 const EXIT_PATH_SOURCES = Object.freeze(['deposit', 'indexer', 'rebuild']);
+// After the vault refused a proof's root: any source but the saved one, and
+// never the refused root itself.
+const AFTER_UNKNOWN_ROOT_SOURCES = Object.freeze(['indexer', 'rebuild']);
 const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'request_nullifier', 'authorization_tag', 'anonymous_commitment_x', 'anonymous_commitment_y',
     'solvency_bound', 'request_time'
@@ -1255,6 +1258,7 @@ class BrowserWalletRuntime extends EventTarget {
         const exits = releasedExitProofs(lock);
         const stateSeq = Number(this.runtime?.stateSeq || 0);
         const exported = this.runtime?.exitKitExportedSeq;
+        const exitRpcUrlValue = this.getExitRpcUrl();
         return {
             must_initiate_by: deadline == null ? null : deadline * 1_000,
             near_expiry: deadline != null && nearExpiry({ now, settlementWindowSeconds: this.settlementWindowSeconds(),
@@ -1272,7 +1276,12 @@ class BrowserWalletRuntime extends EventTarget {
             } : null,
             exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
             deposit_path_saved: Boolean(state.deposit_path),
-            exit_rpc_url: this.getExitRpcUrl()
+            exit_rpc_url: exitRpcUrlValue,
+            // Without a saved deposit path an escape's path comes from the
+            // operator's indexer or a log rebuild; the user's own exit RPC
+            // (or an exit kit made on the depositing device) removes that
+            // dependence on the operator.
+            exit_rpc_recommended: !state.deposit_path && !exitRpcUrlValue
         };
     }
 
@@ -3716,52 +3725,108 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
-     * The vault's currentRoot through the user's exit RPC when one is set,
-     * else through the pinned RPC (E4.1).
+     * The vault's currentRoot for the indexer check of E4.1: through the
+     * user's exit RPC when one is set; else through the wallet provider when
+     * it is on the vault's chain, then the pinned RPC.
      */
-    async exitCurrentRoot(signal = null) {
+    async exitCurrentRoot(signal = null, walletRequest = null) {
+        const call = { method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+            data: VAULT_SELECTORS.currentRoot }, 'latest'] };
+        const rootOf = (word, source) => {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error(`The ${source} returned an invalid vault root.`);
+            return BigInt(word);
+        };
         const exit = this.exitRpc();
-        if (!exit) return this.vaultWord(VAULT_SELECTORS.currentRoot, signal);
-        const word = await abortable(exit({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-            data: VAULT_SELECTORS.currentRoot }, 'latest'] }), signal);
-        if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error('The exit RPC returned an invalid vault root.');
-        return BigInt(word);
+        if (exit) return rootOf(await abortable(exit(call), signal), 'exit RPC');
+        if (walletRequest) {
+            try {
+                const chain = await abortable(walletRequest({ method: 'eth_chainId', params: [] }), signal);
+                if (BigInt(chain) === BigInt(this.config.funding.chain_id)) {
+                    return rootOf(await abortable(walletRequest(call), signal), 'wallet provider');
+                }
+            } catch (error) {
+                if (signal?.aborted) throw error;
+            }
+        }
+        return this.vaultWord(VAULT_SELECTORS.currentRoot, signal);
+    }
+
+    /**
+     * §6.6: the note's path rebuilt from the vault's logs, through the
+     * user's exit RPC when one is set, else through the wallet provider and
+     * then the pinned RPC, all within one rebuild budget.
+     */
+    async rebuildExitPath(state, { signal = null, walletRequest = null } = {}) {
+        const exit = this.exitRpc();
+        const requests = exit ? [exit] : [walletRequest, this.pinnedRpc()].filter(Boolean);
+        const deadline = Date.now() + this.exitTiming().rebuildBudgetMs;
+        const trusted = this.browserConfig?.trusted_deployment || {};
+        let failure = null;
+        for (const request of requests) {
+            try {
+                return await rebuildNotePath({
+                    request,
+                    vault: this.config.funding.contract_address,
+                    deployBlock: trusted.deploy_block,
+                    noteId: Number(state.note_id),
+                    chainId: Number(this.config.funding.chain_id),
+                    worker: this.worker,
+                    signal,
+                    deadline
+                });
+            } catch (error) {
+                if (signal?.aborted || error?.name === 'AbortError') throw error;
+                failure = error;
+                if (error?.code === 'tree_rebuild_timeout') break;
+            }
+        }
+        throw failure;
     }
 
     /**
      * E4.1: a path at a root the vault holds. The deposit-time path first
      * (Amendment A1), then the operator's indexer with its root checked
-     * against the vault's currentRoot (through the exit RPC when one is set),
-     * then the vault's own logs (§6.6). `sources` narrows the order: after an
-     * UnknownRoot refusal only the logs are used.
+     * against the vault's currentRoot (exitCurrentRoot), then the vault's
+     * own logs (§6.6). `sources` narrows the order; after an UnknownRoot
+     * refusal no source may return `refusedRoot`.
      */
-    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES } = {}) {
+    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES, refusedRoot = null, walletRequest = null } = {}) {
+        const refused = root => refusedRoot != null && sameFelt(root, refusedRoot);
         const saved = state?.deposit_path;
-        if (sources.includes('deposit')
-            && saved?.active_root != null && Array.isArray(saved.siblings) && saved.siblings.length === 32) {
+        if (sources.includes('deposit') && saved?.active_root != null && Array.isArray(saved.siblings)
+            && saved.siblings.length === 32 && !refused(saved.active_root)) {
             return { active_root: saved.active_root, note_id: Number(state.note_id), siblings: saved.siblings, source: 'deposit' };
         }
         if (sources.includes('indexer')) {
             const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
             const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
             try {
-                const root = await abortable(this.exitCurrentRoot(callSignal), callSignal);
-                const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
-                if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
+                const root = await abortable(this.exitCurrentRoot(callSignal, walletRequest), callSignal);
+                if (!refused(root)) {
+                    const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
+                    if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
+                }
             } catch (error) {
                 if (signal?.aborted) throw error;
             }
         }
-        const trusted = this.browserConfig?.trusted_deployment || {};
-        const rebuilt = await rebuildNotePath({
-            request: this.exitRpc() || this.pinnedRpc(),
-            vault: this.config.funding.contract_address,
-            deployBlock: trusted.deploy_block,
-            noteId: Number(state.note_id),
-            chainId: Number(this.config.funding.chain_id),
-            worker: this.worker,
-            signal
-        });
+        let rebuilt;
+        try {
+            rebuilt = await this.rebuildExitPath(state, { signal, walletRequest });
+        } catch (error) {
+            if (signal?.aborted || error?.name === 'AbortError') throw error;
+            // The code of the rebuild's failure (tree_logs_unavailable,
+            // tree_rebuild_timeout, a worker's tree_root_mismatch, …), marked
+            // as a path failure: the caller decides whether a proof that
+            // already exists is submitted anyway.
+            const code = error?.code || /^(?:Error: )?([a-z_]+):/.exec(String(error?.message || ''))?.[1] || 'tree_rebuild_failed';
+            throw new BrowserWalletHttpError(error?.message || 'The Merkle path could not be rebuilt.', 503, code,
+                { exit_path_unavailable: true });
+        }
+        if (refused(rebuilt.active_root)) {
+            throw new BrowserWalletHttpError('The vault’s own logs end at the root its simulation refused.', 409,
+                'tree_root_refused', { exit_path_unavailable: true });
+        }
         return { active_root: rebuilt.active_root, note_id: rebuilt.note_id, siblings: rebuilt.siblings, source: 'rebuild' };
     }
 
@@ -3954,20 +4019,33 @@ class BrowserWalletRuntime extends EventTarget {
      * user's choice for an escape forced before T (E3). Throws
      * request_settlement_pending (with escape_at) when a mutual request must
      * wait for T, and device_not_newest when another device spent this state.
+     *
+     * `refusedRoot` is the root of a proof the vault (or the wallet's
+     * simulation) refused with UnknownRoot: the next proof takes its path
+     * from the indexer or the vault's logs at any other root (E4.1, §6.6).
+     * `walletRequest` is the user's wallet provider (an EIP-1193 request
+     * function); without an exit RPC it is read before the pinned RPC for
+     * the vault's root and logs.
      */
     async prepareWithdrawal(mode, destination, {
         expectedActiveRoot = null,
         reprove = false,
         earlyConcession = 'zero',
-        pathSource = null,
+        refusedRoot = null,
+        walletRequest = null,
         signal = null,
         onProgress = () => {}
     } = {}) {
         await this.init();
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
-        // 'rebuild' after the vault refused a proof's root (UnknownRoot): the
-        // next proof takes its path from the vault's logs only (§6.6).
-        if (![null, 'rebuild'].includes(pathSource)) throw new Error('Choose a valid Merkle path source.');
+        if (refusedRoot != null) {
+            try {
+                BigInt(refusedRoot);
+            } catch {
+                throw new Error('Choose a valid refused Merkle root.');
+            }
+        }
+        if (walletRequest != null && typeof walletRequest !== 'function') throw new Error('The wallet provider must be a request function.');
         if (!['zero', 'bound'].includes(earlyConcession)) {
             throw new BrowserWalletHttpError('Choose zero or bound for a forced escape.', 400, 'invalid_concession_choice');
         }
@@ -3985,7 +4063,7 @@ class BrowserWalletRuntime extends EventTarget {
                 // there (E1, E3.2, E4.3, E6).
                 for (let pass = 0; pass < 4; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        expectedActiveRoot, reprove, earlyConcession, pathSource, signal, onProgress
+                        expectedActiveRoot, reprove, earlyConcession, refusedRoot, walletRequest, signal, onProgress
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -4016,7 +4094,8 @@ class BrowserWalletRuntime extends EventTarget {
             && withdrawalProofStillValid(inputs));
     }
 
-    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, pathSource = null, signal,
+    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, refusedRoot = null,
+        walletRequest = null, signal,
         onProgress }) {
         await this.reload();
         const state = this.runtime.state;
@@ -4138,7 +4217,7 @@ class BrowserWalletRuntime extends EventTarget {
                 await this.commit({ ...this.runtime, exitLock: switchExitLock(this.runtime.exitLock, 'mutual') });
             }
             const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot,
-                pathSource, signal });
+                refusedRoot, walletRequest, signal });
             if (outcome === WITHDRAWAL_RESTART) return outcome;
             if (outcome.plan) return outcome.plan;
             const next = afterClearanceFailure(outcome.error);
@@ -4157,7 +4236,8 @@ class BrowserWalletRuntime extends EventTarget {
                 decision = { ...next, clearanceError: outcome.error?.code || null };
             }
         }
-        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, pathSource,
+        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot,
+            walletRequest,
             signal, onProgress });
     }
 
@@ -4204,21 +4284,26 @@ class BrowserWalletRuntime extends EventTarget {
      * the kind-1 close proof, journaled with its plan. Returns { plan },
      * WITHDRAWAL_RESTART, or { error } when the clearance failed.
      */
-    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, pathSource = null, signal }) {
+    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, refusedRoot = null,
+        walletRequest = null, signal }) {
         let clearance = validClearance(existing, nullifier) ? existing.clearance : null;
         let path;
-        try {
-            if (pathSource === 'rebuild') {
-                path = await this.exitPathLocked(state, { signal, sources: ['rebuild'] });
-            } else {
+        // After UnknownRoot (with the clearance kept), the close proof takes
+        // a path at another root; a failure reaches the caller, which may
+        // still submit the existing proof (E4.5 is advisory).
+        if (refusedRoot != null && clearance) {
+            path = await this.exitPathLocked(state, { signal, sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot, walletRequest });
+        }
+        if (!path) {
+            try {
                 const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
                 const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
                 const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
                 path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
+            } catch (error) {
+                if (signal?.aborted) throw error;
+                return { error: { code: 'indexer_unavailable', message: error?.message || null } };
             }
-        } catch (error) {
-            if (signal?.aborted) throw error;
-            return { error: { code: 'indexer_unavailable', message: error?.message || null } };
         }
         if (!clearance) {
             const result = await this.requestClearanceLocked({ state, destination, nullifier, path, existing, signal });
@@ -4321,8 +4406,8 @@ class BrowserWalletRuntime extends EventTarget {
      * the archive (abandoned_for_escape), where a later receipt can still
      * install once the lock is released.
      */
-    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, pathSource = null, signal,
-        onProgress }) {
+    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, refusedRoot = null,
+        walletRequest = null, signal, onProgress }) {
         let lock = this.runtime.exitLock;
         if (lock.mode !== 'escape') {
             lock = switchExitLock(lock, 'escape');
@@ -4335,7 +4420,8 @@ class BrowserWalletRuntime extends EventTarget {
         if (refusal) throw new BrowserWalletHttpError('This escape is not allowed at this balance state.', 409, refusal);
         if (!reprove && this.reusablePlan(existing, { mode: 'escape', destination, state, nullifier, conceded })) return existing;
         onProgress('path', 'Finding this balance’s Merkle path…');
-        const path = await this.exitPathLocked(state, { signal, sources: pathSource === 'rebuild' ? ['rebuild'] : EXIT_PATH_SOURCES });
+        const path = await this.exitPathLocked(state, { signal, walletRequest,
+            ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
         onProgress('checking', 'Checking that this device holds the newest balance state…');
         const { successor } = await this.staleDeviceCheckLocked(state, { signal });
         if (nowSeconds() < deadline) {

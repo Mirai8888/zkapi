@@ -2239,9 +2239,12 @@ class ZkapiClient extends EventTarget {
         // expired proof or UnknownRoot() re-proves.
         const withdrawalAttempts = 4;
         let reprove = false;
-        // After UnknownRoot the next proof takes its path from the vault's
-        // logs (E4.1, §6.6), not from the same saved path or indexer again.
-        let pathSource = null;
+        // After UnknownRoot the next proof takes its path at any other root:
+        // the indexer checked against the vault, or the vault's logs (E4.1,
+        // §6.6), never the refused one. The wallet provider is read before
+        // the pinned RPC when no exit RPC is set.
+        let refusedRoot = null;
+        const walletRequest = request => this.ethereum.request(request);
         // A simulation refusal re-proves once per reason; after that it only
         // warns (E4.5).
         const reproved = new Set();
@@ -2283,13 +2286,26 @@ class ZkapiClient extends EventTarget {
                 const expectedActiveRoot = mode === 'mutual'
                     ? await this.readContractUint(this.config.funding.contract_address, `0x${ABI.currentRoot}`)
                     : null;
-                plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
-                    expectedActiveRoot,
-                    reprove,
-                    earlyConcession: concede,
-                    ...(pathSource ? { pathSource } : {}),
-                    onProgress: (_phase, message) => onStatus(message)
-                });
+                try {
+                    plan = await browserWalletRuntime.prepareWithdrawal(mode, destination, {
+                        expectedActiveRoot,
+                        reprove,
+                        earlyConcession: concede,
+                        walletRequest,
+                        ...(refusedRoot != null ? { refusedRoot } : {}),
+                        onProgress: (_phase, message) => onStatus(message)
+                    });
+                } catch (error) {
+                    // E4.5 is advisory: when no path at another root can be
+                    // found after UnknownRoot, the proof that exists is
+                    // submitted anyway (its refusal then only warns).
+                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true
+                        || attempt + 1 >= withdrawalAttempts) throw error;
+                    onStatus(`No Merkle path at another root was found (${error.message}). The existing proof is submitted anyway; if the vault does not know its root, the transaction reverts and costs only gas.`);
+                    refusedRoot = null;
+                    reprove = false;
+                    continue;
+                }
                 for (const warning of plan.warnings || []) {
                     if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
                 }
@@ -2401,7 +2417,7 @@ class ZkapiClient extends EventTarget {
                     const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code);
                     if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
                     reproved.add(error.code);
-                    if (error.code === 'unknown_root') pathSource = 'rebuild';
+                    if (error.code === 'unknown_root') refusedRoot = plan.public_inputs.active_root;
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;

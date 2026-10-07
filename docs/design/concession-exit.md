@@ -1,6 +1,6 @@
 # zkAPI concession exit: final specification (circuit `zkapi-v2-concession-v1`, vault revision 3), red-team revision
 
-> **Status:** design and migration plan for circuit `zkapi-v2-concession-v1` (vault revision 3). Implemented on `main` with a `dev` setup; the multi-party setup, external review, Sepolia drill and mainnet rollout in §10 are operational gates, not yet run.
+> **Status:** design and migration plan for circuit `zkapi-v2-concession-v1` (vault revision 3). Implemented with the `dev` setup in `protocol/setup/v2-concession-dev`; no revision-3 vault is deployed, and the packaged profiles are `not_deployed` placeholders. The multi-party setup, external review, Sepolia drill and mainnet rollout in §10 are operational gates, not yet run. Where the implementation differs from this text, [Implementation status](#implementation-status) records it. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
 >
 > **Amendment A1 (any known root).** §4.2 step 6 and §4.5 accept any root the vault ever held, not only the current root or one retired within 1 day. The tree is append-only for every note that is not `Closed` (`retireClosedLeaf` only removes a `Closed` note's leaf), so every root recorded since a note's deposit contains that note's leaf, and `initiateEscapeWithdrawal` and `mutualClose` require `Active`. The vault records every root it sets (`knownRoots[root] = true`, one extra SSTORE per deposit and per retirement), and a client can exit with the Merkle path it saved at deposit, with no indexer and no log rebuild. §6.6's rebuild remains the fallback for a client that has no saved path.
 
@@ -105,7 +105,11 @@ Today an exit names only the nullifier `N_k` of the state it leaves, and the vau
 
 ### 2.2 Assumptions
 - **A1 Cryptography.** Groth16 knowledge soundness for both verifying keys; Poseidon collision and preimage resistance in fixed-arity domains; EUF-CMA Schnorr on Baby-JubJub; Pedersen binding (no known discrete-log relation among `G`, `H`, `J`).
-- **A2 Setup integrity.** At least one phase-2 contributor (or the public phase-1 transcript) is honest and outside the attacker's control. This is load-bearing for G1, because a trapdoor holder can forge defeat evidence. It is enforced by G-SETUP (§10.2), and users can audit it through the published transcript plus the codehash and VK-hash pins.
+- **A2 Setup integrity.** Nobody knows the setup's toxic waste, which has a phase-1 part and a phase-2 part. Both of these hold:
+  - **Phase 1.** At least one contributor to the public powers-of-tau transcript was honest, **and** the ceremony actually used that public transcript: one listed in `zkapi_proof::ceremony::PUBLIC_PTAU`, matched by the Blake2b-512 its publisher lists. A powers of tau that one party made alone passes every consistency check, so only its provenance shows that phase 1 is sound.
+  - **Phase 2.** At least one phase-2 contributor was honest and outside the attacker's control.
+
+  The keys must also be keys of this circuit (the binding checks of §10.2). This is load-bearing for G1 and G2, because a trapdoor holder can forge any proof, including defeat evidence. It is enforced by G-SETUP (§10.2), and users can audit it through the powers-of-tau hash in the setup manifest, the published transcript, and the codehash and VK-hash pins.
 - **A3 Chain liveness.** The user can get one transaction included before `must_initiate_by` (§6.4). Owner pauses are bounded (§4.7) and are not an assumption.
 - **A4 Operator liveness (G2 only).** Before each pending escape's deadline, the operator's challenger lands the one transaction its policy calls for: a defeat when evidence at `N⁺` exists, otherwise a raise when `Ω > c`.
 - **A5 Durable client storage.** `bound_at_state`, the journal and `exit_lock` are written before transmission (§6.2 ordering).
@@ -346,7 +350,7 @@ Selector `0xa38d62aa` (was `0x9073639b`; the siblings argument is removed). Modi
    - `Nn != 0 && Nn != N`, else `InvalidDeploymentBinding()`.
    - `challengedNullifiers[N]` → `ChallengedNullifier()`.
    - `challengedNullifiers[Nn]` → `SupersededState()`.
-6. `isKnownRoot(inputs.activeRoot)` (current, or retired at most 1 day ago), else `UnknownRoot()`.
+6. `isKnownRoot(inputs.activeRoot)` (any root the vault ever held, Amendment A1), else `UnknownRoot()`.
 7. `proofAdapter.assertValidWithdrawal(inputs, proof)`.
 8. The note is `Active` (else `NoteNotActive()`), and `uint256(finalBalance) + conceded ≤ depositAmount` (else `InvalidBalance()`).
 9. `_consumeNullifier(N)`, then `_consumeNullifier(Nn)`. Either reverts `ReplayedNullifier()`.
@@ -534,7 +538,7 @@ CREATE TRIGGER IF NOT EXISTS request_evidence_no_delete BEFORE DELETE ON request
 - **Checks:**
   - `kind == 2`, `next_nullifier == 0`, `conceded == 0`, `destination == [0;20]`, `withdrawal_nullifier == N`;
   - `now ≤ valid_until ≤ now + 3600`;
-  - deployment triple and both keys; root window (unchanged); Groth16 verification.
+  - deployment triple and both keys; a root the server saw within its window, the vault's `currentRoot()`, or any root the vault ever held (`knownRoots`, Amendment A1); Groth16 verification.
 - **Unchanged:** `NullifierUsed` if `N` has any non-`ClearanceReserved` row; sign `M_clear(pv, chain, vault, N)`; permanent `ClearanceReserved` row; the `ClearanceResponseV2` response.
 
 ### 5.4 Challenger evidence policy (`zkapi-challenged`; `watcher.rs`, `challenge_service.rs`, `challenge_status.rs`)
@@ -771,7 +775,7 @@ The browser's `transmitted_anchor_escape_unsafe`, `anchor_challenged` and `recei
   2. Fetch logs from `deploy_block` to the finalized block. Start with 2,000-block chunks; on a range or size error, halve the chunk (minimum 100) and retry.
   3. Apply the logs in `(blockNumber, logIndex)` order and build the sparse depth-32 tree in WASM.
   4. **After each event, require the computed root to equal that event's root.** The final root is the last event's root.
-  5. No archive-state reads are needed. The proof's root stays usable at the vault while it is current, or within 1 day of retirement.
+  5. No archive-state reads are needed. The proof's root stays usable at the vault for good (Amendment A1).
 - **Cost:** roughly `#notes × (32 − log2 #notes)` hashes, a few seconds for 10k notes.
 - **When:** whenever the indexer is unreachable or disagrees with the chain. The companion uses the same procedure with `zkapi_core` hashing.
 
@@ -841,7 +845,7 @@ Let `S_k` be the newest installed state and `b_k = bound_at_state(S_k)`. The cli
    - `usedNullifiers[N_k]` and `[N_{k+1}]` are set only by exits that name them, which need `s` (L1). By C3 and L6, every exit proof the client released can land only while the client is frozen, so any landed exit is the client's chosen one.
    - `challengedNullifiers[N_k]` is set only by a defeat with a proof at `N_{k+1}` (point 2).
    - `challengedNullifiers[N_{k+1}]` is set only by the defeat of an escape at `N_{k+1}`, which needs a withdrawal proof from `S_{k+1}` that the client never made.
-   - The path needs only a known root (§6.6), so no deposit or front-run can invalidate a submission. A proof's root stays known for at least 1 day after a change, and `valid_until` triggers a re-proof.
+   - The path needs only a known root (§6.6), so no deposit or front-run can invalidate a submission. A proof's root stays known for good (Amendment A1), and `valid_until` triggers a re-proof.
    - **Timing.** No operator call can delay the decision past `must_initiate_by` (E0 timeouts; E1 is skipped after it).
    - **Note still `Active`.** `must_initiate_by ≤ effectiveExpiry − 12 h`, `claimExpired` requires `Active` and `now ≥ _claimableAt`, and a pending escape cannot be swept.
    - **Pause.** If a pause is in force at `must_initiate_by`, exits reopen at `pausedAt + maxPauseDuration` at the latest. `claimExpired` is blocked while paused, paused time extends `_claimableAt`, and after any unpause `_claimableAt ≥ lastUnpausedAt + unpauseClaimGrace` (at least 1 day), with no re-pause for 1 day.
@@ -967,7 +971,7 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
 - **Leaked state key.** Forged states, each capped at `D`.
 - **Leaked clearance key.** A dishonest owner can close at a spent state.
 - **R3, permanent clearance reservations.** Harmless under C5.
-- **Setup trust.** At least one honest contributor (A2).
+- **Setup trust.** An honest public phase 1 that the ceremony actually used, and at least one honest phase-2 contributor (A2).
 - **Stale-backup restore without operator evidence.** The note is defeated; the user loses only gas, but must find the newest state.
 - **A4-failure bound.** Includes post-exit service until `retireClosedLeaf` (§7.4).
 - **Owner pause** up to `maxPauseDuration` (mainnet 45 days) per cycle.
@@ -1002,7 +1006,7 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
      - (a) parse the file back (ark-circom R1CS reader) and assert A, B, C, `num_instance`, `num_witness` and the instance order equal the in-memory matrices;
      - (b) for every WP-A negative case, generate the full unsatisfying assignment and assert that an independent evaluator over the exported file rejects it;
      - (c) after the ceremony, assert that the matrices from `ark_circom::read_zkey` equal the synthesized matrices for both circuits.
-  3. **ptau.** A public BN254 powers-of-tau of at least 2^16 (for example Hermez `powersOfTau28_hez_final_16.ptau`), pinned by SHA-256.
+  3. **ptau.** A public BN254 powers-of-tau of at least 2^16, listed in `zkapi_proof::ceremony::PUBLIC_PTAU` (the Hermez `powersOfTau28_hez_final_16.ptau` to `_27.ptau`) and checked against the Blake2b-512 that the snarkjs README publishes for it, then pinned by SHA-256 (`ptau_sha256`). An `mpc-1` import refuses any file not on that list; another public transcript is a reviewed change to the list. Each external reviewer downloads the file from its public source, not from the coordinator.
   4. **Contributions.** `snarkjs groth16 setup`, then at least 3 contributions, **at least 2 by parties not selected by the operator** (nominated by the external reviewers or a public call), then a public random beacon.
   5. **Publication.** The transcript, `snarkjs zkey verify` output and all hashes.
   6. **Import.** `examples/import_zkey.rs` writes arkworks keys with the `mpc-1` headers and regenerates the adapter with the VK hashes.
@@ -1365,9 +1369,90 @@ decide S1 + CircomReduction ─► WP-A ──► WP-B ─┐
 | 29 | medium | Stale device escapes without a pre-check | **Fixed** | `GET /v2/nullifiers/{N⁺}/evidence`, verified locally under the pinned VK and run after the lock, just before broadcast. An unverifiable answer is ignored, so a lying server cannot block exits. The endpoint never serves published nullifiers. §5.2, §6.4 E4 |
 | 30 | medium | clientd and companion specifics open | **Fixed** | (a) Go escape checks `word 9 + word 14 == B`, a confirmed `c`, kind and next-nullifier words, binding over `words[:16]`. (b) Explicit fsync orders with crash tests. (c) S3 uses `bound_at_state`. (d) Protocol-workspace tests run from `protocol/rust`. §6.2, §6.7, §10.6 |
 | 31 | medium | Tests miss order and encoder bugs outside Rust | **Fixed** | Generated Forge mutation test over real proofs; a shared golden vector across Rust, JS and Go submitted to Anvil; a challenger "evidence at `N` only, no defeat" test; legacy-build tests over a new-build store fixture. §11 |
-| 32 | low | Root-change front-running taxes escapes and defeats | **Fixed structurally** | No exit, defeat, close or claim depends on the live root (append-only tree). The proof root stays valid for 1 day after a change. §4.2, §7.3 |
+| 32 | low | Root-change front-running taxes escapes and defeats | **Fixed structurally** | No exit, defeat, close or claim depends on the live root (append-only tree). The proof root stays valid for good (Amendment A1). §4.2, §7.3 |
 | 33 | low | `main` staging and host bundling underspecified | **Fixed** | `deployment_status: "not_deployed"` placeholder and CI exemption; host recipe with two package entries, dynamic import and a sample host test; `main` refuses profiles without `exit_concession: 1`, and the revision-2 code paths are deleted. §10.5, §6.5 |
 | 34 | low | Rollback over-promises for pause | **Fixed** | §10.8 says explicitly that pausing stops only new initiations and closes, for at most `maxPauseDuration`; pending escapes finalize unless acted on; decision criteria written in advance. |
 | 35 | low | Tree rebuild needs per-event checks and realistic RPC limits | **Fixed** | Per-event root equality, scan only to the finalized block, comparison to the last event's root (no archive reads), adaptive chunking, retirement fixture. §6.6 |
 | 36 | low | For a forced early exit, conceding 0 dominates | **Fixed** | Forced early exits default to `c = 0` (the user may pick `b_k` for privacy). E2-unreachable also uses `c = 0`. `c = b_k` only at or after `T`. §6.4 E2, E3; §9.2 |
 | 37 | low | Startup self-test signs with the production key | **Fixed** | The self-test uses an ephemeral in-memory key. The production path asserts anchor derivation before the signing call. §5.1 |
+---
+
+## Implementation status
+
+Work packages A to E are implemented with the `dev` setup (`protocol/setup/v2-concession-dev`). No revision-3 vault is deployed: the SDK and clientd profiles are `deployment_status: "not_deployed"` placeholders, which every build and client refuses. G-SETUP, the external review, the Sepolia drill and soak, and the mainnet rollout (§10.2, §10.7 A step 4 onwards) have not run. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
+
+The implementation differs from the text above as follows. Each item names the section it amends.
+
+### Measured figures (§1.5, §4.9)
+
+| Item | Estimate | Measured |
+|---|---|---|
+| Request circuit | ≈31,679 constraints | 31,670 constraints, 12 public inputs, 31,378 witnesses, domain 2^15 |
+| Withdrawal circuit | ≈36,458 constraints | 36,452 constraints, 16 public inputs, 36,001 witnesses, domain 2^16 |
+| Native prove (Apple Silicon, release, median of 3) | n/a | request 356 ms, escape 395 ms; verify 1.5 ms |
+| `initiateEscapeWithdrawal` (transaction gas) | 0.55–0.62M | 574,544 |
+| Defeat | 0.33–0.40M | 374,881 |
+| Raise | ≈0.33M | 335,128 |
+| `mutualClose` | 0.40–0.45M | 427,837 |
+| `finalizeEscapeWithdrawal` | 30–206k | 91,898 |
+| `claimExpired` | 0.06–0.15M | 77,509 |
+| `retireClosedLeaf` | ≈6.0M | ≈5.95M; a duplicate that reverts `StaleRoot` costs ≈5.9M |
+| Vault runtime size | 16.3–17.3 KB | 17,431 B (7,145 B under EIP-170); adapter 7,343 B, Poseidon 9,723 B |
+
+The gas figures are pinned in `protocol/contracts/snapshots/concession-exit-gas.json`, with a ceiling of 250k added for `finalizeEscapeWithdrawal`. All are dev-setup figures; G-SETUP replaces the keys, adapter, fixtures and snapshot.
+
+### Circuits, setup and key policy (§3, §10.1, §10.2)
+
+- **Setup ids.** Besides `dev` and `mpc-1`, a `rehearsal` id labels dry runs of the ceremony pipeline. The test-build policy is split across two features: `dev-setup` accepts `dev`, `rehearsal` and unpinned `mpc-1` keys, and `dev-fixtures` exposes the fixture module without changing the policy. Generating keys needs neither.
+- **Ceremony pins.** A release build accepts an `mpc-1` key only when its verifying key's keccak256 equals `CEREMONY_VK_KECCAK256` in `compact.rs`, which is `None` until G-SETUP step 7. A release build therefore loads no key at all until the ceremony keys are committed with their pins. The binary `release_policy_check` (CI job `release-key-policy`) enforces this, and checks that no production build enables `dev-setup`. It reads the root workspace and `docker/Dockerfile` as well as `protocol/rust`.
+- **Public phase 1 only (A2, step 3).** An `mpc-1` import accepts only a powers of tau on `ceremony::PUBLIC_PTAU` (Hermez `powersOfTau28_hez_final_16..27`), matched by its published Blake2b-512. The importer also checks the file's consistency itself: exact snarkjs section sizes, that the points it uses form one reference string, and the top block of section 12. `rehearsal` imports may use any file.
+- **Import gates (step 6).** `import_zkey` requires `--setup-id`, `--ptau`, `--ptau-sha256` and the ceremony's `.r1cs` files, which must be byte for byte this build's export. It refuses an `mpc-1` zkey with fewer than three contributions before its beacon. Besides the coefficient check of step 2(c), it runs a binding check of every circuit-dependent point against this build's A, B **and C** matrices (`check_key_binding`), which refuses keys set up from an R1CS that differs only in C. The contribution chain itself is checked only by each reviewer's `snarkjs zkey verify`.
+- **Setup manifest.** `manifest.json` also records `r1cs_sha256`, `zkey_sha256` and `ptau_sha256` (computed by the import) and the circuit shapes.
+- **Canonical inputs.** Provers and verifiers refuse public inputs at or above the BN254 scalar order instead of reducing them, and the vault refuses such a nullifier itself (`InvalidFelt`), in addition to the adapter's range check.
+- **Legacy setup.** `protocol/setup/v2` (circuit `zkapi-v2-note-bound-v1`) stays in the tree for the legacy release line; the gateway image ships only `protocol/setup/v2-concession`, so it serves no proving keys until G-SETUP commits them.
+
+### Contracts and deployment (§4, §10.4)
+
+- **Amendment A1.** `isKnownRoot` returns `knownRoots[root]`, every root the vault ever set; `rootRetiredAt` is informational. `ROOT_HISTORY_WINDOW()` stays 86400 and is now only a probe value and the default bound of off-chain root windows.
+- **Two-stage deployment manifest (§10.4 items 1 and 4).** `Deploy.s.sol` writes only a provisional manifest, `$OUTPUT_PATH.pending`, with `deploymentStatus` `"pending"` (or `"simulated"` without `--broadcast`) and `deployBlockLowerBound`. `node scripts/expected-codehashes.mjs --deployment $OUTPUT_PATH.pending --rpc $RPC_URL --finalize $OUTPUT_PATH` then reads the creation receipts from forge's broadcast log, checks each creation, the three runtime codehashes, the owner and the treasury on chain, and only then writes the final manifest with `deploymentStatus: "deployed"`, `deployBlock` (the vault's creation block) and `deployTransactions`. `deploy_block` (§10.3, §10.7 B step 2.1) is that `deployBlock`. serverd, `zkapi db init`, the companion, the SDK build and clientd refuse a `pending` or `simulated` manifest. Finalize needs forge's broadcast log (or `--broadcast-log`), defaults to `--confirmations 1`, and checks owner and treasury only when it runs; `--check --rpc` later audits codehashes only.
+- **Setup policy (§10.2 "no single-party setup").** Enforced by `SetupPolicy` in `Deploy.s.sol`: off local chains a `dev` or `rehearsal` setup needs `ALLOW_DEV_SETUP=1` (recorded as `allowDevSetup`; a profile built from such a manifest is a drill profile only) and mainnet refuses it, and an `mpc-1` setup must have the verifying keys of the committed `protocol/setup/v2-concession/manifest.json`. Local chains (31337, 1337) accept any setup id.
+- **Deployment script.** It links `Bn254Poseidon` itself; requires `OWNER`, `TREASURY`, `SETUP_MANIFEST` and `MAX_PAUSE_DURATION_SECONDS` off local chains; checks the signing keys (prime-order subgroup, distinct, not the published development keys off local chains); and writes key coordinates as decimal strings. The demo Foundry profile uses the protocol profile's compiler settings, so both build the same runtime code.
+- **Tests (§11 WP-B).** Besides the listed tests: closed-note re-exit tests (mock, real proofs and invariant), tampered-statement real-proof tests, setup-policy tests, an Anvil broadcast-and-finalize scenario in CI, and a shared golden vector (`protocol/contracts/test/fixtures/withdrawal-golden.json`, a real escape conceding 100,000 and a real close) that the Rust, JS and Go encoders reproduce byte for byte and that `scripts/check-withdrawal-golden.mjs` submits to an Anvil vault.
+
+### Server, challenger and indexer (§5)
+
+- **Settle, then sign (§5.1).** Between `settle_charge` and `sign_successor` the lease row already reads `finalized`; clients poll recovery until `nullifier_status` is `finalized`. The reserve transaction also writes the provisioning lease row. The signing pass pages never-deferred and deferred requests separately, at most 200 of each per pass, so a deferred request is re-checked within ⌈deferred/200⌉+1 passes rather than every pass. Dashboard events are recorded at settlement, without successor fields. `settlement reopen` adds the refusals `AlreadySettled` and `RebindSettled`.
+- **Recovery and evidence (§5.2).** Both read `usedNullifiers` and `challengedNullifiers` first, then the indexer's published-nullifier table (`/v1/nullifiers/{N}/published`). When no indexer is configured, or (for recovery only) the indexer fails, they scan the vault's `EscapeConcessionRecorded` logs from an hour before the reservation, over at most 50,000 blocks; anything else they cannot read is `503 chain_read_unavailable`. The evidence endpoint stays strict while an indexer is configured. The one publication the scan cannot see is a nullifier its owner published before the reservation, through an escape with a proof the server never saw; recovery serves that case, where §5.2 says "never". The endpoint is not rate-limited by the server; the reference gateway counts only POST requests.
+- **Root freshness (§5.2).** With no indexer configured, the vault's root alone counts.
+- **Clearance (§5.3).** The legacy clearance code is deleted, and `--allow-legacy-clearance` refuses startup. A clearance accepts any root the vault ever held (`knownRoots`, Amendment A1), so an ownership proof at the deposit-time root is accepted. A nullifier already `ClearanceReserved` is signed again.
+- **Binding and manifest (§5.5).** serverd requires `--deployment`. `deployment_binding` gains a `source` column (`vault` or `manifest`); a manifest binding is verified against the vault before serving, and a database whose binding cannot be read is refused at startup by serverd and by `zkapi db init`. serverd also refuses manifest keys that its seeds do not derive, a `challenge_period` other than the vault's, and a settlement window above the manifest's `settlement_window_seconds`. The indexer binds by its checkpoint's `circuit_id` and the `CONCESSION_ESCAPE_VERSION` probe, not by `deployment_binding`; its checkpoint is version 3 and records `last_lifecycle_block`, and it rebuilds after a deep reorganization near lifecycle events.
+- **Challenger (§5.4).** `zkapi-challenged` requires `--deployment`; `--chain-id` and `--contract-address` are optional and must equal the manifest. It checks `challengePeriod` against the manifest and the binding, and takes `--settlement-window-seconds` (default and ceiling: the manifest's) and `--settlement-poll-seconds`. Evidence at `N⁺` that does not verify never holds back the raise at `N`; it keeps the obligation critical (`evidence_invalid`) and counts as a possible missed defeat. A raise that became moot releases its nonce, and a raise mined after a defeat is accepted as harmless. Gas limits: defeat 600,000 and raise 450,000, each raised to the estimate plus 20% when that is higher; a retirement uses the estimate plus 20%. The status schema is `zkapi-challenged-status/v2`, and a miss logs `MISSED escape deadline` with `missed="defeat"` or `missed="raise"`.
+- **Retire on miss (§5.4).** It is sent only after a confirmed miss on a `Closed` note, with an indexer path that hashes to the live root; a stale path is never sent, a zero leaf means the obligation is done, and the obligation stays a warning until the retirement mines. The signer sidecar adds a bound §5.4 does not have: it signs `retireClosedLeaf` only while `ZKAPI_CHALLENGE_RETIRE_ON_MISS` is on and only for a note whose escape finalized within `ZKAPI_CHALLENGE_RETIREMENT_LOOKBACK_BLOCKS` (default 50,400); it counts retirement nonces against `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2, rolling 24 hours, in memory), refuses a note's retirement on a new nonce while an earlier counted nonce may still mine (`retirement_in_flight`), and requires canonical re-encoding of every call it signs. This trades retirement liveness for a hard gas bound: forced root races can spend the budget and delay a retirement.
+- **Indexer (§5.5).** Escapes change no leaf, so the root check does not cover `/v1/escapes/pending`; it is a hint, and the challenger relies on its own event scan and the vault. The zero-slot path endpoint is kept with a `Deprecation: true` header.
+- **Adversary modes (§5.5).** `overcharge` persists the overcharged amount, and adversarial successors skip the anchor assertion. A release build, and the Docker image, reject `--adversary`.
+- **Docker.** The gateway image ships only `protocol/setup/v2-concession`, so `/proofs/*` answers 404 and the daemons refuse to start until G-SETUP commits the pinned keys.
+
+### Clients (§6)
+
+- **Record classes (§6.4 E1).** `invalid_successor` is unresolved, handled like a withheld successor (§6.1), not terminal; `late_successor` is terminal. The SDK, the companion and clientd share one vector file, `protocol/rust/crates/zkapi-client/tests/vectors/exit-rules.json` (S1–S6, C3–C4, E0–E7, the exit kit), which each test suite reproduces.
+- **E2.** `bound_at_state == 0` is fresh whatever the records say. A `nullifier_used` answer while no released request of the state is on record escapes at once, conceding `bound_at_state` (nothing when nothing left the device), instead of waiting in E3. E3 waits from the newest unresolved release, E2 step 4 from the newest release. A lost ε concedes `min(charge, bound_at_state)` at once, whatever the records say.
+- **C3 ownership proofs (§6.3).** At most one live kind-2 proof per state, across exit locks: it is sent again while valid, a new one is made only after it expired, and within 5 seconds of its expiry the client waits (`ownership_proof_wait` in the SDK). The marker of C5 keeps it past a cancelled lock. The SDK makes ownership proofs valid 55 minutes, not 3,600 s, to absorb a client clock up to 5 minutes fast.
+- **E0.** The SDK also counts a 401 as unreachable, and ends every other operator call after 90 seconds.
+- **E6.** The SDK reads the note status and the finalized block from the exit RPC (on the vault's chain), then the wallet provider (during a withdrawal or a cancel, on the vault's chain), then the pinned RPC; only the exit RPC can release a live lock early on a `Closed` reading. A lock is released only once this device's clock also passes `valid_until + 900`. When a dead lock cannot be released yet while a verified `late_successor` waits, a withdrawal refuses with `exit_release_pending` before `must_initiate_by` rather than exit from the older state; from `must_initiate_by` on it exits from the older state, conceding nothing. The chat path still reads only the exit RPC, then the pinned RPC.
+- **Exit RPC (§1.2(6), §6.6, §6.7, red-team #4).** Every client asks the exit RPC for `eth_chainId` first and ignores one on another chain. In the SDK an exit RPC that fails or is on another chain gives way to the wallet provider and the pinned RPC for roots and logs, but is never used for `E_low` or a gas estimate. In the companion and clientd, an escape with an exit RPC configured reads and sends only through it (nonces, gas, receipts, logs, chain ID, known roots, rebuild, status), retrying twice (1 s, 3 s) and then stopping with an error; the pinned RPC is never used in its place. `E_low` still reads both RPCs.
+- **E4.** Merkle paths come from the deposit-time path first (Amendment A1), then the indexer, then the rebuild, which has a 5-minute total budget in the SDK. Wallet simulations are advisory: after a refusal the SDK uses the exit RPC's estimate or a fixed limit, and after `UnknownRoot` it proves once more at another root. clientd signs escapes at gas floors of 900,000 (initiation), 350,000 (finalization) and 150,000 (claim), retires a signed escape that can no longer be included (phase `escape_expired`: its proof expired, its nonce was taken in a finalized block, or its nonce stayed above the pending nonce for 15 minutes), and signs it again at the account nonce, replacing a mempool copy with fees raised by 12.5% plus 1 wei. The G1 exit-cost warning never delays a withdrawal, and a deposit waits for its gas read at most 20 seconds.
+- **Closes.** A mutual close near its `valid_until` is proved again from the kept clearance signature at the plan's root (A1), under a re-taken mutual lock, for the wallet's current state only. Only a granted mutual close can be set aside in the SDK (`park_requires_clearance`).
+- **Initialization.** The SDK runs in exit-only mode from the build-pinned profile while the operator's manifest is missing or different; deposits and chats wait for it, exits never do.
+- **Exit kits (§6.4 E7).** The companion has `exit-kit export` as well as `exit-kit escape`, and reads both the SDK's envelope and its own earlier one.
+- **clientd (§6.7, §10.6).** Escapes use the existing quote-and-approve signing path, and a cancel route implements E6's "user cancels". The companion is built from this repository at the commit pinned in `packaging/zkapi-source.env`; the upstream pins and patches are deleted. Packaged profiles are `not_deployed`, so package tests use invented deployed profiles.
+
+### Migration (§10)
+
+- **The legacy point release (§10.7 D).** zkapi-clientd 0.1.7 exists only as local commits on `release/v2-note-bound` (deposits closed, an in-product fresh-state escape and finalize, and `docs/LEGACY_ESCAPE.md`). It is not pushed, tagged or packaged. The new clientd's `scripts/assemble-release.py` refuses to assemble a release until `packaging/releases/clientd-0.1.7.json` records the published point release, so the legacy release must ship first.
+- **Acceptance (§11 WP-F).** The wallet driver (`examples/v2_acceptance_wallet.rs`) is ported to this circuit and built by default. The Anvil lifecycle scenario of `scripts/v2-acceptance.mjs` still drives the legacy circuit and is being ported. The scripted Sepolia drills of §10.7 B (`--network sepolia-drill`) do not exist yet; the drill list there is the checklist for running them by hand with an `adversary` build.
+
+### Open items
+
+- G-SETUP and the mainnet gates of §11.
+- No live Sepolia or drill run of this stack has happened.
+- The residual risks of §9.2, plus the signer's retirement budget above.

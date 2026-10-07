@@ -50,9 +50,13 @@ struct World {
     indexer_hang: bool,
     // RPCs: the pinned one (`/rpc`) and the owner's exit RPC (`/exit-rpc`).
     pinned_down: bool,
-    /// The pinned RPC reports the note Active with no pending exit, and a
-    /// finalized block far in the future.
+    /// The pinned RPC reports the note Active with no pending exit, its
+    /// nullifiers challenged, and a finalized block far in the future.
     pinned_lies: bool,
+    /// Calls the pinned RPC answered.
+    pinned_calls: usize,
+    /// The exit RPC refuses every call.
+    exit_down: bool,
     /// The finalized block trails the latest by this many blocks.
     finalized_lag: u64,
     // Chain.
@@ -83,7 +87,8 @@ fn rpc_result(result: Value) -> Response {
 /// The pinned RPC: down, lying, or the chain as it is.
 async fn pinned_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
     let (down, lies) = {
-        let world = world.lock().unwrap();
+        let mut world = world.lock().unwrap();
+        world.pinned_calls += 1;
         (world.pinned_down, world.pinned_lies)
     };
     if down {
@@ -92,8 +97,11 @@ async fn pinned_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Res
     answer(&world, &body, lies)
 }
 
-/// The owner's exit RPC: the chain as it is.
+/// The owner's exit RPC: the chain as it is, or down.
 async fn exit_rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
+    if world.lock().unwrap().exit_down {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
     answer(&world, &body, false)
 }
 
@@ -191,6 +199,7 @@ fn answer(world: &Shared, body: &Value, lies: bool) -> Response {
                     ),
                     None => format!("0x{}", "0".repeat(64 * 3)),
                 },
+                chain::CHALLENGED_NULLIFIERS if lies => format!("0x{}", word(1u8)),
                 chain::CHALLENGED_NULLIFIERS => {
                     let nullifier = Felt252::from_hex(&format!("0x{argument}")).unwrap();
                     format!(
@@ -1460,14 +1469,52 @@ async fn escapes_follow_the_exit_rpc_when_the_pinned_rpc_is_down_or_lies() {
     let status = harness.service.oa_escape_status().await.unwrap();
     assert_eq!(status["phase"], "pending", "{status}");
     assert!(harness.wallet().exit_lock().unwrap().is_some());
-    // The exit RPC down too: what the pinned RPC shows is displayed, but it
-    // decides nothing.
-    let mut config = harness.config.clone();
-    config.exit_rpc_url = Some("http://127.0.0.1:9/unreachable".into());
-    let service = AuthService::new(config).unwrap();
-    let status = service.oa_escape_status().await.unwrap();
-    assert_eq!(status["chain_rpc"], "pinned");
-    assert!(harness.wallet().exit_lock().unwrap().is_some());
+    // The exit RPC rate-limited or unreachable too: the pinned RPC is not
+    // asked in its place (here it would report the escape defeated, which
+    // the caller records for good), and nothing is decided.
+    for unreachable in [false, true] {
+        let service = if unreachable {
+            let mut config = harness.config.clone();
+            config.exit_rpc_url = Some("http://127.0.0.1:9/unreachable".into());
+            AuthService::new(config).unwrap()
+        } else {
+            harness.world.lock().unwrap().exit_down = true;
+            harness.service.clone()
+        };
+        harness.world.lock().unwrap().pinned_calls = 0;
+        let status = service.oa_escape_status().await.unwrap();
+        assert_eq!(status["chain"], "unavailable", "{status}");
+        assert_ne!(status["phase"], "defeated");
+        assert!(status.get("chain_rpc").is_none());
+        assert_eq!(harness.world.lock().unwrap().pinned_calls, 0);
+        assert!(harness.wallet().exit_lock().unwrap().is_some());
+    }
+}
+
+/// E4 step 1 with the owner's exit RPC down and no deposit-time path: the
+/// pinned RPC neither confirms the indexer's root nor serves the logs of a
+/// rebuild (a root it vouched for is proved and signed), so no escape is
+/// proved until the exit RPC answers.
+#[tokio::test]
+async fn without_its_exit_rpc_an_escape_takes_no_root_from_the_pinned_rpc() {
+    let harness = Harness::new(false).await.with_exit_rpc();
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.exit_down = true;
+        world.pinned_calls = 0;
+    }
+    let refused = harness.prepare(Some("0"), None).await;
+    assert!(
+        matches!(&refused, Err(AuthError::Wallet(message)) if message.contains("429")),
+        "{refused:?}"
+    );
+    assert!(harness.wallet().exit_lock().unwrap().is_none());
+    harness.world.lock().unwrap().exit_down = false;
+    let plan = harness.prepare(Some("0"), None).await.unwrap();
+    assert_eq!(
+        (plan["status"].as_str(), plan["path_source"].as_str()),
+        (Some("prepared"), Some("indexer"))
+    );
 }
 
 /// E0: the indexer is the operator's. One that accepts a connection and

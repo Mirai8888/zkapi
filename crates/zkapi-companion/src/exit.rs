@@ -263,24 +263,13 @@ async fn e_low(config: &AuthConfig, note_id: u32, expiry_ts: u64) -> u64 {
     exit_policy::e_low(expiry_ts, pinned, exit)
 }
 
-/// The RPCs an exit reads the chain through, in order: the owner's exit RPC
-/// when one is configured, then the pinned RPC (§1.2(6), §6.7: an exit never
-/// waits on the pinned RPC alone).
-pub(crate) fn exit_rpcs(config: &AuthConfig) -> Vec<Rpc> {
-    [
-        config.exit_rpc_url.as_deref(),
-        config.demo_rpc_url.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|url| Rpc::new(url).ok())
-    .collect()
-}
-
-/// The RPC whose answer closes the note or releases the exit lock (E5, E6):
-/// the owner's exit RPC when one is configured, otherwise the pinned RPC.
-/// The pinned RPC is operator-influenced (§2.1), so it never decides alone
-/// when the owner named an RPC of their own.
+/// The RPC an escape reads the chain through: the owner's exit RPC when one
+/// is configured, otherwise the pinned RPC (§1.2(6), §6.7). The pinned RPC is
+/// operator-influenced (§2.1), so when the owner named an RPC of their own it
+/// is never asked in its place, even when that one fails: what it answered
+/// would decide what is proved and signed (the root, the start block) or the
+/// escape's state (pending, closed, defeated), and the lock's release (E5,
+/// E6). A failing exit RPC is reported; the owner retries or names another.
 pub(crate) fn deciding_rpc(config: &AuthConfig) -> Result<Rpc, AuthError> {
     let url = config
         .exit_rpc_url
@@ -419,7 +408,7 @@ pub(crate) async fn escape_path(
     let state = wallet.state().ok_or(AuthError::NoActiveNote)?;
     let leaf = wallet.current_note_leaf().ok_or(AuthError::NoActiveNote)?;
     let vault = chain::vault_address(&config.contract_address)?;
-    let rpcs = exit_rpcs(config);
+    let rpcs: Vec<Rpc> = deciding_rpc(config).into_iter().collect();
     // The indexer's path, at a root the vault confirms it held.
     let from_indexer = async {
         let root = indexer.root().await.ok()?;
@@ -871,10 +860,9 @@ async fn decide_and_prove_escape(
             continue;
         }
         let mut start_block = config.deploy_block;
-        for rpc in exit_rpcs(config) {
+        if let Ok(rpc) = deciding_rpc(config) {
             if let Ok((number, _)) = rpc.block("latest").await {
                 start_block = number;
-                break;
             }
         }
         let bound = wallet.state().map_or(0, |state| state.bound_at_state);
@@ -950,16 +938,16 @@ async fn escape_status_locked(
         return Ok(status);
     }
     let vault = chain::vault_address(&config.contract_address)?;
-    // What is shown comes from the first RPC that answers, the owner's exit
-    // RPC first: a pinned RPC that is down or refuses does not hide the
-    // escape's progress.
-    let mut read = None;
-    for rpc in exit_rpcs(config) {
-        if let Ok(view) = chain::read_note(&rpc, &vault, record.note_id, "latest").await {
-            read = Some((rpc, view));
-            break;
-        }
-    }
+    // What is shown comes from the escape's RPC alone (deciding_rpc): the
+    // caller acts on it (finalizes after a pending deadline, records a
+    // defeat), so a pinned RPC never answers for a failing exit RPC.
+    let read = match deciding_rpc(config) {
+        Ok(rpc) => match chain::read_note(&rpc, &vault, record.note_id, "latest").await {
+            Ok(view) => Some((rpc, view)),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
     let Some((rpc, view)) = read else {
         status["chain"] = json!("unavailable");
         return Ok(status);

@@ -79,4 +79,30 @@ library Errors {
 
     /// @notice A field value is outside the BN254 scalar field.
     error InvalidFelt();
+
+    /// @notice The withdrawal proof's kind is not the one this entry point accepts: escapes take
+    ///         kind 0, mutual closes kind 1, and no entry point accepts an ownership proof (kind 2).
+    error WrongWithdrawalKind();
+
+    /// @notice An escape from the state just below a defeated escape: its successor nullifier
+    ///         belongs to a state that was spent, so successor evidence exists.
+    error SupersededState();
+
+    /// @notice A defeat must carry a request proof at the escape's successor nullifier.
+    error NotSuccessorEvidence();
+
+    /// @notice A raise must carry a request proof at the escaped state's nullifier.
+    error NotStateEvidence();
+
+    /// @notice The raise would not increase the escape's concession.
+    error NotARaise();
+
+    /// @notice The withdrawal proof's validUntil has passed.
+    error ProofExpired();
+
+    /// @notice A pause within PAUSE_COOLDOWN of the latest unpause.
+    error PauseCooldown();
+
+    /// @notice retireClosedLeaf on a note that is not Closed.
+    error NoteNotClosed();
 }

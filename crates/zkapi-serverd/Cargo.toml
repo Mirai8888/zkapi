@@ -51,3 +51,7 @@ zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["de
 # runs the browser wallet core of circuit zkapi-v2-concession-v1. A
 # dev-dependency: never part of a server build.
 zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser" }
+# The driver's `spend_refused_successor` synthesizes the request circuit for a
+# successor the client refused, to show the circuit itself cannot spend it.
+ark-bn254 = "0.5"
+ark-relations = "0.5"

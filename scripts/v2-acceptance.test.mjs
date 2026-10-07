@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { challengeFees, localJSON, mockProvider, proxyJsonRpc } from './v2-acceptance.mjs';
+import { createHash } from 'node:crypto';
+import {
+    CHAIN_ID, INFERENCE_CHARGE, TIMING, challengeFees, drillTiming, gasLedger, localJSON, mockOaOrg, mockProvider,
+    proxyAuthorized, proxyJsonRpc, trustedDeployment,
+} from './v2-acceptance.mjs';
 
 test('provider mock accounts only accepted calls against the issued child key', async () => {
     const mock = mockProvider('test-management');
@@ -146,4 +150,103 @@ test('challenger RPC proxy relays upstream errors with their revert data', async
         upstream.closeAllConnections();
         await new Promise(resolve => upstream.close(resolve));
     }
+});
+
+test('drill timing passes serverd\'s and zkapi-challenged\'s startup checks, and a shorter period would not', () => {
+    const timing = drillTiming();
+    assert.equal(timing.ok, true, JSON.stringify(timing));
+    assert.equal(timing.settlement_window_seconds, TIMING.leaseTtl + TIMING.settlementGrace + TIMING.settlementDeadline);
+    assert.equal(TIMING.leaseTtl % 60, 0, 'OA org keys last whole minutes');
+    assert.equal(drillTiming({ ...TIMING, challengePeriod: 3_000 }).ok, false, 'G5 needs W + 2 poll + 600 <= cp / 2');
+    assert.equal(drillTiming({ ...TIMING, raiseLead: 2_000 }).ok, false, 'the raise must land within the period');
+    assert.equal(drillTiming({ ...TIMING, maxPauseDuration: TIMING.challengePeriod }).ok, false, 'maxPauseDuration >= 2 cp');
+    assert.equal(drillTiming({ ...TIMING, settlementDeadline: 900 }).ok, false, 'the deadline leaves 900 s of retries');
+    // One accepted inference ($0.001 at $2,500/ETH) costs 400 gwei.
+    assert.equal(INFERENCE_CHARGE, 400);
+});
+
+test('profiles come only from a finalized Deploy.s.sol manifest', () => {
+    const finalized = {
+        deploymentStatus: 'deployed', deployBlock: 7, chainId: CHAIN_ID, vaultRevision: 3, concessionEscapeVersion: 1,
+        vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
+        poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        requestVkKeccak256: `0x${'11'.repeat(32)}`, withdrawalVkKeccak256: `0x${'22'.repeat(32)}`,
+        vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
+        challengePeriod: 3_600, noteTtl: 2_592_000, maxPauseDuration: 7_200,
+        // Deploy.s.sol writes the key coordinates as decimal strings.
+        stateSigningKeyX: '1', stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '18446744073709551617',
+    };
+    const services = { deploymentId: 'acceptance', protocolServerUrl: 'http://127.0.0.1:1', indexerUrl: 'http://127.0.0.1:2',
+        rpcUrl: 'http://127.0.0.1:3', priceFeed: '0x0000000000000000000000000000000000001234', settlementWindowSeconds: 962,
+        inferenceBase: 'http://127.0.0.1:4/v1', verifierUrl: 'http://127.0.0.1:4/verifier',
+        keyHashes: { requestPk: 'a', withdrawalPk: 'b', requestVk: 'c' } };
+    const profile = trustedDeployment(finalized, services);
+    assert.equal(profile.deployment_status, 'deployed');
+    assert.equal(profile.deploy_block, 7);
+    assert.equal(profile.contract_address, '0xabcd000000000000000000000000000000000001');
+    assert.equal(profile.clearance_signing_key.y, `0x${(2n ** 64n + 1n).toString(16).padStart(64, '0')}`);
+    assert.equal(profile.exit_concession, 1);
+    assert.equal(profile.vault_revision, 3);
+    assert.equal(profile.settlement_window_seconds, 962);
+    assert.equal(profile.allow_dev_setup, true);
+    for (const status of ['pending', 'simulated']) {
+        assert.throws(() => trustedDeployment({ ...finalized, deploymentStatus: status }, services), /finalized manifest/);
+    }
+    assert.throws(() => trustedDeployment({ ...finalized, deployBlock: undefined }, services), /deployBlock/);
+});
+
+test('the companion\'s proxy admits only its own basic credentials', () => {
+    const header = `Basic ${Buffer.from('clientd:secret').toString('base64')}`;
+    assert.equal(proxyAuthorized(header, 'clientd', 'secret'), true);
+    assert.equal(proxyAuthorized(header, 'clientd', 'other'), false);
+    assert.equal(proxyAuthorized(undefined, 'clientd', 'secret'), false);
+    assert.equal(proxyAuthorized(`Bearer ${Buffer.from('clientd:secret').toString('base64')}`, 'clientd', 'secret'), false);
+});
+
+test('the OA org mock reports usage only once its key expired, and the verifier binds the key it is shown', async () => {
+    const provider = mockProvider();
+    const options = { sharedSecret: 'org-secret', verifierUrl: 'http://127.0.0.1:9/verifier', inferenceBase: 'http://127.0.0.1:9/v1' };
+    const oa = mockOaOrg(provider, options);
+    const servers = [http.createServer(oa.org), http.createServer(oa.verifier)];
+    await Promise.all(servers.map(server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve))));
+    const [org, verifier] = servers.map(server => `http://127.0.0.1:${server.address().port}`);
+    const post = (url, value, token = 'org-secret') => localJSON(url, { method: 'POST', value, headers: { authorization: `Bearer ${token}` } });
+    try {
+        assert.equal((await post(`${org}/api/zkapi/request_key`, {}, 'wrong')).status, 401);
+        const issued = await post(`${org}/api/zkapi/request_key`, { client_request_id: 'r1', credit_limit: 1, credit_limit_credits: 1_000_000,
+            duration_minutes: 1 });
+        assert.equal(issued.status, 200);
+        assert.equal(issued.value.source, 'oa_org');
+        assert.match(issued.value.station_signature, /^[0-9a-f]{128}$/);
+        assert.equal(issued.value.verifier_url, options.verifierUrl);
+        assert.ok(provider.keys.has(issued.value.key_hash), 'the key works at the provider mock');
+        const usage = await post(`${org}/api/zkapi/key_usage`, { client_request_id: 'r1', key_hash: issued.value.key_hash,
+            credit_limit_credits: 1_000_000 });
+        assert.equal(usage.value.status, 'pending', 'an OA key is never revoked early');
+        assert.match(usage.value.station_request_id, /^[0-9a-f]{64}$/);
+        const verified = await localJSON(`${verifier}/submit_key`, { method: 'POST', value: { station_id: issued.value.station_id,
+            api_key: issued.value.key } });
+        assert.deepEqual(verified.value, { status: 'verified', station_id: issued.value.station_id,
+            key_hash: createHash('sha256').update(issued.value.key).digest('hex') });
+    } finally {
+        for (const server of servers) {
+            server.closeAllConnections();
+            await new Promise(resolve => server.close(resolve));
+        }
+    }
+});
+
+test('the gas ledger summarizes receipts by operation', () => {
+    const ledger = gasLedger();
+    const receipt = (gas, status = '0x1') => ({ gasUsed: `0x${gas.toString(16)}`, status, transactionHash: '0x01', blockNumber: '0x2' });
+    ledger.record('escape', receipt(574_000));
+    ledger.record('escape', receipt(575_000));
+    ledger.record('superseded', receipt(45_000, '0x0'));
+    assert.deepEqual(ledger.summary(), {
+        escape: { count: 2, min: 574_000, max: 575_000, total: 1_149_000, mean: 574_500 },
+        superseded: { count: 1, min: 45_000, max: 45_000, total: 45_000, mean: 45_000 },
+    });
+    assert.equal(ledger.entries[2].status, 0);
+    assert.throws(() => ledger.record('escape', null), /no receipt/);
 });

@@ -7,11 +7,19 @@
 //! It calls the same pure wallet operations the browser SDK runs in WASM
 //! (`zkapi-browser`): the successor checks S1–S6, one bound per state (C2),
 //! and the three withdrawal statements (escape with a concession, mutual close,
-//! ownership proof). Named snapshots deliberately retain a genuine
-//! server-signed state for the stale escape scenario (defeated by the
-//! successor's request); the helper never constructs a synthetic signed state.
-//! It knows no signing keys: the harness derives per-run keys from random
-//! seeds with `zkapi signing-keys` and passes them to `init`.
+//! ownership proof). Named snapshots deliberately retain a genuine state (the
+//! deposit's genesis state or a server-signed one) for the stale escape
+//! scenarios (defeated by the successor's request); the helper never
+//! constructs a synthetic signed state. It knows no signing keys: the harness
+//! derives per-run keys from random seeds with `zkapi signing-keys` and passes
+//! them to `init`.
+//!
+//! `spend_refused_successor` takes a server-signed successor the wallet
+//! refused (S3, S4 or S5: the drill server's born-spent, reused or random
+//! anchors), installs it in a scratch copy as if the checks had been skipped,
+//! and tries to spend it: the wallet core refuses the request proof, and the
+//! request circuit itself is synthesized for it and must be unsatisfied (Q6a,
+//! `is_genesis = (τ == 1)`), so such a successor is never spendable.
 //!
 //! Withdrawal plans carry the vault calldata of the server's own encoder
 //! (`zkapi_serverd::watcher::withdrawal_calldata`), so the harness submits
@@ -19,9 +27,12 @@
 //! `POST /v2/withdraw/clearance` body instead.
 //!
 //! Usage: `v2_acceptance_wallet SETUP_DIRECTORY` (the development setup,
-//! `protocol/setup/v2-concession-dev`).
+//! `protocol/setup/v2-concession-dev`). The wallet serves only a local chain:
+//! 31337, or 11155111 on a disposable Anvil (the harness runs the challenge
+//! signer sidecar, which signs only for Sepolia's or mainnet's chain ID).
 
 use anyhow::{bail, ensure, Context, Result};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,10 +45,15 @@ use zkapi_browser::{
     BrowserNoteState, BrowserWalletConfig, CompleteResponseArgs, ConfirmDepositArgs, NotePathArgs,
     PendingRequestJournal, PrepareRequestArgs, PrepareWithdrawalArgs, TreeSnapshot,
 };
-use zkapi_proof::compact::{RequestProver, CIRCUIT_ID};
+use zkapi_proof::compact::{
+    add_blindings, random_scalar, request_circuit, rerandomize, verify_signature, RequestProver,
+    RequestWitnessData, CIRCUIT_ID,
+};
 use zkapi_serverd::watcher::withdrawal_calldata;
 use zkapi_types::wire::RequestResponseV2;
-use zkapi_types::{Felt252, RequestPublicInputsV2};
+use zkapi_types::{
+    canonical_payload_hash, canonical_request_context, Felt252, RequestPublicInputsV2,
+};
 
 /// A request journal moved out of the pending slot, as the SDK archives it.
 struct ArchivedRequest {
@@ -83,6 +99,19 @@ struct VerifyArgs {
     public_inputs: RequestPublicInputsV2,
     proof: String,
 }
+
+#[derive(Deserialize)]
+struct RefusedSuccessorArgs {
+    response: RequestResponseV2,
+    active_root: Felt252,
+    merkle_siblings: Vec<Felt252>,
+    request_time: u64,
+}
+
+/// The local chains this in-memory wallet serves: Anvil's default chain, or
+/// a disposable Anvil running with Sepolia's chain ID (the challenge signer
+/// sidecar signs only for 1 and 11155111).
+const LOCAL_CHAINS: [u64; 2] = [31_337, 11_155_111];
 
 impl WalletDriver {
     fn new(setup: PathBuf) -> Self {
@@ -163,6 +192,151 @@ impl WalletDriver {
         }
     }
 
+    /// A server-signed successor this wallet refused (archived
+    /// `invalid_successor`), installed in a scratch copy as if S3–S5 had
+    /// been skipped, and then spent: the wallet core's request proof and the
+    /// request circuit itself must both refuse. The wallet's own state does
+    /// not change.
+    fn spend_refused_successor(&mut self, args: RefusedSuccessorArgs) -> Result<Value> {
+        let config = self.config()?.clone();
+        let state = self.current()?.clone();
+        let response = args.response;
+        let journal = self
+            .archive
+            .iter()
+            .rev()
+            .find(|record| {
+                record.disposition == "invalid_successor"
+                    && record.journal.client_request_id == response.client_request_id
+            })
+            .map(|record| record.journal.clone())
+            .context("the wallet refused no successor for this request")?;
+        ensure!(
+            journal.nullifier == zkapi_browser::withdrawal_nullifier(&state),
+            "the refused successor is not of the current state"
+        );
+        // S6: the successor really is the server's signed state.
+        let message = zkapi_core::v2::state_message(
+            state.protocol_version,
+            state.chain_id,
+            &state.contract_address,
+            &response.next_commitment.x,
+            &response.next_commitment.y,
+            &response.next_anchor,
+        );
+        let server_signed = verify_signature(
+            &config.state_signing_key,
+            &message,
+            &response.next_state_signature,
+        )?;
+        let blinding = Felt252::from_hex(&state.balance_blinding).map_err(anyhow::Error::msg)?;
+        let next_blinding = add_blindings(
+            &add_blindings(&blinding, &journal.user_rerandomization),
+            &response.blind_delta_srv,
+        );
+        let mut forced = state.clone();
+        forced.prev_anchor = Some(state.current_anchor);
+        forced.current_balance = state
+            .current_balance
+            .checked_sub(response.charge_applied)
+            .context("the refused successor charges more than the balance")?;
+        forced.balance_blinding = next_blinding.to_hex();
+        forced.current_commitment_x = response.next_commitment.x;
+        forced.current_commitment_y = response.next_commitment.y;
+        forced.current_anchor = response.next_anchor;
+        forced.is_genesis = false;
+        forced.state_signature = Some(response.next_state_signature);
+        forced.bound_at_state = 0;
+        let siblings: [Felt252; zkapi_types::MERKLE_DEPTH] = args
+            .merkle_siblings
+            .clone()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 32 Merkle siblings"))?;
+        let client_request_id = format!("refused-successor-{}", uuid_like(&response.next_anchor));
+        let payload = "{}".to_string();
+        if self.request_prover.is_none() {
+            self.request_prover = Some(RequestProver::load(&self.setup)?);
+        }
+        // The wallet core refuses to prove a request from it.
+        let wallet_refusal = match zkapi_browser::prepare_request_with_prover(
+            &config,
+            &forced,
+            PrepareRequestArgs {
+                payload: payload.clone(),
+                active_root: args.active_root,
+                merkle_siblings: args.merkle_siblings,
+                client_request_id: client_request_id.clone(),
+                request_time: args.request_time,
+                created_at_ms: args.request_time.saturating_mul(1000),
+            },
+            self.request_prover
+                .as_ref()
+                .context("missing request prover")?,
+        ) {
+            Ok(_) => bail!("the wallet core proved a request from a refused successor"),
+            Err(error) => format!("{error:#}"),
+        };
+        // The request circuit, synthesized for exactly this state.
+        let nullifier =
+            zkapi_core::v2::nullifier(&forced.secret_s, forced.note_id, &forced.current_anchor);
+        let request_context = canonical_request_context(
+            &client_request_id,
+            &canonical_payload_hash(payload.as_bytes()),
+        );
+        let rerandomization = random_scalar();
+        let anonymous = rerandomize(&response.next_commitment, &rerandomization)?;
+        let public = RequestPublicInputsV2 {
+            protocol_version: forced.protocol_version,
+            chain_id: forced.chain_id,
+            contract_address: forced.contract_address,
+            active_root: args.active_root,
+            state_signing_key_x: config.state_signing_key.x,
+            state_signing_key_y: config.state_signing_key.y,
+            request_time: args.request_time,
+            solvency_bound: config.request_charge_cap,
+            request_nullifier: nullifier,
+            authorization_tag: zkapi_core::v2::authorization_tag(&nullifier, &request_context),
+            anonymous_commitment_x: anonymous.x,
+            anonymous_commitment_y: anonymous.y,
+        };
+        let witness = RequestWitnessData {
+            secret: forced.secret_s,
+            request_context,
+            note_id: forced.note_id,
+            deposit_amount: forced.deposit_amount,
+            expiry: forced.expiry_ts,
+            merkle_siblings: siblings,
+            current_balance: forced.current_balance,
+            current_blinding: next_blinding,
+            rerandomization,
+            current_anchor: forced.current_anchor,
+            prev_anchor: forced.prev_anchor,
+            state_signature: forced.state_signature,
+        };
+        let circuit = request_circuit(&public, &witness)?;
+        let cs = ConstraintSystem::<ark_bn254::Fr>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .map_err(|error| anyhow::anyhow!("request circuit synthesis failed: {error}"))?;
+        let circuit_satisfied = cs
+            .is_satisfied()
+            .map_err(|error| anyhow::anyhow!("request circuit check failed: {error}"))?;
+        Ok(json!({
+            "server_signed": server_signed,
+            "next_anchor": response.next_anchor,
+            "derived_anchor": zkapi_core::v2::next_anchor(&journal.nullifier),
+            "charge_applied": response.charge_applied.to_string(),
+            "forced_nullifier": nullifier,
+            "genesis_nullifier": zkapi_core::v2::nullifier(
+                &forced.secret_s,
+                forced.note_id,
+                &zkapi_core::v2::GENESIS_ANCHOR,
+            ),
+            "wallet_refusal": wallet_refusal,
+            "circuit_satisfied": circuit_satisfied,
+        }))
+    }
+
     fn handle(&mut self, command: &Value) -> Result<Value> {
         match command["command"]
             .as_str()
@@ -181,8 +355,8 @@ impl WalletDriver {
                     "only protocol v2 is supported"
                 );
                 ensure!(
-                    config.chain_id == 31_337,
-                    "acceptance wallet requires local chain 31337"
+                    LOCAL_CHAINS.contains(&config.chain_id),
+                    "acceptance wallet requires a local Anvil chain (31337, or 11155111 on Anvil)"
                 );
                 ensure!(
                     !config.contract_address.is_zero(),
@@ -307,9 +481,11 @@ impl WalletDriver {
                     "snapshot already exists"
                 );
                 let state = self.current()?.clone();
+                // Only states this wallet installed: the deposit's genesis
+                // state, or one whose server signature it verified.
                 ensure!(
-                    !state.is_genesis && state.state_signature.is_some(),
-                    "a stale-state snapshot requires a verified server settlement"
+                    state.is_genesis || state.state_signature.is_some(),
+                    "a stale-state snapshot must be a genuine deposit or verified settlement"
                 );
                 let reply = json!({
                     "name": name,
@@ -415,10 +591,19 @@ impl WalletDriver {
                     )?,
                 }))
             }
+            "spend_refused_successor" => {
+                let args: RefusedSuccessorArgs = serde_json::from_value(command["args"].clone())?;
+                self.spend_refused_successor(args)
+            }
             "status" => Ok(self.status()),
             _ => bail!("unsupported command"),
         }
     }
+}
+
+/// A request id for the scratch request of `spend_refused_successor`.
+fn uuid_like(anchor: &Felt252) -> String {
+    hex::encode(&anchor.as_bytes()[24..])
 }
 
 fn main() -> Result<()> {

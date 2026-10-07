@@ -125,6 +125,14 @@ startup prints a warning naming its directory: withdraw it with the earlier
 zkapi-clientd release line, which keeps that vault's exit routes, then fund
 this release.
 
+Payment state (the local signing address and its key, pending deposits and
+their recovery records) is kept per deployment as well, in
+`funding/<network>/<deployment_id>/` under the configuration directory. The
+earlier release kept its own in `funding/<network>/`; this release neither
+reads nor changes those files, and startup prints a warning naming them while
+they exist. Keep them for the earlier release until its note is withdrawn and
+its signing address emptied.
+
 ### Deployment checks and the exit RPC
 
 At startup and before every deposit, the client checks through the pinned
@@ -140,10 +148,15 @@ refuses deposits with `deployment_mismatch`; exits stay available.
 
 `config --exit-rpc-url URL` saves your own Ethereum RPC (HTTPS, or plain HTTP
 to a node on this machine; no credentials, query or fragment). Deployment
-checks use it as well, escape transactions are sent through it, and the
-wallet companion reads exit state (note status, known roots, logs for a tree
-rebuild) through it. `config --exit-rpc-url none` clears it. The companion
-takes the same setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
+checks use it as well. An escape reads the chain and sends its transactions
+through it first, and through the pinned RPC only when it fails: the
+balance, nonce, fee and simulation reads, the receipts, the raise and
+finalization logs, and the wallet companion's exit state (note status, known
+roots, logs for a tree rebuild). Whether the note closed, and whether an
+escape proof that never landed is dead, is decided by your exit RPC alone, so
+a pinned RPC that is down or answers falsely can neither block an escape nor
+end one. `config --exit-rpc-url none` clears it. The companion takes the same
+setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
@@ -314,9 +327,12 @@ A withdrawal first takes the note's exit lock (`exit_lock.json` in the
 companion's state directory): from then on the companion makes no request
 proof from that note state, only the withdrawal's own proofs, and the chat
 API answers 409 `exit_locked`. The lock is released when the note closes,
-when you cancel a withdrawal that released no escape or close proof, or once
-every released proof is dead (its `valid_until` plus 15 minutes is before the
-finalized block and the note is still active).
+when you cancel a withdrawal that released no escape or close proof
+(`withdraw --escape --cancel`), or once every released proof is dead (its
+`valid_until` plus 15 minutes is before the finalized block and the note is
+still active). A decision that releases nothing (showing the escape's terms,
+waiting for a sent request to settle, or a refusal before any proof) leaves
+no lock behind, so chats continue.
 
 Every request from one note state carries the same solvency bound `b`, the
 largest charge the state can be asked to pay; a request needing a larger one
@@ -340,7 +356,15 @@ installs any that passes its checks. Then:
   have settled the request by then.
 - **The server refuses the clearance or cannot be reached**, or the note is
   less than an hour from that latest start: the withdrawal needs an escape
-  conceding nothing.
+  conceding nothing. A server that answers `nullifier_used` while no request
+  of that state is on record leaves nothing to wait for: the escape concedes
+  the state's bound at once (nothing, when no request was sent).
+
+A mutual close proof is valid for 3 hours. If it is not signed or mined in
+time (a fee spike, waiting for gas funds, an owner's pause), asking again
+proves a fresh close from the clearance the companion kept, with no new
+request to the operator; and once a close has a final revert, `withdraw
+--escape` may take over the same note.
 
 A withdrawal that needs an escape stops with `escape_required` and the
 decision; continue with `withdraw --escape` (below).
@@ -401,7 +425,13 @@ zkapi-clientd withdraw --escape --to 0xDESTINATION --conceded 1500    # quote it
 zkapi-clientd withdraw --approve QUOTE_ID                             # sign and send
 zkapi-clientd withdraw --escape --to 0xDESTINATION                    # later: quote finalization
 zkapi-clientd withdraw --claim --to 0xDESTINATION                     # deliver a credited payout
+zkapi-clientd withdraw --escape --cancel                              # drop an unsigned escape
 ```
+
+`--escape --cancel` drops an escape whose proof was never released (only its
+decision was shown, or it waits for a request to settle); chats resume. Once
+the escape proof was released it cannot be cancelled: the exit lock stays
+until the proof is dead or the note closes.
 
 The first run shows what the escape concedes (in gwei), why, and what it
 pays; nothing is signed. `--conceded` repeats the concession you reviewed
@@ -421,23 +451,30 @@ note's state, and refuses with `device_not_newest` when the server shows a
 valid request proof of the next state. The escape proof is valid for 3 hours;
 the transaction is checked word by word against the decision you confirmed
 (kind 0, destination, concession, `B − c` and `valid_until`) before it is
-signed, and is sent through your exit RPC when one is configured. After the
+signed, and is sent through your exit RPC when one is configured. Its
+simulation is advisory: when the RPC refuses to simulate or estimate it, the
+quote carries a warning and a fixed gas limit, and you may still approve it
+(an escape that would fail reverts cheaply). After the
 challenge period the same `withdraw --escape --to` quotes
 `finalizeEscapeWithdrawal`. The payout is matched as described under
 **Withdrawals** above; a credited payout is delivered with `--claim`.
 
 The management API serves the same steps: `GET`/`POST /admin/escape`,
-`POST /admin/escape/quote`, `POST /admin/escape/claim/quote` and
-`POST /admin/escape/approve`. The companion's routes are
-`POST /oa/v1/withdraw/escape/prepare`, `POST /oa/v1/withdraw/escape/submit`,
-`GET /oa/v1/withdraw/escape/status` and `POST /oa/v1/withdraw/escape/finalize`.
+`POST /admin/escape/quote`, `POST /admin/escape/claim/quote`,
+`POST /admin/escape/approve` and `POST /admin/escape/cancel`. The companion's
+routes are `POST /oa/v1/withdraw/escape/prepare`,
+`POST /oa/v1/withdraw/escape/submit`, `GET /oa/v1/withdraw/escape/status`,
+`POST /oa/v1/withdraw/escape/finalize` and `POST /oa/v1/withdraw/escape/cancel`
+(`escape_routes_version` 2).
 
 ### Exit kit
 
 `zkapi-walletd exit-kit export --state-dir DIR --deployment MANIFEST --out
-FILE` writes an encrypted copy of the note (format `zkapi-exit-kit-v1`: PBKDF2-SHA256 with 600,000 iterations and
+FILE` writes an encrypted copy of the note (format `zkapi-exit-kit-v1`, the
+browser SDK's: PBKDF2 with SHA-256 and 600,000 iterations, then
 AES-256-GCM) with the deployment profile, the note's secret and current
-state, and the state's bound. Export it again after each chat request: an
+state, the state's bound and the deposit-time Merkle path. `exit-kit escape`
+reads kits the browser SDK exported as well as this tool's. Export it again after each chat request: an
 older kit escapes from a state that was already spent, and that escape is
 defeated. `zkapi-walletd exit-kit escape --kit FILE --destination ADDRESS
 [--rpc URL] [--conceded UNITS]` checks the deployment's code hashes through

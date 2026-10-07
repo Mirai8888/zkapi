@@ -99,7 +99,9 @@ contract ZkApiVault is ReentrancyGuard, Ownable2Step, Events {
     mapping(uint32 => Types.Note) public notes;
     mapping(uint32 => Types.PendingWithdrawalData) public pendingWithdrawals;
     mapping(uint256 => bool) public usedNullifiers;
-    /// @notice Nullifiers whose escape was defeated by a challenge; they can never escape again.
+    /// @notice States an escape from which was defeated by successor evidence (a request proof at
+    ///         the state's successor nullifier); they can never escape again, and the state just
+    ///         below one reverts SupersededState. mutualClose does not consult it.
     mapping(uint256 => bool) public challengedNullifiers;
     /// @notice Last time each root stopped being currentRoot; zero if it never was replaced.
     ///         Informational: isKnownRoot accepts a replaced root however long ago it was replaced.

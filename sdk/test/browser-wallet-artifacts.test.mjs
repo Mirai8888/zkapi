@@ -245,7 +245,11 @@ test('wallet transactions use a bounded preflight gas limit and leave EIP-1559 f
     const gasIndex = send.indexOf('transaction.gas = bufferedGasLimit(estimate)');
     const submitIndex = send.indexOf("method: 'eth_sendTransaction'");
     assert.ok(estimateIndex >= 0 && gasIndex > estimateIndex && submitIndex > gasIndex);
-    assert.match(send, /catch \(error\) \{[\s\S]*tagTransactionError\(contractEstimateError\(error\), 'estimate', false\)[\s\S]*\}\s*let hash;[\s\S]*method: 'eth_sendTransaction'/);
+    assert.match(send, /catch \(error\) \{[\s\S]*const estimateError = contractEstimateError\(error\);[\s\S]*tagTransactionError\(estimateError, 'estimate', false\)[\s\S]*\}\s*let hash;[\s\S]*method: 'eth_sendTransaction'/);
+    // An exit's failed simulation is advisory (E4.5): a fixed, bounded limit
+    // (behaviour: browser-wallet-exit-submission.test.mjs).
+    assert.match(send, /exitEstimate\.blocking\?\.\(estimateError\)/);
+    assert.ok(gas.EXIT_FALLBACK_GAS_LIMIT < gas.MAX_TRANSACTION_GAS_LIMIT);
     assert.doesNotMatch(send, /transaction\.(?:gasPrice|maxFeePerGas|maxPriorityFeePerGas)\s*=/);
     assert.match(client, /contractRevertSelector\(error\)/);
     assert.match(client, /error\?\.code !== 'stale_root'/);
@@ -283,7 +287,8 @@ test('a saved withdrawal proof is reused until its valid_until, never refreshed 
     assert.match(reuse, /withdrawalProofStillValid\(inputs\)/);
     assert.doesNotMatch(runtime, /siblingsRoot/);
     const withdraw = sourceMethodAt(client, 'async performWithdrawal(');
-    assert.match(withdraw, /\['proof_expired', 'unknown_root'\]\.includes\(error\?\.code\)/);
+    assert.match(client, /const REPROVABLE_EXIT_ERRORS = Object\.freeze\(\['proof_expired', 'unknown_root'\]\)/);
+    assert.match(withdraw, /REPROVABLE_EXIT_ERRORS\.includes\(error\?\.code\)/);
 });
 
 test('withdrawal root synchronization waits for the indexer and fails closed', async () => {

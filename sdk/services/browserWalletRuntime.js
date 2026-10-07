@@ -3545,6 +3545,22 @@ class BrowserWalletRuntime extends EventTarget {
         return pinnedRpcRequest(this.config.funding, { timeoutMs: this.exitTiming().callTimeoutMs });
     }
 
+    /**
+     * E4.5: an exit transaction's gas through the user's exit RPC, or null
+     * when none is set or it refuses (advisory only).
+     */
+    async exitRpcEstimateGas(transaction) {
+        const exit = this.exitRpc();
+        if (!exit) return null;
+        try {
+            const estimate = BigInt(await exit({ method: 'eth_estimateGas', params: [{ from: transaction.from,
+                to: transaction.to, data: transaction.data }] }));
+            return estimate > 0n ? estimate : null;
+        } catch {
+            return null;
+        }
+    }
+
     /** The user's exit RPC (persisted per origin), or null. */
     exitRpc() {
         const url = this.getExitRpcUrl();

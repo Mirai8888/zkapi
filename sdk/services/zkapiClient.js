@@ -3,7 +3,7 @@ import { isNativeEthFunding, validateNativeFunding, assertNativeVault, validateN
 import { beginBrowserSdkInitialization } from '../configure.js';
 import browserWalletRuntime from './browserWalletRuntime.js';
 import { contractEstimateError, contractRevertSelector } from './zkapiContractError.mjs';
-import { bufferedGasLimit } from './zkapiGas.mjs';
+import { EXIT_FALLBACK_GAS_LIMIT, bufferedGasLimit } from './zkapiGas.mjs';
 import { normalizeWalletError, walletErrorMessage } from './zkapiWalletError.mjs';
 import { backgroundWithdrawalClaims, isUnsubmittedParkedMutualWithdrawal } from './zkapiWithdrawalRecovery.mjs';
 import { deriveExpiryRecords, readFinalizedExpiryClaims } from './zkapiExpiryHistory.mjs';
@@ -267,6 +267,10 @@ function walletNonceNumber(value, depth = 0) {
     if (quantity < 0n || quantity > BigInt(Number.MAX_SAFE_INTEGER)) return null;
     return Number(quantity);
 }
+
+// Refusals of an exit that a new proof can cure: valid_until passed (E4.7) or
+// the vault does not know the proof's root (E4.1).
+const REPROVABLE_EXIT_ERRORS = Object.freeze(['proof_expired', 'unknown_root']);
 
 class ZkapiClient extends EventTarget {
     constructor() {
@@ -1392,7 +1396,8 @@ class ZkapiClient extends EventTarget {
         onPrepared = null,
         preparedNonce = null,
         externalRecovery = null,
-        value = 0n
+        value = 0n,
+        { exitEstimate = null } = {}
     ) {
         const normalizedPreparedNonce = preparedNonce == null
             ? null
@@ -1433,7 +1438,27 @@ class ZkapiClient extends EventTarget {
                 || error?.code === 'transaction_gas_limit_exceeded') {
                 throw tagTransactionError(error, 'estimate', false);
             }
-            throw tagTransactionError(contractEstimateError(error), 'estimate', false);
+            const estimateError = contractEstimateError(error);
+            if (!exitEstimate || exitEstimate.blocking?.(estimateError)) {
+                throw tagTransactionError(estimateError, 'estimate', false);
+            }
+            // E4.5: an exit's simulation is advisory. A lagging or lying
+            // wallet RPC cannot stop it: simulate through the user's exit RPC
+            // when one is set, else submit with a fixed, bounded gas limit, and
+            // warn; the wallet still asks the user to confirm.
+            let alternative = null;
+            try {
+                alternative = await exitEstimate.alternative?.({ from: transaction.from, to: transaction.to,
+                    data: transaction.data }) ?? null;
+            } catch {
+                alternative = null;
+            }
+            try {
+                transaction.gas = alternative != null ? bufferedGasLimit(alternative) : `0x${EXIT_FALLBACK_GAS_LIMIT.toString(16)}`;
+            } catch {
+                transaction.gas = `0x${EXIT_FALLBACK_GAS_LIMIT.toString(16)}`;
+            }
+            await exitEstimate.onAdvisory?.(estimateError, { gas: transaction.gas, exitRpcEstimate: alternative });
         }
         let hash;
         try {
@@ -2196,6 +2221,12 @@ class ZkapiClient extends EventTarget {
         // expired proof or UnknownRoot() re-proves.
         const withdrawalAttempts = 4;
         let reprove = false;
+        // After UnknownRoot the next proof takes its path from the vault's
+        // logs (E4.1, §6.6), not from the same saved path or indexer again.
+        let pathSource = null;
+        // A simulation refusal re-proves once per reason; after that it only
+        // warns (E4.5).
+        const reproved = new Set();
         // An escape's destination is fixed once its proof exists. Before
         // proving, check the vault's payout push to it: a destination that
         // rejects ETH is only credited, which anyone can claim for it later.
@@ -2238,8 +2269,12 @@ class ZkapiClient extends EventTarget {
                     expectedActiveRoot,
                     reprove,
                     earlyConcession: concede,
+                    ...(pathSource ? { pathSource } : {}),
                     onProgress: (_phase, message) => onStatus(message)
                 });
+                for (const warning of plan.warnings || []) {
+                    if (warning?.message) onStatus(`${warning.message} It can still be submitted.`);
+                }
                 if (Number(plan.public_inputs?.note_id) !== Number(note.note_id)) {
                     throw new Error('The private wallet returned a withdrawal for a different note.');
                 }
@@ -2328,14 +2363,27 @@ class ZkapiClient extends EventTarget {
                                 );
                             },
                         null,
-                        { kind: 'withdrawal', submission }
+                        { kind: 'withdrawal', submission },
+                        0n,
+                        {
+                            exitEstimate: {
+                                blocking: error => REPROVABLE_EXIT_ERRORS.includes(error?.code)
+                                    && !reproved.has(error.code) && attempt + 1 < withdrawalAttempts,
+                                alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
+                                onAdvisory: (error, { exitRpcEstimate }) => onStatus(exitRpcEstimate != null
+                                    ? `Your wallet’s simulation refused this ${mode === 'mutual' ? 'close' : 'escape'} (${error.message}), but your exit RPC accepts it. It is submitted with that estimate.`
+                                    : `Your wallet’s simulation refused this ${mode === 'mutual' ? 'close' : 'escape'} (${error.message}). It can still be submitted, with a fixed gas limit; if the refusal is right, the transaction reverts and costs only gas.`)
+                            }
+                        }
                     );
                     break;
                 } catch (error) {
                     // A proof past its valid_until (E4.7) or a root the vault
                     // does not know is proved again: another release.
-                    const reprovable = ['proof_expired', 'unknown_root'].includes(error?.code);
+                    const reprovable = REPROVABLE_EXIT_ERRORS.includes(error?.code);
                     if (!reprovable || attempt + 1 >= withdrawalAttempts) throw error;
+                    reproved.add(error.code);
+                    if (error.code === 'unknown_root') pathSource = 'rebuild';
                     await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
                     submission = null;
                     submissionMetadata = null;
@@ -2730,7 +2778,17 @@ class ZkapiClient extends EventTarget {
                         await browserWalletRuntime.rememberBackgroundWithdrawalSubmissionMetadata(submission, value);
                     },
                     null,
-                    { kind: 'background-withdrawal', submission }
+                    { kind: 'background-withdrawal', submission },
+                    0n,
+                    {
+                        // A root refusal re-proves while attempts remain;
+                        // otherwise the simulation only warns (E4.5).
+                        exitEstimate: {
+                            blocking: error => ['stale_root', 'unknown_root'].includes(error?.code) && attempt < 2,
+                            alternative: transaction => browserWalletRuntime.exitRpcEstimateGas(transaction),
+                            onAdvisory: error => onStatus(`Your wallet’s simulation refused this withdrawal (${error.message}). It can still be submitted, with a fixed gas limit.`, 'wallet')
+                        }
+                    }
                 );
                 break;
             } catch (failure) {

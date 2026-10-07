@@ -13,6 +13,10 @@
 //! 3. Otherwise nothing: the honest outcome. After a raise, evidence at `N⁺`
 //!    is still watched until the deadline.
 //!
+//! Rows at `N⁺` that do not verify defeat nothing: they never hold back the
+//! raise, but keep the obligation critical (`evidence_invalid`) and count as
+//! a possible missed defeat if the escape is paid out.
+//!
 //! One signer and one nonce lane. A same-nonce replacement may change only
 //! fees, with one exception: a defeat may replace an unmined raise; a raise
 //! never replaces a defeat. The call and its digest are persisted before
@@ -542,6 +546,11 @@ struct Decision {
     owed: Option<u128>,
     raise_due_at: u64,
     due: Due,
+    /// Rows at `N⁺` exist and none of them verifies. They defeat nothing, so
+    /// `due` is decided from Ω as if they were absent, but they are alarmed
+    /// on (evidence_invalid) and, at the deadline, counted as a possible
+    /// missed defeat.
+    successor_invalid: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1990,7 +1999,38 @@ impl ChallengeService {
                 .record_expiry(note, &decision, &state, Some(nonce_state))
                 .await;
         }
-        self.act(note, nonce_state, head, &pending, decision).await
+        let successor_invalid = decision.successor_invalid.clone();
+        let acted = self.act(note, nonce_state, head, &pending, decision).await;
+        let Some(detail) = successor_invalid else {
+            return acted;
+        };
+        // Whatever was sent, the rows that do not verify stay alarmed on.
+        self.flag_invalid_evidence(note, &detail);
+        acted.and(Err(anyhow!(detail)))
+    }
+
+    /// Mark the obligation's recorded status blocked on evidence that does
+    /// not verify, unless a condition as critical already blocks it.
+    fn flag_invalid_evidence(&mut self, note: u32, detail: &str) {
+        let Some(evaluation) = self.evaluations.get_mut(&note) else {
+            return;
+        };
+        if evaluation
+            .blocked
+            .is_some_and(BlockedReason::is_immediately_critical)
+        {
+            return;
+        }
+        let detail = match (evaluation.blocked, &evaluation.detail) {
+            (Some(_), Some(previous)) => format!("{detail}; {previous}"),
+            _ => detail.to_owned(),
+        };
+        if evaluation.blocked.is_none() {
+            let entry = self.blocked_since.entry(note).or_insert((unix_now(), 0));
+            entry.1 = entry.1.saturating_add(1);
+        }
+        evaluation.blocked = Some(BlockedReason::EvidenceInvalid);
+        evaluation.detail = Some(bounded(&detail));
     }
 
     /// The deployment every evidence row must name.
@@ -2009,50 +2049,52 @@ impl ChallengeService {
     /// defeat with any verified evidence at `N⁺`; otherwise a raise to `Ω`
     /// once `Ω` is final, or at `deadline - raise_lead_seconds` at the
     /// latest, when `min(Ω, bound, B)` exceeds the concession by at least
-    /// `raise_min_units`; otherwise nothing. An unreadable database is an
-    /// error, never "nothing due".
+    /// `raise_min_units`; otherwise nothing. Rows at `N⁺` that do not verify
+    /// defeat nothing: they are reported (`successor_invalid`) and the raise
+    /// is decided as without them. An unreadable database is an error, never
+    /// "nothing due".
     fn decide(&self, state: &EscapeState, now: u64) -> anyhow::Result<Decision> {
         let binding = self.evidence_binding()?;
         let unreadable = |error: ServerError| anyhow!("evidence database read failed: {error}");
         let raise_due_at = state
             .deadline
             .saturating_sub(self.config.raise_lead_seconds);
-        let decision = |evidence, settlement, owed, due| Decision {
-            evidence,
-            settlement,
-            owed,
-            raise_due_at,
-            due,
-        };
         let successor = self
             .watcher
             .verified_evidence(&state.next_nullifier, &self.verifier, &binding)
             .map_err(unreadable)?;
         if let Some(evidence) = successor.earliest() {
-            return Ok(decision(
-                EvidenceKind::Successor,
-                None,
-                None,
-                Due::Defeat {
+            return Ok(Decision {
+                evidence: EvidenceKind::Successor,
+                settlement: None,
+                owed: None,
+                raise_due_at,
+                due: Due::Defeat {
                     evidence: evidence.clone(),
                     before_deadline: successor.existed_before(state.deadline),
                 },
-            ));
+                successor_invalid: None,
+            });
         }
-        if !successor.rejected.is_empty() {
-            return Ok(decision(
-                EvidenceKind::Corrupt,
-                None,
-                None,
-                Due::Invalid {
-                    kind: CallKind::Defeat,
-                    detail: format!(
-                        "evidence at the successor nullifier does not verify: {}",
-                        successor.rejected.join("; ")
-                    ),
-                },
-            ));
-        }
+        let successor_invalid = (!successor.rejected.is_empty()).then(|| {
+            format!(
+                "evidence at the successor nullifier does not verify: {}",
+                successor.rejected.join("; ")
+            )
+        });
+        let decision = |evidence, settlement, owed, due: Due| Decision {
+            // Shown as corrupt unless a raise is sent from verified rows.
+            evidence: if successor_invalid.is_some() && !matches!(due, Due::Raise { .. }) {
+                EvidenceKind::Corrupt
+            } else {
+                evidence
+            },
+            settlement,
+            owed,
+            raise_due_at,
+            due,
+            successor_invalid: successor_invalid.clone(),
+        };
         let Owed { basis, settlement } = self.watcher.owed(&state.nullifier).map_err(unreadable)?;
         let at_escaped = self
             .watcher
@@ -4472,6 +4514,13 @@ fn evaluation_of(decision: &Decision) -> Evaluation {
         Due::Invalid { detail, .. } => Evaluation::new(ObligationState::Ready, Some(decision.evidence))
             .blocked(BlockedReason::EvidenceInvalid, detail.clone()),
     };
+    if let Some(invalid) = &decision.successor_invalid {
+        let detail = match (&decision.due, &evaluation.detail) {
+            (Due::Invalid { .. }, Some(detail)) => format!("{invalid}; {detail}"),
+            _ => invalid.clone(),
+        };
+        evaluation = evaluation.blocked(BlockedReason::EvidenceInvalid, detail);
+    }
     evaluation.settlement = decision.settlement.clone();
     evaluation.owed = decision.owed;
     evaluation.raise_due_at = Some(decision.raise_due_at);
@@ -4503,6 +4552,15 @@ fn miss_of(decision: &Decision) -> Option<MissEvidence> {
         settlement: decision.settlement.clone(),
         reason,
     };
+    if let Some(detail) = &decision.successor_invalid {
+        // Rows at N⁺ that may have been a defeat: a possible missed defeat,
+        // whatever was due at N.
+        return Some(miss(
+            CallKind::Defeat,
+            EvidenceKind::Corrupt,
+            format!("evidence invalid at the deadline: {detail}"),
+        ));
+    }
     match &decision.due {
         Due::Defeat {
             before_deadline: true,
@@ -10787,6 +10845,103 @@ mod tests {
         let status = service.status();
         assert_eq!(status.missed_total, 0);
         assert_eq!(kinds(&fixture.sends()), [CallKind::Raise, CallKind::Defeat]);
+    }
+
+    /// §5.4: a raise goes at the 450,000 default gas limit, unless its
+    /// estimate plus 20% is higher.
+    #[tokio::test]
+    async fn a_raise_goes_at_the_default_gas_limit_unless_the_estimate_is_higher() {
+        for (estimate, gas) in [(300_000, 450_000), (500_000, 600_000)] {
+            let (fixture, ..) = raise_then_successor().await;
+            fixture.chain.lock().unwrap().estimate = estimate;
+            let mut service = fixture.service();
+            service.poll_once().await.unwrap();
+            let sends = fixture.sends();
+            assert_eq!(kinds(&sends), [CallKind::Raise], "estimate {estimate}");
+            assert_eq!(sends[0]["gas"], format!("0x{gas:x}"), "estimate {estimate}");
+        }
+        assert_eq!(format!("0x{DEFAULT_RAISE_GAS_LIMIT:x}"), "0x6ddd0");
+    }
+
+    /// Review regression: evidence at `N⁺` that does not verify defeats
+    /// nothing, so it must not hold back the raise owed at `N`. The raise
+    /// goes out, and the invalid row still raises the critical
+    /// evidence_invalid alarm and fails the poll.
+    #[tokio::test]
+    async fn invalid_successor_evidence_alarms_but_never_blocks_the_raise() {
+        let (fixture, store, _first, second) = raise_then_successor().await;
+        let mut tampered = proof_bytes(&second);
+        tampered[40] ^= 1;
+        crate::watcher::tests::append_raw_evidence(
+            &store,
+            &second.public_inputs.request_nullifier,
+            &serde_json::to_string(&second.public_inputs).unwrap(),
+            &second.public_inputs.solvency_bound.to_string(),
+            &tampered,
+            unix_now(),
+        );
+        let mut service = fixture.service();
+        let error = service.poll_once().await.unwrap_err().to_string();
+        assert!(
+            error.contains("evidence at the successor nullifier does not verify"),
+            "{error}"
+        );
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise]);
+        let status = service.status();
+        let raised = obligation(&status, 0);
+        assert_eq!(raised.action, Some(CallKind::Raise));
+        assert_eq!(raised.state, ObligationState::Submitted);
+        assert_eq!(raised.blocked_reason, Some(BlockedReason::EvidenceInvalid));
+        assert_eq!(raised.severity, Severity::Critical);
+        assert_eq!(status.status, Severity::Critical);
+        // A verified row at N⁺ still takes precedence: the defeat replaces
+        // the raise on its nonce.
+        file_evidence(&store, &second, unix_now());
+        service.poll_once().await.unwrap();
+        let sends = fixture.sends();
+        assert_eq!(kinds(&sends), [CallKind::Raise, CallKind::Defeat]);
+        assert_eq!(sends[1]["nonce"], sends[0]["nonce"]);
+        assert_eq!(obligation(&service.status(), 0).blocked_reason, None);
+    }
+
+    /// Review regression: with nothing owed at `N`, an unverifiable row at
+    /// `N⁺` is still reported, and a payout at the deadline is still
+    /// counted as a possible missed defeat.
+    #[tokio::test]
+    async fn invalid_successor_evidence_with_nothing_owed_is_critical_and_missed_at_the_deadline() {
+        let (_, first, second) = two_finalized_v2_requests().await;
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let fixture = escape_at_request(store.clone(), &first).await;
+        fixture.chain.lock().unwrap().next_nullifier = second.public_inputs.request_nullifier;
+        let mut tampered = proof_bytes(&second);
+        tampered[40] ^= 1;
+        crate::watcher::tests::append_raw_evidence(
+            &store,
+            &second.public_inputs.request_nullifier,
+            &serde_json::to_string(&second.public_inputs).unwrap(),
+            &second.public_inputs.solvency_bound.to_string(),
+            &tampered,
+            1,
+        );
+        let mut service = fixture.service();
+        assert!(service.poll_once().await.is_err());
+        assert!(fixture.sends().is_empty());
+        let invalid = obligation(&service.status(), 0);
+        assert_eq!(invalid.blocked_reason, Some(BlockedReason::EvidenceInvalid));
+        assert_eq!(invalid.evidence, Some(EvidenceKind::Corrupt));
+        assert_eq!(invalid.severity, Severity::Critical);
+        {
+            let mut chain = fixture.chain.lock().unwrap();
+            chain.head_timestamp = chain.deadline;
+        }
+        service.poll_once().await.unwrap();
+        let status = service.status();
+        let missed = obligation(&status, 0);
+        assert_eq!(missed.state, ObligationState::Missed);
+        assert_eq!(missed.evidence, Some(EvidenceKind::Corrupt));
+        assert_eq!(status.missed_total, 1);
+        assert_eq!(status.last_missed.unwrap().kind, Some(CallKind::Defeat));
     }
 
     #[tokio::test]

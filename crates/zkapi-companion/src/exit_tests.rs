@@ -180,6 +180,9 @@ async fn rpc(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
     }
 }
 
+/// How long a hanging operator holds each call: far beyond any bound E0 sets.
+const OPERATOR_HANG: Duration = Duration::from_secs(600);
+
 async fn operator_pause(world: &Shared) -> bool {
     let hang = {
         let mut world = world.lock().unwrap();
@@ -187,7 +190,7 @@ async fn operator_pause(world: &Shared) -> bool {
         world.hang
     };
     if hang {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(OPERATOR_HANG).await;
     }
     hang
 }
@@ -709,24 +712,32 @@ async fn a_hanging_operator_cannot_delay_the_exit() {
     let harness = Harness::new(true).await;
     harness.release_request(1_000, 60);
     harness.world.lock().unwrap().hang = true;
+    // The decision makes no proof: a bounded recovery pass and reading.
     let started = Instant::now();
-    let decision = harness
-        .prepare(None, Some(EarlyExit::ConcedeNothing))
-        .await
-        .unwrap();
+    let decision = tokio::time::timeout(
+        Duration::from_secs(25),
+        harness.prepare(None, Some(EarlyExit::ConcedeNothing)),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("a hanging operator held the decision"))
+    .unwrap();
     assert_eq!(decision["conceded"], "0");
-    let plan = harness
-        .prepare(Some("0"), Some(EarlyExit::ConcedeNothing))
-        .await
-        .unwrap();
+    // The plan adds the escape proof, which takes what it takes (minutes in
+    // an unoptimized build on a loaded machine), and the bounded pre-check
+    // and E1 reruns: far below a single hanging call.
+    let plan = tokio::time::timeout(
+        OPERATOR_HANG / 2,
+        harness.prepare(Some("0"), Some(EarlyExit::ConcedeNothing)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "a hanging operator held the escape: {:?}",
+            started.elapsed()
+        )
+    })
+    .unwrap();
     assert_eq!(plan["status"], "prepared");
-    // Two decisions, each with a bounded recovery pass and reading, plus the
-    // bounded pre-check and E1 reruns: far below the 30 s the operator hangs.
-    assert!(
-        started.elapsed() < Duration::from_secs(25),
-        "{:?}",
-        started.elapsed()
-    );
 
     // Past must_initiate_by: nothing is asked of the operator.
     let harness = Harness::new(true).await;

@@ -2,12 +2,11 @@
 pragma solidity ^0.8.28;
 
 // Golden calldata of the revision-3 vault calls, as Solidity's abi.encodeCall
-// encodes them: vault_calldata_golden.json is this test's output. Regenerate
-// from a Foundry project with forge-std (for example protocol/contracts):
-//   forge test --match-contract GoldenTest -vv
-// and copy each logged hex string into the JSON. zkapi-serverd's
+// encodes them: vault_calldata_golden.json is this test's output.
+// check-calldata-golden.sh runs it with forge and compares (CI), or rewrites
+// the JSON with --update. zkapi-serverd's
 // watcher::tests::golden_calldata_matches_forge_abi_encode pins its encoders
-// against it.
+// against the JSON.
 
 import {Test, console} from "forge-std/Test.sol";
 

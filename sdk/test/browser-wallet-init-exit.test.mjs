@@ -353,3 +353,19 @@ test('an untrusted ?zkapiDeployment link leaves exits to the pins instead of sto
     assert.equal((await runtime.prepareWithdrawal('escape', DESTINATION)).mode, 'escape');
     await assert.rejects(runtime.prepareDepositQuote(1_000_000, null), { code: 'deployment_manifest_untrusted' });
 });
+
+test('a withdrawal in the same tab stops a private key still being issued instead of waiting for it', async () => {
+    await savedWallet({ liveRequest: false });
+    Object.assign(net, { browserConfig: 'ok', manifest: 'ok', rpc: 'ok', operator: 'hang' });
+    // A long non-exit bound: only the preemption can free the lock in time.
+    const runtime = reloadedPage({ ...FAST, operatorCallTimeoutMs: 60_000 });
+    await runtime.init();
+    const chat = runtime.ensureLease('chat').then(() => assert.fail('the chat cannot start'), error => error);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const started = Date.now();
+    const plan = await runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(plan.mode, 'escape');
+    assert.ok(elapsed(started) < 2_000, `the exit waited ${elapsed(started)} ms`);
+    const error = await chat;
+    assert.equal(error.name, 'AbortError', String(error));
+});

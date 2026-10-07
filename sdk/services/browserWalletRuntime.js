@@ -1488,11 +1488,11 @@ class BrowserWalletRuntime extends EventTarget {
         return payload;
     }
 
-    async treePath(noteId, requireExisting = true, expectedActiveRoot = null) {
+    async treePath(noteId, requireExisting = true, expectedActiveRoot = null, signal = null) {
         return waitForExpectedActiveRoot(async () => {
-            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`);
+            const snapshot = await this.remoteJson(`${this.config.funding.indexer_url}/v1/tree/snapshot`, { signal });
             return this.worker.call('treePath', { snapshot, noteId, requireExisting });
-        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds) });
+        }, expectedActiveRoot, { sleep: milliseconds => delay(milliseconds, signal) });
     }
 
     async nextDepositPath(expectedActiveRoot = null) {
@@ -2363,7 +2363,7 @@ class BrowserWalletRuntime extends EventTarget {
         }
         this.assertAnchorAcceptsRequest(this.runtime.state);
         onProgress('syncing', 'Checking your private balance…');
-        const path = await this.treePath(this.runtime.state.note_id, true);
+        const path = await this.treePath(this.runtime.state.note_id, true, null, signal);
         throwIfAborted(signal);
         const now = Date.now();
         const quote = await this.nativeBillingQuote(signal);
@@ -2727,7 +2727,8 @@ class BrowserWalletRuntime extends EventTarget {
                     }
                     const installed = await this.installRecoveredResponse(
                         legacyLease.client_request_id,
-                        reportRecovery
+                        reportRecovery,
+                        { signal }
                     );
                     if (!installed) throw new Error('The legacy private-key receipt is not ready yet.');
                 } finally {
@@ -3747,7 +3748,7 @@ class BrowserWalletRuntime extends EventTarget {
             const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
             try {
                 const root = await abortable(this.exitCurrentRoot(callSignal), callSignal);
-                const path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+                const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
                 if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
             } catch (error) {
                 if (signal?.aborted) throw error;
@@ -4198,7 +4199,7 @@ class BrowserWalletRuntime extends EventTarget {
                 const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
                 const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
                 const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
-                path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+                path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
             }
         } catch (error) {
             if (signal?.aborted) throw error;

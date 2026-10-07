@@ -133,6 +133,20 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 	if _, _, err := escapeCalldata(other, config, expected, time.Now()); err == nil {
 		t.Fatal("a changed signing key kept the binding")
 	}
+	// Signed bytes are checked against the saved confirmation alone too (a
+	// resumed transaction has no plan): payout plus concession must be its
+	// state balance, the concession within its bound, and the mode escape.
+	for name, mutate := range map[string]func(*addressWithdrawalRecord){
+		"state balance":          func(r *addressWithdrawalRecord) { r.StateBalance++ },
+		"bound below concession": func(r *addressWithdrawalRecord) { r.Bound = r.Conceded - 1 },
+		"mode":                   func(r *addressWithdrawalRecord) { r.Mode = "mutual" },
+	} {
+		record := *expected
+		mutate(&record)
+		if validateSignedEscape(raw, config, &record, time.Now()) == nil {
+			t.Errorf("a saved escape with another %s accepted", name)
+		}
+	}
 	// Every word of the signed bytes is checked.
 	for _, index := range []int{0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 16, 17, 4, 15} {
 		tampered := append([]byte(nil), raw...)

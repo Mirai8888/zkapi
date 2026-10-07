@@ -4417,7 +4417,8 @@ class BrowserWalletRuntime extends EventTarget {
             state,
             args: {
                 mode: 'ownership',
-                valid_until: nowSeconds() + this.exitTiming().ownershipProofValiditySeconds,
+                valid_until: nowSeconds() + this.exitTiming().ownershipProofValiditySeconds
+                    - this.exitTiming().ownershipProofSkewMarginSeconds,
                 active_root: path.active_root,
                 merkle_siblings: path.siblings
             },

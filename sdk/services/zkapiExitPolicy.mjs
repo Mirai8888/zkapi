@@ -27,7 +27,12 @@ export const EXIT_TIMING = Object.freeze({
     unknownSettledAfterSeconds: 1_200,
     // valid_until = now + VALIDITY.
     exitProofValiditySeconds: 10_800,
+    // The server accepts a kind-2 proof while now <= valid_until <= now + 3,600
+    // at its own clock, read one proving time later. The client stays this
+    // far below that bound, so a clock up to five minutes fast still closes
+    // cooperatively instead of falling back to an escape.
     ownershipProofValiditySeconds: 3_600,
+    ownershipProofSkewMarginSeconds: 300,
     // E6: a released proof is dead once a finalized block is later than
     // valid_until + 900.
     lockReleaseMarginSeconds: 900

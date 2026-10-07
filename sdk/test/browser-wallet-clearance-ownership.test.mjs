@@ -73,7 +73,7 @@ test('mutual clearance sends a kind-2 ownership proof for the same nullifier and
     assert.equal(ownership.payload.args.destination, undefined, 'the ownership proof names no destination');
     assert.equal(ownership.payload.args.conceded, undefined);
     const validity = ownership.payload.args.valid_until - Math.floor(Date.now() / 1000);
-    assert.ok(validity > 3_500 && validity <= 3_600, 'an ownership proof is valid for one hour');
+    assert.ok(validity > 3_250 && validity <= 3_300, 'an ownership proof is valid for one hour less a skew margin');
     assert.equal(markerBeforeProof, null, 'local proving precedes the withdrawal-only marker');
     const { body, saved } = atPost;
     assert.deepEqual(Object.keys(body).sort(), ['ownership_proof', 'withdrawal_nullifier']);
@@ -95,6 +95,24 @@ test('mutual clearance sends a kind-2 ownership proof for the same nullifier and
     assert.deepEqual(persisted.preparedWithdrawal.clearance, plan.clearance);
     assert.equal(JSON.stringify(persisted).includes(body.ownership_proof.proof.proof), false,
         'the ownership proof itself is never persisted');
+});
+
+test('a client clock a few minutes fast still gets its clearance (the server checks now <= valid_until <= now + 3600)', async () => {
+    for (const skewSeconds of [0, 15, 30, 120, 290]) {
+        const h = await freshWallet({ clearanceOwnershipProof: 'required' });
+        // The server's clock is behind the client's, and it reads the proof
+        // one proving time (here 10 s) after the client started it.
+        h.server.clearance = body => {
+            const serverNow = Math.floor(Date.now() / 1000) - skewSeconds + 10;
+            const validUntil = Number(body.ownership_proof.public_inputs.valid_until);
+            if (!(serverNow <= validUntil && validUntil <= serverNow + 3_600)) {
+                throw new HttpError('The ownership proof is not fresh.', 400, 'invalid_ownership_proof');
+            }
+            return clearanceFor(body);
+        };
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'mutual', `a clock ${skewSeconds} s fast closes cooperatively`);
+    }
 });
 
 test('a local ownership-proof failure never makes the note withdrawal-only', async () => {

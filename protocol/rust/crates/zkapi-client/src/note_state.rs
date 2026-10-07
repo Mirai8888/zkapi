@@ -39,6 +39,29 @@ pub struct NoteState {
     pub prev_anchor: Option<Felt252>,
     pub is_genesis: bool,
     pub state_signature: Option<SchnorrSignature>,
+    /// C2 (design §6.2): the one `solvency_bound` every request proof at
+    /// this state carries. 0 until the first request proof at the state is
+    /// prepared, and reset to 0 by every install. A raise of an escape from
+    /// this state can never take more than it.
+    #[serde(default)]
+    pub bound_at_state: u128,
+    /// Installs since the deposit (0 at genesis); an exit kit records the
+    /// state it was exported at.
+    #[serde(default)]
+    pub state_seq: u64,
+    /// Amendment A1: the note's Merkle path at the root its own deposit set.
+    /// The vault accepts any root it ever held, and the tree is append-only
+    /// for every note that is not closed, so this path proves membership for
+    /// every exit, with no indexer and no log rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_path: Option<DepositPath>,
+}
+
+/// A note's Merkle path at the root of its deposit (Amendment A1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositPath {
+    pub root: Felt252,
+    pub siblings: Vec<Felt252>,
 }
 
 impl NoteState {
@@ -75,6 +98,9 @@ impl NoteState {
             prev_anchor: None,
             is_genesis: true,
             state_signature: None,
+            bound_at_state: 0,
+            state_seq: 0,
+            deposit_path: None,
         }
     }
 
@@ -170,6 +196,36 @@ mod tests {
         assert_eq!(state.current_anchor, Felt252::ONE);
         assert!(state.prev_anchor.is_none());
         assert!(state.state_signature.is_none());
+    }
+
+    /// A state file written before `bound_at_state`, `state_seq` and
+    /// `deposit_path` existed loads with no bound, sequence 0 and no saved
+    /// path.
+    #[test]
+    fn a_state_file_without_the_concession_fields_loads_with_defaults() {
+        let dir = test_dir("no_concession_fields");
+        let path = dir.join("note_state.json");
+        let state = NoteState::new_from_deposit(
+            2,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        for field in ["bound_at_state", "state_seq", "deposit_path"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = NoteState::load(&path).unwrap();
+        assert_eq!(loaded.bound_at_state, 0);
+        assert_eq!(loaded.state_seq, 0);
+        assert!(loaded.deposit_path.is_none());
     }
 
     /// A state file written before `prev_anchor` existed still loads; its

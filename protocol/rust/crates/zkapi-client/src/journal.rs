@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use zkapi_types::wire::ApiRequestV2;
+use zkapi_types::wire::{ApiRequestV2, RequestResponseV2};
 use zkapi_types::Felt252;
 
 use crate::error::ClientError;
@@ -82,23 +82,29 @@ impl PendingRequestJournal {
     /// Delete the journal file after the next state has been persisted
     /// successfully. The removal is synced before this returns.
     pub fn clear(path: &Path) -> Result<(), ClientError> {
-        if path.exists() {
-            fs::remove_file(path)?;
-            sync_parent(path)?;
-        }
-        Ok(())
+        remove_file_durably(path)
     }
 
     /// Move the journal at `path`, if any, into the append-only archive under
     /// `archive_dir`. The record is durable before the journal is removed, so
     /// a crash leaves both, never neither.
     pub fn archive(path: &Path, archive_dir: &Path, disposition: &str) -> Result<(), ClientError> {
+        Self::archive_with_response(path, archive_dir, disposition, None)
+    }
+
+    /// Like `archive`, keeping `response` with the record: a late successor
+    /// (§6.4 E4 step 6) is installed from it once the exit lock is released.
+    pub fn archive_with_response(
+        path: &Path,
+        archive_dir: &Path,
+        disposition: &str,
+        response: Option<&RequestResponseV2>,
+    ) -> Result<(), ClientError> {
         let Some(journal) = Self::read(path)? else {
             return Ok(());
         };
-        archive_request(archive_dir, &journal, disposition)?;
-        fs::remove_file(path)?;
-        sync_parent(path)
+        archive_request_with_response(archive_dir, &journal, disposition, response)?;
+        remove_file_durably(path)
     }
 }
 
@@ -112,6 +118,10 @@ pub struct ArchivedRequest {
     /// Wall-clock time of archiving (milliseconds since epoch); informational.
     pub archived_at_ms: u64,
     pub journal: PendingRequestJournal,
+    /// The signed response a `late_successor` or `invalid_successor` record
+    /// was set aside with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<RequestResponseV2>,
 }
 
 fn archive_directory(archive_dir: &Path, nullifier: &Felt252) -> PathBuf {
@@ -126,6 +136,17 @@ pub fn archive_request(
     journal: &PendingRequestJournal,
     disposition: &str,
 ) -> Result<PathBuf, ClientError> {
+    archive_request_with_response(archive_dir, journal, disposition, None)
+}
+
+/// Like `archive_request`, keeping `response` with the record.
+pub fn archive_request_with_response(
+    archive_dir: &Path,
+    journal: &PendingRequestJournal,
+    disposition: &str,
+    response: Option<&RequestResponseV2>,
+) -> Result<PathBuf, ClientError> {
+    crash::point()?;
     let directory = archive_directory(archive_dir, &journal.nullifier);
     for path in [archive_dir, directory.as_path()] {
         if !path.exists() {
@@ -148,6 +169,7 @@ pub fn archive_request(
             .map(|time| time.as_millis() as u64)
             .unwrap_or_default(),
         journal: journal.clone(),
+        response: response.cloned(),
     };
     let json = serde_json::to_vec_pretty(&record)
         .map_err(|e| ClientError::Serialization(e.to_string()))?;
@@ -269,6 +291,22 @@ pub fn read_archive(
     Ok(listing)
 }
 
+/// The latest record of each request in `listing`, in order of each
+/// request's first record. Records are append-only, so a request's latest
+/// disposition is its newest record's.
+pub fn latest_records(listing: &ArchiveListing) -> Vec<&ArchivedRequest> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut latest: std::collections::HashMap<&str, &ArchivedRequest> =
+        std::collections::HashMap::new();
+    for record in &listing.records {
+        let id = record.journal.client_request_id.as_str();
+        if latest.insert(id, record).is_none() {
+            order.push(id);
+        }
+    }
+    order.into_iter().map(|id| latest[id]).collect()
+}
+
 /// Every archived request for `nullifier`, oldest first. An unreadable
 /// record is an error: callers must not mistake it for absence.
 pub fn archived_requests(
@@ -310,10 +348,21 @@ pub(crate) fn sync_parent(path: &Path) -> Result<(), ClientError> {
 /// the rename is synced. Without the syncs a new file's name could reach the
 /// disk before its contents (an empty file), or not at all.
 pub(crate) fn replace_file_durably(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
+    crash::point()?;
     let tmp_path = path.with_extension("tmp");
     write_private_file(&tmp_path, bytes)?;
     fs::rename(&tmp_path, path)?;
     sync_parent(path)
+}
+
+/// Remove `path`, if present, and sync the removal before returning.
+pub(crate) fn remove_file_durably(path: &Path) -> Result<(), ClientError> {
+    if path.exists() {
+        crash::point()?;
+        fs::remove_file(path)?;
+        sync_parent(path)?;
+    }
+    Ok(())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
@@ -335,6 +384,48 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
     #[cfg(test)]
     durability::record("file", path);
     Ok(())
+}
+
+/// Crash injection for the write-order tests (§11 WP-E "crash tests at each
+/// step of the §6.2 write orders"). Every durable step (a replace, an
+/// archive record, a removal) passes `point()` first. In tests,
+/// `crash::after(n)` lets `n` steps complete and fails the next one before
+/// it touches the disk, as a process killed there would leave it.
+pub(crate) mod crash {
+    #[cfg(test)]
+    use std::cell::Cell;
+
+    #[cfg(test)]
+    thread_local! {
+        static REMAINING: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    #[inline]
+    pub(crate) fn point() -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let remaining = REMAINING.with(Cell::get);
+            match remaining {
+                Some(0) => {
+                    return Err(std::io::Error::other("injected crash"));
+                }
+                Some(left) => REMAINING.with(|cell| cell.set(Some(left - 1))),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Let `steps` durable steps complete, then fail every later one.
+    #[cfg(test)]
+    pub(crate) fn after(steps: usize) {
+        REMAINING.with(|cell| cell.set(Some(steps)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disarm() {
+        REMAINING.with(|cell| cell.set(None));
+    }
 }
 
 /// The syncs this thread made, in order, so tests can check that a write is

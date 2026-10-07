@@ -7,8 +7,16 @@ export function parseChainId(value) {
   if (value !== '1' && value !== '11155111') throw new ConfigError('Explicit challenge chain ID must be 1 or 11155111');
   return BigInt(value);
 }
-export const CHALLENGE_ABI = 'function challengeEscapeWithdrawal(uint32 noteId,(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs,bytes proof,uint256[32] siblings)';
-export const vaultInterface = new Interface([CHALLENGE_ABI]);
+// The calls of the concession-exit challenger (vault revision 3, circuit
+// zkapi-v2-concession-v1): a defeat by a request proof at an escape's
+// successor nullifier, a raise by one at its escaped nullifier, and the
+// retirement of a closed note's leaf after a missed defeat. The revision-2
+// challenge with siblings (0x8a43467c) is refused.
+const REQUEST_INPUTS = '(uint16 protocolVersion,uint64 chainId,address contractAddress,uint256 activeRoot,uint256 stateSigningKeyX,uint256 stateSigningKeyY,uint64 requestTime,uint128 solvencyBound,uint256 requestNullifier,uint256 authorizationTag,uint256 anonymousCommitmentX,uint256 anonymousCommitmentY) inputs';
+export const CHALLENGE_ABI = `function challengeEscapeWithdrawal(uint32 noteId,${REQUEST_INPUTS},bytes proof)`;
+export const RAISE_ABI = `function raiseEscapeConcession(uint32 noteId,${REQUEST_INPUTS},bytes proof,uint128 amount)`;
+export const RETIRE_ABI = 'function retireClosedLeaf(uint32 noteId,uint256[32] siblings)';
+export const vaultInterface = new Interface([CHALLENGE_ABI, RAISE_ABI, RETIRE_ABI]);
 export const GWEI = 1_000_000_000n;
 export const DEFAULT_SEPOLIA_MAX_FEE_PER_GAS = 10n * GWEI;
 export const DEFAULT_PRIORITY_FEE_PER_GAS = 1n * GWEI;
@@ -247,13 +255,16 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     requireValid(nonce <= BigInt(Number.MAX_SAFE_INTEGER), 'Nonce is too large');
     const { maxFee, tip } = requestedFees(tx);
     requireValid(isHexString(tx.data) && tx.data.length <= 16_386, 'Invalid calldata');
-    let decoded;
+    let call;
     try {
-      decoded = vaultInterface.decodeFunctionData('challengeEscapeWithdrawal', tx.data);
-      requireValid(vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', decoded).toLowerCase() === tx.data.toLowerCase(), 'Noncanonical challenge calldata');
-    } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal calls are authorized'); }
-    requireValid(decoded.inputs.protocolVersion === 2n && decoded.inputs.chainId === chainId && address(decoded.inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
-    requireValid(isHexString(decoded.proof, 256), 'Challenge requires a 256-byte Groth16 proof');
+      call = vaultInterface.parseTransaction({ data: tx.data });
+      if (!call || vaultInterface.encodeFunctionData(call.fragment, call.args).toLowerCase() !== tx.data.toLowerCase()) throw new Error();
+    } catch { throw new RpcError(-32602, 'Only canonical challengeEscapeWithdrawal, raiseEscapeConcession and retireClosedLeaf calls are authorized'); }
+    if (call.name !== 'retireClosedLeaf') {
+      // A defeat or raise carries a request proof, which must be this deployment's.
+      requireValid(call.args.inputs.protocolVersion === 2n && call.args.inputs.chainId === chainId && address(call.args.inputs.contractAddress) === destination, 'Challenge proof targets another deployment');
+      requireValid(isHexString(call.args.proof, 256), 'Challenge requires a 256-byte Groth16 proof');
+    }
     return { type: 2, to: destination, data: tx.data, value: 0n, chainId, gasLimit, nonce: Number(nonce), maxFeePerGas: maxFee, maxPriorityFeePerGas: tip, accessList: [] };
   }
 

@@ -16,6 +16,20 @@ require() {
     done
 }
 
+# A launcher setting that must be a decimal number of seconds; an unset or
+# empty value means the default.
+seconds() {
+    value=$(printenv "$1" || true)
+    value=${value:-$2}
+    case "$value" in
+        '' | *[!0-9]* | 0?* | ??????????*)
+            echo "$1 must be a decimal number of seconds" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$value"
+}
+
 require CHAIN_ID VAULT_ADDRESS DEPLOY_BLOCK CIRCUIT_ID
 if [ "$CIRCUIT_ID" != zkapi-v2-concession-v1 ]; then
     echo "This image requires the zkapi-v2-concession-v1 circuit and a fresh vault" >&2
@@ -73,10 +87,20 @@ case "${1:-}" in
     challenger)
         require ZKAPI_CHALLENGE_RPC_URL ZKAPI_CHALLENGE_SENDER \
             ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI
-        # The RPC, sender and fee settings reach zkapi-challenged from the
-        # environment. Its status listener stays on the container's loopback,
-        # for the healthcheck and `docker compose exec`; never publish it.
+        # The API server's settlement window (lease TTL + grace + settlement
+        # deadline, from the deployment.env the server reads) for the
+        # challenger's startup timing checks; it may not exceed the manifest's
+        # settlement_window_seconds.
+        ttl=$(seconds LEASE_TTL_SECONDS 300)
+        grace=$(seconds SETTLEMENT_GRACE_SECONDS 5)
+        deadline=$(seconds ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS 21600)
+        # The RPC, sender, fee, raise-lead, raise-minimum and retire-on-miss
+        # settings reach zkapi-challenged from the environment. Its status
+        # listener stays on the container's loopback, for the healthcheck and
+        # `docker compose exec`; never publish it.
         exec zkapi-challenged --indexer-url http://indexer:3001 \
+            --deployment "$ZKAPI_DEPLOYMENT_MANIFEST" \
+            --settlement-window-seconds "$((ttl + grace + deadline))" \
             --chain-id "$CHAIN_ID" --contract-address "$VAULT_ADDRESS" \
             --from-block "$DEPLOY_BLOCK" --confirmations "${CHALLENGE_CONFIRMATIONS:-2}" \
             --db-path /data/server.db --checkpoint /data/challenges.json \

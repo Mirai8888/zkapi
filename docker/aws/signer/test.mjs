@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { Transaction, Wallet, keccak256 } from 'ethers';
+import { Interface, Transaction, Wallet, keccak256 } from 'ethers';
 import {
   ABSOLUTE_FEE_CEILING, ConfigError, DEFAULT_TX_FEE_CAP, GWEI, RpcError, UPSTREAM_TIMEOUT_MS, createSigner, createUpstream,
   parseChainId, parseSignerConfig, vaultInterface,
@@ -22,8 +22,12 @@ const sender = new Wallet(key).address;
 const vault = '0x0000000000000000000000000000000000001234';
 const proof = `0x${'00'.repeat(256)}`;
 const inputs = [2, CHAIN_ID, vault, 0, 1, 2, 0, 1, 0, 0, 0, 0];
-const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]);
+const data = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof]);
 const validTx = { from: sender, to: vault, data, gas: '0x7a1200', nonce: '0x4' };
+// The revision-2 challenge: request inputs, proof and a zero-slot path.
+const legacyChallenge = new Interface([
+  'function challengeEscapeWithdrawal(uint32 noteId,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256) inputs,bytes proof,uint256[32] siblings)',
+]).encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, proof, Array(32).fill(0)]);
 const ONE_ETH = '0xde0b6b3a7640000';
 const wei = value => `0x${value.toString(16)}`;
 const fees = (maxFee, tip) => ({ maxFeePerGas: wei(maxFee), maxPriorityFeePerGas: wei(tip) });
@@ -104,15 +108,47 @@ test('rejects unauthorized transaction changes before any RPC or signature', asy
     { maxFeePerGas: '0x2540be400', maxPriorityFeePerGas: '0x03b9aca00' }, { maxFeePerGas: '0x02540be400', maxPriorityFeePerGas: '0x3b9aca00' },
     { maxFeePerGas: 10_000_000_000, maxPriorityFeePerGas: 1_000_000_000 }, { maxFeePerGas: null, maxPriorityFeePerGas: null },
     { maxFeePerGas: '0x', maxPriorityFeePerGas: '0x1' },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, 1, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]) },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, sender, ...inputs.slice(3)], proof, Array(32).fill(0)]) },
-    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, '0x00', Array(32).fill(0)]) },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, 1, vault, ...inputs.slice(3)], proof]) },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, CHAIN_ID, sender, ...inputs.slice(3)], proof]) },
+    { data: vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, inputs, '0x00']) },
+    { data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, [2, 1, vault, ...inputs.slice(3)], proof, 5]) },
+    { data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, '0x00', 5]) },
+    // The revision-2 challenge with siblings, and other vault calls.
+    { data: legacyChallenge },
+    { data: new Interface(['function finalizeEscapeWithdrawal(uint32)']).encodeFunctionData('finalizeEscapeWithdrawal', [0]) },
+    { data: new Interface(['function claimExpired(uint32)']).encodeFunctionData('claimExpired', [0]) },
   ];
   for (const modification of modifications) {
     const { signer, calls } = fixture();
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, ...modification }]), error => error instanceof RpcError && error.code === -32602, JSON.stringify(modification));
     assert.equal(calls.length, 0);
   }
+});
+
+test('signs the three concession-exit calls by their pinned selectors', async () => {
+  // Selectors pinned in the concession-exit spec (sections 4.3-4.5).
+  assert.equal(vaultInterface.getFunction('challengeEscapeWithdrawal').selector, '0xda0ce43d');
+  assert.equal(vaultInterface.getFunction('raiseEscapeConcession').selector, '0xdd0064ba');
+  assert.equal(vaultInterface.getFunction('retireClosedLeaf').selector, '0xe41f4c31');
+  assert.equal(legacyChallenge.slice(0, 10), '0x8a43467c');
+  assert.equal((data.length - 2) / 2, 740);
+  const raise = vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 123]);
+  assert.equal((raise.length - 2) / 2, 772);
+  const siblings = Array.from({ length: 32 }, (_, index) => index + 1);
+  const retire = vaultInterface.encodeFunctionData('retireClosedLeaf', [9, siblings]);
+  assert.equal((retire.length - 2) / 2, 1060);
+  for (const call of [raise, retire]) {
+    const { signer, calls } = fixture();
+    const hash = await signer.handle('eth_sendTransaction', [{ ...validTx, data: call }]);
+    const signed = Transaction.from(broadcasts(calls)[0].params[0]);
+    assert.equal(signed.hash, hash);
+    assert.equal(signed.data, call);
+  }
+  // A non-canonical encoding of an allowed call is refused before any RPC.
+  const { signer, calls } = fixture();
+  const padded = `${raise.slice(0, 10)}${'00'.repeat(32)}${raise.slice(10)}`;
+  await assert.rejects(signer.handle('eth_sendTransaction', [{ ...validTx, data: padded }]), RpcError);
+  assert.equal(calls.length, 0);
 });
 
 test('fee proposals outside 0 < tip <= max fee <= cap and tip <= tip cap are refused before any RPC', async () => {
@@ -679,7 +715,7 @@ test('Mainnet and Sepolia preserve chain-specific signatures, proof bindings and
   for (const chainId of [1n, 11155111n]) {
     const other = chainId === 1n ? 11155111n : 1n;
     const chainHex = `0x${chainId.toString(16)}`;
-    const selectedData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, chainId, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]);
+    const selectedData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, chainId, vault, ...inputs.slice(3)], proof]);
     const transaction = { ...validTx, data: selectedData, chainId: chainHex };
     const options = { chainId, maxFeePerGas: 30n * GWEI };
     const { signer, calls } = fixture({ eth_chainId: chainHex }, options);
@@ -691,7 +727,7 @@ test('Mainnet and Sepolia preserve chain-specific signatures, proof bindings and
     assert.equal(signed.maxFeePerGas, 30n * GWEI);
     const baseline = calls.length;
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...transaction, chainId: `0x${other.toString(16)}` }]), RpcError);
-    const wrongData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, other, vault, ...inputs.slice(3)], proof, Array(32).fill(0)]);
+    const wrongData = vaultInterface.encodeFunctionData('challengeEscapeWithdrawal', [0, [2, other, vault, ...inputs.slice(3)], proof]);
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...transaction, data: wrongData }]), RpcError);
     await assert.rejects(signer.handle('eth_sendTransaction', [{ ...transaction, ...fees(30n * GWEI + 1n, GWEI) }]), RpcError);
     assert.equal(calls.length, baseline);

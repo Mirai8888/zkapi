@@ -187,44 +187,43 @@ for the signer and in `deployment.env` for the daemon (the signer reads only
 `signer.env`). The signer refuses a costlier bid before any upstream call
 (`tx_fee_above_cap`). The daemon bids within the lower of its own value and the
 signer's, which `zkapi_signerStatus` reports, and its `/status` warns when the
-two differ. A real challenge has a gas limit of about 7.53M, so at 1 ETH no bid
-exceeds about 132 gwei, whatever the fee caps. The middle column is the ceiling
-at which every challenge can bid the full fee cap, with room up to a 7.6M gas
-limit:
+two differ. The challenger sends three calls; their gas limits (from the
+design estimates; re-measure on the deployed vault) and the highest bid each
+allows at the default 1 ETH are:
 
-| Fee cap | 7.6M gas x fee cap | Highest bid at the default 1 ETH |
+| Call | Gas limit | Highest bid at 1 ETH |
 | --- | --- | --- |
-| 10 gwei (Sepolia default) | 0.076 ETH | 10 gwei |
-| 100 gwei | 0.76 ETH | 100 gwei |
-| 300 gwei | 2.28 ETH | about 132 gwei; the daemon warns that its fee cap exceeds the ceiling |
+| Defeat (`challengeEscapeWithdrawal`) | 600,000, or the estimate plus 20% when higher | about 1,666 gwei |
+| Raise (`raiseEscapeConcession`) | 450,000, or the estimate plus 20% when higher | about 2,222 gwei |
+| Leaf retirement (`retireClosedLeaf`, after a missed defeat) | the estimate plus 20%, about 7.2M | about 138.9 gwei |
 
-For a higher fee cap, raise the node's `--rpc.txfeecap` and
-`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI` together in `signer.env` and `deployment.env`
-to at least the middle column (2.28 ETH for a 300 gwei fee cap), then recreate
-the signer and the challenger (above), or keep the fee cap within the ceiling.
-A hosted provider's cap usually cannot be raised. A value above the node's cap
-makes the signer report `upstream_tx_fee_cap`, which the daemon treats as
-critical at once. It then bids within 10/11 of the lowest refused fee until it
-restarts, and its `/status` warns with that fee
+Defeats and raises are deadline-bound and fit any realistic fee cap at 1 ETH.
+A leaf retirement has no deadline; to let it bid a fee cap above about 138.9
+gwei, raise the node's `--rpc.txfeecap` and `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`
+together in `signer.env` and `deployment.env` (2.4 ETH for a 300 gwei fee cap
+at 8M gas), then recreate the signer and the challenger (above). A hosted
+provider's cap usually cannot be raised. A value above the node's cap makes the
+signer report `upstream_tx_fee_cap`, which the daemon treats as critical at
+once. It then bids within 10/11 of the lowest refused fee until it restarts,
+and its `/status` warns with that fee
 ([details](../../docs/challenge-service.md#when-no-valid-bid-remains)). The
 signer also warns `tx_fee_cap_below_fee_cap` while `ZKAPI_CHALLENGE_MAX_GAS` x
 its fee cap exceeds the ceiling; see
 [Node transaction fee cap](signer/README.md#node-transaction-fee-cap).
 
 Fund the sender with at least (N + K) x gas limit x the highest bid, that is the
-fee cap or, when lower, the ceiling / gas limit. N is the number of challenges
-that may be pending at once and K a budget of reverted attempts. That is 0.75
-ETH per challenge at a 100 gwei cap, and at most the ceiling (1 ETH by default)
-per challenge at any cap. The signer's status warns `balance_below_required`
-below its `required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH
-at 100 gwei and the default 12M gas), which is more than one challenge needs:
-fund up to it, or lower `ZKAPI_CHALLENGE_MAX_GAS` toward the challenge's gas
-limit while keeping a margin above it, for example 8M (0.8 ETH at 100 gwei). A
-challenge's gas limit is its gas estimate plus 20%, about 7.53M as measured;
-re-measure after redeploying the vault. The signer refuses a larger gas limit
-with `gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
-critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised: at 7.6M a
-challenge 0.9% costlier than measured is refused.
+fee cap or, when lower, the ceiling / gas limit. N is the number of
+transactions that may be pending at once and K a budget of reverted attempts.
+At a 100 gwei cap that is 0.06 ETH per defeat and about 0.72 ETH per leaf
+retirement; size N for `ceil(m/2)` defeats per note (a user holding `m`
+archived states can force that many), at most 64 concurrent escapes and a 20%
+margin. The signer's status warns `balance_below_required` below its
+`required_balance`, `ZKAPI_CHALLENGE_MAX_GAS` x its fee cap (1.2 ETH at 100
+gwei and the default 12M gas): fund up to it, or lower
+`ZKAPI_CHALLENGE_MAX_GAS` while keeping a margin above a leaf retirement, for
+example 8M (0.8 ETH at 100 gwei). The signer refuses a larger gas limit with
+`gas_limit_exceeds_cap`, which the challenger reports as `signer_refused`,
+critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised.
 
 `challenge.env` holds the daemon's own bounds, which it proposes to the signer
 (its transaction fee cap is in `deployment.env`, above):
@@ -234,6 +233,24 @@ challenge 0.9% costlier than measured is refused.
 | `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | Required. At most the signer's `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`. |
 | `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; a higher tip cap leaves more before it, within the signer's tip cap (10 gwei by default, 5 times the default priority fee; raise the signer's first). The daemon does not read the signer's fee or tip cap, so a cap above the signer's makes escalated bids fail with `fee_out_of_bounds` (`signer_refused`, critical at once) instead of bidding at the signer's cap. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
+
+The challenger also reads from `deployment.env` (see
+[`deployment.env.example`](deployment.env.example)):
+
+| Variable | Requirement |
+| --- | --- |
+| `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
+| `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas). |
+
+The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
+SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which
+may not exceed the manifest's `settlement_window_seconds`) and the mounted
+manifest to the challenger. At startup it checks the manifest against the vault:
+`CONCESSION_ESCAPE_VERSION() == 1`, `ROOT_HISTORY_WINDOW() == 86400`, the
+adapter's circuit and verifying-key hashes, the three runtime codehashes and
+`challengePeriod()`, and the timing checks above. It retries a failed RPC read
+and exits on a mismatch.
 
 The launcher binds the daemon's status listener to `127.0.0.1:3002` inside the
 container. The Compose healthcheck reads its `/livez`; never publish the port or
@@ -269,7 +286,8 @@ can run before a signer is available. Omitting it starts only the API, indexer
 and gateway; such a deployment does not have escape-challenge protection. The
 challenger requires RPC `eth_sendTransaction`; an ordinary public RPC
 cannot act as its signer. The included restricted signer sidecar requires an explicit supported chain
-(1 or 11155111) and accepts only challenge calls to its
+(1 or 11155111) and accepts only the challenger's defeat, raise and
+leaf-retirement calls to its
 configured vault. Its chain must match the RPC, public manifest and daemon. Never publish its RPC port.
 Keep the funded sender exclusive to this daemon and deployment. Keep the API
 running whenever the challenger runs: its settlement produces the challenge
@@ -390,10 +408,11 @@ Alert on:
   nothing itself: the `exec` fails, and none of its other signals below can
   fire;
 - any `critical` entry in the challenger's `/status` `alarms` (it then answers
-  503 on `/health`): a missed deadline, including an escape with evidence
-  found paid out past its deadline (the latest miss stays critical for an
-  hour); an obligation with evidence whose
-  deadline is within a quarter of `challengePeriod()`; an obligation blocked by
+  503 on `/health`): a missed defeat (an escape paid out although verified
+  request evidence at its successor nullifier existed before its deadline) or
+  a missed raise (an escape paid out with a concession below what the server
+  was owed); the latest miss stays critical for an hour; an obligation ready
+  to defeat or raise whose deadline is within a quarter of `challengePeriod()`; an obligation blocked by
   `evidence_invalid`, `evidence_db_error`, `indexer_invalid_response`,
   `indexer_diverged`, `signer_refused` or `upstream_tx_fee_cap`, or by any
   other reason (including `fee_reserve_held`) for 1800 seconds; stale polls; a
@@ -403,10 +422,14 @@ Alert on:
   differs from the daemon's, a transaction fee the signer's node refused
   (`upstream_tx_fee_cap`), a fee cap above the ceiling, or an indexer
   pending-escapes list that disagrees with the vault;
-- the challenger log lines `MISSED escape challenge deadline`,
-  `indexer mirror diverged from vault currentRoot`, and
+- the challenger log lines `MISSED escape deadline` (with `missed="defeat"`
+  or `missed="raise"`), `escape paid out after a missed defeat; retiring the
+  closed note's leaf`, `indexer mirror diverged from vault currentRoot`, and
   `challenge obligation status changed` at error level, and a rising
-  `missed_total` in `/status`;
+  `missed_total`, `escapes_finalized_with_successor_evidence_total` or
+  `missed_raises_total` in `/status`. A `retiring_leaf` obligation is a warning
+  until its `retireClosedLeaf` mines; it needs the indexer's path for the
+  note;
 - indexer `/health` not 200 for more than two minutes (outside a planned replay),
   an increase in its `divergence_count`, `rebuild_count` or
   `missed_re_escape_count` (`zkapi_indexer_divergences_total`,
@@ -418,8 +441,8 @@ Alert on:
   challenge and re-escape of a note, or that a reorganization below the
   checkpoint replaced an escape: check that RPC's log completeness, then resync
   (below). Each is counted once per escape, logged at warn level for a
-  challenge and at error level for a finalization, and the counts restart with
-  the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
+  defeat or a raise (`event="raised"`, `missed_re_escape_raised_count`) and at
+  error level for a finalization, and the counts restart with the indexer. Page on `event="finalized"` (`missed_re_escape_finalized_count`):
   the vault finalized that escape (it paid the destination or credited the
   payout to it), so also confirm that the challenger tracked it;
 - the indexer's `root` differing from `currentRoot()` read at its `served_block`
@@ -454,13 +477,9 @@ Alert on:
   the credit as that runbook says;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
   `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
-  suppress the last only while the signer's
-  `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` x 7.6M gas is at most its
-  `ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, and check that again after every fee-cap
-  change, because with a challenger from an earlier release the same warning
-  also covers fee caps at which every challenge is refused (this release's
-  challenger instead bids no higher than the ceiling / gas limit); see the
-  signer README, Upgrading from 0.1, step 2),
+  the challenger bids no higher than the ceiling / gas limit, so the last
+  means only that a leaf retirement may not bid the full fee cap; see the
+  signer README, Deploying with a concession-exit vault, step 2),
   signer `/health` failures, and signer audit lines
   `"event":"challenge_refused"` with reason `base_fee_above_max_fee`,
   `insufficient_balance`, `tx_fee_above_cap`, `upstream_tx_fee_cap` or

@@ -21,7 +21,7 @@ struct Cli {
     #[arg(
         long,
         env = "ZKAPI_PROOF_SETUP_DIR",
-        default_value = "protocol/setup/v2",
+        default_value = "protocol/setup/v2-concession",
         hide_env_values = true
     )]
     proof_setup_dir: String,
@@ -91,8 +91,9 @@ enum Commands {
             hide_env_values = true
         )]
         openrouter_settlement_deadline_seconds: u64,
-        /// Transitional only: sign mutual-close clearance without a note
-        /// ownership proof, for clients that predate it. Default off.
+        /// Legacy deployments only. Circuit zkapi-v2-concession-v1 signs a
+        /// clearance only against a kind-2 ownership proof: the server
+        /// refuses to start with this set.
         #[arg(
             long,
             env = "ZKAPI_ALLOW_LEGACY_CLEARANCE",
@@ -101,15 +102,29 @@ enum Commands {
             hide_env_values = true
         )]
         allow_legacy_clearance: bool,
-        /// Cap on new proof-less clearance reservations per minute while
-        /// --allow-legacy-clearance is set.
+        /// The deployment manifest (the trusted_deployment profile the
+        /// database was initialized from with `zkapi db init`). Required:
+        /// startup probes the vault, adapter and Poseidon library against it.
+        #[arg(long, env = "ZKAPI_DEPLOYMENT_MANIFEST", hide_env_values = true)]
+        deployment: Option<PathBuf>,
+        /// Admission refuses (root_unavailable) unless the indexer root and
+        /// the vault's currentRoot() agreed at most this many seconds ago.
         #[arg(
             long,
-            env = "ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE",
-            default_value_t = zkapi_serverd::config::DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE,
+            env = "ZKAPI_ROOT_MAX_STALENESS_SECONDS",
+            default_value_t = zkapi_serverd::config::DEFAULT_ROOT_MAX_STALENESS_SECONDS,
             hide_env_values = true
         )]
-        legacy_clearance_max_per_minute: u32,
+        root_max_staleness_seconds: u64,
+        /// Refuse a request whose lease budget exceeds this many micro-USD
+        /// (the operator's per-request exposure). Unset: no ceiling;
+        /// 6000000 during the canary, and recommended permanently.
+        #[arg(
+            long,
+            env = "ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS",
+            hide_env_values = true
+        )]
+        request_limit_max_usd_micros: Option<u128>,
         /// How long a Merkle root the server observed stays acceptable for a
         /// clearance ownership proof (60..=86400).
         #[arg(
@@ -222,6 +237,36 @@ enum Commands {
     /// Offline settlement remediation on a stopped API server's database.
     #[command(subcommand)]
     Settlement(SettlementCommand),
+    /// Server database administration.
+    #[command(subcommand)]
+    Db(DbCommand),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DbCommand {
+    /// Create (or migrate) a server database and bind it to a deployment,
+    /// before any daemon starts (order: indexer, `zkapi db init`,
+    /// zkapi-challenged, serverd).
+    ///
+    /// Creates the schema, the append-only request_evidence table and its
+    /// triggers, and the deployment_binding row from the manifest: chain,
+    /// vault, signing keys, challenge period, circuit, setup and verifying-key
+    /// hashes. The verifying keys in --proof-setup-dir must be the ones the
+    /// manifest pins. serverd verifies the binding against the vault on its
+    /// first start. Refuses a placeholder (not_deployed) manifest, a database
+    /// bound to anything else, and a database a running server holds.
+    Init {
+        /// The deployment manifest (trusted_deployment profile).
+        #[arg(long)]
+        deployment: PathBuf,
+        /// The server's SQLite database (the --db-path of serverd).
+        #[arg(long)]
+        db: PathBuf,
+        /// The proof setup the daemons load (defaults to the top-level
+        /// --proof-setup-dir).
+        #[arg(long = "proof-setup-dir")]
+        proof_setup_dir: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -324,7 +369,9 @@ async fn main() -> anyhow::Result<()> {
             openrouter_settlement_poll_seconds,
             openrouter_settlement_deadline_seconds,
             allow_legacy_clearance,
-            legacy_clearance_max_per_minute,
+            deployment,
+            root_max_staleness_seconds,
+            request_limit_max_usd_micros,
             clearance_root_window_seconds,
             allow_key_source_switch,
             native_billing_rpc_url,
@@ -412,8 +459,15 @@ async fn main() -> anyhow::Result<()> {
                 native_billing,
                 proof_setup_dir: cli.proof_setup_dir.clone(),
                 allow_legacy_clearance,
-                legacy_clearance_max_per_minute,
                 clearance_root_window_seconds,
+                root_max_staleness_seconds,
+                request_limit_max_usd_micros,
+                // From the vault, once run_server has verified the binding.
+                challenge_period_seconds: None,
+                deployment: deployment
+                    .as_deref()
+                    .map(zkapi_serverd::deployment::DeploymentManifest::load)
+                    .transpose()?,
                 allow_key_source_switch,
             };
             zkapi_serverd::routes::run_server(config).await?;
@@ -448,6 +502,17 @@ async fn main() -> anyhow::Result<()> {
             };
             zkapi_indexerd::run_indexer(config).await?;
         }
+        Commands::Db(DbCommand::Init {
+            deployment,
+            db,
+            proof_setup_dir,
+        }) => {
+            print_json(&init_database(
+                &deployment,
+                &db,
+                proof_setup_dir.as_deref().unwrap_or(&cli.proof_setup_dir),
+            )?)?;
+        }
         Commands::Settlement(SettlementCommand::Reopen {
             db_path,
             client_request_id,
@@ -472,6 +537,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `zkapi db init`. The manifest and the verifying keys are checked before
+/// the database is created.
+fn init_database(
+    deployment: &std::path::Path,
+    db: &std::path::Path,
+    proof_setup_dir: &str,
+) -> anyhow::Result<zkapi_serverd::deployment::DbInitReport> {
+    let manifest = zkapi_serverd::deployment::DeploymentManifest::load(deployment)
+        .context("refusing to initialize the database")?;
+    let identity = zkapi_serverd::nullifier_store::StatementIdentity::load(proof_setup_dir)
+        .context("refusing to initialize the database")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    zkapi_serverd::deployment::init_database(db, &manifest, &identity, now)
 }
 
 /// The request of `--saved-request`: a JSON file, or `-` for `stdin`.
@@ -925,16 +1008,20 @@ mod tests {
                 Commands::Serverd {
                     openrouter_settlement_deadline_seconds,
                     allow_legacy_clearance,
-                    legacy_clearance_max_per_minute,
+                    root_max_staleness_seconds,
+                    request_limit_max_usd_micros,
                     clearance_root_window_seconds,
                     allow_key_source_switch,
+                    deployment,
                     ..
                 } => (
                     openrouter_settlement_deadline_seconds,
                     allow_legacy_clearance,
-                    legacy_clearance_max_per_minute,
+                    root_max_staleness_seconds,
+                    request_limit_max_usd_micros,
                     clearance_root_window_seconds,
                     allow_key_source_switch,
+                    deployment,
                 ),
                 _ => panic!("expected serverd"),
             }
@@ -943,19 +1030,40 @@ mod tests {
             "--openrouter-settlement-deadline-seconds",
             "7200",
             "--allow-legacy-clearance",
-            "--legacy-clearance-max-per-minute",
-            "5",
+            "--root-max-staleness-seconds",
+            "30",
+            "--request-limit-max-usd-micros",
+            "6000000",
             "--clearance-root-window-seconds",
             "600",
             "--allow-key-source-switch",
+            "--deployment",
+            "/srv/zkapi/deployment.json",
         ]);
-        assert_eq!(overridden, (7200, true, 5, 600, true));
+        assert_eq!(
+            overridden,
+            (
+                7200,
+                true,
+                30,
+                Some(6_000_000),
+                600,
+                true,
+                Some("/srv/zkapi/deployment.json".into())
+            )
+        );
+        // The proof-less clearance budget is gone with legacy clearance.
+        let mut legacy = base.to_vec();
+        legacy.extend(["--legacy-clearance-max-per-minute", "5"]);
+        assert!(Cli::try_parse_from(legacy).is_err());
         if [
             "ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS",
             "ZKAPI_ALLOW_LEGACY_CLEARANCE",
-            "ZKAPI_LEGACY_CLEARANCE_MAX_PER_MINUTE",
+            "ZKAPI_ROOT_MAX_STALENESS_SECONDS",
+            "ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS",
             "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",
             "ZKAPI_ALLOW_KEY_SOURCE_SWITCH",
+            "ZKAPI_DEPLOYMENT_MANIFEST",
         ]
         .iter()
         .any(|name| std::env::var_os(name).is_some())
@@ -963,7 +1071,7 @@ mod tests {
             eprintln!("skipping default checks: a settlement or clearance variable is set");
             return;
         }
-        assert_eq!(parse(&[]), (21_600, false, 60, 3_600, false));
+        assert_eq!(parse(&[]), (21_600, false, 60, None, 3_600, false, None));
     }
 
     #[test]
@@ -1089,10 +1197,11 @@ mod tests {
         path
     }
 
-    /// The repository's proof setup, as serverd's --proof-setup-dir.
+    /// The repository's development proof setup, as a test server's
+    /// --proof-setup-dir.
     fn setup_directory() -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../protocol/setup/v2")
+            .join("../../protocol/setup/v2-concession-dev")
             .to_string_lossy()
             .into_owned()
     }
@@ -1181,7 +1290,8 @@ mod tests {
                 "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
                 "anonymous_commitment_y": "0x5"
             },
-            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+            // 256 zero bytes: the size of a Groth16 proof (it does not verify).
+            "proof": {"backend": "groth16_bn254", "proof": "A".repeat(340) + "AA=="}
         })
     }
 

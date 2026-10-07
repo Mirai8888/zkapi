@@ -9,6 +9,9 @@ use zkapi_types::{Felt252, SchnorrSignature};
 pub struct ServerSigner {
     state: CompactSigner,
     clearance: CompactSigner,
+    /// State signatures made, for tests that prove a path never signs.
+    #[cfg(test)]
+    state_signatures: std::sync::atomic::AtomicUsize,
 }
 
 impl ServerSigner {
@@ -18,6 +21,8 @@ impl ServerSigner {
         Self {
             state: CompactSigner::from_seed(state_seed),
             clearance: CompactSigner::from_seed(clearance_seed),
+            #[cfg(test)]
+            state_signatures: Default::default(),
         }
     }
 
@@ -25,7 +30,12 @@ impl ServerSigner {
     /// `zkapi_proof::compact::validate_operator_signing_seeds`).
     pub fn try_new(state_seed: &Felt252, clearance_seed: &Felt252) -> anyhow::Result<Self> {
         let (state, clearance) = validate_operator_signing_seeds(state_seed, clearance_seed)?;
-        Ok(Self { state, clearance })
+        Ok(Self {
+            state,
+            clearance,
+            #[cfg(test)]
+            state_signatures: Default::default(),
+        })
     }
 
     /// Cheap check for every serving processor, including library embeddings
@@ -56,12 +66,31 @@ impl ServerSigner {
         self.clearance.public_key()
     }
 
+    /// Sign a state message. Successors are signed only through
+    /// `crate::successor::sign_successor_state`, which refuses any anchor but
+    /// the derived one.
     pub fn sign_state(&self, message: &Felt252) -> SchnorrSignature {
+        #[cfg(test)]
+        self.state_signatures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state.sign(message)
+    }
+
+    /// State signatures this signer made (tests only).
+    #[cfg(test)]
+    pub(crate) fn state_signature_count(&self) -> usize {
+        self.state_signatures
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn sign_clearance(&self, message: &Felt252) -> SchnorrSignature {
         self.clearance.sign(message)
+    }
+}
+
+impl crate::successor::StateSigner for ServerSigner {
+    fn sign_state(&self, message: &Felt252) -> SchnorrSignature {
+        ServerSigner::sign_state(self, message)
     }
 }
 

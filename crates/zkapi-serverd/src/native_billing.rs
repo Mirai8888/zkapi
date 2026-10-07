@@ -21,8 +21,11 @@ pub const STATE_SIGNING_KEY_Y_SELECTOR: &str = "0x230e2a24"; // stateSigningKeyY
 pub const CLEARANCE_SIGNING_KEY_X_SELECTOR: &str = "0xdc41d636"; // clearanceSigningKeyX()
 pub const CLEARANCE_SIGNING_KEY_Y_SELECTOR: &str = "0x112cd6bc"; // clearanceSigningKeyY()
 pub const CHALLENGE_PERIOD_SELECTOR: &str = "0xf3f480d9"; // challengePeriod()
-/// Read at runtime only, after a clearance ownership proof verified.
+/// Read by the root poller (O5) and after a clearance ownership proof verified.
 pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
+/// Nullifier flags, read before signing (O7) and before serving request data.
+pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
+pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
 
 #[derive(Clone)]
 pub struct NativeBillingConfig {
@@ -335,6 +338,66 @@ impl NativeBillingOracle {
         }
         .await
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    /// One raw 32-byte word from a getter of the contract at `address`, at
+    /// "latest", after an eth_chainId check.
+    pub async fn contract_word(
+        &self,
+        address: &str,
+        selector: &str,
+    ) -> Result<[u8; 32], ServerError> {
+        self.assert_chain().await?;
+        let raw = self.call(address, selector).await?;
+        let word = raw
+            .strip_prefix("0x")
+            .filter(|word| word.len() == 64)
+            .ok_or_else(|| {
+                invalid("getter returned no 32-byte word (is the contract deployed at this address on this chain?)")
+            })?;
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(word, &mut bytes).map_err(|_| invalid("malformed ABI word"))?;
+        Ok(bytes)
+    }
+
+    /// keccak256 of the runtime code at `address` at "latest" (eth_getCode),
+    /// after an eth_chainId check. An address without code is an error.
+    pub async fn code_hash(&self, address: &str) -> Result<[u8; 32], ServerError> {
+        self.assert_chain().await?;
+        let code = self
+            .rpc("eth_getCode", json!([address, "latest"]))
+            .await?
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| invalid("invalid eth_getCode response"))?;
+        let body = code
+            .strip_prefix("0x")
+            .ok_or_else(|| invalid("invalid eth_getCode response"))?;
+        if body.is_empty() {
+            return Err(invalid("no contract code at this address on this chain"));
+        }
+        let bytes = hex::decode(body).map_err(|_| invalid("invalid eth_getCode response"))?;
+        Ok(Keccak256::digest(&bytes).into())
+    }
+
+    /// A vault `mapping(uint256 => bool)` flag at "latest" (usedNullifiers,
+    /// challengedNullifiers), after an eth_chainId check.
+    pub async fn nullifier_flag(
+        &self,
+        selector: &str,
+        nullifier: &Felt252,
+    ) -> Result<bool, ServerError> {
+        self.assert_chain().await?;
+        let data = format!("{selector}{}", hex::encode(nullifier.as_bytes()));
+        let raw = self.call(&self.contract_address, &data).await?;
+        if raw.len() != 66 {
+            return Err(invalid("invalid vault nullifier response length"));
+        }
+        match decode_word(&raw, 0)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("invalid vault nullifier boolean")),
+        }
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ServerError> {

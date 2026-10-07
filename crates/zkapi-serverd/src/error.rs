@@ -35,20 +35,12 @@ pub enum ServerError {
     #[error("lease cannot be settled from measured usage: {0}")]
     Unsettleable(String),
 
-    /// POST /v2/withdraw/clearance without an escape-form withdrawal proof.
-    #[error("clearance requires an escape-form withdrawal proof of note ownership")]
+    /// POST /v2/withdraw/clearance without a kind-2 ownership proof.
+    #[error("clearance requires a kind-2 ownership proof of the note")]
     ClearanceOwnershipRequired,
 
     #[error("capacity exhausted")]
     CapacityExhausted,
-
-    /// A proof-less clearance found this minute's transitional legacy budget
-    /// spent. Nothing was reserved; a request with an ownership proof never
-    /// consults the budget.
-    #[error(
-        "legacy clearance capacity exhausted; send an ownership proof or retry after {retry_after_seconds} seconds"
-    )]
-    LegacyClearanceCapacity { retry_after_seconds: u64 },
 
     #[error("nullifier already used")]
     NullifierUsed,
@@ -85,6 +77,33 @@ pub enum ServerError {
     #[error("OA org rejected the key allowance or duration; recover the saved request")]
     OaKeyPolicyRejected,
 
+    /// O5: the server has no Merkle root on which the indexer and the
+    /// vault's currentRoot() agreed recently enough (or they disagree), so
+    /// it admits no request. Nothing was reserved.
+    #[error("the current Merkle root is unavailable: {0}; retry shortly")]
+    RootUnavailable(String),
+
+    /// The request's lease budget exceeds the operator's per-request ceiling
+    /// (`--request-limit-max-usd-micros`). Nothing was reserved.
+    #[error(
+        "the request's lease budget of {limit_micro_usd} micro-USD exceeds this server's \
+         ceiling of {max_micro_usd} micro-USD; prove a lower solvency bound"
+    )]
+    RequestLimitExceeded {
+        limit_micro_usd: u128,
+        max_micro_usd: u128,
+    },
+
+    /// The nullifier is consumed or challenged on chain, or appears in a
+    /// vault event: the server no longer serves its request data.
+    #[error("the nullifier is published on chain")]
+    Published,
+
+    /// A chain (or indexer) read the answer depends on failed; nothing is
+    /// served until it succeeds.
+    #[error("chain state is unavailable: {0}; retry shortly")]
+    ChainReadUnavailable(String),
+
     #[error(
         "OA org key issuance was rate limited ({reason}); retry after {retry_after_seconds} seconds"
     )]
@@ -108,7 +127,6 @@ impl ServerError {
             ServerError::Unsettleable(_) => "lease_unsettleable",
             ServerError::ClearanceOwnershipRequired => "clearance_ownership_required",
             ServerError::CapacityExhausted => "capacity_exhausted",
-            ServerError::LegacyClearanceCapacity { .. } => "legacy_clearance_capacity",
             ServerError::NullifierUsed => "nullifier_used",
             ServerError::Database(_) => "database_error",
             ServerError::LeaseRecordUnreadable => "lease_record_unreadable",
@@ -118,6 +136,10 @@ impl ServerError {
             ServerError::LeaseSettlementPending { .. } => "lease_settlement_pending",
             ServerError::OaKeyPolicyRejected => "oa_key_policy_rejected",
             ServerError::OaRateLimited { reason, .. } => reason,
+            ServerError::RootUnavailable(_) => "root_unavailable",
+            ServerError::RequestLimitExceeded { .. } => "request_limit_exceeded",
+            ServerError::Published => "published",
+            ServerError::ChainReadUnavailable(_) => "chain_read_unavailable",
         }
     }
 
@@ -138,8 +160,6 @@ impl ServerError {
             ServerError::NoteExpired => false,
             // Clearance proof verification is bounded; retry after backoff.
             ServerError::CapacityExhausted => true,
-            // Retry after the window, or at once with an ownership proof.
-            ServerError::LegacyClearanceCapacity { .. } => true,
             ServerError::NullifierUsed => false,
             ServerError::InvalidRequest(_) => false,
             ServerError::ProtocolMismatch(_) => false,
@@ -147,6 +167,10 @@ impl ServerError {
             ServerError::LeaseSettlementPending { .. } => true,
             ServerError::OaKeyPolicyRejected => false,
             ServerError::OaRateLimited { .. } => true,
+            ServerError::RootUnavailable(_) => true,
+            ServerError::RequestLimitExceeded { .. } => false,
+            ServerError::Published => false,
+            ServerError::ChainReadUnavailable(_) => true,
         }
     }
 }

@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use zkapi_types::{Felt252, NullifierStatus, RequestPublicInputsV2, MERKLE_DEPTH};
+use zkapi_types::{Felt252, RequestPublicInputsV2, MERKLE_DEPTH};
 
 use crate::error::ServerError;
-use crate::nullifier_store::{DeploymentBinding, NullifierStore, TranscriptRecord};
+use crate::nullifier_store::{
+    DeploymentBinding, NullifierStatus, NullifierStore, TranscriptRecord,
+};
 
 pub const CHALLENGE_SIGNATURE: &str = "challengeEscapeWithdrawal(uint32,(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256),bytes,uint256[32])";
 
@@ -178,7 +180,7 @@ impl ChallengeWatcher {
         };
         Ok(match record.status {
             NullifierStatus::ClearanceReserved => EvidenceStatus::ClearanceOnly,
-            NullifierStatus::Reserved => {
+            NullifierStatus::Reserved | NullifierStatus::ExitedUnsigned => {
                 EvidenceStatus::AwaitingSettlement(self.settlement_progress(&record))
             }
             // Zero-charge transcripts are evidence too: an older zero-charge
@@ -304,10 +306,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{config::ServerConfig, processor::RequestProcessor, signer::ServerSigner};
     use base64::Engine;
-    use zkapi_core::v2 as core;
-    use zkapi_proof::compact::{balance_commitment, RequestProver, RequestWitnessData};
     use zkapi_types::wire::ApiRequestV2;
-    use zkapi_types::{canonical_payload_hash, canonical_request_context};
 
     /// Prove a genesis request for note 0 and have the active processor accept
     /// and archive it, rather than hand-constructing a transcript that could
@@ -317,87 +316,39 @@ pub(crate) mod tests {
         secret: u64,
         client_request_id: &str,
     ) -> ApiRequestV2 {
-        let setup_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/setup/v2");
-        let signer = Arc::new(ServerSigner::new(
-            &Felt252::from_u64(11),
-            &Felt252::from_u64(12),
-        ));
-        let key = signer.state_public_key();
-        let secret = Felt252::from_u64(secret);
+        let seeds = (Felt252::from_u64(11), Felt252::from_u64(12));
+        let signer = Arc::new(ServerSigner::new(&seeds.0, &seeds.1));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let expiry = now + 86_400;
-        let siblings = core::zero_hashes()[..MERKLE_DEPTH].try_into().unwrap();
-        let registration = core::registration_commitment(&secret);
-        let leaf = core::note_leaf(0, &registration, 100, expiry);
-        let root = core::merkle_root(0, &leaf, &siblings);
-        let nullifier = core::nullifier(&secret, &Felt252::ONE);
         let test_config = ServerConfig {
+            contract_address: Felt252::from_u64(0xdead),
+            request_charge_cap: 1,
+            proof_setup_dir: crate::test_support::setup_directory(),
             native_billing: Some(crate::test_support::native_config()),
             openrouter_leases: Some(crate::test_support::lease_config()),
             ..Default::default()
         };
+        let deployment = crate::test_support::deployment_of(&test_config, seeds);
+        let note = zkapi_proof::dev::DevNote {
+            secret: Felt252::from_u64(secret),
+            note_id: 0,
+            deposit_amount: 100,
+            expiry: now + 86_400,
+        };
+        let wallet = crate::test_support::TestNote {
+            deployment,
+            state: note.genesis(Felt252::from_u64(17)),
+            tree: zkapi_proof::dev::tree_with(&[&note]),
+        };
         let payload = crate::test_support::lease_payload(&test_config, now);
-        let payload_hash = canonical_payload_hash(payload.as_bytes());
-        let request_context = canonical_request_context(client_request_id, &payload_hash);
-        let blind = Felt252::from_u64(17);
-        let anonymous = balance_commitment(100, &blind, &leaf);
-        let public = RequestPublicInputsV2 {
-            protocol_version: 2,
-            chain_id: 1,
-            contract_address: Felt252::from_u64(0xdead),
-            active_root: root,
-            state_signing_key_x: key.x,
-            state_signing_key_y: key.y,
-            request_time: now,
-            solvency_bound: 1,
-            request_nullifier: nullifier,
-            authorization_tag: core::authorization_tag(&nullifier, &request_context),
-            anonymous_commitment_x: anonymous.x,
-            anonymous_commitment_y: anonymous.y,
-        };
-        let proof = RequestProver::load(&setup_dir)
-            .unwrap()
-            .prove(
-                &public,
-                RequestWitnessData {
-                    secret,
-                    request_context,
-                    note_id: 0,
-                    deposit_amount: 100,
-                    expiry,
-                    merkle_siblings: siblings,
-                    current_balance: 100,
-                    current_blinding: Felt252::ZERO,
-                    rerandomization: blind,
-                    current_anchor: Felt252::ONE,
-                    is_genesis: true,
-                    state_signature: None,
-                },
-            )
-            .unwrap();
-        let request = ApiRequestV2 {
-            client_request_id: client_request_id.into(),
-            payload_hash,
-            payload,
-            public_inputs: public.clone(),
-            proof,
-        };
-        let processor = RequestProcessor::try_new(
-            ServerConfig {
-                contract_address: public.contract_address,
-                request_charge_cap: 1,
-                proof_setup_dir: setup_dir.to_string_lossy().into_owned(),
-                ..test_config
-            },
-            store.clone(),
-            signer,
-            root,
-        )
-        .unwrap();
+        let request = wallet
+            .prepare_request(client_request_id, payload, now, 1)
+            .request;
+        let processor =
+            RequestProcessor::try_new(test_config, store.clone(), signer, wallet.root()).unwrap();
+        processor.update_root(wallet.root());
         processor.finalize_test_lease(&request, 1).unwrap();
         request
     }
@@ -465,6 +416,10 @@ pub(crate) mod tests {
             api_request_binding: None,
             created_at: 0,
             finalized_at: None,
+            settled_charge: None,
+            settled_basis: None,
+            settled_at: None,
+            exit_deferred_since: None,
         }
     }
 

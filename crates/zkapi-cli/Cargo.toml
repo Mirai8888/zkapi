@@ -21,3 +21,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Tests load the development setup (protocol/setup/v2-concession-dev); a
+# release build never accepts it.
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup"] }

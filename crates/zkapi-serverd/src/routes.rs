@@ -6,10 +6,12 @@
 //! - POST /v2/openrouter/leases     -- open a prompt-private runtime-key lease
 //! - POST /v2/openrouter/leases/:id -- retire a rejected runtime-key lease
 //! - POST /v2/withdraw/clearance    -- request mutual-close clearance; requires
-//!   an escape-form withdrawal proof of note ownership unless the transitional
-//!   legacy flag is set
+//!   a fresh kind-2 ownership proof for the nullifier
 //! - GET  /v2/requests/:id          -- recover by client_request_id
 //! - GET  /v2/nullifiers/:nullifier -- recover by nullifier
+//! - GET  /v2/nullifiers/:nullifier/evidence -- the earliest request proof the
+//!   server reserved at a nullifier (clients' stale-device check); 404 when it
+//!   holds none, 410 once the nullifier is published on chain
 //! - GET  /v1/dashboard/settlement  -- operator-only pending leases and reviews
 
 use std::convert::Infallible;
@@ -31,7 +33,7 @@ use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
 use zkapi_types::wire::{
-    ApiRequestV2, ClearanceRequest, ClearanceResponseV2, CurvePointWire, ErrorResponse,
+    ApiRequestV2, ClearanceRequestV2C, ClearanceResponseV2, CurvePointWire, ErrorResponse,
     OpenRouterLeaseStatusResponse, RecoveryResponseV2,
 };
 use zkapi_types::Felt252;
@@ -40,11 +42,15 @@ use crate::config::ServerConfig;
 use crate::dashboard::{
     DashboardEvent, DashboardHub, DashboardTotals, SettlementCounts, SettlementOverview,
 };
+use crate::deployment::{probe_deployment, DeploymentManifest, ProbeError};
 use crate::error::ServerError;
 use crate::native_billing::{vault_address_hex, NativeBillingOracle, VaultSigningKeys};
-use crate::nullifier_store::{DeploymentBinding, KeySourceBacklog, NullifierStore};
+use crate::nullifier_store::{
+    DeploymentBinding, KeySourceBacklog, NullifierStore, StatementIdentity,
+    BINDING_SOURCE_MANIFEST, BINDING_SOURCE_VAULT,
+};
 use crate::oa_org::IssuedOpenRouterLease;
-use crate::processor::RequestProcessor;
+use crate::processor::{RequestEvidenceResponse, RequestProcessor};
 use crate::signer::ServerSigner;
 use crate::testnet_auth::{
     handle_auth_check, require_testnet_password, TestnetPassword, TESTNET_PASSWORD_HEADER,
@@ -84,14 +90,18 @@ const VAULT_REVERIFY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 /// Start the HTTP server with the given config.
 ///
-/// The signing seeds must pass the operator key policy, and their public keys
-/// must equal the vault's immutable stateSigningKeyX/Y and
-/// clearanceSigningKeyX/Y, read over the native billing RPC (which must serve
-/// `chain_id`), before the database is opened for writes. The verified binding
-/// is recorded in the database; a restart with a matching record starts
-/// without the RPC and re-verifies in the background. The lease settlement
-/// timing must then fit the vault's challengePeriod() (from that binding):
-/// every possibly delivered lease reaches a signed transcript in time.
+/// The signing seeds must pass the operator key policy, and the deployment
+/// manifest (`--deployment`) must pin this server's vault, keys and loaded
+/// verifying keys (circuit, setup and VK hashes). Before the database is
+/// opened for writes, the public keys must equal the vault's immutable
+/// stateSigningKeyX/Y and clearanceSigningKeyX/Y, read over the native billing
+/// RPC (which must serve `chain_id`), and the startup probes must pass
+/// (`crate::deployment::probe_deployment`). The verified binding is recorded
+/// in the database; a restart with a matching record starts without the RPC
+/// and re-verifies in the background. A database bound to another vault or
+/// statement is refused. The lease settlement timing must then fit the
+/// vault's challengePeriod() (from that binding): every possibly delivered
+/// lease reaches a signed transcript in time.
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     run_server_with(config, VAULT_BINDING_RETRY).await
 }
@@ -106,16 +116,20 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
             "refusing to start: invalid signing seeds (ZKAPI_STATE_SEED / ZKAPI_CLEAR_SEED)",
         )?,
     );
-    let (binding, binding_source) = establish_deployment_binding(&config, &signer, retry).await?;
+    let manifest = check_deployment_manifest(&config, &signer)?;
+    let identity = StatementIdentity::load(&config.proof_setup_dir)
+        .context("refusing to start: cannot load the verifying keys")?;
+    manifest
+        .check_statement(&identity)
+        .context("refusing to start")?;
+    let (binding, binding_source) =
+        establish_deployment_binding(&config, &signer, &manifest, &identity, retry).await?;
     if let Some(lease) = config.openrouter_leases.as_ref() {
         lease.validate_settlement_timing(binding.challenge_period_seconds)?;
     }
-    if config.allow_legacy_clearance {
-        tracing::warn!(
-            max_per_minute = config.legacy_clearance_max_per_minute,
-            "--allow-legacy-clearance: clearance reserves nullifiers without a note ownership proof; disable after the migration window"
-        );
-    }
+    // O7: how long a settled request's signature waits for a consuming exit
+    // to be defeated.
+    config.challenge_period_seconds = Some(binding.challenge_period_seconds);
     let store = Arc::new(NullifierStore::new(&config.db_path)?);
     let initial_root = if let Some(indexer_url) = config.indexer_url.as_deref() {
         match fetch_indexer_root(indexer_url).await {
@@ -143,13 +157,12 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
     if binding_source == BindingSource::VerifiedNow {
         processor.store().write_deployment_binding(&binding)?;
     }
-    if let Some(indexer_url) = config.indexer_url.clone() {
-        spawn_root_poller(
-            processor.clone(),
-            indexer_url,
-            Duration::from_millis(config.root_poll_interval_ms),
-        );
-    }
+    // O5: admission needs a root the indexer and the vault agree on.
+    spawn_root_poller(
+        processor.clone(),
+        config.indexer_url.clone(),
+        Duration::from_millis(config.root_poll_interval_ms),
+    );
     if let Some(lease) = config.openrouter_leases.as_ref() {
         spawn_openrouter_lease_settler(
             processor.clone(),
@@ -165,7 +178,7 @@ async fn run_server_with(mut config: ServerConfig, retry: StartupRetry) -> anyho
         // vault definitively contradicts the recorded binding.
         tokio::select! {
             result = serve => result?,
-            Err(mismatch) = reverify_deployment_binding(&config, &binding, &signing_keys, VAULT_REVERIFY_FIRST_DELAY) => {
+            Err(mismatch) = reverify_deployment_binding(&config, &binding, &signing_keys, &manifest, &identity, VAULT_REVERIFY_FIRST_DELAY) => {
                 return Err(mismatch);
             }
         }
@@ -203,6 +216,47 @@ async fn startup_root_from_vault(config: &ServerConfig) -> Felt252 {
     }
 }
 
+/// The deployment manifest, which must pin this server's vault and signing
+/// keys (and, if it records one, admit its settlement window).
+fn check_deployment_manifest(
+    config: &ServerConfig,
+    signer: &ServerSigner,
+) -> anyhow::Result<DeploymentManifest> {
+    let manifest = config.deployment.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to start: --deployment <manifest> is required (the deployment profile the \
+             database was initialized from with `zkapi db init`)"
+        )
+    })?;
+    let contract_address = vault_address_hex(&config.contract_address);
+    anyhow::ensure!(
+        manifest.chain_id == config.chain_id && manifest.contract_address == contract_address,
+        "refusing to start: the deployment manifest is for vault {} on chain {}, not vault {} on \
+         chain {}",
+        manifest.contract_address,
+        manifest.chain_id,
+        contract_address,
+        config.chain_id
+    );
+    anyhow::ensure!(
+        manifest.state_signing_key == signer.state_public_key()
+            && manifest.clearance_signing_key == signer.clearance_public_key(),
+        "refusing to start: the signing seeds do not derive the keys the deployment manifest pins"
+    );
+    if let (Some(window), Some(lease)) = (
+        manifest.settlement_window_seconds,
+        config.openrouter_leases.as_ref(),
+    ) {
+        anyhow::ensure!(
+            lease.settlement_window_seconds() <= window,
+            "refusing to start: lease TTL + settlement grace + settlement deadline is {} s, but \
+             clients wait only the deployment's settlement_window_seconds ({window} s)",
+            lease.settlement_window_seconds()
+        );
+    }
+    Ok(manifest)
+}
+
 /// Whether the deployment binding was verified against the vault during this
 /// startup or read from a previous successful verification in the database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +270,8 @@ enum BindingSource {
 async fn establish_deployment_binding(
     config: &ServerConfig,
     signer: &ServerSigner,
+    manifest: &DeploymentManifest,
+    identity: &StatementIdentity,
     retry: StartupRetry,
 ) -> anyhow::Result<(DeploymentBinding, BindingSource)> {
     let contract_address = vault_address_hex(&config.contract_address);
@@ -229,9 +285,26 @@ async fn establish_deployment_binding(
             contract_address,
             config.chain_id
         );
-        if recorded.state_signing_key == signer.state_public_key()
+        if let Some(mismatch) = identity.mismatch(&recorded) {
+            anyhow::bail!(
+                "refusing to start: server database {} is bound to another statement: {mismatch}; \
+                 use a fresh database (`zkapi db init`) for each circuit and setup",
+                config.db_path
+            );
+        }
+        if recorded.source == BINDING_SOURCE_MANIFEST {
+            // Recorded by `zkapi db init`: the same deployment, verified
+            // against the vault below before anything is served.
+            if let Some(mismatch) = manifest.binding_mismatch(&recorded) {
+                anyhow::bail!("refusing to start: {mismatch}");
+            }
+            tracing::info!("verifying the binding `zkapi db init` recorded against the vault");
+        } else if recorded.state_signing_key == signer.state_public_key()
             && recorded.clearance_signing_key == signer.clearance_public_key()
         {
+            if let Some(mismatch) = manifest.binding_mismatch(&recorded) {
+                anyhow::bail!("refusing to start: {mismatch}");
+            }
             tracing::info!(
                 vault = %recorded.contract_address,
                 chain_id = recorded.chain_id,
@@ -239,12 +312,13 @@ async fn establish_deployment_binding(
                 "starting from the recorded vault signing-key binding; re-verifying in the background"
             );
             return Ok((recorded, BindingSource::Recorded));
+        } else {
+            tracing::warn!(
+                "configured signing keys differ from the keys recorded for this vault; checking the vault"
+            );
         }
-        tracing::warn!(
-            "configured signing keys differ from the keys recorded for this vault; checking the vault"
-        );
     }
-    let binding = verify_vault_binding(config, signer, retry).await?;
+    let binding = verify_vault_binding(config, signer, manifest, identity, retry).await?;
     Ok((binding, BindingSource::VerifiedNow))
 }
 
@@ -304,10 +378,13 @@ fn wrong_chain_message(served: u64, expected: u64) -> String {
     )
 }
 
-/// The startup gate for a database with no matching recorded binding.
+/// The startup gate for a database with no matching recorded binding: the
+/// vault's keys and challenge period, then the startup probes.
 async fn verify_vault_binding(
     config: &ServerConfig,
     signer: &ServerSigner,
+    manifest: &DeploymentManifest,
+    identity: &StatementIdentity,
     retry: StartupRetry,
 ) -> anyhow::Result<DeploymentBinding> {
     let oracle = NativeBillingOracle::for_server(config)?;
@@ -337,6 +414,24 @@ async fn verify_vault_binding(
         }
     };
     ensure_vault_keys_match(config, &derived, &vault.keys)?;
+    anyhow::ensure!(
+        vault.challenge_period_seconds == manifest.challenge_period,
+        "refusing to start: vault challengePeriod() is {} s, but the deployment manifest pins {} s",
+        vault.challenge_period_seconds,
+        manifest.challenge_period
+    );
+    let report = probe_deployment(&oracle, manifest, identity)
+        .await
+        .map_err(|error| anyhow::anyhow!("refusing to start: startup probe failed: {error}"))?;
+    tracing::info!(
+        adapter = %report.proof_adapter_address,
+        vault_codehash = %report.vault_runtime_codehash,
+        adapter_codehash = %report.adapter_runtime_codehash,
+        poseidon_codehash = %report.poseidon_runtime_codehash,
+        circuit_id = %identity.circuit_id,
+        setup_id = %identity.setup_id,
+        "the vault, adapter and Poseidon library match the deployment manifest"
+    );
     let contract_address = vault_address_hex(&config.contract_address);
     tracing::info!(
         vault = %contract_address,
@@ -359,6 +454,11 @@ async fn verify_vault_binding(
             .unwrap_or_default()
             .as_secs(),
         verified_block: None,
+        circuit_id: Some(identity.circuit_id.clone()),
+        setup_id: Some(identity.setup_id.clone()),
+        request_vk_keccak256: Some(identity.request_vk_keccak256.clone()),
+        withdrawal_vk_keccak256: Some(identity.withdrawal_vk_keccak256.clone()),
+        source: BINDING_SOURCE_VAULT.to_string(),
     })
 }
 
@@ -407,6 +507,8 @@ async fn reverify_deployment_binding(
     config: &ServerConfig,
     recorded: &DeploymentBinding,
     signing_keys: &VaultSigningKeys,
+    manifest: &DeploymentManifest,
+    identity: &StatementIdentity,
     first_delay: Duration,
 ) -> anyhow::Result<Infallible> {
     let oracle = NativeBillingOracle::for_server(config)?;
@@ -436,6 +538,22 @@ async fn reverify_deployment_binding(
                         "the vault contradicts this database's recorded deployment binding; shutting down instead of signing"
                     );
                     return Err(mismatch);
+                }
+                match probe_deployment(&oracle, manifest, identity).await {
+                    Ok(_) => {}
+                    Err(ProbeError::Unavailable(error)) => {
+                        tracing::warn!(error = %error, "startup probe re-verification failed; retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = delay.saturating_mul(2).min(VAULT_REVERIFY_MAX_DELAY);
+                        continue;
+                    }
+                    Err(mismatch @ ProbeError::Mismatch(_)) => {
+                        tracing::error!(
+                            error = %mismatch,
+                            "the vault or adapter contradicts the deployment manifest; shutting down instead of signing"
+                        );
+                        return Err(anyhow::anyhow!("startup probe failed: {mismatch}"));
+                    }
                 }
                 tracing::info!(
                     vault = %recorded.contract_address,
@@ -680,6 +798,10 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
             "/v2/nullifiers/{nullifier}",
             get(handle_recovery_by_nullifier),
         )
+        .route(
+            "/v2/nullifiers/{nullifier}/evidence",
+            get(handle_request_evidence),
+        )
         .merge(dashboard)
         .layer(DefaultBodyLimit::max(PROTOCOL_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -717,15 +839,36 @@ struct HealthResponse {
     auth_scheme: &'static str,
     request_modes: Vec<&'static str>,
     testnet_password_required: bool,
-    /// POST /v2/withdraw/clearance requires `ownership_proof`.
+    /// POST /v2/withdraw/clearance requires a kind-2 `ownership_proof`.
     clearance_ownership_proof_required: bool,
-    /// New proof-less clearances admitted this minute.
-    legacy_clearance_window_used: u32,
-    /// Their per-minute limit, shared by every caller; 0 while legacy
-    /// clearance is off.
-    legacy_clearance_window_limit: u32,
-    /// Proof-less clearances refused by that limit since the process started.
-    legacy_clearance_rejected_total: u64,
+    #[serde(flatten)]
+    deployment: DeploymentInfo,
+}
+
+/// The statement this server serves. Informational: clients use their
+/// build-pinned values (§6.4).
+#[derive(Debug, Serialize)]
+struct DeploymentInfo {
+    circuit_id: &'static str,
+    setup_id: String,
+    /// Vault capability: concession exits (revision 3).
+    exit_concession: u8,
+    /// Lease TTL + settlement grace + settlement deadline: a lease's charge
+    /// is final this long after its issuance.
+    settlement_window_seconds: Option<u64>,
+}
+
+fn deployment_info(processor: &RequestProcessor) -> DeploymentInfo {
+    DeploymentInfo {
+        circuit_id: zkapi_proof::compact::CIRCUIT_ID,
+        setup_id: processor.setup_id().to_string(),
+        exit_concession: 1,
+        settlement_window_seconds: processor
+            .config()
+            .openrouter_leases
+            .as_ref()
+            .map(|lease| lease.settlement_window_seconds()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -738,11 +881,12 @@ struct AttestationResponse {
     state_signing_key: CurvePointWire,
     clearance_signing_key: CurvePointWire,
     auth_scheme: &'static str,
+    #[serde(flatten)]
+    deployment: DeploymentInfo,
 }
 
 async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse> {
     let config = processor.config();
-    let legacy = processor.legacy_clearance_usage();
     Json(HealthResponse {
         status: "ok",
         protocol_version: config.protocol_version,
@@ -755,10 +899,8 @@ async fn handle_health(State(processor): State<AppState>) -> Json<HealthResponse
         auth_scheme: "state-anchor",
         request_modes: vec!["direct_openrouter"],
         testnet_password_required: config.testnet_password.is_some(),
-        clearance_ownership_proof_required: !config.allow_legacy_clearance,
-        legacy_clearance_window_used: legacy.window_used,
-        legacy_clearance_window_limit: legacy.window_limit,
-        legacy_clearance_rejected_total: legacy.rejected_total,
+        clearance_ownership_proof_required: true,
+        deployment: deployment_info(&processor),
     })
 }
 
@@ -773,6 +915,7 @@ async fn handle_attestation(State(processor): State<AppState>) -> Json<Attestati
         state_signing_key: processor.state_signing_key(),
         clearance_signing_key: processor.clearance_signing_key(),
         auth_scheme: "state-anchor",
+        deployment: deployment_info(&processor),
     })
 }
 
@@ -814,11 +957,24 @@ async fn handle_openrouter_lease_retirement(
         .map_err(|error| error_to_response(&error, &client_request_id, &processor))
 }
 
-/// POST /v2/withdraw/clearance -- request a clearance signature.
+/// POST /v2/withdraw/clearance -- request a clearance signature. A body
+/// without a kind-2 ownership proof is refused with
+/// `clearance_ownership_required`.
 async fn handle_clearance(
     State(processor): State<AppState>,
-    Json(clearance_req): Json<ClearanceRequest>,
+    body: axum::body::Bytes,
 ) -> Result<Json<ClearanceResponseV2>, ErrorHttpResponse> {
+    let clearance_req: ClearanceRequestV2C = serde_json::from_slice(&body).map_err(|error| {
+        let missing_proof = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .is_some_and(|value| value.get("ownership_proof").is_none_or(|v| v.is_null()));
+        let error = if missing_proof {
+            ServerError::ClearanceOwnershipRequired
+        } else {
+            ServerError::InvalidRequest(format!("invalid clearance request: {error}"))
+        };
+        error_to_response(&error, "clearance", &processor)
+    })?;
     processor
         .process_clearance(&clearance_req)
         .await
@@ -835,6 +991,7 @@ async fn handle_recovery_by_id(
 ) -> Result<Json<RecoveryResponseV2>, ErrorHttpResponse> {
     processor
         .recover_by_client_id(&client_request_id)
+        .await
         .map(Json)
         .map_err(|e| error_to_response(&e, &client_request_id, &processor))
 }
@@ -851,8 +1008,31 @@ async fn handle_recovery_by_nullifier(
 
     processor
         .recover_by_nullifier(&nullifier)
+        .await
         .map(Json)
         .map_err(|e| error_to_response(&e, &nullifier_hex, &processor))
+}
+
+/// GET /v2/nullifiers/:nullifier/evidence -- the earliest request proof the
+/// server reserved at a nullifier: 404 when there is none, 410 (`published`)
+/// once the nullifier is published on chain, 503 when that cannot be read.
+async fn handle_request_evidence(
+    State(processor): State<AppState>,
+    Path(nullifier_hex): Path<String>,
+) -> Result<Response, ErrorHttpResponse> {
+    let nullifier = Felt252::from_hex(&nullifier_hex).map_err(|e| {
+        let err = ServerError::InvalidRequest(format!("invalid nullifier hex: {}", e));
+        error_to_response(&err, &nullifier_hex, &processor)
+    })?;
+    match processor.request_evidence(&nullifier).await {
+        Ok(Some(evidence)) => Ok(Json::<RequestEvidenceResponse>(evidence).into_response()),
+        Ok(None) => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"status":"not_found"})),
+        )
+            .into_response()),
+        Err(error) => Err(error_to_response(&error, &nullifier_hex, &processor)),
+    }
 }
 
 async fn handle_native_lease_expiry(
@@ -1060,13 +1240,16 @@ fn build_error_response(
         // Like an unknown lease, it sends clients to the authoritative
         // nullifier record (GET /v2/nullifiers/{request_nullifier}).
         ServerError::LeaseRecordUnreadable => StatusCode::NOT_FOUND,
-        ServerError::CapacityExhausted | ServerError::LegacyClearanceCapacity { .. } => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        ServerError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
         ServerError::Internal(_) | ServerError::Database(_) | ServerError::Unsettleable(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
         ServerError::OaRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        ServerError::RootUnavailable(_) | ServerError::ChainReadUnavailable(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        ServerError::RequestLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+        ServerError::Published => StatusCode::GONE,
     };
 
     let retry_after_seconds = match err {
@@ -1075,9 +1258,6 @@ fn build_error_response(
             ..
         }
         | ServerError::LeaseSettlementPending {
-            retry_after_seconds,
-        }
-        | ServerError::LegacyClearanceCapacity {
             retry_after_seconds,
         } => Some(*retry_after_seconds),
         _ => None,
@@ -1119,32 +1299,28 @@ fn spawn_openrouter_lease_settler(processor: Arc<RequestProcessor>, interval: Du
     });
 }
 
-fn spawn_root_poller(processor: Arc<RequestProcessor>, indexer_url: String, interval: Duration) {
+/// O5: refresh the indexer root and the vault's currentRoot() every
+/// `interval`; admission accepts only a root they agreed on recently.
+fn spawn_root_poller(
+    processor: Arc<RequestProcessor>,
+    indexer_url: Option<String>,
+    interval: Duration,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
-            match fetch_indexer_root(&indexer_url).await {
-                Ok(root) => processor.update_root(root),
-                Err(err) => tracing::warn!("failed to refresh root from indexer: {}", err),
+            if let Err(err) = processor.refresh_roots(indexer_url.as_deref()).await {
+                tracing::warn!("failed to refresh the indexer and vault roots: {}", err);
             }
         }
     });
 }
 
 async fn fetch_indexer_root(indexer_url: &str) -> anyhow::Result<Felt252> {
-    #[derive(serde::Deserialize)]
-    struct RootResponse {
-        root: Felt252,
-    }
-
-    let base = indexer_url.trim_end_matches('/');
-    let url = format!("{base}/v1/tree/root");
-    let response = reqwest::get(&url).await?;
-    let response = response.error_for_status()?;
-    Ok(response.json::<RootResponse>().await?.root)
+    crate::processor::fetch_indexer_root(indexer_url).await
 }
 
 #[cfg(test)]
@@ -1250,27 +1426,41 @@ mod rate_limit_tests {
     }
 
     #[test]
-    fn legacy_clearance_capacity_is_a_distinct_503_with_retry_after() {
-        let error = ServerError::LegacyClearanceCapacity {
-            retry_after_seconds: 42,
-        };
-        let (status, headers, Json(body)) = build_error_response(&error, "clearance", None);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(headers.get(RETRY_AFTER).unwrap(), "42");
-        assert_eq!(body.error_code, "legacy_clearance_capacity");
-        assert!(body.retriable);
-        assert_eq!(body.retry_after_seconds, Some(42));
-        // Verification saturation keeps its own code.
-        let (status, headers, Json(body)) =
-            build_error_response(&ServerError::CapacityExhausted, "clearance", None);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(headers.get(RETRY_AFTER).is_none());
-        assert_eq!(body.error_code, "capacity_exhausted");
+    fn concession_error_codes_map_to_http() {
+        for (error, status, code, retriable) in [
+            (
+                ServerError::RootUnavailable("stale".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "root_unavailable",
+                true,
+            ),
+            (
+                ServerError::RequestLimitExceeded {
+                    limit_micro_usd: 7,
+                    max_micro_usd: 6,
+                },
+                StatusCode::BAD_REQUEST,
+                "request_limit_exceeded",
+                false,
+            ),
+            (ServerError::Published, StatusCode::GONE, "published", false),
+            (
+                ServerError::ChainReadUnavailable("rpc".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "chain_read_unavailable",
+                true,
+            ),
+        ] {
+            let (actual, _, Json(body)) = build_error_response(&error, "request", None);
+            assert_eq!(actual, status, "{code}");
+            assert_eq!(body.error_code, code);
+            assert_eq!(body.retriable, retriable, "{code}");
+        }
     }
 
     #[test]
     fn stale_root_errors_report_the_root_carried_by_the_error() {
-        let processor = crate::routes::settlement_route_tests::processor(false);
+        let processor = crate::routes::settlement_route_tests::processor();
         processor.update_root(Felt252::from_u64(5));
         let vault_root = Felt252::from_u64(0x7007);
         let ErrorHttpResponse(response) = error_to_response(
@@ -1328,6 +1518,23 @@ mod startup_tests {
         CLEARANCE_SIGNING_KEY_Y_SELECTOR,
         CHALLENGE_PERIOD_SELECTOR,
     ];
+    /// The startup probes, in order: six getters and three code reads, each
+    /// after an eth_chainId check.
+    const PROBE_READS: [(&str, &str); 9] = [
+        (
+            "eth_call",
+            crate::deployment::CONCESSION_ESCAPE_VERSION_SELECTOR,
+        ),
+        ("eth_call", crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR),
+        ("eth_call", crate::deployment::PROOF_ADAPTER_SELECTOR),
+        ("eth_call", crate::deployment::CIRCUIT_ID_HASH_SELECTOR),
+        ("eth_call", crate::deployment::REQUEST_VK_HASH_SELECTOR),
+        ("eth_call", crate::deployment::WITHDRAWAL_VK_HASH_SELECTOR),
+        ("eth_getCode", VAULT),
+        ("eth_getCode", ADAPTER),
+        ("eth_getCode", POSEIDON),
+    ];
+    const PROBE_CALLS: usize = 2 * PROBE_READS.len();
 
     /// Independent strong seeds for a vault the configured seeds do not match.
     fn other_strong_seeds() -> (Felt252, Felt252) {
@@ -1347,6 +1554,43 @@ mod startup_tests {
         }
     }
 
+    const VAULT: &str = "0x0000000000000000000000000000000000001234";
+    const ADAPTER: &str = "0x00000000000000000000000000000000000a11a5";
+    const POSEIDON: &str = "0x0000000000000000000000000000000000000bee";
+
+    /// What the vault and its adapter answer the startup probes.
+    #[derive(Clone)]
+    struct Probes {
+        version: u64,
+        root_window: u64,
+        adapter: String,
+        circuit_id_hash: [u8; 32],
+        request_vk: String,
+        withdrawal_vk: String,
+        vault_code: Vec<u8>,
+        adapter_code: Vec<u8>,
+        poseidon_code: Vec<u8>,
+    }
+
+    impl Probes {
+        /// A revision-3 deployment of the development setup, as
+        /// `crate::deployment::tests::manifest_json` pins it.
+        fn matching() -> Self {
+            let identity = crate::deployment::tests::dev_identity();
+            Self {
+                version: 1,
+                root_window: 86_400,
+                adapter: ADAPTER.into(),
+                circuit_id_hash: zkapi_proof::compact::CIRCUIT_ID_HASH,
+                request_vk: identity.request_vk_keccak256,
+                withdrawal_vk: identity.withdrawal_vk_keccak256,
+                vault_code: b"vault code".to_vec(),
+                adapter_code: b"adapter code".to_vec(),
+                poseidon_code: b"poseidon code".to_vec(),
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct VaultRpc {
         chain: &'static str,
@@ -1358,6 +1602,7 @@ mod startup_tests {
         challenge_period: u64,
         /// Answers currentRoot() when set.
         root: Option<Felt252>,
+        probes: Probes,
     }
 
     impl VaultRpc {
@@ -1369,8 +1614,22 @@ mod startup_tests {
                 gate: None,
                 challenge_period: 86_400,
                 root: None,
+                probes: Probes::matching(),
             }
         }
+    }
+
+    /// The deployment manifest of `VAULT` signed by `seeds`.
+    fn manifest_for(seeds: (Felt252, Felt252)) -> DeploymentManifest {
+        DeploymentManifest::parse(
+            &crate::deployment::tests::manifest_json(
+                VAULT,
+                &keys_of(seeds),
+                &crate::deployment::tests::dev_identity(),
+            )
+            .to_string(),
+        )
+        .unwrap()
     }
 
     type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
@@ -1389,10 +1648,17 @@ mod startup_tests {
                         let _permit = gate.acquire().await.unwrap();
                     }
                     let method = request["method"].as_str().unwrap_or_default().to_string();
-                    let data = request["params"][0]["data"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
+                    let data = if method == "eth_getCode" {
+                        request["params"][0]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    } else {
+                        request["params"][0]["data"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    };
                     let block = request["params"][1]
                         .as_str()
                         .unwrap_or_default()
@@ -1405,9 +1671,50 @@ mod startup_tests {
                         return Err(StatusCode::SERVICE_UNAVAILABLE);
                     }
                     let word = |value: &Felt252| format!("0x{}", hex::encode(value.as_bytes()));
+                    let number = |value: u64| format!("0x{value:064x}");
+                    let probes = &vault.probes;
                     let result = match (method.as_str(), vault.keys.as_ref()) {
                         ("eth_chainId", _) => vault.chain.to_string(),
+                        ("eth_getCode", Some(_)) => {
+                            let code = match data.as_str() {
+                                VAULT => &probes.vault_code,
+                                ADAPTER => &probes.adapter_code,
+                                POSEIDON => &probes.poseidon_code,
+                                _ => return Err(StatusCode::BAD_REQUEST),
+                            };
+                            format!("0x{}", hex::encode(code))
+                        }
                         ("eth_call", None) => "0x".to_string(),
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::CONCESSION_ESCAPE_VERSION_SELECTOR =>
+                        {
+                            number(probes.version)
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::ROOT_HISTORY_WINDOW_SELECTOR =>
+                        {
+                            number(probes.root_window)
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::PROOF_ADAPTER_SELECTOR =>
+                        {
+                            format!("0x{:0>64}", probes.adapter.trim_start_matches("0x"))
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::CIRCUIT_ID_HASH_SELECTOR =>
+                        {
+                            format!("0x{}", hex::encode(probes.circuit_id_hash))
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::REQUEST_VK_HASH_SELECTOR =>
+                        {
+                            probes.request_vk.clone()
+                        }
+                        ("eth_call", Some(_))
+                            if data == crate::deployment::WITHDRAWAL_VK_HASH_SELECTOR =>
+                        {
+                            probes.withdrawal_vk.clone()
+                        }
                         ("eth_call", Some(keys)) => match data.as_str() {
                             STATE_SIGNING_KEY_X_SELECTOR => word(&keys.state.x),
                             STATE_SIGNING_KEY_Y_SELECTOR => word(&keys.state.y),
@@ -1444,22 +1751,41 @@ mod startup_tests {
                 ..crate::test_support::native_config()
             }),
             openrouter_leases: Some(crate::test_support::lease_config()),
-            proof_setup_dir: format!("{}/../../protocol/setup/v2", env!("CARGO_MANIFEST_DIR")),
+            proof_setup_dir: crate::test_support::setup_directory(),
+            // Seeds the operator policy refuses are refused before the
+            // manifest is read: pin any valid keys then.
+            deployment: Some(manifest_for(
+                if ServerSigner::try_new(&seeds.0, &seeds.1).is_ok() {
+                    seeds
+                } else {
+                    strong_test_seeds()
+                },
+            )),
             ..Default::default()
         }
     }
 
     fn recorded_binding(seeds: (Felt252, Felt252)) -> DeploymentBinding {
         let keys = keys_of(seeds);
+        let identity = crate::deployment::tests::dev_identity();
         DeploymentBinding {
             chain_id: 1,
-            contract_address: "0x0000000000000000000000000000000000001234".into(),
+            contract_address: VAULT.into(),
             state_signing_key: keys.state,
             clearance_signing_key: keys.clearance,
             challenge_period_seconds: 86_400,
             verified_at: 1_700_000_000,
             verified_block: None,
+            circuit_id: Some(identity.circuit_id),
+            setup_id: Some(identity.setup_id),
+            request_vk_keccak256: Some(identity.request_vk_keccak256),
+            withdrawal_vk_keccak256: Some(identity.withdrawal_vk_keccak256),
+            source: BINDING_SOURCE_VAULT.into(),
         }
+    }
+
+    fn identity() -> StatementIdentity {
+        crate::deployment::tests::dev_identity()
     }
 
     async fn free_listen_addr() -> String {
@@ -1565,7 +1891,12 @@ mod startup_tests {
         .await;
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("must-not-exist.db");
-        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+        let short_period = |db_path: &std::path::Path| {
+            let mut config = config(&rpc, db_path, seeds);
+            config.deployment.as_mut().unwrap().challenge_period = 3_600;
+            config
+        };
+        let error = run_server_with(short_period(&db_path), TEST_RETRY)
             .await
             .unwrap_err()
             .to_string();
@@ -1584,7 +1915,7 @@ mod startup_tests {
                 ..recorded_binding(seeds)
             })
             .unwrap();
-        let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+        let error = run_server_with(short_period(&db_path), TEST_RETRY)
             .await
             .unwrap_err()
             .to_string();
@@ -1598,9 +1929,15 @@ mod startup_tests {
         let directory = tempfile::tempdir().unwrap();
         let config = config(&rpc, &directory.path().join("server.db"), seeds);
         let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
-        let binding = verify_vault_binding(&config, &signer, TEST_RETRY)
-            .await
-            .unwrap();
+        let binding = verify_vault_binding(
+            &config,
+            &signer,
+            config.deployment.as_ref().unwrap(),
+            &identity(),
+            TEST_RETRY,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             binding,
             DeploymentBinding {
@@ -1609,11 +1946,12 @@ mod startup_tests {
             }
         );
         assert!(binding.verified_at > 1_700_000_000);
-        // Only eth_chainId, the four key getters and challengePeriod(), at
-        // "latest": no feed decimals() or nativeAssetWeiPerUnit() at startup.
+        // Only eth_chainId, the four key getters and challengePeriod(), then
+        // the startup probes, all at "latest": no feed decimals() or
+        // nativeAssetWeiPerUnit() at startup.
         let calls = methods(&calls);
         assert_eq!(calls[0].0, "eth_chainId");
-        let reads: Vec<_> = calls[1..]
+        let reads: Vec<_> = calls[1..=KEY_READS.len()]
             .iter()
             .map(|(method, data, block)| {
                 assert_eq!((method.as_str(), block.as_str()), ("eth_call", "latest"));
@@ -1621,6 +1959,210 @@ mod startup_tests {
             })
             .collect();
         assert_eq!(reads, KEY_READS);
+        let probes: Vec<_> = calls[1 + KEY_READS.len()..]
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0].0, "eth_chainId");
+                assert_eq!(pair[1].2, "latest");
+                (pair[1].0.as_str(), pair[1].1.as_str())
+            })
+            .collect();
+        assert_eq!(probes, PROBE_READS);
+    }
+
+    /// §5.5: every startup probe fails closed, before the database exists.
+    #[tokio::test]
+    async fn startup_probes_refuse_a_deployment_that_differs_from_the_manifest() {
+        let seeds = strong_test_seeds();
+        type Mutation = Box<dyn Fn(&mut Probes)>;
+        let mismatches: Vec<(Mutation, &str)> = vec![
+            (
+                Box::new(|probes| probes.version = 0),
+                "CONCESSION_ESCAPE_VERSION()",
+            ),
+            (
+                Box::new(|probes| probes.root_window = 3_600),
+                "ROOT_HISTORY_WINDOW()",
+            ),
+            (
+                Box::new(|probes| {
+                    probes.adapter = "0x00000000000000000000000000000000000ba0ba".into()
+                }),
+                "proofAdapter()",
+            ),
+            (
+                Box::new(|probes| probes.circuit_id_hash = [7; 32]),
+                "CIRCUIT_ID_HASH()",
+            ),
+            (
+                Box::new(|probes| probes.request_vk = format!("0x{}", "ab".repeat(32))),
+                "REQUEST_VK_HASH()",
+            ),
+            (
+                Box::new(|probes| probes.withdrawal_vk = format!("0x{}", "ab".repeat(32))),
+                "WITHDRAWAL_VK_HASH()",
+            ),
+            (
+                Box::new(|probes| probes.vault_code = b"other vault".to_vec()),
+                "the vault at",
+            ),
+            (
+                Box::new(|probes| probes.adapter_code = b"other adapter".to_vec()),
+                "the adapter at",
+            ),
+            (
+                Box::new(|probes| probes.poseidon_code = b"other library".to_vec()),
+                "the Poseidon library at",
+            ),
+        ];
+        for (mutate, expected) in mismatches {
+            let mut vault = VaultRpc::serving(keys_of(seeds));
+            mutate(&mut vault.probes);
+            let (rpc, _) = vault_rpc(vault).await;
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("must-not-exist.db");
+            let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("startup probe failed") && error.contains(expected),
+                "{expected}: {error}"
+            );
+            assert!(!db_path.exists());
+        }
+        // The manifest itself must pin this server's keys and statement.
+        let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut foreign = config(&rpc, &directory.path().join("must-not-exist.db"), seeds);
+        foreign.deployment = Some(manifest_for(other_strong_seeds()));
+        let error = run_server_with(foreign, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("do not derive the keys"), "{error}");
+        let mut missing = config(&rpc, &directory.path().join("must-not-exist.db"), seeds);
+        missing.deployment = None;
+        let error = run_server_with(missing, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--deployment"), "{error}");
+        let mut period = config(&rpc, &directory.path().join("must-not-exist.db"), seeds);
+        period.deployment.as_mut().unwrap().challenge_period = 7_200;
+        let error = run_server_with(period, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pins 7200 s"), "{error}");
+        let mut window = config(&rpc, &directory.path().join("must-not-exist.db"), seeds);
+        window
+            .deployment
+            .as_mut()
+            .unwrap()
+            .settlement_window_seconds = Some(600);
+        let error = run_server_with(window, TEST_RETRY)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("settlement_window_seconds"), "{error}");
+        assert!(!directory.path().join("must-not-exist.db").exists());
+        // Only the period check reached the RPC.
+        assert_eq!(methods(&calls).len(), 1 + KEY_READS.len());
+    }
+
+    /// `zkapi db init` binds a database before the first start; serverd then
+    /// verifies that binding against the vault and records it as verified,
+    /// and refuses a database bound to another statement.
+    #[test]
+    fn startup_verifies_a_db_init_binding_and_refuses_another_statement() {
+        let seeds = strong_test_seeds();
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("server.db");
+        let manifest = manifest_for(seeds);
+        let report =
+            crate::deployment::init_database(&db_path, &manifest, &identity(), 1_700_000_000)
+                .unwrap();
+        assert_eq!(report.result, "bound");
+        assert_eq!(report.binding_source, BINDING_SOURCE_MANIFEST);
+        // A second init of the same deployment changes nothing.
+        let again =
+            crate::deployment::init_database(&db_path, &manifest, &identity(), 1_800_000_000)
+                .unwrap();
+        assert_eq!(again.result, "already_bound");
+        // A manifest of another deployment is refused.
+        let error = crate::deployment::init_database(
+            &db_path,
+            &manifest_for(other_strong_seeds()),
+            &identity(),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("state signing key"), "{error}");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+            let mut serving = config(&rpc, &db_path, seeds);
+            serving.listen_addr = free_listen_addr().await;
+            tokio::spawn(run_server_with(serving.clone(), TEST_RETRY));
+            wait_for_health(&serving.listen_addr).await;
+            // The manifest binding was verified against the vault first.
+            assert!(methods(&calls).len() >= 1 + KEY_READS.len() + PROBE_CALLS);
+            let health: Value = reqwest::get(format!("http://{}/health", serving.listen_addr))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(health["circuit_id"], "zkapi-v2-concession-v1");
+            assert_eq!(health["setup_id"], "dev");
+            assert_eq!(health["exit_concession"], 1);
+            assert_eq!(health["settlement_window_seconds"], 300 + 21_600);
+        });
+        drop(runtime);
+        let released = std::time::Instant::now();
+        while crate::writer_lock::ServerWriterLock::acquire(&db_path).is_err() {
+            assert!(released.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = NullifierStore::open_read_only(&db_path)
+            .unwrap()
+            .read_deployment_binding()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.source, BINDING_SOURCE_VAULT);
+        assert_eq!(recorded.setup_id.as_deref(), Some("dev"));
+
+        // A database bound to another setup (or a legacy one with none
+        // recorded) is refused before any RPC.
+        for (setup_id, expected) in [
+            (Some("mpc-1"), "setup_id is mpc-1"),
+            (None, "zkapi-v2-note-bound-v1"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("server.db");
+            NullifierStore::new(&db_path)
+                .unwrap()
+                .write_deployment_binding(&DeploymentBinding {
+                    setup_id: setup_id.map(str::to_string),
+                    circuit_id: setup_id.map(|_| zkapi_proof::compact::CIRCUIT_ID.to_string()),
+                    ..recorded_binding(seeds)
+                })
+                .unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (rpc, calls) = vault_rpc(VaultRpc::serving(keys_of(seeds))).await;
+                let error = run_server_with(config(&rpc, &db_path, seeds), TEST_RETRY)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("bound to another statement") && error.contains(expected),
+                    "{error}"
+                );
+                assert!(methods(&calls).is_empty());
+            });
+        }
     }
 
     #[tokio::test]
@@ -1630,10 +2172,16 @@ mod startup_tests {
         let directory = tempfile::tempdir().unwrap();
         let config = config(&rpc, &directory.path().join("server.db"), (state, clear));
         let signer = ServerSigner::try_new(&state, &clear).unwrap();
-        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = verify_vault_binding(
+            &config,
+            &signer,
+            config.deployment.as_ref().unwrap(),
+            &identity(),
+            TEST_RETRY,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("appear swapped"), "{error}");
     }
 
@@ -1648,10 +2196,16 @@ mod startup_tests {
         let directory = tempfile::tempdir().unwrap();
         let config = config(&rpc, &directory.path().join("server.db"), seeds);
         let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
-        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = verify_vault_binding(
+            &config,
+            &signer,
+            config.deployment.as_ref().unwrap(),
+            &identity(),
+            TEST_RETRY,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("serves chain 11155111, but --chain-id is 1"),
             "{error}"
@@ -1696,10 +2250,16 @@ mod startup_tests {
         let directory = tempfile::tempdir().unwrap();
         let config = config(&rpc, &directory.path().join("server.db"), seeds);
         let signer = ServerSigner::try_new(&seeds.0, &seeds.1).unwrap();
-        let error = verify_vault_binding(&config, &signer, TEST_RETRY)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = verify_vault_binding(
+            &config,
+            &signer,
+            config.deployment.as_ref().unwrap(),
+            &identity(),
+            TEST_RETRY,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("after 3 attempts") && error.contains("no 32-byte word"),
             "{error}"
@@ -1875,6 +2435,8 @@ mod startup_tests {
                     &config,
                     &recorded,
                     &keys_of(seeds),
+                    config.deployment.as_ref().unwrap(),
+                    &identity(),
                     Duration::from_millis(1)
                 ),
             )
@@ -1882,8 +2444,8 @@ mod startup_tests {
             .is_err());
             let calls = methods(&calls);
             if matching {
-                // Verified once, then idle.
-                assert_eq!(calls.len(), 1 + KEY_READS.len());
+                // Verified once, probes included, then idle.
+                assert_eq!(calls.len(), 1 + KEY_READS.len() + PROBE_CALLS);
             } else {
                 assert!(calls.len() > 2);
             }
@@ -1894,6 +2456,8 @@ mod startup_tests {
             &config,
             &recorded,
             &keys_of(seeds),
+            config.deployment.as_ref().unwrap(),
+            &identity(),
             Duration::from_millis(1),
         )
         .await
@@ -1973,6 +2537,8 @@ mod startup_tests {
                 &config,
                 &recorded_binding(seeds),
                 &keys_of(other_strong_seeds()),
+                config.deployment.as_ref().unwrap(),
+                &identity(),
                 Duration::from_millis(1),
             ),
         )
@@ -2041,7 +2607,7 @@ mod startup_tests {
                 "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
                 "anonymous_commitment_y": "0x5"
             },
-            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+            "proof": {"backend": "groth16_bn254", "proof": crate::test_support::fake_proof(2)}
         }))
         .unwrap();
         store.reserve_openrouter_lease(&request).unwrap();
@@ -2566,14 +3132,13 @@ pub(crate) mod settlement_route_tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    pub(crate) fn processor(allow_legacy_clearance: bool) -> RequestProcessor {
+    pub(crate) fn processor() -> RequestProcessor {
         RequestProcessor::try_new(
             ServerConfig {
                 contract_address: Felt252::from_u64(123),
                 native_billing: Some(crate::test_support::native_config()),
                 openrouter_leases: Some(crate::test_support::lease_config()),
                 proof_setup_dir: crate::test_support::setup_directory(),
-                allow_legacy_clearance,
                 ..Default::default()
             },
             Arc::new(NullifierStore::in_memory().unwrap()),
@@ -2598,41 +3163,50 @@ pub(crate) mod settlement_route_tests {
     }
 
     #[tokio::test]
-    async fn health_reports_clearance_ownership_requirement() {
-        for (legacy, required, limit) in [(false, true, 0), (true, false, 60)] {
-            let app = create_router(Arc::new(processor(legacy)));
-            let (status, body) = get_json(&app, "/health").await;
+    async fn health_and_attestation_report_the_statement_served() {
+        let app = create_router(Arc::new(processor()));
+        for uri in ["/health", "/v1/attestation"] {
+            let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body["clearance_ownership_proof_required"], required);
-            assert_eq!(body["legacy_clearance_window_used"], 0);
-            assert_eq!(body["legacy_clearance_window_limit"], limit);
-            assert_eq!(body["legacy_clearance_rejected_total"], 0);
-            // No settlement data on the public health endpoint.
+            assert_eq!(body["circuit_id"], "zkapi-v2-concession-v1", "{uri}");
+            assert_eq!(body["setup_id"], "dev", "{uri}");
+            assert_eq!(body["exit_concession"], 1, "{uri}");
+            assert_eq!(body["settlement_window_seconds"], 300 + 21_600, "{uri}");
+            // No settlement data on the public endpoints.
             assert!(body.get("settlement").is_none());
         }
+        let (_, health) = get_json(&app, "/health").await;
+        assert_eq!(health["clearance_ownership_proof_required"], true);
+        assert!(health.get("legacy_clearance_window_limit").is_none());
     }
 
     #[tokio::test]
     async fn proofless_clearance_is_rejected_over_http() {
-        let processor = Arc::new(processor(false));
+        let processor = Arc::new(processor());
         let app = create_router(processor.clone());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v2/withdraw/clearance")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"withdrawal_nullifier":"0x2a"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+        for body in [
+            r#"{"withdrawal_nullifier":"0x2a"}"#,
+            r#"{"withdrawal_nullifier":"0x2a","ownership_proof":null}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v2/withdraw/clearance")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(body["error_code"], "clearance_ownership_required");
-        assert_eq!(body["retriable"], false);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error_code"], "clearance_ownership_required");
+            assert_eq!(body["retriable"], false);
+        }
         assert!(processor
             .store()
             .lookup_by_nullifier(&Felt252::from_u64(42))
@@ -2641,7 +3215,7 @@ pub(crate) mod settlement_route_tests {
 
     async fn post_clearance(
         app: &Router,
-        request: &ClearanceRequest,
+        request: &ClearanceRequestV2C,
     ) -> (StatusCode, HeaderMap, serde_json::Value) {
         let response = app
             .clone()
@@ -2660,73 +3234,124 @@ pub(crate) mod settlement_route_tests {
         (status, headers, serde_json::from_slice(&body).unwrap())
     }
 
+    /// The kind-2 ownership proof is admitted over HTTP; a legacy (14-field)
+    /// statement is refused at the wire.
     #[tokio::test]
-    async fn junk_exhausting_the_legacy_budget_gets_its_own_code_and_shows_on_health() {
+    async fn ownership_proof_clearance_over_http() {
         let fixture = crate::test_support::ownership_fixture().await;
-        let (state_seed, clear_seed) = crate::test_support::OWNERSHIP_SEEDS;
+        let (state_seed, clear_seed) = crate::test_support::ownership_seeds();
         let processor = RequestProcessor::try_new(
-            ServerConfig {
-                allow_legacy_clearance: true,
-                legacy_clearance_max_per_minute: 60,
-                ..crate::test_support::ownership_server_config()
-            },
+            crate::test_support::ownership_server_config(),
             Arc::new(NullifierStore::in_memory().unwrap()),
-            Arc::new(ServerSigner::new(
-                &Felt252::from_u64(state_seed),
-                &Felt252::from_u64(clear_seed),
-            )),
+            Arc::new(ServerSigner::new(&state_seed, &clear_seed)),
             fixture.root,
         )
         .unwrap();
         let app = create_router(Arc::new(processor));
-        // Stay inside one budget window on the real clock.
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            % 60;
-        if elapsed > 50 {
-            tokio::time::sleep(Duration::from_secs(60 - elapsed)).await;
-        }
-        let proofless = |nullifier| ClearanceRequest {
-            withdrawal_nullifier: nullifier,
-            ownership_proof: None,
-        };
-        for junk in 0..60 {
-            let junk = proofless(Felt252::from_u64(0xdead_0000 + junk));
-            assert_eq!(post_clearance(&app, &junk).await.0, StatusCode::OK);
-        }
-        let nullifier = fixture.plan.public_inputs.withdrawal_nullifier;
-        let (status, headers, body) = post_clearance(&app, &proofless(nullifier)).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error_code"], "legacy_clearance_capacity");
-        assert_eq!(body["retriable"], true);
-        let retry_after: u64 = headers[RETRY_AFTER].to_str().unwrap().parse().unwrap();
-        assert!((1..=60).contains(&retry_after), "{retry_after}");
-        assert_eq!(body["retry_after_seconds"], retry_after);
-        // The owner's ownership proof is admitted regardless.
-        let proved = ClearanceRequest {
-            withdrawal_nullifier: nullifier,
-            ownership_proof: Some(zkapi_types::wire::ClearanceOwnershipProof {
-                public_inputs: fixture.plan.public_inputs.clone(),
-                proof: fixture.plan.proof.clone(),
-            }),
-        };
-        let (status, _, body) = post_clearance(&app, &proved).await;
+        let nullifier = fixture.request.withdrawal_nullifier;
+        let (status, _, body) = post_clearance(&app, &fixture.request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body["withdrawal_nullifier"],
             serde_json::to_value(nullifier).unwrap()
         );
-        let (_, health) = get_json(&app, "/health").await;
-        assert_eq!(health["legacy_clearance_window_used"], 60);
-        assert_eq!(health["legacy_clearance_window_limit"], 60);
-        assert_eq!(health["legacy_clearance_rejected_total"], 1);
+        let mut legacy = serde_json::to_value(&fixture.request).unwrap();
+        let inputs = legacy["ownership_proof"]["public_inputs"]
+            .as_object_mut()
+            .unwrap();
+        for field in ["kind", "next_nullifier", "conceded", "valid_until"] {
+            inputs.remove(field);
+        }
+        inputs.insert("has_clearance".into(), false.into());
+        inputs.insert("withdrawal_tag".into(), "0x1".into());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/withdraw/clearance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&legacy).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_code"], "invalid_request");
+    }
+
+    /// GET /v2/nullifiers/{N}/evidence: 404 without evidence, the earliest
+    /// reserved proof otherwise, and 410 once N is published on chain (also
+    /// only through a vault event), with a 503 when that cannot be read.
+    #[tokio::test]
+    async fn evidence_endpoint_serves_reserved_proofs_until_published() {
+        let processor = Arc::new(processor());
+        let app = create_router(processor.clone());
+        let mut request: ApiRequestV2 = serde_json::from_value(serde_json::json!({
+            "client_request_id": "evidence-lease",
+            "payload": "{}",
+            "payload_hash": "0x1",
+            "public_inputs": {
+                "protocol_version": 2, "chain_id": 1, "contract_address": "0x7b",
+                "active_root": "0x0", "state_signing_key_x": "0x1", "state_signing_key_y": "0x2",
+                "request_time": 1, "solvency_bound": 10, "request_nullifier": "0x99",
+                "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
+                "anonymous_commitment_y": "0x5"
+            },
+            "proof": {"backend": "groth16_bn254", "proof": crate::test_support::fake_proof(5)}
+        }))
+        .unwrap();
+        let (status, _) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        processor
+            .store()
+            .reserve_openrouter_lease(&request)
+            .unwrap();
+        let (status, body) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["public_inputs"],
+            serde_json::to_value(&request.public_inputs).unwrap()
+        );
+        assert_eq!(body["proof"], serde_json::to_value(&request.proof).unwrap());
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        let nullifier = request.public_inputs.request_nullifier;
+        processor.test_chain().unavailable = true;
+        let (status, body) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error_code"], "chain_read_unavailable");
+        processor.test_chain().unavailable = false;
+        processor.test_chain().events.insert(nullifier);
+        let (status, body) = get_json(&app, "/v2/nullifiers/0x99/evidence").await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error_code"], "published");
+        // Consumed or challenged on chain: also published.
+        for consumed in [true, false] {
+            request.public_inputs.request_nullifier =
+                Felt252::from_u64(if consumed { 0x100 } else { 0x101 });
+            request.client_request_id = format!("evidence-{consumed}");
+            processor
+                .store()
+                .reserve_openrouter_lease(&request)
+                .unwrap();
+            let n = request.public_inputs.request_nullifier;
+            if consumed {
+                processor.set_test_spent(n, true);
+            } else {
+                processor.test_chain().challenged.insert(n);
+            }
+            let (status, _) =
+                get_json(&app, &format!("/v2/nullifiers/{}/evidence", n.to_hex())).await;
+            assert_eq!(status, StatusCode::GONE);
+        }
     }
 
     #[tokio::test]
     async fn dashboard_settlement_endpoint_lists_pending_leases_and_counts() {
-        let processor = Arc::new(processor(false));
+        let processor = Arc::new(processor());
         let request: ApiRequestV2 = serde_json::from_value(serde_json::json!({
             "client_request_id": "dashboard-lease",
             "payload": "{}",
@@ -2738,7 +3363,7 @@ pub(crate) mod settlement_route_tests {
                 "authorization_tag": "0x3", "anonymous_commitment_x": "0x4",
                 "anonymous_commitment_y": "0x5"
             },
-            "proof": {"backend": "groth16_bn254", "proof": "AA=="}
+            "proof": {"backend": "groth16_bn254", "proof": crate::test_support::fake_proof(1)}
         }))
         .unwrap();
         let store = processor.store();

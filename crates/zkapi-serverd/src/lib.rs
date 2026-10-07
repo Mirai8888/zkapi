@@ -7,6 +7,7 @@ pub mod challenge_service;
 pub mod challenge_status;
 pub mod config;
 pub mod dashboard;
+pub mod deployment;
 pub mod error;
 pub mod native_billing;
 pub mod nullifier_store;
@@ -19,6 +20,7 @@ pub mod routes;
 pub mod settlement;
 #[path = "signer_v2.rs"]
 pub mod signer;
+pub mod successor;
 pub mod testnet_auth;
 pub mod watcher;
 mod writer_lock;

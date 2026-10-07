@@ -4794,7 +4794,7 @@ mod tests {
                 confirmations: 2,
                 checkpoint: directory.path().join("checkpoint.json"),
                 proof_setup_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../protocol/setup/v2"),
+                    .join("../../protocol/setup/v2-concession-dev"),
                 // A transaction fee ceiling the mock's 12M gas limit never
                 // reaches at these caps; the ceiling tests use real figures.
                 fee: FeePolicy {
@@ -7880,6 +7880,11 @@ mod tests {
             challenge_period_seconds: 86_400,
             verified_at: 1,
             verified_block: None,
+            circuit_id: Some(zkapi_proof::compact::CIRCUIT_ID.into()),
+            setup_id: Some("dev".into()),
+            request_vk_keccak256: None,
+            withdrawal_vk_keccak256: None,
+            source: crate::nullifier_store::BINDING_SOURCE_VAULT.into(),
         };
         store.write_deployment_binding(&binding).unwrap();
         assert_eq!(service.verify_deployment_binding().await.unwrap(), binding);

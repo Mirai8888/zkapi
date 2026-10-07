@@ -14,8 +14,21 @@ pub const SETTLEMENT_SWEEP_SLACK_SECONDS: u64 = 600;
 pub const DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 3_600;
 pub const MIN_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 60;
 pub const MAX_CLEARANCE_ROOT_WINDOW_SECONDS: u64 = 86_400;
-/// In-process cap on new proof-less (legacy) clearance reservations.
-pub const DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE: u32 = 60;
+/// O5: admission requires a Merkle root on which the indexer and the vault's
+/// currentRoot() agreed at most this long ago.
+pub const DEFAULT_ROOT_MAX_STALENESS_SECONDS: u64 = 60;
+pub const MAX_ROOT_MAX_STALENESS_SECONDS: u64 = 3_600;
+/// The per-request lease ceiling recommended for the canary and beyond
+/// (`--request-limit-max-usd-micros`, §5.2): $6.
+pub const RECOMMENDED_REQUEST_LIMIT_MAX_USD_MICROS: u128 = 6_000_000;
+/// Slack of the challenger's raise timing check (§5.4): the raise must land
+/// `ttl + grace + settlement deadline + raise lead + 4·poll + 1200 <=
+/// challengePeriod`.
+pub const RAISE_TIMING_SLACK_SECONDS: u64 = 1_200;
+/// After a settled request's nullifier is first found consumed on chain,
+/// its signature waits challengePeriod + this long for the consuming exit
+/// to be defeated before the request becomes ExitedUnsigned (O7).
+pub const EXIT_DEFERRAL_SLACK_SECONDS: u64 = 3_600;
 
 /// Source used to provision prompt-private, short-lived OpenRouter keys.
 #[derive(Clone)]
@@ -102,6 +115,45 @@ pub struct OpenRouterLeaseConfig {
 }
 
 impl OpenRouterLeaseConfig {
+    /// The settlement window `W` clients wait for (§6.4 E0): a lease's charge
+    /// is final by its issuance + TTL + grace + settlement deadline.
+    pub fn settlement_window_seconds(&self) -> u64 {
+        self.ttl_seconds
+            .saturating_add(self.settlement_grace_seconds)
+            .saturating_add(self.settlement_deadline_seconds)
+    }
+
+    /// The challenger's raise timing check (§5.4): a raise decided
+    /// `raise_lead_seconds` before an escape's deadline, once the request it
+    /// raises for has settled, lands inside the challenge period:
+    /// ttl + grace + deadline + raise lead + 4*poll + 1200 <= challengePeriod.
+    pub fn validate_raise_timing(
+        &self,
+        raise_lead_seconds: u64,
+        challenge_period_seconds: u64,
+    ) -> anyhow::Result<()> {
+        let bound = self
+            .settlement_window_seconds()
+            .checked_add(raise_lead_seconds)
+            .and_then(|value| {
+                value.checked_add(self.settlement_poll_seconds.max(1).checked_mul(4)?)
+            })
+            .and_then(|value| value.checked_add(RAISE_TIMING_SLACK_SECONDS))
+            .ok_or_else(|| anyhow::anyhow!("raise timing overflows"))?;
+        anyhow::ensure!(
+            bound <= challenge_period_seconds,
+            "refusing to start: lease TTL ({} s) + settlement grace ({} s) + settlement deadline \
+             ({} s) + raise lead ({raise_lead_seconds} s) + 4 x poll ({} s) + \
+             {RAISE_TIMING_SLACK_SECONDS} s = {bound} s exceeds the vault challengePeriod() \
+             ({challenge_period_seconds} s); lower --raise-lead-seconds or the settlement deadline",
+            self.ttl_seconds,
+            self.settlement_grace_seconds,
+            self.settlement_deadline_seconds,
+            self.settlement_poll_seconds.max(1),
+        );
+        Ok(())
+    }
+
     /// Every lease that may have been delivered must reach a Finalized
     /// transcript well inside the vault's escape challenge period:
     /// ttl + grace + deadline + 2*poll + slack <= challengePeriod / 2.
@@ -177,14 +229,30 @@ pub struct ServerConfig {
     pub native_billing: Option<crate::native_billing::NativeBillingConfig>,
     /// Directory containing the v2 Groth16 proving/verifying key files.
     pub proof_setup_dir: String,
-    /// Transitional: let POST /v2/withdraw/clearance reserve a nullifier
-    /// without an ownership proof (older clients). Off by default.
+    /// Legacy deployments only: let POST /v2/withdraw/clearance reserve a
+    /// nullifier without an ownership proof. Circuit zkapi-v2-concession-v1
+    /// requires a kind-2 ownership proof: the server refuses to start with
+    /// it set.
     pub allow_legacy_clearance: bool,
-    /// In-process cap on new proof-less clearance reservations per minute.
-    pub legacy_clearance_max_per_minute: u32,
     /// How long after the server last observed a Merkle root a clearance
     /// ownership proof may still use it.
     pub clearance_root_window_seconds: u64,
+    /// O5: admission refuses (`root_unavailable`) unless the indexer root and
+    /// the vault's currentRoot() agreed at most this many seconds ago.
+    pub root_max_staleness_seconds: u64,
+    /// The operator's per-request exposure ceiling: a request whose lease
+    /// budget (`limit_micro_usd(solvency_bound)`) exceeds it is refused.
+    /// None disables it; 6,000,000 during the canary, and recommended
+    /// permanently.
+    pub request_limit_max_usd_micros: Option<u128>,
+    /// The vault's challengePeriod(), from the verified deployment binding.
+    /// Sets how long a settled request's signature is deferred while an exit
+    /// consumes its nullifier (O7) before it becomes ExitedUnsigned: None
+    /// (a library embedding without a binding) never ends the deferral.
+    pub challenge_period_seconds: Option<u64>,
+    /// The deployment manifest (`--deployment`): run_server requires it, to
+    /// probe the vault and adapter against it and to bind the database.
+    pub deployment: Option<crate::deployment::DeploymentManifest>,
     /// Start even though the database holds leases (or live direct-key
     /// deletions) of a lease key source other than the configured one, which
     /// this server can neither measure nor delete: each such lease is
@@ -224,7 +292,88 @@ impl ServerConfig {
                 .contains(&self.clearance_root_window_seconds),
             "--clearance-root-window-seconds must be between {MIN_CLEARANCE_ROOT_WINDOW_SECONDS} and {MAX_CLEARANCE_ROOT_WINDOW_SECONDS}"
         );
+        anyhow::ensure!(
+            !self.allow_legacy_clearance,
+            "refusing to start with --allow-legacy-clearance: circuit zkapi-v2-concession-v1 \
+             signs a clearance only against a kind-2 ownership proof"
+        );
+        anyhow::ensure!(
+            (1..=MAX_ROOT_MAX_STALENESS_SECONDS).contains(&self.root_max_staleness_seconds),
+            "--root-max-staleness-seconds must be between 1 and {MAX_ROOT_MAX_STALENESS_SECONDS}"
+        );
+        anyhow::ensure!(
+            self.request_limit_max_usd_micros
+                .is_none_or(|max| max > 0 && max <= crate::native_billing::MAX_SAFE_UNITS),
+            "--request-limit-max-usd-micros must be positive and browser-safe"
+        );
         Ok(())
+    }
+
+    /// The deployment of the state messages this server signs.
+    pub fn successor_deployment(&self) -> crate::successor::Deployment {
+        crate::successor::Deployment {
+            protocol_version: self.protocol_version,
+            chain_id: self.chain_id,
+            contract_address: self.contract_address,
+        }
+    }
+}
+
+/// The daemon timing of one documented network (§10.4), checked by the
+/// parameter-set test against both startup checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterSet {
+    pub name: &'static str,
+    pub challenge_period_seconds: u64,
+    pub ttl_seconds: u64,
+    pub settlement_grace_seconds: u64,
+    pub settlement_deadline_seconds: u64,
+    pub settlement_poll_seconds: u64,
+    pub raise_lead_seconds: u64,
+}
+
+/// The documented mainnet, Sepolia production and Sepolia drill parameters
+/// (§10.4 table).
+pub const PARAMETER_SETS: [ParameterSet; 3] = [
+    ParameterSet {
+        name: "mainnet",
+        challenge_period_seconds: 172_800,
+        ttl_seconds: 300,
+        settlement_grace_seconds: 5,
+        settlement_deadline_seconds: 21_600,
+        settlement_poll_seconds: 2,
+        raise_lead_seconds: 21_600,
+    },
+    ParameterSet {
+        name: "sepolia",
+        challenge_period_seconds: 43_200,
+        ttl_seconds: 300,
+        settlement_grace_seconds: 5,
+        settlement_deadline_seconds: 14_400,
+        settlement_poll_seconds: 2,
+        raise_lead_seconds: 21_600,
+    },
+    ParameterSet {
+        name: "sepolia-drill",
+        challenge_period_seconds: 7_200,
+        ttl_seconds: 300,
+        settlement_grace_seconds: 5,
+        settlement_deadline_seconds: 1_800,
+        settlement_poll_seconds: 2,
+        raise_lead_seconds: 1_800,
+    },
+];
+
+impl ParameterSet {
+    /// The lease timing of this network, with `source` as its key source.
+    pub fn lease_config(&self, source: OpenRouterLeaseSourceConfig) -> OpenRouterLeaseConfig {
+        OpenRouterLeaseConfig {
+            source,
+            ttl_seconds: self.ttl_seconds,
+            settlement_grace_seconds: self.settlement_grace_seconds,
+            settlement_poll_seconds: self.settlement_poll_seconds,
+            settlement_deadline_seconds: self.settlement_deadline_seconds,
+        }
     }
 }
 
@@ -249,8 +398,11 @@ impl std::fmt::Debug for ServerConfig {
             native_billing,
             proof_setup_dir,
             allow_legacy_clearance,
-            legacy_clearance_max_per_minute,
             clearance_root_window_seconds,
+            root_max_staleness_seconds,
+            request_limit_max_usd_micros,
+            challenge_period_seconds,
+            deployment,
             allow_key_source_switch,
         } = self;
         formatter
@@ -273,12 +425,17 @@ impl std::fmt::Debug for ServerConfig {
             .field("proof_setup_dir", proof_setup_dir)
             .field("allow_legacy_clearance", allow_legacy_clearance)
             .field(
-                "legacy_clearance_max_per_minute",
-                legacy_clearance_max_per_minute,
-            )
-            .field(
                 "clearance_root_window_seconds",
                 clearance_root_window_seconds,
+            )
+            .field("root_max_staleness_seconds", root_max_staleness_seconds)
+            .field("request_limit_max_usd_micros", request_limit_max_usd_micros)
+            .field("challenge_period_seconds", challenge_period_seconds)
+            .field(
+                "deployment",
+                &deployment
+                    .as_ref()
+                    .map(|manifest| &manifest.contract_address),
             )
             .field("allow_key_source_switch", allow_key_source_switch)
             .finish()
@@ -303,10 +460,13 @@ impl Default for ServerConfig {
             root_poll_interval_ms: 1_000,
             openrouter_leases: None,
             native_billing: None,
-            proof_setup_dir: "protocol/setup/v2".to_string(),
+            proof_setup_dir: "protocol/setup/v2-concession".to_string(),
             allow_legacy_clearance: false,
-            legacy_clearance_max_per_minute: DEFAULT_LEGACY_CLEARANCE_MAX_PER_MINUTE,
             clearance_root_window_seconds: DEFAULT_CLEARANCE_ROOT_WINDOW_SECONDS,
+            root_max_staleness_seconds: DEFAULT_ROOT_MAX_STALENESS_SECONDS,
+            request_limit_max_usd_micros: None,
+            challenge_period_seconds: None,
+            deployment: None,
             allow_key_source_switch: false,
         }
     }
@@ -454,7 +614,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!config.allow_legacy_clearance);
-        assert_eq!(config.legacy_clearance_max_per_minute, 60);
         config.validate_native_mode().unwrap();
         for window in [0, 59, 86_401] {
             config.clearance_root_window_seconds = window;
@@ -464,5 +623,90 @@ mod tests {
             config.clearance_root_window_seconds = window;
             config.validate_native_mode().unwrap();
         }
+    }
+
+    #[test]
+    fn this_deployment_refuses_legacy_clearance_and_unbounded_staleness() {
+        let mut config = ServerConfig {
+            native_billing: Some(crate::test_support::native_config()),
+            openrouter_leases: Some(crate::test_support::lease_config()),
+            ..Default::default()
+        };
+        assert_eq!(config.root_max_staleness_seconds, 60);
+        assert_eq!(config.request_limit_max_usd_micros, None);
+        config.validate_native_mode().unwrap();
+        config.allow_legacy_clearance = true;
+        let error = config.validate_native_mode().unwrap_err().to_string();
+        assert!(error.contains("--allow-legacy-clearance"), "{error}");
+        config.allow_legacy_clearance = false;
+        for staleness in [0, MAX_ROOT_MAX_STALENESS_SECONDS + 1] {
+            config.root_max_staleness_seconds = staleness;
+            assert!(config.validate_native_mode().is_err(), "{staleness}");
+        }
+        config.root_max_staleness_seconds = 60;
+        config.request_limit_max_usd_micros = Some(0);
+        assert!(config.validate_native_mode().is_err());
+        config.request_limit_max_usd_micros = Some(RECOMMENDED_REQUEST_LIMIT_MAX_USD_MICROS);
+        config.validate_native_mode().unwrap();
+    }
+
+    /// §10.4: both startup checks pass on every documented network, with the
+    /// sums the table records, and fail one second past their bound.
+    #[test]
+    fn documented_parameter_sets_pass_the_g5_and_raise_checks() {
+        let expected = [
+            ("mainnet", 21_905, 22_509, 44_713),
+            ("sepolia", 14_705, 15_309, 37_513),
+            ("sepolia-drill", 2_105, 2_709, 5_113),
+        ];
+        for (set, (name, window, g5, raise)) in PARAMETER_SETS.iter().zip(expected) {
+            assert_eq!(set.name, name);
+            let lease = set.lease_config(crate::test_support::lease_config().source);
+            assert_eq!(lease.settlement_window_seconds(), window, "{name}");
+            assert_eq!(
+                window + 2 * set.settlement_poll_seconds + SETTLEMENT_SWEEP_SLACK_SECONDS,
+                g5,
+                "{name}"
+            );
+            assert_eq!(
+                window
+                    + set.raise_lead_seconds
+                    + 4 * set.settlement_poll_seconds
+                    + RAISE_TIMING_SLACK_SECONDS,
+                raise,
+                "{name}"
+            );
+            lease
+                .validate_settlement_timing(set.challenge_period_seconds)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            lease
+                .validate_raise_timing(set.raise_lead_seconds, set.challenge_period_seconds)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            // One second more of raise lead than the challenge period allows.
+            let slack = set.challenge_period_seconds - raise;
+            let error = lease
+                .validate_raise_timing(
+                    set.raise_lead_seconds + slack + 1,
+                    set.challenge_period_seconds,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("--raise-lead-seconds"), "{name}: {error}");
+            lease
+                .validate_raise_timing(set.raise_lead_seconds + slack, set.challenge_period_seconds)
+                .unwrap();
+            // A deadline one second past half the challenge period fails G5.
+            let g5_slack = set.challenge_period_seconds / 2 - g5;
+            let late = OpenRouterLeaseConfig {
+                settlement_deadline_seconds: set.settlement_deadline_seconds + g5_slack + 1,
+                ..lease.clone()
+            };
+            assert!(late
+                .validate_settlement_timing(set.challenge_period_seconds)
+                .is_err());
+        }
+        // The drill vault's settlement does not fit a mainnet-sized raise lead.
+        let drill = PARAMETER_SETS[2].lease_config(crate::test_support::lease_config().source);
+        assert!(drill.validate_raise_timing(21_600, 7_200).is_err());
     }
 }

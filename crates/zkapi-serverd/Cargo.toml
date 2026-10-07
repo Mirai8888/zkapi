@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
+# Never enable `dev-setup` here: production binaries load only the pinned
+# ceremony keys (`zkapi-proof --bin release_policy_check` checks the Docker
+# build). The tests enable it through the dev-dependency below.
 zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
 anyhow = { workspace = true }
 axum = { workspace = true }
@@ -28,9 +31,25 @@ tower-http = { version = "0.6", features = ["cors"] }
 futures-util = "0.3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The scripts/v2-acceptance.mjs wallet driver (examples/v2_acceptance_wallet.rs)
+# only: it drives the browser wallet crate, which is being ported to circuit
+# zkapi-v2-concession-v1 separately. Never part of a server build.
+zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser", optional = true }
+
+[features]
+# Builds examples/v2_acceptance_wallet.rs. Off by default until zkapi-browser
+# builds against circuit zkapi-v2-concession-v1 (WP-F restores it).
+acceptance-wallet = ["dep:zkapi-browser"]
+
+[[example]]
+name = "v2_acceptance_wallet"
+required-features = ["acceptance-wallet"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true }
 tempfile = { workspace = true }
-zkapi-browser = { path = "../../protocol/rust/crates/zkapi-browser" }
+# Tests load the development setup (protocol/setup/v2-concession-dev) and use
+# the published development fixtures. Dev-dependency features never reach a
+# release build (resolver 2).
+zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof", features = ["dev-setup", "dev-fixtures"] }

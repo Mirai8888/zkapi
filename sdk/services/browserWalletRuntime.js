@@ -45,7 +45,9 @@ import {
     markBrowserWithdrawalFinalizationAmbiguous,
     markBrowserBackgroundWithdrawalAmbiguous,
     markBrowserWithdrawalFinalizationMissingReceipts,
+    PARK_REQUIRES_CLEARANCE_MESSAGE,
     parkBrowserWithdrawal,
+    preparedWithdrawalParkable,
     projectBrowserDeposits,
     putBrowserRequestArchive,
     readBrowserWalletSnapshot,
@@ -426,6 +428,30 @@ function withDepositPath(next, previous) {
 
 function nowSeconds() {
     return Math.floor(Date.now() / 1000);
+}
+
+// A set-aside balance warns this long before its must_initiate_by.
+const SET_ASIDE_WARNING_SECONDS = 7 * 86_400;
+
+/**
+ * The exit deadlines of a set-aside (parked or restored) note, from its own
+ * expiry_ts (E0), for the snapshot: `expiry` and `must_initiate_by` in
+ * milliseconds, and `exit_deadline_near` within a week of must_initiate_by.
+ * An unfinished set-aside close is claimed by the treasury at expiry.
+ */
+function setAsideDeadlines(record) {
+    if (!['parked', 'restored'].includes(record?.phase)) return {};
+    let deadline;
+    try {
+        deadline = mustInitiateBy(lowExpiry(record.state?.expiry_ts));
+    } catch {
+        return {};
+    }
+    return {
+        expiry: Number(record.state.expiry_ts) * 1_000,
+        must_initiate_by: deadline * 1_000,
+        exit_deadline_near: nowSeconds() >= deadline - SET_ASIDE_WARNING_SECONDS
+    };
 }
 
 /** A saved kind-0/1 proof is reused only while enough of its validity remains. */
@@ -1165,6 +1191,8 @@ class BrowserWalletRuntime extends EventTarget {
                     : prepared.destination,
                 transaction_hash: prepared.transactionHash || null,
                 clearance_reserved: prepared.clearanceReserved === true || prepared.mode === 'mutual',
+                // Only a granted close can be set aside (parkPreparedWithdrawal).
+                clearance_granted: preparedWithdrawalParkable(prepared, this.runtime?.exitLock),
                 replacement_available: prepared.phase === 'dropped_or_pending'
                     && replacementIdentities.size === 1
             } : null,
@@ -1185,7 +1213,7 @@ class BrowserWalletRuntime extends EventTarget {
                     challengeEvidence,
                     ...summary
                 } = record;
-                return { ...summary, challengeObserved: Boolean(challengeEvidence),
+                return { ...summary, ...setAsideDeadlines(record), challengeObserved: Boolean(challengeEvidence),
                     backgroundWithdrawalReady: isUnsubmittedParkedMutualWithdrawal(
                     record, this.runtime?.lateWithdrawalAttempts || []
                 ), backgroundPreparationCancelable: Boolean(this.config && this.manifest)
@@ -3836,7 +3864,8 @@ class BrowserWalletRuntime extends EventTarget {
      * own logs (§6.6). `sources` narrows the order; after an UnknownRoot
      * refusal no source may return `refusedRoot`.
      */
-    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES, refusedRoot = null, walletRequest = null } = {}) {
+    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES, refusedRoot = null, walletRequest = null,
+        currentRoot = null } = {}) {
         const refused = root => refusedRoot != null && sameFelt(root, refusedRoot);
         const saved = state?.deposit_path;
         if (sources.includes('deposit') && saved?.active_root != null && Array.isArray(saved.siblings)
@@ -3847,7 +3876,10 @@ class BrowserWalletRuntime extends EventTarget {
             const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
             const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
             try {
-                const root = await abortable(this.exitCurrentRoot(callSignal, walletRequest), callSignal);
+                // A current root the caller read through the wallet provider,
+                // or the vault's currentRoot read here.
+                const root = currentRoot != null ? currentRoot
+                    : await abortable(this.exitCurrentRoot(callSignal, walletRequest), callSignal);
                 if (!refused(root)) {
                     const path = await abortable(this.treePath(Number(state.note_id), true, root, callSignal), callSignal);
                     if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
@@ -5613,7 +5645,7 @@ class BrowserWalletRuntime extends EventTarget {
         return result;
     }
 
-    async prepareBackgroundWithdrawal(recordId, { expectedActiveRoot } = {}) {
+    async prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, refusedRoot = null, walletRequest = null } = {}) {
         await this.init();
         await this.reload();
         const record = structuredClone(this.withdrawals.find(entry => entry.recordId === recordId));
@@ -5633,13 +5665,24 @@ class BrowserWalletRuntime extends EventTarget {
         }
         // Deliberately outside the global wallet lock: a proof or indexer wait
         // must not stall unrelated deposits, requests, or settlement in another tab.
-        const path = await this.treePath(identity.noteId, true, expectedActiveRoot);
         // A persisted clearance for this exact nullifier needs no second
         // ownership proof or server request when only the root moved.
         let clearance = validClearance(record.preparedWithdrawal, nullifier)
             ? record.preparedWithdrawal.clearance
             : null;
-        if (!clearance) clearance = await this.backgroundClearance({ state, nullifier, path });
+        let path;
+        if (clearance) {
+            // The close proof needs only a root the vault ever held (A1):
+            // the deposit-time path first, then the indexer at the vault's
+            // current root, then the vault's logs; never the operator alone.
+            path = await this.exitPathLocked(state, { currentRoot: expectedActiveRoot, walletRequest,
+                ...(refusedRoot != null ? { sources: AFTER_UNKNOWN_ROOT_SOURCES, refusedRoot } : {}) });
+        } else {
+            // A record set aside before its clearance (an earlier build): the
+            // ownership proof needs a root within the server's window.
+            path = await this.treePath(identity.noteId, true, expectedActiveRoot);
+            clearance = await this.backgroundClearance({ state, nullifier, path });
+        }
         const plan = await this.worker.call('prepareWithdrawal', {
             config: config.wallet_core, state,
             args: { mode: 'mutual', destination: identity.destination,
@@ -5653,7 +5696,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (!plan.proof || Number(inputs?.note_id) !== identity.noteId
             || Number(inputs?.chain_id) !== identity.chainId
             || !sameFelt(inputs?.contract_address, identity.contractAddress)
-            || !sameFelt(inputs?.active_root, expectedActiveRoot)
+            || !sameFelt(inputs?.active_root, path.active_root)
             || !sameFelt(inputs?.withdrawal_nullifier, nullifier)
             || !sameFelt(inputs?.final_balance, state.current_balance)
             || String(encodedDestination || '').toLowerCase() !== identity.destination.toLowerCase()
@@ -5661,6 +5704,7 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The generated withdrawal proof does not match its saved balance and vault.');
         }
         Object.assign(plan, { destination: identity.destination, mode: 'mutual', phase: 'prepared',
+            ...(path.source ? { pathSource: path.source } : {}),
             operationId: uuid(), noteId: identity.noteId, withdrawalNullifier: nullifier,
             clearanceReserved: true, createdAt: Number(record.createdAt || Date.now()),
             ...(clearance?.signature ? { clearance } : {}) });
@@ -5731,6 +5775,12 @@ class BrowserWalletRuntime extends EventTarget {
             if (!prepared || (prepared.mode !== 'mutual' && prepared.clearanceReserved !== true)
                 || !Number.isFinite(noteId)) {
                 throw new Error('There is no withdrawal-only balance to set aside.');
+            }
+            // A set-aside note leaves only by its mutual close. Without a
+            // granted clearance that close depends on the operator, so the
+            // note exits through the exit rules (escape) instead.
+            if (!preparedWithdrawalParkable(prepared, this.runtime.exitLock)) {
+                throw new BrowserWalletHttpError(PARK_REQUIRES_CLEARANCE_MESSAGE, 409, 'park_requires_clearance');
             }
             const hashes = Array.isArray(prepared.transactionHashes)
                 ? prepared.transactionHashes

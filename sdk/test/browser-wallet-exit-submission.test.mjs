@@ -228,3 +228,41 @@ test('G1: a withdrawal warns first when the balance returns less than three esca
         assert.equal(wallet.sent.length, 1, 'the warning never blocks the exit');
     }
 });
+
+test('a set-aside close leaves without the operator: the deposit-time path first, another root after UnknownRoot, and the saved path when no other exists', async () => {
+    for (const [label, indexerUp, logs, expectedRoots, gas] of [
+        ['indexer up', true, logsRpc, ['0x51', '0x77'], bufferedGasLimit(0x9c40n)],
+        ['indexer and logs unavailable', false, async ({ method }) => {
+            if (method === 'eth_chainId') return '0xaa36a7';
+            if (method === 'eth_getBlockByNumber') return { number: '0x64' };
+            throw new Error('eth_getLogs is not supported');
+        }, ['0x51', '0x51', '0x51'], FIXED_EXIT_GAS]
+    ]) {
+        const { h, client, wallet, statuses } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+        h.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+        await runtime.prepareWithdrawal('mutual', DESTINATION);
+        const record = await runtime.parkPreparedWithdrawal();
+        // The user funds a newer balance; the old one is set aside.
+        await store.writeBrowserWallet({ ...(await store.readBrowserWallet()),
+            state: noteState({ note_id: 8, current_anchor: '0x4444' }) });
+        await runtime.reload();
+        // Later the server and its indexer are gone.
+        h.server.clearance = () => assert.fail('the kept clearance is reused');
+        if (!indexerUp) runtime.treePath = async () => { throw new Error('indexer down'); };
+        runtime.pinnedRpc = () => logs;
+        client.syncEscapeWithdrawals = async () => [];
+        client.readBrowserWithdrawalStatus = async () => ({ status: 'active', observed_block: 100 });
+        client.readContractUint = async () => 0x77n;
+        const closes = () => h.workerOperations('prepareWithdrawal').filter(call => call.payload.args.mode === 'mutual').slice(1);
+        wallet.estimate = (_transaction, count) => {
+            if (count === 1 || !indexerUp) throw revert(UNKNOWN_ROOT);
+            return '0x9c40';
+        };
+        await assert.rejects(within(5_000, client.withdrawBackground(record.recordId, message => statuses.push(message)), label),
+            refusedInWallet, label);
+        assert.deepEqual(closes().map(call => call.payload.args.active_root), expectedRoots, label);
+        assert.equal(wallet.sent.length, 1, `${label}: the close reached the wallet`);
+        assert.equal(wallet.sent[0].gas, gas, label);
+        assert.equal((await store.readBrowserWallet()).state.note_id, 8, `${label}: the newer balance stays selected`);
+    }
+});

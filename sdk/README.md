@@ -475,6 +475,25 @@ that state:
   client clock up to five minutes fast. The SDK proves again after
   `proof_expired` or `unknown_root`.
 
+### Setting a balance aside
+
+`client.parkPreparedWithdrawal()` sets a withdrawal-only balance aside so the
+user can fund another one. Only a mutual close whose clearance the server
+granted can be set aside: `snapshot().config.prepared_withdrawal.clearance_granted`
+says so. Any other withdrawal-only balance (an ownership proof answered with
+`nullifier_used`, a refusal or no answer, or a released escape proof) is
+refused with `park_requires_clearance`. It must be withdrawn first, by the
+exit rules above, so that it never depends on the operator once set aside.
+
+`client.withdrawBackground(recordId)` later closes a set-aside balance with its
+kept clearance. The close proof takes the deposit-time path first, then the
+indexer at the vault's current root, then the vault's logs, and it re-proves
+at another root after `unknown_root` like any exit. Each set-aside record in
+`snapshot().withdrawals` carries `expiry` and `must_initiate_by` (milliseconds,
+from the note's own `expiry_ts`) and `exit_deadline_near`, which is true within
+7 days of `must_initiate_by`. Show it: a set-aside close that is not finished
+before expiry is claimed by the treasury.
+
 ### Raised concessions and the payout
 
 While an escape is pending, the operator may raise its concession
@@ -585,7 +604,7 @@ Each of these errors carries a `shortMessage` for display.
 
 | Group | Codes |
 | --- | --- |
-| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending` |
+| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance` |
 | Deposits | `deployment_mismatch`, `deployment_unverifiable`, `canary_cap_exceeded`, `canary_cap_unverified` |
 | Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
 | Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |

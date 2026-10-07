@@ -2346,7 +2346,8 @@ class ZkapiClient extends EventTarget {
                         note_id: withdrawal.noteId,
                         destination,
                         transaction_hash: submittedHash,
-                        clearance_reserved: plan.clearanceReserved === true || mode === 'mutual'
+                        clearance_reserved: plan.clearanceReserved === true || mode === 'mutual',
+                        clearance_granted: mode === 'mutual' && Boolean(plan.clearance?.signature)
                     };
                 }
                 const calldata = encodeWithdrawal(
@@ -2787,6 +2788,11 @@ class ZkapiClient extends EventTarget {
         let receipt;
         let plan;
         let submittedHash = null;
+        // After UnknownRoot the next close proof takes a path at another root
+        // (E4.1); a path failure then falls back to the saved one, whose
+        // simulation refusal only warns on the last attempt (E4.5).
+        let refusedRoot = null;
+        const walletRequest = request => this.ethereum.request(request);
         for (let attempt = 0; attempt < 3; attempt += 1) {
             let submission = null;
             let metadata = null;
@@ -2803,7 +2809,15 @@ class ZkapiClient extends EventTarget {
                 const expectedActiveRoot = await this.readContractUint(
                     this.config.funding.contract_address, `0x${ABI.currentRoot}`
                 );
-                plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot });
+                try {
+                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot,
+                        walletRequest, ...(refusedRoot != null ? { refusedRoot } : {}) });
+                } catch (error) {
+                    if (refusedRoot == null || error?.data?.exit_path_unavailable !== true) throw error;
+                    onStatus(`No Merkle path at another root was found (${error.message}). The saved path is used again.`, 'preparing');
+                    refusedRoot = null;
+                    plan = await browserWalletRuntime.prepareBackgroundWithdrawal(recordId, { expectedActiveRoot, walletRequest });
+                }
                 if (plan.mode !== 'mutual' || Number(plan.public_inputs?.note_id) !== noteId
                     || plan.destination?.toLowerCase() !== destination?.toLowerCase()
                     || Number(plan.public_inputs?.final_balance) !== Number(record.finalBalance)) {
@@ -2853,8 +2867,12 @@ class ZkapiClient extends EventTarget {
                 } else if (submission && (error.broadcastPossible === false || isWalletRejection(error))) {
                     await browserWalletRuntime.releaseBackgroundWithdrawalSubmission(submission);
                     // The background flow always re-proves (reusing its
-                    // persisted clearance), so either root rejection retries.
-                    if (['stale_root', 'unknown_root'].includes(error.code) && attempt < 2) continue;
+                    // persisted clearance), so either root rejection retries,
+                    // and an UnknownRoot one at another root.
+                    if (['stale_root', 'unknown_root'].includes(error.code) && attempt < 2) {
+                        if (error.code === 'unknown_root') refusedRoot = plan?.public_inputs?.active_root ?? null;
+                        continue;
+                    }
                     if (isWalletRejection(error)) {
                         error.shortMessage = 'Canceled. The old balance is still set aside and can be withdrawn later.';
                     }
@@ -4963,7 +4981,9 @@ class ZkapiClient extends EventTarget {
         const prepared = this.config?.prepared_withdrawal;
         if (!prepared && !this.config?.exit?.lock) return false;
         if (prepared && (prepared.mode === 'mutual' || prepared.clearance_reserved === true)) {
-            throw new Error('This balance already has a mutual-close authorization. Finish it, use the escape hatch, or set it aside before funding another balance.');
+            throw new Error(prepared.clearance_granted === true
+                ? 'This balance already has a mutual-close authorization. Finish it, use the escape hatch, or set it aside before funding another balance.'
+                : 'This balance already sent its ownership proof, so it can only be withdrawn. Finish the withdrawal (the escape hatch needs nothing from the server) before funding another balance.');
         }
         if (prepared?.transaction_hash) {
             throw new Error('This transaction was already submitted. Check its on-chain status instead of canceling it.');

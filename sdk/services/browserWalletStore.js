@@ -2008,6 +2008,24 @@ export async function releaseBrowserWithdrawalStartSubmission(recordId, submissi
 }
 
 /** Park a withdrawal-only mutual-close note so a fresh note can be funded. */
+/**
+ * Whether a prepared withdrawal may be set aside (parked): a mutual close
+ * whose clearance the server granted for exactly its state's nullifier, with
+ * no escape proof released from its exit lock. A parked note leaves only by
+ * that close (performBackgroundWithdrawal), which then needs nothing more
+ * from the operator; a note without a granted clearance must exit through
+ * the exit rules first (escape, E2.5 and E3).
+ */
+export function preparedWithdrawalParkable(prepared, exitLock = null) {
+    const nullifier = prepared?.withdrawalNullifier ?? prepared?.public_inputs?.withdrawal_nullifier ?? null;
+    const clearance = prepared?.clearance;
+    return Boolean(prepared && prepared.mode === 'mutual' && nullifier != null && clearance?.signature
+        && clearance.withdrawal_nullifier != null && sameFeltValue(clearance.withdrawal_nullifier, nullifier)
+        && !(exitLock?.released || []).some(entry => Number(entry.kind) === 0));
+}
+
+export const PARK_REQUIRES_CLEARANCE_MESSAGE = 'Only a balance whose cooperative close the server granted can be set aside. Withdraw this balance first: its escape needs nothing from the server.';
+
 export async function parkBrowserWithdrawal(record) {
     if (!record?.recordId || record.noteId == null) {
         throw new Error('A parked withdrawal requires a durable note identity.');
@@ -2024,6 +2042,10 @@ export async function parkBrowserWithdrawal(record) {
     if (current.journal || current.lease || current.pendingDeposit) {
         transaction.abort();
         throw new Error('Finish the other private-balance operation before setting this balance aside.');
+    }
+    if (!preparedWithdrawalParkable(current.preparedWithdrawal, current.exitLock)) {
+        transaction.abort();
+        throw Object.assign(new Error(PARK_REQUIRES_CLEARANCE_MESSAGE), { code: 'park_requires_clearance', status: 409 });
     }
     const prepared = current.preparedWithdrawal;
     const hashes = Array.isArray(prepared.transactionHashes)

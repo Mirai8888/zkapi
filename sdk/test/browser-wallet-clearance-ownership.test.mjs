@@ -337,3 +337,68 @@ test('vault errors decode from selectors computed from their signatures', () => 
     assert.match(contractEstimateError({ data: selectorOf('Paused()') }).message, /paused/i);
 });
 
+
+test('only a close the server granted can be set aside; every other withdrawal-only balance must exit first', async () => {
+    for (const [label, answer] of [
+        ['nullifier_used', () => { throw new HttpError('The nullifier is used.', 409, 'nullifier_used'); }],
+        ['refused', () => { throw new HttpError('Invalid ownership proof.', 400, 'invalid_ownership_proof'); }],
+        ['unreachable', () => { throw new HttpError('Unavailable', 503, 'service_unavailable'); }]
+    ]) {
+        const h = await freshWallet({ clearanceOwnershipProof: 'required' });
+        await discardFirstRequest(h);
+        h.server.clearance = answer;
+        // nullifier_used waits for T; the others escape with c = 0 (E2.5).
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION).catch(error => error);
+        assert.equal(label === 'nullifier_used' ? plan.code : plan.mode, label === 'nullifier_used' ? 'request_settlement_pending' : 'escape', label);
+        const before = await store.readBrowserWallet();
+        assert.equal(before.preparedWithdrawal.clearanceReserved, true, `${label}: withdrawal-only`);
+        assert.equal(h.runtime.snapshot().config.prepared_withdrawal.clearance_granted, false, label);
+        await assert.rejects(h.runtime.parkPreparedWithdrawal(), { code: 'park_requires_clearance' }, label);
+        // The store refuses it too, in the same transaction that would park it.
+        await assert.rejects(store.parkBrowserWithdrawal({ recordId: RECORD_ID, noteId: 7, mode: 'mutual' }),
+            { code: 'park_requires_clearance' }, label);
+        assert.deepEqual(await store.readBrowserWallet(), before, `${label}: the balance stays selected`);
+        assert.deepEqual(await store.listBrowserWithdrawals(DEPLOYMENT), [], label);
+        // The client tells the user to withdraw, not to set the balance aside.
+        const client = new ZkapiClient();
+        client.config = h.runtime.snapshot().config;
+        await assert.rejects(client.cancelPreparedWithdrawal(), /can only be withdrawn.*escape hatch needs nothing from the server/, label);
+    }
+});
+
+test('a granted close set aside shows its deadlines and closes later without the operator, from the deposit-time path', async () => {
+    const depositPath = { active_root: '0x51', siblings: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`) };
+    const soon = Math.floor(Date.now() / 1_000) + 43_200 + 3 * 86_400;
+    for (const [expiry, near] of [[2_000_000_000, false], [soon, true]]) {
+        const h = await freshWallet({ clearanceOwnershipProof: 'required' }, noteState({ deposit_path: depositPath, expiry_ts: expiry }));
+        h.server.clearance = body => clearanceFor(body);
+        const plan = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(plan.mode, 'mutual');
+        assert.equal(h.runtime.snapshot().config.prepared_withdrawal.clearance_granted, true);
+        const record = await h.runtime.parkPreparedWithdrawal();
+        assert.equal(record.phase, 'parked');
+        assert.equal((await store.readBrowserWallet()).state, null);
+        const [summary] = h.runtime.snapshot().withdrawals;
+        assert.equal(summary.expiry, expiry * 1_000);
+        assert.equal(summary.must_initiate_by, (expiry - 43_200) * 1_000);
+        assert.equal(summary.exit_deadline_near, near, `expiry ${expiry}`);
+        assert.equal(summary.state, undefined, 'no private state in the snapshot');
+        // Later, with the indexer and the server gone: the kept clearance and
+        // the deposit-time path close it.
+        h.runtime.treePath = () => assert.fail('no indexer for a set-aside close with a saved path');
+        h.server.clearance = () => assert.fail('no second clearance');
+        const posts = clearancePosts(h).length;
+        const background = await h.runtime.prepareBackgroundWithdrawal(record.recordId, { expectedActiveRoot: '0x99' });
+        assert.equal(background.mode, 'mutual');
+        assert.equal(background.pathSource, 'deposit');
+        assert.equal(background.public_inputs.active_root, '0x51');
+        assert.equal(background.public_inputs.final_balance, 5_000_000);
+        assert.equal(clearancePosts(h).length, posts);
+        // After an UnknownRoot refusal of that root, another one is used.
+        h.runtime.treePath = async noteId => ({ active_root: '0x99', note_id: noteId,
+            siblings: Array.from({ length: 32 }, (_, index) => `0x99${index.toString(16)}`) });
+        const again = await h.runtime.prepareBackgroundWithdrawal(record.recordId, { expectedActiveRoot: '0x99', refusedRoot: '0x51' });
+        assert.equal(again.pathSource, 'indexer');
+        assert.equal(again.public_inputs.active_root, '0x99');
+    }
+});

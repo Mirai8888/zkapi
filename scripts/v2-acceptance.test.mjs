@@ -252,3 +252,78 @@ test('the gas ledger summarizes receipts by operation', () => {
     assert.equal(ledger.entries[2].status, 0);
     assert.throws(() => ledger.record('escape', null), /no receipt/);
 });
+
+// scripts/deployment-profile.mjs: every consumer's profile from one finalized
+// manifest (migration runbook B2, step 5).
+test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, and clientd\'s own names', async () => {
+    const { clientdProfile, deploymentProfile, setupPins } = await import('./deployment-profile.mjs');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { spawnSync } = await import('node:child_process');
+    const root = new URL('..', import.meta.url).pathname;
+    const setupDir = path.join(root, 'protocol/setup/v2-concession-dev');
+    const setup = JSON.parse(fs.readFileSync(path.join(setupDir, 'manifest.json'), 'utf8'));
+    const finalized = {
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
+        vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
+        poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
+        vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
+        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
+        // Deploy.s.sol writes decimal coordinates; a 77-digit one would not
+        // parse as the hex every consumer reads.
+        stateSigningKeyX: (2n ** 252n + 7n).toString(), stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '4',
+    };
+    const keyHashes = setupPins(setupDir, finalized);
+    assert.equal(keyHashes.requestVk, setup.files['request.vk']);
+    assert.throws(() => setupPins(setupDir, { ...finalized, withdrawalVkKeccak256: `0x${'00'.repeat(32)}` }), /withdrawal verifying key/);
+    assert.throws(() => setupPins(setupDir, { ...finalized, setupId: 'mpc-1' }), /setup dev/);
+    const services = { protocolServerUrl: 'https://api.example', indexerUrl: 'https://indexer.example', rpcUrl: 'https://rpc.example',
+        verifierUrl: 'https://verifier.example', priceFeed: '0x694AA1769357215DE4FAC081bf1f309aDC325306', settlementWindowSeconds: 14_705, keyHashes };
+    assert.throws(() => deploymentProfile(finalized, services), /new deployment ID/);
+    assert.throws(() => deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-note-bound-v1-fresh-20260930' }),
+        /legacy vault/);
+    const profile = deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v1' });
+    assert.equal(profile.state_signing_key.x, `0x${(2n ** 252n + 7n).toString(16).padStart(64, '0')}`);
+    assert.match(profile.clearance_signing_key.y, /^0x0{63}4$/);
+    assert.equal(profile.deploy_block, 9_100_000);
+    const placeholder = JSON.parse(fs.readFileSync(path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'), 'utf8'));
+    const clientd = clientdProfile(placeholder, profile, finalized, keyHashes);
+    assert.equal(clientd.deployment_status, 'deployed');
+    assert.equal(clientd.deployment_id, 'zkapi-native-eth-sepolia-concession-v1');
+    assert.equal(clientd.challenge_period_seconds, 43_200);
+    assert.equal(clientd.note_ttl_seconds, 2_592_000);
+    assert.equal(clientd.max_pause_duration_seconds, 604_800);
+    assert.equal(clientd.deployment_evidence.adapter_runtime_keccak256, finalized.adapterRuntimeCodehash);
+    assert.equal(clientd.proof_setup.withdrawal_verifying_key_sha256, setup.files['withdrawal.vk']);
+    assert.deepEqual(clientd.state_signing_key, profile.state_signing_key);
+    assert.ok(!clientd.limitations.some(text => text.startsWith('Placeholder:')));
+    // The command line, in each format.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkapi-profile-'));
+    const file = path.join(dir, 'deployment.json');
+    fs.writeFileSync(file, JSON.stringify(finalized));
+    const run = (...args) => spawnSync(process.execPath, [path.join(root, 'scripts/deployment-profile.mjs'), '--finalized', file,
+        '--deployment-id', 'zkapi-native-eth-sepolia-concession-v1', '--protocol-server-url', services.protocolServerUrl,
+        '--indexer-url', services.indexerUrl, '--verifier-url', services.verifierUrl, ...args], { encoding: 'utf8' });
+    const trusted = run('--rpc-url', services.rpcUrl, '--price-feed', services.priceFeed, '--settlement-window-seconds', '14705');
+    assert.equal(trusted.status, 0, trusted.stderr);
+    assert.deepEqual(JSON.parse(trusted.stdout).trusted_deployment, { ...profile, rpc_url: services.rpcUrl });
+    const clientdOut = run('--format', 'clientd', '--base', path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'));
+    assert.equal(clientdOut.status, 0, clientdOut.stderr);
+    assert.equal(JSON.parse(clientdOut.stdout).rpc_url, placeholder.rpc_url);
+    const sdkOut = run('--format', 'sdk', '--base', path.join(root, 'sdk/assets/config/sepolia.json'));
+    assert.equal(sdkOut.status, 0, sdkOut.stderr);
+    const sdk = JSON.parse(sdkOut.stdout);
+    assert.equal(sdk.trusted_deployment.deployment_status, 'deployed');
+    assert.ok(sdk.deployment_manifest_url !== undefined, 'the browser fields stay');
+    const pending = path.join(dir, 'pending.json');
+    fs.writeFileSync(pending, JSON.stringify({ ...finalized, deploymentStatus: 'pending' }));
+    const refused = spawnSync(process.execPath, [path.join(root, 'scripts/deployment-profile.mjs'), '--finalized', pending,
+        '--deployment-id', 'zkapi-x', '--protocol-server-url', 'https://a', '--indexer-url', 'https://b', '--verifier-url', 'https://c',
+        '--rpc-url', 'https://d', '--price-feed', '0x1', '--settlement-window-seconds', '1'], { encoding: 'utf8' });
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /finalized manifest/);
+    fs.rmSync(dir, { recursive: true, force: true });
+});

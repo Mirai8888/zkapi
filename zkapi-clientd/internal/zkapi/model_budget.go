@@ -31,7 +31,7 @@ func modelBudget(tier uint64) (uint64, bool) {
 }
 
 func (c *Client) modelPolicyJSON(ctx context.Context, path string, value any) error {
-	deployment, _, err := pinnedDeployment(c.config.Network)
+	deployment, _, err := deployedDeployment(c.config.Network)
 	if err != nil {
 		return err
 	}

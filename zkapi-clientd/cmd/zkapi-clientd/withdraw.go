@@ -35,8 +35,40 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	confirmationText := flags.String("confirm", "", "confirm an independently submitted matching withdrawal after a finalized local revert")
 	approval := flags.String("approve", "", "approve the displayed withdrawal quote ID")
 	resume := flags.Bool("resume", false, "recover a saved signed withdrawal without authorizing a new transaction")
+	escape := flags.Bool("escape", false, "withdraw by escape, without the operator: shows the decision, then --conceded quotes it")
+	concededText := flags.String("conceded", "", "with --escape: the concession the escape decision showed, confirming it")
+	earlyExitText := flags.String("early-exit", "", "with --escape: exit before a sent request can settle, conceding nothing or the state's bound (nothing|bound)")
+	claim := flags.Bool("claim", false, "deliver an escape payout the vault credited to --to")
+	cancel := flags.Bool("cancel", false, "with --escape: cancel an escape that released no exit proof, so chats resume")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *cancel {
+		if !*escape || *claim || *approval != "" || *resume || *confirmationText != "" || *concededText != "" || *earlyExitText != "" || *destinationText != "" || flags.NArg() != 0 {
+			return errors.New("use --escape --cancel alone")
+		}
+		return runEscapeCancel(ctx, c, out)
+	}
+	if *escape || *claim || *concededText != "" || *earlyExitText != "" {
+		if *approval != "" || *resume || *confirmationText != "" || flags.NArg() != 0 || *destinationText == "" || (*escape && *claim) || (!*escape && (*concededText != "" || *earlyExitText != "")) {
+			return errors.New("use --escape --to ADDRESS [--conceded AMOUNT] [--early-exit nothing|bound], or --claim --to ADDRESS")
+		}
+		destination, err := zkapi.NormalizeWithdrawalDestination(*destinationText)
+		if err != nil {
+			return err
+		}
+		options := escapeOptions{destination: destination, claim: *claim}
+		if options.earlyExit, err = parseEarlyExit(*earlyExitText); err != nil {
+			return err
+		}
+		if *concededText != "" {
+			conceded, err := strconv.ParseUint(*concededText, 10, 64)
+			if err != nil {
+				return errors.New("--conceded must be the concession in gwei that the escape decision showed")
+			}
+			options.conceded = &conceded
+		}
+		return runEscape(ctx, c, options, out)
 	}
 	emptyApproval := false
 	flags.Visit(func(f *flag.Flag) {
@@ -76,6 +108,14 @@ func runWithdrawal(ctx context.Context, c config.Config, args []string, out io.W
 	c, err = activeFundingConfig(ctx, c)
 	if err != nil {
 		return err
+	}
+	if *approval != "" {
+		// An escape quote (initiation, finalization or claim) is approved
+		// through the escape route.
+		if handled, err := approveEscapeQuote(ctx, c, *approval, out); handled || err != nil {
+			submitted = handled
+			return err
+		}
 	}
 	state, err := requestWithdrawal(ctx, c, http.MethodGet, nil)
 	if err != nil {

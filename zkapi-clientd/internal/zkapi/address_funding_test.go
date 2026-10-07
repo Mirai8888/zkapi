@@ -19,7 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-const addressTestVault = "0x4386fdbda35d995beb3bf8625118ec5982ec81fe"
+const addressTestVault = "0xc0c0000000000000000000000000000000000001"
 const addressTestToken = "0x2222222222222222222222222222222222222222"
 
 // addressTestBlock is the hash of the fixture's canonical block 0x20, whose
@@ -59,6 +59,8 @@ type addressFixture struct {
 	cachedVersion, leafVersion int
 	mined                      map[string]uint32
 	minedExpiry                map[uint32]uint64
+	// minedRoot is NoteDeposited.newRoot of each mined deposit, by hash.
+	minedRoot map[string]*big.Int
 	// Block headers served by eth_getBlockByHash, by lowercase hash.
 	headers map[string]*types.Header
 	// Companion wallet state for activation and rebind.
@@ -76,6 +78,28 @@ type addressFixture struct {
 	// lowercase destination address; a missing destination reads zero.
 	escapeCredits map[string]string
 	creditReads   int
+	// codeTamper makes the RPC serve other runtime code at the vault.
+	codeTamper bool
+	// pinnedDown makes the pinned RPC refuse every call; exitRPC serves the
+	// same chain as the owner's exit RPC (--exit-rpc-url), and exitCalls
+	// lists the methods it answered.
+	pinnedDown bool
+	exitRPC    string
+	exitCalls  []string
+	// refuseSimulation makes the RPCs refuse the eth_call simulation and the
+	// gas estimate of a signed vault call.
+	refuseSimulation bool
+	// pinnedNonce, when set, is the nonce the pinned RPC alone answers (a
+	// lying pinned RPC). pendingNonce and finalizedNonce, when set, answer
+	// eth_getTransactionCount at the "pending" and "finalized" tags (a
+	// mempool transaction, a nonce taken by another transaction).
+	pinnedNonce, pendingNonce, finalizedNonce string
+	// latestTime, when set, is the timestamp of every block served.
+	latestTime int64
+	// hideReceipts makes this many receipt reads answer null first.
+	hideReceipts int
+	// logs are the vault logs eth_getLogs serves, filtered by topics.
+	logs []map[string]any
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -159,9 +183,13 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		_ = json.NewEncoder(w).Encode(body)
 	}))
 	t.Cleanup(f.indexer.Close)
-	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	chainRPC := func(w http.ResponseWriter, r *http.Request, exit bool) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if !exit && f.pinnedDown {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 			t.Error("identity reached payment RPC")
 		}
@@ -177,15 +205,40 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Error("invalid RPC request")
 			return
 		}
-		f.rpcCalls = append(f.rpcCalls, request.Method)
+		if exit {
+			f.exitCalls = append(f.exitCalls, request.Method)
+		} else {
+			f.rpcCalls = append(f.rpcCalls, request.Method)
+		}
 		var result any
+		// The deployment checks before a deposit read the fixture vault's
+		// code and getters.
+		if answer, ok := deploymentCheckAnswer("mainnet", request.Method, request.Params); ok {
+			if f.codeTamper && request.Method == "eth_getCode" && answer == fixtureCode["vault"] {
+				answer = "0x60016001"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": answer})
+			return
+		}
 		switch request.Method {
 		case "eth_chainId":
 			result = f.chain
 		case "eth_getBalance":
 			result = f.eth
 		case "eth_getTransactionCount":
+			var tag string
+			if len(request.Params) == 2 {
+				_ = json.Unmarshal(request.Params[1], &tag)
+			}
 			result = f.nonce
+			switch {
+			case !exit && f.pinnedNonce != "":
+				result = f.pinnedNonce
+			case tag == "pending" && f.pendingNonce != "":
+				result = f.pendingNonce
+			case tag == "finalized" && f.finalizedNonce != "":
+				result = f.finalizedNonce
+			}
 		case "eth_getCode":
 			result = "0x"
 		case "eth_feeHistory":
@@ -201,6 +254,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			}
 			result = map[string]any{"oldestBlock": "0xd", "baseFeePerGas": bases, "reward": rewards, "gasUsedRatio": ratios}
 		case "eth_estimateGas":
+			if f.refuseSimulation {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if len(request.Params) == 3 {
 				f.overrideReads++
 			}
@@ -210,6 +267,26 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			result = f.gas
 		case "eth_gasPrice":
 			result = f.gasPrice
+		case "eth_blockNumber":
+			result = "0x20"
+		case "eth_getLogs":
+			var filter struct {
+				Address string   `json:"address"`
+				Topics  []string `json:"topics"`
+			}
+			_ = json.Unmarshal(request.Params[0], &filter)
+			found := []map[string]any{}
+			for _, log := range f.logs {
+				topics, _ := log["topics"].([]string)
+				matches := strings.EqualFold(fmt.Sprint(log["address"]), filter.Address)
+				for i, topic := range filter.Topics {
+					matches = matches && i < len(topics) && strings.EqualFold(topics[i], topic)
+				}
+				if matches {
+					found = append(found, log)
+				}
+			}
+			result = found
 		case "eth_call":
 			var call struct {
 				From string `json:"from"`
@@ -217,6 +294,10 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 				Data string `json:"data"`
 			}
 			_ = json.Unmarshal(request.Params[0], &call)
+			if call.From != "" && f.refuseSimulation && strings.EqualFold(call.To, addressTestVault) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": 3, "message": "execution reverted"}})
+				return
+			}
 			if call.From != "" {
 				result = "0x"
 				if len(request.Params) == 3 {
@@ -266,8 +347,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 		case "eth_getTransactionReceipt":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
-			if found, ok := f.receipts[hash]; ok {
+			if found, ok := f.receipts[hash]; ok && f.hideReceipts == 0 {
 				result = found
+			}
+			if f.hideReceipts > 0 {
+				f.hideReceipts--
 			}
 		case "eth_getBlockByNumber":
 			var number string
@@ -278,7 +362,11 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			if number == "latest" {
 				number = "0x20"
 			}
-			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", time.Now().Unix()), "baseFeePerGas": f.gasPrice}
+			timestamp := time.Now().Unix()
+			if f.latestTime != 0 {
+				timestamp = f.latestTime
+			}
+			result = map[string]string{"number": number, "hash": f.canonical, "timestamp": fmt.Sprintf("0x%x", timestamp), "baseFeePerGas": f.gasPrice}
 		case "eth_getBlockByHash":
 			var hash string
 			_ = json.Unmarshal(request.Params[0], &hash)
@@ -326,8 +414,12 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			t.Errorf("unexpected RPC %s", request.Method)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
-	}))
+	}
+	rpc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, false) }))
 	t.Cleanup(rpc.Close)
+	exitRPC := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chainRPC(w, r, true) }))
+	t.Cleanup(exitRPC.Close)
+	f.exitRPC = exitRPC.URL
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -452,8 +544,12 @@ func (f *addressFixture) mine(t *testing.T, hash string, reverted bool) {
 				id = uint32(len(f.leaves))
 				f.mined[hash], f.minedExpiry[id] = id, uint64(time.Now().Unix())+3600
 				f.registerDeposit(id, commitment, amount.Uint64(), f.minedExpiry[id])
+				if f.minedRoot == nil {
+					f.minedRoot = map[string]*big.Int{}
+				}
+				f.minedRoot[hash], _ = f.tree()
 			}
-			receipt["logs"] = depositEventReceipt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id]).Logs
+			receipt["logs"] = depositEventReceiptAt(addressTestVault, id, commitment, amount.Uint64(), f.minedExpiry[id], f.minedRoot[hash]).Logs
 			f.allowance = "0x0"
 		}
 	}

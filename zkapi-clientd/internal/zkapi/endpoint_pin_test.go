@@ -57,8 +57,8 @@ func TestPinnedDeploymentRequiresHTTPSEndpoints(t *testing.T) {
 		if err != nil || identity.RPC == "" || identity.IndexerURL == "" || identity.ProtocolServerURL == "" || identity.NoteTTL != 2592000 {
 			t.Fatalf("%s: packaged endpoints not parsed: %+v %v", network, identity, err)
 		}
-		if identity.requiresClearanceOwnershipProof() {
-			t.Fatalf("%s: the shipped manifest must not activate the clearance capability gate", network)
+		if !identity.requiresClearanceOwnershipProof() {
+			t.Fatalf("%s: a concession deployment must require clearance ownership proofs", network)
 		}
 		for _, mutation := range []struct{ field, value string }{
 			{"rpc_url", "http://ethereum-rpc.publicnode.com"},
@@ -83,30 +83,23 @@ func TestPinnedDeploymentRequiresHTTPSEndpoints(t *testing.T) {
 				t.Errorf("%s: accepted %s=%q", network, mutation.field, mutation.value)
 			}
 		}
+		// Only the concession vault parses, and it always requires the
+		// clearance ownership proof.
 		for _, capability := range []struct {
 			field string
 			value any
-			gate  bool
 		}{
-			{"vault_revision", 1, false},
-			{"vault_revision", 2, true},
-			{"clearance_ownership_proof", "optional", true},
-			{"clearance_ownership_proof", "required", true},
-			{"vault_revision", -1, false},
+			{"vault_revision", 1},
+			{"vault_revision", 2},
+			{"vault_revision", -1},
+			{"clearance_ownership_proof", "optional"},
 		} {
 			var manifest map[string]any
 			_ = json.Unmarshal(raw, &manifest)
 			manifest[capability.field] = capability.value
 			mutated, _ := json.Marshal(manifest)
-			parsed, err := parseDeploymentIdentity(network, mutated)
-			if capability.value == -1 {
-				if err == nil {
-					t.Error("negative vault revision accepted")
-				}
-				continue
-			}
-			if err != nil || parsed.requiresClearanceOwnershipProof() != capability.gate {
-				t.Errorf("%s=%v: gate %v, error %v", capability.field, capability.value, parsed.requiresClearanceOwnershipProof(), err)
+			if _, err := parseDeploymentIdentity(network, mutated); err == nil {
+				t.Errorf("%s=%v accepted", capability.field, capability.value)
 			}
 		}
 	}

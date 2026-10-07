@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -63,6 +64,12 @@ type addressTransaction struct {
 	Nonce             uint64 `json:"nonce"`
 	FinalizedRevert   bool   `json:"finalized_revert,omitempty"`
 	ApprovedFeeWei    string `json:"approved_fee_wei,omitempty"`
+	// SignedAt is when the transaction was signed (Unix seconds; 0 in
+	// records of earlier builds).
+	SignedAt int64 `json:"signed_at,omitempty"`
+	// Unmined marks an escape transaction retired without a receipt once
+	// it could no longer be included (deadEscapeTransaction).
+	Unmined bool `json:"unmined,omitempty"`
 }
 
 func (h *FundingHandler) addressStatePath() string {
@@ -119,8 +126,13 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 	} else if record.Version != 1 || record.BillingAsset == "native_eth" {
 		return nil, errors.New("native payment recovery cannot be used for token funding; preserve the recovery file")
 	}
-	if record.Pending != nil && record.Pending.FinalizedRevert {
+	if record.Pending != nil && (record.Pending.FinalizedRevert || record.Pending.Unmined) {
 		return nil, errors.New("pending payment is incorrectly marked as retired; preserve the recovery file")
+	}
+	for _, entry := range record.History {
+		if entry.Unmined && (entry.FinalizedRevert || entry.ActualFeeWei != "" || !escapeKinds[entry.Kind]) {
+			return nil, errors.New("an unmined payment record is invalid; preserve the recovery file")
+		}
 	}
 	for _, entry := range append(append([]addressTransaction{}, record.History...), pendingAddressTransaction(record.Pending)...) {
 		encoded, decodeErr := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))
@@ -144,7 +156,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			}
 		}
 		from, senderErr := types.Sender(types.LatestSignerForChainID(tx.ChainId()), &tx)
-		if senderErr != nil || !strings.EqualFold(from.Hex(), record.Address) || tx.To() == nil || (entry.Kind != "deposit" && entry.Kind != "approval" && entry.Kind != "approval_reset" && entry.Kind != "withdrawal" && entry.Kind != "return") {
+		if senderErr != nil || !strings.EqualFold(from.Hex(), record.Address) || tx.To() == nil || (entry.Kind != "deposit" && entry.Kind != "approval" && entry.Kind != "approval_reset" && entry.Kind != "withdrawal" && entry.Kind != "return" && !escapeKinds[entry.Kind]) {
 			return nil, errors.New("payment transaction recovery signature is invalid; preserve the file")
 		}
 		if config.nativeETH() {
@@ -177,14 +189,39 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 				return nil, errors.New("return recovery authorization is invalid; preserve the file")
 			}
 		}
-		if entry.Kind == "deposit" || entry.Kind == "withdrawal" {
+		if entry.Kind == "deposit" || entry.Kind == "withdrawal" || escapeKinds[entry.Kind] {
 			expected = config.Contract
 		}
 		if !strings.EqualFold(tx.To().Hex(), expected) {
 			return nil, errors.New("payment transaction recovery destination is invalid; preserve the file")
 		}
-		if entry.Kind == "withdrawal" && (len(tx.Data()) != 4+56*32 || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
+		if entry.Kind == "withdrawal" && (len(tx.Data()) != withdrawalCalldataLength || hex.EncodeToString(tx.Data()[:4]) != withdrawalSelector) {
 			return nil, errors.New("withdrawal transaction recovery call is invalid; preserve the file")
+		}
+		if escapeKinds[entry.Kind] {
+			pending := record.Pending != nil && strings.EqualFold(entry.Hash, record.Pending.Hash)
+			w := record.Withdrawal
+			if pending && (w == nil || w.Mode != "escape") {
+				return nil, errors.New("pending escape authorization is invalid; preserve the file")
+			}
+			if pending {
+				var err error
+				switch entry.Kind {
+				case "escape":
+					err = validateSignedEscape(tx.Data(), config, w, time.Time{})
+				case "escape_finalize":
+					if "0x"+hex.EncodeToString(tx.Data()) != finalizeEscapeCalldata(w.NoteID) {
+						err = errors.New("escape finalization recovery call is invalid; preserve the file")
+					}
+				case "escape_claim":
+					if !strings.EqualFold("0x"+hex.EncodeToString(tx.Data()), claimEscapeCalldata(w.Destination)) {
+						err = errors.New("escape payout claim recovery call is invalid; preserve the file")
+					}
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		if entry.Kind == "withdrawal" {
 			pending := record.Pending != nil && strings.EqualFold(entry.Hash, record.Pending.Hash)
@@ -192,7 +229,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 				return nil, errors.New("pending withdrawal authorization is invalid; preserve the file")
 			}
 			if pending || (record.Withdrawal != nil && strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash)) {
-				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal); err != nil {
+				if err := validateSignedWithdrawal(tx.Data(), config, record.Withdrawal, time.Time{}); err != nil {
 					return nil, err
 				}
 			}
@@ -220,6 +257,15 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 	if w := record.Withdrawal; w != nil {
 		if _, err := NormalizeWithdrawalDestination(w.Destination); err != nil || w.NoteID > 0xffffffff || (w.Binding != "" && (!isHex(w.Binding, 32) || !isHex(w.Nullifier, 32))) {
 			return nil, errors.New("withdrawal recovery data is invalid; preserve the file")
+		}
+		if w.Mode == "escape" {
+			if err := validateEscapeRecord(record, w); err != nil {
+				return nil, err
+			}
+			return &record, nil
+		}
+		if w.Mode != "" {
+			return nil, errors.New("withdrawal recovery mode is invalid; preserve the file")
 		}
 		switch w.Phase {
 		case "quoted", "withdrawal_pending", "waiting_settlement", "waiting_funds", "confirming", "reverted", "complete":
@@ -256,6 +302,38 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		}
 	}
 	return &record, nil
+}
+
+// validateEscapeRecord checks a saved escape: its phase, amounts and the
+// transactions its phase names.
+func validateEscapeRecord(record addressFundingRecord, w *addressWithdrawalRecord) error {
+	invalid := errors.New("escape recovery data is invalid; preserve the file")
+	switch w.Phase {
+	case "escape_decision", "escape_wait", "quoted", "waiting_funds", "reverted", "escape_expired":
+	case "escape_pending", "escape_initiated", "finalize_pending", "defeated":
+		if w.Binding == "" || !isHex(w.NextNullifier, 32) {
+			return invalid
+		}
+	case "complete":
+		if w.Binding == "" || !isHex(w.FinalizeHash, 32) || !strings.EqualFold(w.SettlementHash, w.FinalizeHash) {
+			return invalid
+		}
+	default:
+		return invalid
+	}
+	if w.Conceded > w.StateBalance || (w.Conceded != 0 && w.Conceded > w.Bound) {
+		return invalid
+	}
+	if w.InitiateHash != "" && !isHex(w.InitiateHash, 32) {
+		return invalid
+	}
+	if record.Pending != nil && escapeKinds[record.Pending.Kind] {
+		want := map[string]string{"escape": "escape_pending", "escape_finalize": "finalize_pending", "escape_claim": "complete"}[record.Pending.Kind]
+		if w.Phase != want {
+			return invalid
+		}
+	}
+	return nil
 }
 
 func pendingAddressTransaction(entry *addressTransaction) []addressTransaction {

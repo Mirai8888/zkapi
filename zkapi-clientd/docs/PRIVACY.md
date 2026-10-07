@@ -176,32 +176,39 @@ event. Local reset cannot undo credit already issued, and later inference
 or withdrawal may require recovery. Canonical receipt validation establishes the
 observed chain state, not a guarantee against a later reorganization.
 
-A withdrawal builds two withdrawal proofs. The first, an ownership proof, goes
-to the protocol server with the clearance request; its public statement shows
-the server the note ID, the payout amount and the destination before the close
-transaction publishes them. It is also a valid escape input, so a server that
-kept it could start an escape to the same destination and amount, delaying the
-payout by the vault's challenge period without changing it. The ownership proof
-is never written to disk. On the packaged deployments' vaults (no
-`vault_revision` 2) a challenged escape also consumes the note's nullifier for
-good, and a request proof sent from the same note state, if it never settled,
-is challenge evidence for whoever kept it. So at a note state with such an
-archived request the companion sends no ownership proof and builds no
-escape: it asks for a clearance without one, which only a server that still
-allows legacy clearance grants, and otherwise refuses the withdrawal with
-`unsettled_request_state` until a chat request or the earlier request's
-settlement moves the note to a new state. After the note expires no chat
-request can do that, and the vault's owner can claim the note at any time;
-nor can one once the server holds a clearance for the state (refused with
-`unsettled_clearance_reserved`). Then, and only after the owner types `send`
-at the guided withdrawal's warning, the companion sends the ownership proof
-anyway, accepting that a challenge with the unsettled request would consume
-the nullifier. A request discarded by an earlier release left no archive
-record, so this rule cannot apply to its state. When the server reports the
-note's current nullifier settled by a request the wallet holds no record of,
-chats and withdrawal stop with `receipt_journal_missing` and show that
-nullifier locally, for the owner to give the operator; giving it links the
-owner to that request.
+A withdrawal builds two withdrawal proofs. The first, an ownership proof
+(kind 2), goes to the protocol server with the clearance request; its public
+statement shows the server the note ID, the payout amount and the note
+state's nullifier before the close transaction publishes them. It names no
+destination (it is zero) and the vault accepts it neither as an escape nor
+as a close. The companion keeps the proof it sent in `exit_lock.json`
+(owner-only) so a retry resends the same statement instead of a new one, and
+it sends no chat request from that note state afterwards. The close (kind 1)
+publishes the note ID, payout and destination on chain, as before.
+
+An escape (kind 0) publishes the note ID, the balance, the destination, the
+conceded amount, the proof's validity time (to within 3 hours) and the next
+state's nullifier, which is never used. Just before it is sent, the
+companion asks the server whether that next nullifier was already spent by
+another device; the server then learns it slightly earlier than the chain
+does, and if the escape never lands, a later request at that nullifier is
+linkable to the question by timing and network address. An escape conceding
+the state's bound links the note's last request to the note ID and the
+destination for the server and the gateway, and the amount publishes that
+request's tier. An escape conceding nothing can be raised by the operator
+with the last request's signed charge, which publishes that request's public
+inputs (time, tier, root, tag) on chain. Waiting for settlement and a mutual
+close link nothing new, so the companion prefers them, and escapes only when
+the exit rules require it or you ask for an early exit. An exit kit contains
+the note secret, encrypted with your passphrase; it never leaves the files you
+write it to.
+
+A request discarded by an earlier release left no archive record, so its
+state is not recognized. When the server reports the note's current
+nullifier settled by a request the wallet holds no record of, chats and
+withdrawal stop with `receipt_journal_missing` and show that nullifier
+locally, for the owner to give the operator; giving it links the owner to
+that request.
 
 The daemon creates no request-history log files. Foreground output includes
 HTTP route/method/status/timing, local sequential `request=` numbers and local
@@ -225,5 +232,5 @@ wallet, issuance or redemption support. Exact balances and prompt sizes do
 not choose the bucket.
 
 The protocol is experimental and uses a single-party Groth16 setup. See the
-repository's [note-bound commitments](../../docs/note-bound-commitments.md)
+repository's [concession exit design](../../docs/design/concession-exit.md)
 and [native ETH architecture](../../docs/architecture.md).

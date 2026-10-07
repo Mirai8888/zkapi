@@ -76,9 +76,18 @@ func fieldValue(value string) *big.Int {
 	return parsed
 }
 
-// depositEventReceipt is a successful receipt with one NoteDeposited log.
+// depositEventReceipt is a successful receipt with one NoteDeposited log
+// whose newRoot is zero.
 func depositEventReceipt(contract string, noteID uint32, commitment string, amount, expiry uint64) ethReceipt {
-	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry, 0)
+	return depositEventReceiptAt(contract, noteID, commitment, amount, expiry, nil)
+}
+
+// depositEventReceiptAt is depositEventReceipt with NoteDeposited.newRoot.
+func depositEventReceiptAt(contract string, noteID uint32, commitment string, amount, expiry uint64, root *big.Int) ethReceipt {
+	if root == nil {
+		root = new(big.Int)
+	}
+	raw := fmt.Sprintf(`{"status":"0x1","to":%q,"logs":[{"address":%q,"topics":[%q,"0x%064x","0x%s"],"data":"0x%064x%064x%064x"}]}`, contract, contract, depositEventTopic, noteID, addressABIWord(commitment), amount, expiry, root)
 	var receipt ethReceipt
 	_ = json.Unmarshal([]byte(raw), &receipt)
 	return receipt

@@ -17,6 +17,7 @@ type configureAction func(context.Context, string, config.Config, string, setupP
 
 type configureOptions struct {
 	network, listen, relay, binary, proofs    string
+	exitRPC                                   string
 	usd                                       string
 	keyReuseWindowSeconds                     int
 	status, apiKey, edit, menu, requireAPIKey bool
@@ -32,6 +33,7 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.relay, "relay-url", "", "Wisp relay URL or loopback socks5://IP:PORT (Tor); empty selects direct HTTPS")
 	f.StringVar(&o.binary, "zkapi-binary", "", "path to the installed zkAPI companion")
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
+	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
 	f.BoolVar(&o.status, "status", false, "show saved configuration status without setup")
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
@@ -256,6 +258,12 @@ func applyConfigureOptions(c config.Config, o configureOptions) config.Config {
 	if o.fields["proof-setup-dir"] {
 		c.ZKAPI.ProofSetupDir = o.proofs
 	}
+	if o.fields["exit-rpc-url"] {
+		c.ZKAPI.ExitRPCURL = o.exitRPC
+		if o.exitRPC == "none" {
+			c.ZKAPI.ExitRPCURL = ""
+		}
+	}
 	return c
 }
 
@@ -267,6 +275,9 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 		transport = "Wisp relay enabled"
 	}
 	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
+	if c.ZKAPI.ExitRPCURL != "" {
+		ui.Printf("Exit RPC: %s (deployment checks and exit transactions)\n", c.ZKAPI.ExitRPCURL)
+	}
 	showClientConnection(c, ui)
 	if c.KeyReuseWindowSeconds == 0 {
 		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")

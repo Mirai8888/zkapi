@@ -29,6 +29,51 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		result, err = h.Address(ctx)
 	case r.Method == http.MethodGet && r.URL.Path == "/admin/withdrawal":
 		result, err = h.AddressWithdrawal(ctx)
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/escape":
+		result, err = h.AddressWithdrawal(ctx)
+	case r.Method == http.MethodPost && (r.URL.Path == "/admin/escape" || r.URL.Path == "/admin/escape/quote"):
+		// Design §6.4 E4: conceded is the amount the owner confirmed after
+		// reviewing the decision; without it only the decision is returned.
+		var body struct {
+			Destination string  `json:"destination"`
+			NoteID      *uint64 `json:"note_id"`
+			Conceded    *uint64 `json:"conceded,omitempty"`
+			EarlyExit   string  `json:"early_exit,omitempty"`
+		}
+		if err = decode(&body); err == nil {
+			if body.NoteID == nil {
+				err = errors.New("an escape requires the selected private note ID")
+			} else if r.URL.Path == "/admin/escape/quote" {
+				result, err = h.QuoteAddressEscape(ctx, body.Destination, *body.NoteID, body.Conceded, body.EarlyExit)
+			} else {
+				result, err = h.EscapeAddress(ctx, body.Destination, *body.NoteID, body.Conceded, body.EarlyExit)
+			}
+		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/escape/cancel":
+		var body struct{}
+		if err = decode(&body); err == nil {
+			result, err = h.CancelAddressEscape(ctx)
+		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/escape/claim/quote":
+		var body struct {
+			Destination string `json:"destination"`
+		}
+		if err = decode(&body); err == nil {
+			result, err = h.QuoteEscapeClaim(ctx, body.Destination)
+		}
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/escape/approve":
+		var body struct {
+			QuoteID string `json:"quote_id"`
+		}
+		if err = decode(&body); err == nil {
+			if len(body.QuoteID) != 64 {
+				err = errors.New("invalid quote ID")
+			} else {
+				result, err = h.ApproveAddressEscape(ctx, body.QuoteID)
+			}
+		}
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/escape/quote":
+		result, err = h.SavedEscapeQuote(ctx)
 	case r.Method == http.MethodGet && r.URL.Path == "/admin/return":
 		result, err = h.AddressReturn(ctx)
 	case r.Method == http.MethodGet && (r.URL.Path == "/admin/funding/quote" || r.URL.Path == "/admin/withdrawal/quote" || r.URL.Path == "/admin/return/quote"):
@@ -149,7 +194,7 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		// refused release names ownership_proof_sent, so their code crosses
 		// the management boundary as well as the message.
 		var companion *Error
-		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing" || companion.Code == "ownership_proof_sent") {
+		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing" || companion.Code == "ownership_proof_sent" || companion.Code == "escape_required" || companion.Code == "device_not_newest" || companion.Code == "conceded_mismatch") {
 			failure["code"] = companion.Code
 		}
 		_ = json.NewEncoder(w).Encode(failure)

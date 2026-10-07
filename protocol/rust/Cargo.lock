@@ -4605,11 +4605,13 @@ dependencies = [
 name = "zkapi-client"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "zkapi-core",
  "zkapi-proof",

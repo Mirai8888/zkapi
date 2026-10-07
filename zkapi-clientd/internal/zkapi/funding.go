@@ -40,7 +40,29 @@ type fundingConfig struct {
 	RPC             string `json:"rpc_url"`
 	Indexer         string `json:"indexer_url"`
 	DemoMintEnabled bool   `json:"demo_mint_enabled"`
+	// ExitRPC is the owner's own RPC (--exit-rpc-url): an escape reads the
+	// chain and sends its transactions only through it when it is set.
+	ExitRPC string `json:"-"`
+	// exitOnly marks an escape's config whose RPC is the owner's exit RPC
+	// (see exitConfig): its failures are retried, never answered elsewhere.
+	exitOnly bool
 }
+
+// exitConfig is config for an escape (design §1.2(6), §6.7): when the owner
+// configured an exit RPC, every read and send goes through it alone. The
+// pinned RPC, which the operator may run or influence (§2.1), is never
+// asked in its place: an answer it gave while the exit RPC failed (a nonce,
+// a gas estimate, a receipt, the chain ID) would decide what is signed and
+// what the escape's state is. A failing exit RPC is retried a few times
+// (addressRPC), then reported; the owner retries, or configures another.
+func (c fundingConfig) exitConfig() fundingConfig {
+	if c.ExitRPC == "" {
+		return c
+	}
+	c.RPC, c.exitOnly = c.ExitRPC, true
+	return c
+}
+
 type depositRecord struct {
 	DeploymentID    string   `json:"deployment_id,omitempty"`
 	BillingAsset    string   `json:"billing_asset,omitempty"`
@@ -111,7 +133,10 @@ func NewFundingHandler(client *Client, publicOrigin, stateDir string) (*FundingH
 	if stateDir == "" {
 		return nil, errors.New("funding needs a private state directory")
 	}
-	stateDir = filepath.Join(stateDir, client.config.Network)
+	stateDir, err := fundingStateDir(stateDir, client.config.Network)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
@@ -122,6 +147,54 @@ func NewFundingHandler(client *Client, publicOrigin, stateDir string) (*FundingH
 		return nil, errors.New("cannot sync private funding directory")
 	}
 	return &FundingHandler{client: client, statePath: filepath.Join(stateDir, "pending-deposit.json")}, nil
+}
+
+// fundingStateDir is the payment state directory of this release's packaged
+// deployment: <root>/<network>/<deployment_id>. Design §10.5: state
+// directories are per deployment ID, so this release and the earlier
+// (legacy) one never share a payment address, its key or a pending deposit.
+// The legacy release kept them in <root>/<network>/, which this release
+// never opens (LegacyFundingWarning names them).
+func fundingStateDir(root, network string) (string, error) {
+	if network == "" {
+		network = "mainnet"
+	}
+	identity, _, err := pinnedDeployment(network)
+	if err != nil {
+		return "", err
+	}
+	if !safePathComponent(identity.ID) {
+		return "", errors.New("invalid packaged deployment ID")
+	}
+	return filepath.Join(root, network, identity.ID), nil
+}
+
+func safePathComponent(value string) bool {
+	if value == "" || value == "." || value == ".." || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// LegacyFundingWarning reports the earlier release's payment files in the
+// funding root (its payment address, key and any pending deposit, kept per
+// network), which this release leaves untouched; "" when there are none.
+func LegacyFundingWarning(root, network string) string {
+	if network == "" {
+		network = "mainnet"
+	}
+	dir := filepath.Join(root, network)
+	for _, name := range []string{"address-funding.json", "pending-deposit.json"} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return fmt.Sprintf("The earlier zkapi-clientd release's payment address and deposit recovery files are in %s. They belong to the earlier vault's note: this release keeps its own payment state per deployment and never reads or changes them. Keep them for the earlier release, %s, which withdraws that note.", dir, LegacyRelease)
+		}
+	}
+	return ""
 }
 
 func decodeJSON(r io.Reader, v any) error {
@@ -167,7 +240,7 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 		return fundingConfig{}, errors.New("invalid funding network or contract")
 	}
 	if wire.BillingAsset == "native_eth" {
-		deployment, _, deploymentErr := pinnedDeployment(h.client.config.Network)
+		deployment, _, deploymentErr := deployedDeployment(h.client.config.Network)
 		if deploymentErr != nil || wire.DeploymentID != deployment.ID || wire.ChainID != deployment.ChainID || !strings.EqualFold(wire.Contract, deployment.Contract) || wire.BillingAsset != deployment.Asset || wire.BillingUnit != deployment.Unit {
 			return fundingConfig{}, errors.New("native funding configuration does not match the packaged deployment")
 		}
@@ -188,6 +261,7 @@ func (h *FundingHandler) config(ctx context.Context) (fundingConfig, error) {
 		DeploymentID: wire.DeploymentID, BillingAsset: wire.BillingAsset, BillingUnit: wire.BillingUnit, WeiPerUnit: wire.WeiPerUnit,
 		ChainID: wire.ChainID, Contract: wire.Contract, Token: wire.Token, RPC: pins.RPC, Indexer: pins.Indexer,
 		DemoMintEnabled: wire.DemoMintEnabled && wire.ChainID == 11155111 && wire.BillingAsset != "native_eth",
+		ExitRPC:         h.client.config.ExitRPCURL,
 	}, nil
 }
 
@@ -458,7 +532,11 @@ func (h *FundingHandler) confirm(ctx context.Context, tx string) (any, error) {
 	if record.Active {
 		return nil, errors.New("this deposit was already activated; restore its wallet state instead of reinitializing it")
 	}
-	body, _ := json.Marshal(map[string]any{"secret": record.Secret, "note_id": noteID, "amount": record.Amount, "expiry_ts": expiry})
+	activation := map[string]any{"secret": record.Secret, "note_id": noteID, "amount": record.Amount, "expiry_ts": expiry}
+	if root, siblings, ok := depositTimePath(receipt, record, noteID, expiry); ok {
+		activation["deposit_root"], activation["deposit_siblings"] = root, siblings
+	}
+	body, _ := json.Marshal(activation)
 	_, err = h.client.request(ctx, http.MethodPost, "/funding/api/deposit/confirm", body)
 	if err != nil {
 		return nil, err
@@ -558,6 +636,43 @@ func matchDepositEvent(receipt ethReceipt, record depositRecord, now int64) (uin
 		return matchingNote, matchingExpiry, nil
 	}
 	return 0, 0, errors.New("deposit receipt must contain exactly one event matching this private note")
+}
+
+// depositTimePath is Amendment A1's deposit-time Merkle path: the root this
+// deposit set (NoteDeposited.newRoot) and the zero path the deposit was signed
+// with, which are the note's siblings at that root. The vault accepts every
+// root it ever held, so the companion exits with them without the indexer or
+// a log rebuild. Nothing is returned unless the path proves the note's leaf
+// at that root; the companion checks it again before keeping it.
+func depositTimePath(receipt ethReceipt, record depositRecord, noteID uint32, expiry uint64) (string, []string, bool) {
+	if len(record.ZeroPath) != merkleDepth {
+		return "", nil, false
+	}
+	commitment, ok := parseFieldElement(record.Commitment)
+	if !ok {
+		return "", nil, false
+	}
+	siblings := make([]*big.Int, merkleDepth)
+	for i, sibling := range record.ZeroPath {
+		if siblings[i], ok = parseFieldElement(sibling); !ok {
+			return "", nil, false
+		}
+	}
+	leaf := noteLeaf(noteID, commitment, record.Amount, expiry)
+	computed := merkleRoot(noteID, leaf, siblings)
+	for _, log := range receipt.Logs {
+		if log.Removed || !strings.EqualFold(log.Address, record.Contract) || len(log.Topics) != 3 || !strings.EqualFold(log.Topics[0], depositEventTopic) || !isHex(log.Topics[1], 32) || !isHex(log.Data, 96) {
+			continue
+		}
+		if note, ok := new(big.Int).SetString(log.Topics[1][2:], 16); !ok || !note.IsUint64() || note.Uint64() != uint64(noteID) {
+			continue
+		}
+		root, ok := new(big.Int).SetString(log.Data[130:194], 16)
+		if ok && root.Cmp(computed) == 0 {
+			return fmt.Sprintf("0x%064x", root), record.ZeroPath, true
+		}
+	}
+	return "", nil, false
 }
 
 // Deposit witnesses describe the current shared tree, not private wallet

@@ -47,8 +47,11 @@ protocol server packaged with the release. A deposit activates only after the
 vault, read at the deposit's block, and the indexer's whole-tree snapshot both
 show it at the same note; a withdrawal finishes only after both show the note
 closed. A withdrawal first proves note ownership to the protocol server, which
-then clears the cooperative close. See
-[chain verification and recovery](docs/CLI_ZKAPI.md#chain-verification-and-recovery).
+then clears the cooperative close. When the operator cannot or will not
+clear it, `zkapi-clientd withdraw --escape --to ADDRESS` exits through the
+vault alone, after its challenge period. See
+[chain verification and recovery](docs/CLI_ZKAPI.md#chain-verification-and-recovery)
+and [escape withdrawals](docs/CLI_ZKAPI.md#escape-withdrawals).
 
 [More options, including Tor, Sepolia and Docker clients](docs/CLI_ZKAPI.md) · [Installation details](docs/CLI_PACKAGING.md) · [Privacy](docs/PRIVACY.md)
 

@@ -47,6 +47,9 @@ type AddressPaymentQuote struct {
 	Binding    string `json:"binding,omitempty"`
 	Nonce      uint64 `json:"nonce"`
 	RetryHash  string `json:"retry_hash,omitempty"`
+	// Warnings are advisory findings the owner sees before approving, such
+	// as an escape whose simulation failed (design §6.4 E4 step 5).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type addressQuoteContextKey struct{}
@@ -274,7 +277,7 @@ func positiveDifference(left, right *big.Int) *big.Int {
 	}
 	return n
 }
-func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string) (AddressPaymentQuote, error) {
+func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string, warnings ...string) (AddressPaymentQuote, error) {
 	nonceBytes := make([]byte, 32)
 	if _, err := rand.Read(nonceBytes); err != nil {
 		return AddressPaymentQuote{}, err
@@ -291,7 +294,8 @@ func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to
 	if kind == "deposit" {
 		q.InputMicroUSD = record.DepositMicroUSD
 	}
-	if kind == "withdrawal" && record.Withdrawal != nil {
+	q.Warnings = warnings
+	if (kind == "withdrawal" || escapeKinds[kind]) && record.Withdrawal != nil {
 		q.NoteID = record.Withdrawal.NoteID
 		q.Amount = record.Withdrawal.Amount
 		q.Destination = record.Withdrawal.Destination
@@ -322,7 +326,29 @@ func validatePaymentApproval(record *addressFundingRecord, q *AddressPaymentQuot
 	if kind == "return" && !strings.EqualFold(q.Destination, to) {
 		return errAddressQuoteChanged
 	}
+	if escapeKinds[kind] && (record.Withdrawal == nil || record.Withdrawal.Mode != "escape" || q.NoteID != record.Withdrawal.NoteID || q.Amount != record.Withdrawal.Amount || q.Binding != record.Withdrawal.Binding || !strings.EqualFold(q.Destination, record.Withdrawal.Destination) || !strings.EqualFold(to, record.Contract)) {
+		return errAddressQuoteChanged
+	}
 	return nil
+}
+
+// SavedEscapeQuote is the saved quote of an escape transaction, if any.
+func (h *FundingHandler) SavedEscapeQuote(ctx context.Context) (*AddressPaymentQuote, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	config, err := h.config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	record, err := h.loadAddress(config)
+	if err != nil {
+		return nil, err
+	}
+	if record.Quote == nil || !escapeKinds[record.Quote.Kind] {
+		return nil, nil
+	}
+	copy := *record.Quote
+	return &copy, nil
 }
 
 // SavedAddressQuote is read-only; an expired quote remains inspectable but can

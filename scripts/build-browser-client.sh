@@ -4,9 +4,10 @@
 #   scripts/build-browser-client.sh --setup dev|mpc-1
 #       Build into sdk/wasm/, copy the setup's keys into sdk/assets/proofs/ and
 #       rewrite sdk/assets/manifest.json (scripts/sync-sdk-assets.mjs).
-#   scripts/build-browser-client.sh --setup dev|mpc-1 --check
+#   scripts/build-browser-client.sh --check [--setup dev|mpc-1]
 #       Rebuild into a temporary directory and require every sdk/wasm/ file to
-#       match the hashes in sdk/assets/manifest.json. Changes nothing.
+#       match the hashes in sdk/assets/manifest.json (by default for the setup
+#       the manifest names). Changes nothing. `npm run verify:wasm` runs it.
 #
 # --setup selects the bundle's setup: `mpc-1` (the ceremony keys pinned in
 # zkapi-proof, the production bundle) or `dev` (the development setup in
@@ -26,7 +27,7 @@ readonly REQUIRED_WASM_BINDGEN="0.2.117"
 WASM_FILES=(zkapi_browser.js zkapi_browser_bg.wasm zkapi_browser.d.ts zkapi_browser_bg.wasm.d.ts)
 
 usage() {
-  echo "usage: $0 --setup dev|mpc-1 [--check]" >&2
+  echo "usage: $0 --setup dev|mpc-1 | $0 --check [--setup dev|mpc-1]" >&2
 }
 
 setup_id=""
@@ -40,14 +41,16 @@ while (($#)); do
     *) usage; exit 2 ;;
   esac
 done
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repo_root"
+if ((check)) && [[ -z "$setup_id" ]]; then
+  setup_id="$(node -p "require('./sdk/assets/manifest.json').setupId")"
+fi
 case "$setup_id" in
   dev) features=(--features dev-setup) ;;
   mpc-1) features=() ;;
   *) usage; exit 2 ;;
 esac
-
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-cd "$repo_root"
 protocol_rust="$repo_root/protocol/rust"
 export CARGO_TARGET_DIR="$protocol_rust/target"
 wasm_target="$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/zkapi_browser.wasm"

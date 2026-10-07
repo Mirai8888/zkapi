@@ -408,6 +408,13 @@ pub struct ConfirmDepositRequest {
     pub note_id: u32,
     pub amount: u128,
     pub expiry_ts: u64,
+    /// Amendment A1: the root the deposit set (`NoteDeposited.newRoot`) and
+    /// the note's siblings at it (the zero path the deposit was made with).
+    /// Kept for every later exit when they prove the note's leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_root: Option<Felt252>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_siblings: Option<Vec<Felt252>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1374,11 +1381,38 @@ impl AuthService {
                 wallet.state().map(|state| state.note_id),
             )?;
             crate::oa_withdrawal::check_spending(&config, Some(request.note_id))?;
-            wallet.confirm_deposit(
+            let path = match (request.deposit_root, request.deposit_siblings) {
+                (Some(root), Some(siblings)) => {
+                    let leaf = core_v2::note_leaf(
+                        request.note_id,
+                        &core_v2::registration_commitment(&request.secret),
+                        request.amount,
+                        request.expiry_ts,
+                    );
+                    let proves = <[Felt252; zkapi_types::MERKLE_DEPTH]>::try_from(siblings.clone())
+                        .is_ok_and(|array| {
+                            core_v2::merkle_root(request.note_id, &leaf, &array) == root
+                        });
+                    if proves {
+                        Some(zkapi_client::note_state::DepositPath { root, siblings })
+                    } else {
+                        // The note is still confirmed; exits then find their
+                        // path through the indexer or a log rebuild.
+                        tracing::warn!(
+                            note_id = request.note_id,
+                            "the deposit path does not prove the note's leaf at the deposit root; not kept"
+                        );
+                        None
+                    }
+                }
+                _ => None,
+            };
+            wallet.confirm_deposit_with_path(
                 request.secret,
                 request.note_id,
                 request.amount,
                 request.expiry_ts,
+                path,
             )?;
             Ok(wallet_status(&wallet))
         })
@@ -2818,18 +2852,7 @@ impl AuthService {
                 solvency_bound = quote.budget_units(request_limit_micro_usd.ok_or_else(|| AuthError::Wallet("native lease requires a reviewed model budget".into()))?)?.max(config.request_charge_cap);
                 serde_json::json!({"mode":"openrouter_ephemeral_lease","version":1,"billing_quote":quote}).to_string()
             } else { authorization };
-            // C2: every request proof at a state carries the state's one
-            // bound. A later request at the same state reuses it when it
-            // covers this request's budget; otherwise it must wait.
-            if bound_at_state != 0 {
-                if bound_at_state < solvency_bound {
-                    return Err(AuthError::BoundFixedAtState {
-                        bound: bound_at_state,
-                        requested: solvency_bound,
-                    });
-                }
-                solvency_bound = bound_at_state;
-            }
+            let solvency_bound = state_solvency_bound(bound_at_state, solvency_bound)?;
             let payload_hash = compute_payload_hash(authorization.as_bytes());
             wallet
                 .prepare_request_with_bound(&authorization, payload_hash, active_root, siblings, solvency_bound)
@@ -3915,6 +3938,21 @@ async fn build_request_preview(
     })
 }
 
+/// C2: the bound of a request at a state whose earlier request proofs carry
+/// `bound_at_state` (0: none yet). Every request proof at a state carries
+/// that one bound: a later request reuses it when it covers the request's
+/// own `budget`, and otherwise waits for the state to change.
+fn state_solvency_bound(bound_at_state: u128, budget: u128) -> Result<u128, AuthError> {
+    match bound_at_state {
+        0 => Ok(budget),
+        bound if bound >= budget => Ok(bound),
+        bound => Err(AuthError::BoundFixedAtState {
+            bound,
+            requested: budget,
+        }),
+    }
+}
+
 fn wallet_lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join(".wallet.lock")
 }
@@ -4180,8 +4218,9 @@ mod security_tests {
         abi_word_u64, abi_words, direct_remote_retry_delay, enforce_required_key_source,
         format_address, format_felt_address, is_exhausted_openrouter_key,
         is_rejected_openrouter_key, is_transient_remote_status, matches_trusted_url,
-        normalize_session_id, validate_oa_key_evidence, OaKeyVerificationEvidence,
-        MAX_OA_EVIDENCE_EXPIRY_SKEW_SECONDS, MAX_OA_SIGNATURE_ENCODING_LEN,
+        normalize_session_id, state_solvency_bound, validate_oa_key_evidence,
+        OaKeyVerificationEvidence, MAX_OA_EVIDENCE_EXPIRY_SKEW_SECONDS,
+        MAX_OA_SIGNATURE_ENCODING_LEN,
     };
     use crate::error::AuthError;
     use zkapi_types::Felt252;
@@ -4279,6 +4318,19 @@ mod security_tests {
         assert!(abi_word_u64(&format!("1{:063x}", 0)).is_err());
     }
 
+    /// C2 at the companion: a lease at a state that already released a
+    /// request reuses that request's bound when it covers the new budget,
+    /// and is refused (bound_fixed_at_state) when it does not.
+    #[test]
+    fn a_later_request_at_a_state_reuses_its_bound() {
+        assert_eq!(state_solvency_bound(0, 400_000).unwrap(), 400_000);
+        assert_eq!(state_solvency_bound(900_000, 400_000).unwrap(), 900_000);
+        assert_eq!(state_solvency_bound(400_000, 400_000).unwrap(), 400_000);
+        let refused = state_solvency_bound(400_000, 900_000).unwrap_err();
+        assert_eq!(refused.code(), "bound_fixed_at_state");
+        assert_eq!(refused.status_code(), StatusCode::CONFLICT);
+    }
+
     #[test]
     fn withdrawal_addresses_are_canonical() {
         assert_eq!(
@@ -4346,6 +4398,8 @@ mod wallet_lifecycle_tests {
                 note_id: 18,
                 amount: balance,
                 expiry_ts: 4_000_000_000,
+                deposit_root: None,
+                deposit_siblings: None,
             })
             .await
             .unwrap();
@@ -4483,6 +4537,8 @@ mod oa_withdrawal_tests {
                     note_id: note.note_id + 1,
                     amount: 1,
                     expiry_ts: 4_000_000_000,
+                    deposit_root: None,
+                    deposit_siblings: None,
                 })
                 .await
                 .map(|_| ()),

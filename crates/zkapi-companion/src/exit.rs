@@ -35,6 +35,16 @@ use crate::indexer::IndexerClient;
 
 pub(crate) const ESCAPE_RECORD_FILE: &str = "escape_withdrawal.json";
 
+/// E0's `CALL_TIMEOUT` and `RECOVERY_BUDGET` (shortened in tests).
+#[cfg(not(test))]
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS);
+#[cfg(test)]
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_millis(1_500);
+#[cfg(not(test))]
+const RECOVERY_BUDGET: Duration = Duration::from_secs(exit_policy::RECOVERY_BUDGET_SECONDS);
+#[cfg(test)]
+const RECOVERY_BUDGET: Duration = Duration::from_secs(3);
+
 /// A prepared plan is handed out again only while it stays valid this long.
 const PLAN_REUSE_MARGIN_SECONDS: u64 = 1_800;
 /// How often a recovery install may restart the decision at a new state.
@@ -175,7 +185,7 @@ async fn exit_get(config: &AuthConfig, path: String) -> Option<reqwest::Response
         url,
     )
     .ok()?
-    .timeout(Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS));
+    .timeout(CALL_TIMEOUT);
     request.send().await.ok()
 }
 
@@ -185,13 +195,10 @@ async fn read_nullifier(config: &AuthConfig, nullifier: &Felt252) -> Option<Reco
     if !response.status().is_success() {
         return None;
     }
-    tokio::time::timeout(
-        Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS),
-        response.json::<RecoveryResponseV2>(),
-    )
-    .await
-    .ok()?
-    .ok()
+    tokio::time::timeout(CALL_TIMEOUT, response.json::<RecoveryResponseV2>())
+        .await
+        .ok()?
+        .ok()
 }
 
 /// What an E1 pass did.
@@ -219,12 +226,8 @@ pub(crate) async fn recovery_pass_with_response(
     if now_seconds() >= must_initiate_by {
         return (Recovered::Nothing, None);
     }
-    wallet.set_call_timeout(Some(Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS)));
-    let result = tokio::time::timeout(
-        Duration::from_secs(exit_policy::RECOVERY_BUDGET_SECONDS),
-        wallet.recover(),
-    )
-    .await;
+    wallet.set_call_timeout(Some(CALL_TIMEOUT));
+    let result = tokio::time::timeout(RECOVERY_BUDGET, wallet.recover()).await;
     wallet.set_call_timeout(None);
     match result {
         Ok(Ok(Some(response))) => (Recovered::Installed, Some(response)),
@@ -394,12 +397,7 @@ pub(crate) async fn escape_path(
         }
         None
     };
-    if let Ok(Some((root, siblings))) = tokio::time::timeout(
-        Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS * 2),
-        from_indexer,
-    )
-    .await
-    {
+    if let Ok(Some((root, siblings))) = tokio::time::timeout(CALL_TIMEOUT * 2, from_indexer).await {
         return Ok((root, siblings, PathSource::Indexer));
     }
     // §6.6: rebuild from the vault's logs up to the finalized block.
@@ -452,11 +450,7 @@ pub(crate) async fn stale_device_check(
     if !response.status().is_success() {
         return Ok(());
     }
-    let Ok(Ok(evidence)) = tokio::time::timeout(
-        Duration::from_secs(exit_policy::CALL_TIMEOUT_SECONDS),
-        response.json::<Evidence>(),
-    )
-    .await
+    let Ok(Ok(evidence)) = tokio::time::timeout(CALL_TIMEOUT, response.json::<Evidence>()).await
     else {
         return Ok(());
     };
@@ -1056,3 +1050,7 @@ async fn finalize_escape_locked(
         "record": record,
     }))
 }
+
+#[cfg(test)]
+#[path = "exit_tests.rs"]
+mod tests;

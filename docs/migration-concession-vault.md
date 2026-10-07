@@ -383,10 +383,13 @@ The drill vault tests the adversarial cases with short timings. It uses the
    and the rebuild from logs; a pause with an escape pending, a pause past
    `maxPauseDuration`, and the re-pause cooldown; a codehash-mismatch profile
    refusing deposits; and a missed defeat (challenger stopped) followed by
-   `retireClosedLeaf`. There is no scripted drill harness yet: run them with
-   the drill binaries and record each result. A drill that retires leaves
-   more than twice a day needs `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`
-   raised in `signer.env`.
+   `retireClosedLeaf`. There is no scripted Sepolia drill harness yet: run
+   them with the drill binaries and record each result. The local acceptance
+   ([`npm run test:e2e:v2`](v2-acceptance.md)) rehearses them on Anvil,
+   except `hang`, the late successor and the switch, and the rebuild from
+   logs (with the indexer down it proves from the deposit-time path). A drill
+   that retires leaves more than twice a day needs
+   `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` raised in `signer.env`.
 
 | Parameter | Mainnet | Sepolia production | Sepolia drill |
 | --- | --- | --- | --- |

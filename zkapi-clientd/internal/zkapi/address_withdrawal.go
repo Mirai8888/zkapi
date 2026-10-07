@@ -759,7 +759,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if json.Unmarshal(raw, &plan) != nil {
 		return update(), errors.New("invalid withdrawal proof response")
 	}
-	data, binding, err := withdrawalCalldata(plan, config, w, wallet.Note.Balance)
+	data, binding, err := withdrawalCalldata(plan, config, w, wallet.Note.Balance, time.Now())
 	if err != nil {
 		return update(), err
 	}
@@ -862,7 +862,10 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 	return ok && amount.IsUint64() && amount.Uint64() == record.Amount && status.NoteID == record.NoteID && strings.EqualFold(status.Destination, record.Destination) && isField(status.Nullifier) && strings.EqualFold(addressABIWord(status.Nullifier), addressABIWord(record.Nullifier))
 }
 
-func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64) (string, string, error) {
+// withdrawalCalldata builds mutualClose calldata from the companion's plan
+// and checks it against the authorized note, destination and balance, with
+// valid_until in the signing window at now.
+func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64, now time.Time) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
 	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.Destination) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
@@ -880,7 +883,7 @@ func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addres
 	raw, _ := hex.DecodeString(data[2:])
 	expected := *saved
 	expected.Amount, expected.Nullifier, expected.Binding = p.FinalBalance, "0x"+addressABIWord(p.Nullifier), binding
-	if err := validateSignedWithdrawal(raw, config, &expected, time.Now()); err != nil {
+	if err := validateSignedWithdrawal(raw, config, &expected, now); err != nil {
 		return "", "", invalid
 	}
 	return data, binding, nil

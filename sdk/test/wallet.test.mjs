@@ -167,6 +167,23 @@ test("every selector and event topic is the real vault's", () => {
   assert.equal(wallet.decodePendingConcessions(`0x${"00".repeat(96)}`).nextNullifier, 0n);
 });
 
+// The shared withdrawal golden vector (design §11 WP-F): real kind-0 and
+// kind-1 proofs whose calldata Forge pins to abi.encodeCall against the real
+// vault; scripts/check-withdrawal-golden.mjs submits this encoder's output to
+// a vault on Anvil, with the Rust and Go encoders'.
+test("real proofs encode to the shared withdrawal golden vector", () => {
+  const golden = JSON.parse(readFileSync(new URL("../../protocol/contracts/test/fixtures/withdrawal-golden.json", import.meta.url), "utf8"));
+  for (const [name, mode] of [["escape", "escape"], ["close", "mutual"]]) {
+    const statement = golden[name];
+    const destination = `0x${Buffer.from(statement.public_inputs.destination).toString("hex")}`;
+    const calldata = wallet.encodeWithdrawal(
+      { mode, public_inputs: statement.public_inputs, proof: { backend: "groth16_bn254", proof: statement.proof } },
+      mode, destination, golden.deployment.vault, { conceded: statement.public_inputs.conceded });
+    assert.equal(calldata, statement.calldata, name);
+    assert.equal(statement.proof_hex, `0x${Buffer.from(statement.proof, "base64").toString("hex")}`);
+  }
+});
+
 test("every vault selector and event topic is the keccak of its signature", () => {
   const W = wallet.WITHDRAWAL_TUPLE;
   const Q = wallet.REQUEST_TUPLE;

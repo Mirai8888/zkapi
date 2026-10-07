@@ -299,6 +299,37 @@ jobs:
           npm ci --prefix docker/aws/signer --ignore-scripts --no-audit --no-fund
           ZKAPI_REQUIRE_ANVIL=1 npm run test:anvil --prefix docker/aws/signer
 
+  # The shared withdrawal golden vector (design §11 WP-F): a real kind-0
+  # escape and kind-1 close, encoded by the Rust (zkapi-serverd,
+  # zkapi-companion), JS (sdk/wallet.js) and Go (zkapi-clientd) encoders, each
+  # byte-equal to Forge's abi.encodeCall and each submitted to a vault on Anvil.
+  withdrawal-golden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: zkapi-clientd/go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Every encoder's golden escape and close lands on an Anvil vault
+        run: node scripts/check-withdrawal-golden.mjs
+
   # Full local lifecycle: real vault, proofs, API server, indexer and
   # challenger on Anvil, with mock provider and price feed (docs/v2-acceptance.md).
   lifecycle-acceptance:

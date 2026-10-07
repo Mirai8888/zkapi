@@ -959,6 +959,45 @@ pub(crate) mod tests {
         }
     }
 
+    /// The shared withdrawal golden vector (design §11 WP-F): real kind-0
+    /// and kind-1 proofs whose calldata Forge pins to abi.encodeCall against
+    /// the real vault. With ZKAPI_WITHDRAWAL_GOLDEN_OUT set, the encoder's
+    /// output is written there for scripts/check-withdrawal-golden.mjs,
+    /// which submits it to a vault on Anvil.
+    #[test]
+    fn real_proofs_encode_to_the_shared_withdrawal_golden_vector() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/contracts/test/fixtures/withdrawal-golden.json"
+        ))
+        .unwrap();
+        let mut output = serde_json::Map::new();
+        for (name, kind) in [("escape", 0), ("close", 1)] {
+            let inputs: WithdrawalPublicInputsV2C =
+                serde_json::from_value(golden[name]["public_inputs"].clone()).unwrap();
+            assert_eq!(inputs.kind, kind);
+            let proof = base64::engine::general_purpose::STANDARD
+                .decode(golden[name]["proof"].as_str().unwrap())
+                .unwrap();
+            let calldata = format!(
+                "0x{}",
+                hex::encode(withdrawal_calldata(&inputs, &proof).unwrap())
+            );
+            assert_eq!(
+                calldata,
+                golden[name]["calldata"].as_str().unwrap(),
+                "{name}"
+            );
+            output.insert(name.into(), calldata.into());
+        }
+        if let Some(dir) = std::env::var_os("ZKAPI_WITHDRAWAL_GOLDEN_OUT") {
+            std::fs::write(
+                std::path::Path::new(&dir).join("rust-serverd.json"),
+                serde_json::to_vec(&output).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn encoders_refuse_what_the_vault_would_never_accept() {
         let call = |inputs: RequestPublicInputsV2, proof: Vec<u8>| {

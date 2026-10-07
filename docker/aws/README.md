@@ -177,6 +177,11 @@ defaults to 10 gwei. The tip cap `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI`
 defaults to the lower of the fee cap and 10 times the default tip (10 gwei with
 the 1 gwei default tip). `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` is no longer
 supported, and the signer refuses to start while it is present, even empty.
+`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2) caps the distinct notes
+whose leaf it retires per rolling 24 hours, so a compromised challenger host
+cannot spend the float on closed notes; a further retirement is refused with
+`retirement_budget_exhausted` (the challenger reports `signer_refused`), and
+defeats and raises are never affected.
 
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by
@@ -241,7 +246,7 @@ The challenger also reads from `deployment.env` (see
 | --- | --- |
 | `ZKAPI_CHALLENGE_RAISE_LEAD_SECONDS` | Default 21600 (Mainnet and Sepolia); 1800 for the drill. An escape whose charge is still unsettled is raised to its proof's solvency bound at its deadline minus this. Startup refuses unless `LEASE_TTL_SECONDS + SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS` + this + 4 x 2 + 1200 is at most `challengePeriod()`. |
 | `ZKAPI_CHALLENGE_RAISE_MIN_UNITS` | Optional; default 0. The smallest raise, in gwei, worth its gas. |
-| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas). |
+| `ZKAPI_CHALLENGE_RETIRE_ON_MISS` | Optional; default `true`. After a missed defeat, retire the closed note's leaf with `retireClosedLeaf` (about 7.2M gas), within the signer's `ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY`. |
 
 The launcher passes the server's settlement window (`LEASE_TTL_SECONDS +
 SETTLEMENT_GRACE_SECONDS + ZKAPI_OPENROUTER_SETTLEMENT_DEADLINE_SECONDS`, which

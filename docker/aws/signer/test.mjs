@@ -151,6 +151,76 @@ test('signs the three concession-exit calls by their pinned selectors', async ()
   assert.equal(calls.length, 0);
 });
 
+test('leaf retirements are capped per rolling day by distinct note, reported, and never block defeats or raises', async t => {
+  let clock = 1_700_000_000_000;
+  const siblings = Array(32).fill(0);
+  const retire = note => ({ ...validTx, data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, siblings]) });
+  const raise = { ...validTx, data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]) };
+  const { signer, calls, logs } = fixture({}, { now: () => clock });
+  await signer.handle('eth_sendTransaction', [retire(9)]);
+  // A replacement of a counted retirement needs no new budget.
+  await signer.handle('eth_sendTransaction', [{ ...retire(9), ...fees(5n * GWEI, 2n * GWEI) }]);
+  await signer.handle('eth_sendTransaction', [retire(10)]);
+  assert.equal(broadcasts(calls).length, 3);
+  const before = calls.length;
+  const spent = { code: -32003, message: 'Leaf retirement budget for the last 24 hours is spent', data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x2' } };
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11)]), spent);
+  await assert.rejects(signer.handle('eth_sendTransaction', [{ ...retire(11), nonce: '0x5' }]), spent);
+  assert.equal(calls.length, before, 'refused before any upstream call');
+  assert.deepEqual(logs.filter(line => line.event === 'challenge_refused'), [
+    { event: 'challenge_refused', nonce: 4, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
+    { event: 'challenge_refused', nonce: 5, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
+  ]);
+  // Defeats and raises still sign.
+  await signer.handle('eth_sendTransaction', [validTx]);
+  await signer.handle('eth_sendTransaction', [raise]);
+  assert.equal(broadcasts(calls).length, 5);
+  const status = await signer.handle('zkapi_signerStatus', []);
+  assert.deepEqual([status.retirements_last_24h, status.retirement_refusals, status.last_retirement_refusal_at], [2, 2, clock / 1000]);
+  assert.deepEqual(status.warnings, ['retirement_budget_exhausted']);
+  const server = createHttpServer(signer).listen(0, '127.0.0.1');
+  await once(server, 'listening'); t.after(() => server.close());
+  const health = await fetch(`http://127.0.0.1:${server.address().port}/health`).then(r => r.json());
+  assert.equal(health.status, 'ok');
+  assert.deepEqual([health.max_retirements_per_day, health.retirements_last_24h, health.retirement_refusals], [2, 2, 2]);
+  // A day after the first signing, the window frees its slot.
+  clock += 86_400_000;
+  await signer.handle('eth_sendTransaction', [retire(11)]);
+  assert.equal(broadcasts(calls).length, 6);
+  clock += 86_400_000;
+  assert.deepEqual((await signer.handle('zkapi_signerStatus', [])).warnings, []);
+});
+
+test('a retirement that is not broadcast takes no budget; zero allows none', async () => {
+  const refusedFor = reason => error => error instanceof RpcError && error.data?.reason === reason;
+  const siblings = Array(32).fill(0);
+  const retire = note => ({ ...validTx, data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, siblings]) });
+  const spent = { data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x1' } };
+  // A failed simulation and the node's fee-cap refusal leave the budget.
+  let simulation = new RpcError(-32000, 'reverted', 'upstream_rejected');
+  let broadcast = new RpcError(-32000, 'tx fee exceeds the configured cap', 'upstream_tx_fee_cap');
+  const { signer, calls } = fixture({
+    eth_call: () => { if (simulation) throw simulation; return '0x'; },
+    eth_sendRawTransaction: raw => { if (broadcast) throw broadcast; return keccak256(raw); },
+  }, { maxRetirementsPerDay: 1n });
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(9)]), refusedFor('simulation_failed'));
+  simulation = null;
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(9)]), refusedFor('upstream_tx_fee_cap'));
+  assert.equal((await signer.handle('zkapi_signerStatus', [])).retirements_last_24h, 0);
+  // An ambiguous broadcast may have been broadcast: it takes the budget.
+  broadcast = new RpcError(-32000, 'timeout', 'upstream_unavailable');
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(9)]), refusedFor('broadcast_ambiguous'));
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(10)]), spent);
+  broadcast = null;
+  await signer.handle('eth_sendTransaction', [retire(9)]);
+  assert.equal(broadcasts(calls).length, 3);
+  const none = fixture({}, { maxRetirementsPerDay: 0n });
+  await assert.rejects(none.signer.handle('eth_sendTransaction', [retire(9)]), { data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x0' } });
+  assert.equal(none.calls.length, 0);
+  await none.signer.handle('eth_sendTransaction', [validTx]);
+  for (const bad of [-1n, 1_001n, 2]) assert.throws(() => fixture({}, { maxRetirementsPerDay: bad }), { message: 'Retirement budget is invalid' });
+});
+
 test('fee proposals outside 0 < tip <= max fee <= cap and tip <= tip cap are refused before any RPC', async () => {
   const options = { maxFeePerGas: 50n * GWEI, maxPriorityFeePerGas: 5n * GWEI };
   const bounds = { reason: 'fee_out_of_bounds', max_fee_per_gas: wei(50n * GWEI), max_priority_fee_per_gas: wei(5n * GWEI) };
@@ -460,6 +530,7 @@ test('signer status reports policy, base fee, balance coverage and warnings', as
     chain_id: '0xaa36a7', sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
+    max_retirements_per_day: 2, retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
     block_number: '0x10', base_fee_per_gas: '0x3b9aca00', balance: ONE_ETH, warnings: [],
   });
   const warnings = async (baseFee, balance = ONE_ETH) => (await fixture({
@@ -554,6 +625,7 @@ test('HTTP errors suppress provider details, carry structured refusal reasons, a
     status: 'ok', chain_id: Number(CHAIN_ID), sender: sender.toLowerCase(), vault, transaction_type: '0x2', fee_cap_source: 'default',
     max_fee_per_gas: '0x2540be400', priority_fee_per_gas: '0x3b9aca00', max_priority_fee_per_gas: '0x2540be400',
     fee_ceiling: '0x9184e72a000', tx_fee_cap_wei: ONE_ETH, max_gas: '0xb71b00', required_balance: '0x1aa535d3d0c0000',
+    max_retirements_per_day: 2, retirements_last_24h: 0, retirement_refusals: 0, last_retirement_refusal_at: null,
   });
   const failed = await post({ jsonrpc: '2.0', id: 8, method: 'eth_blockNumber', params: [] });
   assert.deepEqual(failed, { jsonrpc: '2.0', id: 8, error: { code: -32603, message: 'Signer request failed' } });
@@ -644,13 +716,20 @@ test('Mainnet refuses to start without an explicit fee cap; Sepolia uses a repor
     ...env, ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '300000000000', ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI: '2000000000',
     ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI: '20000000000', ZKAPI_CHALLENGE_FEE_CEILING_WEI: '1000000000000',
     ZKAPI_CHALLENGE_MAX_GAS: '9000000', ZKAPI_CHALLENGE_PORT: '65535', ZKAPI_CHALLENGE_LISTEN_HOST: '',
-    ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2700000000000000000',
+    ZKAPI_CHALLENGE_TX_FEE_CAP_WEI: '2700000000000000000', ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '0',
   });
   assert.deepEqual(configured, {
     chainId: 1n, privateKey: key, vault, rpcUrl: 'https://rpc.invalid', listenHost: '127.0.0.1', port: 65535, maxGas: 9_000_000n,
     maxFeePerGas: 300n * GWEI, priorityFeePerGas: 2n * GWEI, maxPriorityFeePerGas: 20n * GWEI, feeCeiling: 1_000n * GWEI,
-    txFeeCap: 2_700_000_000_000_000_000n,
+    txFeeCap: 2_700_000_000_000_000_000n, maxRetirementsPerDay: 0n,
   });
+  assert.equal(parseSignerConfig(env).maxRetirementsPerDay, undefined);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '' }).maxRetirementsPerDay, undefined);
+  assert.equal(parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: '1000' }).maxRetirementsPerDay, 1_000n);
+  for (const bad of ['1001', '-1', '0x2', '02', ' 2', '2.0', 'two']) {
+    assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY: bad }),
+      configError('ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY must be a decimal integer from 0 to 1000'), bad);
+  }
   for (const legacy of ['50000000000', '']) {
     assert.throws(() => parseSignerConfig({ ...env, ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI: '50000000000', ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI: legacy }),
       configError('ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI is no longer supported; remove it and set ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI (the EIP-1559 fee cap in wei)'));
@@ -802,7 +881,7 @@ test('server process starts from strict configuration and prints its fee policy 
     max_fee_per_gas_wei: '10000000000', priority_fee_per_gas_wei: '1000000000', max_priority_fee_per_gas_wei: '10000000000',
     // 0.1 ETH over 12M gas leaves 8.33 gwei per gas, below the 10 gwei fee cap.
     fee_ceiling_wei: '10000000000000', tx_fee_cap_wei: '100000000000000000', max_fee_per_gas_allowed_at_max_gas_wei: '8333333333',
-    max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1',
+    max_gas: '12000000', required_balance_wei: '120000000000000000', balance_wei: '1', max_retirements_per_day: 2,
     base_fee_per_gas_wei: '9000000000', warnings: ['base_fee_near_cap', 'balance_below_required', 'tx_fee_cap_below_fee_cap'],
   });
   const health = await fetch(`http://127.0.0.1:${port}/health`).then(r => r.json());

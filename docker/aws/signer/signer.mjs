@@ -25,6 +25,13 @@ export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
 // geth's and reth's default --rpc.txfeecap: 1 ether of gas limit x maxFeePerGas.
 export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
+// Leaf retirements (about 6M gas each) follow only a missed defeat, which is
+// rare and alarmed on, but any closed note simulates successfully. Distinct
+// notes retired per rolling day are capped so that a compromised caller
+// cannot spend the float meant for defeats and raises on them.
+export const DEFAULT_MAX_RETIREMENTS_PER_DAY = 2n;
+export const MAX_RETIREMENTS_PER_DAY_LIMIT = 1_000n;
+export const RETIREMENT_WINDOW_MS = 86_400_000;
 const readMethods = new Set([
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getLogs',
   'eth_getTransactionReceipt', 'eth_getTransactionByHash',
@@ -74,6 +81,15 @@ function envInteger(env, name) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,30}$/.test(value)) throw new ConfigError(`${name} must be a positive decimal integer`);
   return BigInt(value);
 }
+// A count that may be zero: unset or empty means the default.
+function envCount(env, name, limit) {
+  const value = env[name];
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,30})$/.test(value) || BigInt(value) > limit) {
+    throw new ConfigError(`${name} must be a decimal integer from 0 to ${limit}`);
+  }
+  return BigInt(value);
+}
 export function parseSignerConfig(env) {
   if (env.ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI !== undefined) {
     throw new ConfigError('ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI is no longer supported; remove it and set ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI (the EIP-1559 fee cap in wei)');
@@ -93,6 +109,7 @@ export function parseSignerConfig(env) {
     maxPriorityFeePerGas: envInteger(env, 'ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI'),
     feeCeiling: envInteger(env, 'ZKAPI_CHALLENGE_FEE_CEILING_WEI'),
     txFeeCap: envInteger(env, 'ZKAPI_CHALLENGE_TX_FEE_CAP_WEI'),
+    maxRetirementsPerDay: envCount(env, 'ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY', MAX_RETIREMENTS_PER_DAY_LIMIT),
   };
 }
 
@@ -125,7 +142,7 @@ export function createUpstream(url, { timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
   };
 }
 
-export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, log = line => console.log(JSON.stringify(line)), ...unsupported }) {
+export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_000n, maxFeePerGas, priorityFeePerGas, maxPriorityFeePerGas, feeCeiling = DEFAULT_FEE_CEILING, txFeeCap = DEFAULT_TX_FEE_CAP, maxRetirementsPerDay, log = line => console.log(JSON.stringify(line)), now = () => Date.now(), ...unsupported }) {
   requireValid(Object.keys(unsupported).length === 0, 'Unsupported signer option');
   requireValid(chainId === 1n || chainId === 11155111n, 'Explicit challenge chain ID must be 1 or 11155111');
   // Mainnet never inherits the testnet default; null counts as unset.
@@ -141,6 +158,8 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   const positive = value => typeof value === 'bigint' && value > 0n;
   requireValid(positive(feeCeiling) && feeCeiling <= ABSOLUTE_FEE_CEILING, 'Fee ceiling is invalid');
   requireValid(positive(txFeeCap), 'Transaction fee cap is invalid');
+  maxRetirementsPerDay ??= DEFAULT_MAX_RETIREMENTS_PER_DAY;
+  requireValid(typeof maxRetirementsPerDay === 'bigint' && maxRetirementsPerDay >= 0n && maxRetirementsPerDay <= MAX_RETIREMENTS_PER_DAY_LIMIT, 'Retirement budget is invalid');
   requireValid(positive(maxFeePerGas) && maxFeePerGas <= feeCeiling, 'Fee cap is invalid or exceeds the fee ceiling');
   requireValid(maxPriorityFeePerGas == null || (positive(maxPriorityFeePerGas) && maxPriorityFeePerGas <= maxFeePerGas), 'Priority fee cap is invalid or exceeds the fee cap');
   priorityFeePerGas ??= min(DEFAULT_PRIORITY_FEE_PER_GAS, maxPriorityFeePerGas ?? maxFeePerGas);
@@ -157,7 +176,39 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     max_fee_per_gas: hex(maxFeePerGas), priority_fee_per_gas: hex(priorityFeePerGas),
     max_priority_fee_per_gas: hex(maxPriorityFeePerGas), fee_ceiling: hex(feeCeiling), tx_fee_cap_wei: hex(txFeeCap),
     max_gas: hex(maxGas), required_balance: hex(maxGas * maxFeePerGas),
+    max_retirements_per_day: Number(maxRetirementsPerDay),
   });
+
+  // The notes whose leaf retirement was broadcast (or may have been) in the
+  // last RETIREMENT_WINDOW_MS, by first signing time. A replacement or retry
+  // of a note already counted needs no new budget; a retirement refused for
+  // the budget is counted and reported (status, /health, audit log). Kept in
+  // memory: a restart of this sidecar starts a new window.
+  const retirements = new Map();
+  let retirementRefusals = 0;
+  let lastRetirementRefusal = null;
+  function retirementsInWindow() {
+    const cutoff = now() - RETIREMENT_WINDOW_MS;
+    for (const [note, at] of retirements) if (at <= cutoff) retirements.delete(note);
+    return retirements.size;
+  }
+  function requireRetirementBudget(note) {
+    if (retirementsInWindow() < Number(maxRetirementsPerDay) || retirements.has(note)) return;
+    retirementRefusals += 1;
+    lastRetirementRefusal = now();
+    throw new RpcError(-32003, 'Leaf retirement budget for the last 24 hours is spent', 'retirement_budget_exhausted', {
+      max_retirements_per_day: hex(maxRetirementsPerDay),
+    });
+  }
+  function retirementStatus() {
+    const refusedRecently = lastRetirementRefusal !== null && lastRetirementRefusal > now() - RETIREMENT_WINDOW_MS;
+    return {
+      retirements_last_24h: retirementsInWindow(),
+      retirement_refusals: retirementRefusals,
+      last_retirement_refusal_at: lastRetirementRefusal === null ? null : Math.floor(lastRetirementRefusal / 1000),
+      refused_recently: refusedRecently,
+    };
+  }
 
   // Bounded, de-duplicated audit trail: one line per refusal transition of a
   // nonce and one per signed hash. No raw transactions, upstream text or keys.
@@ -226,7 +277,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     if (balance < maxGas * maxFeePerGas) warnings.push('balance_below_required');
     // Bids near the fee cap at a gas limit near MAX_GAS would be refused.
     if (maxGas * maxFeePerGas > txFeeCap) warnings.push('tx_fee_cap_below_fee_cap');
-    return { chain_id: hex(chainId), ...policy, block_number: hex(number), base_fee_per_gas: hex(baseFee), balance: hex(balance), warnings };
+    const { refused_recently: refusedRecently, ...retirement } = retirementStatus();
+    // A retirement after a real missed defeat waits for the budget.
+    if (refusedRecently) warnings.push('retirement_budget_exhausted');
+    return { chain_id: hex(chainId), ...policy, ...retirement, block_number: hex(number), base_fee_per_gas: hex(baseFee), balance: hex(balance), warnings };
   }
 
   // Both fee fields or neither. Absent fields bid (cap, default tip), which
@@ -288,6 +342,9 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
   // hash and upstream_tx_fee_cap, which the node answers before its pool.
   async function signAndSend(tx) {
     const transaction = validateTransaction(tx);
+    const call = vaultInterface.parseTransaction({ data: transaction.data });
+    const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
+    if (retiredNote !== null) requireRetirementBudget(retiredNote);
     // Nodes refuse a gas limit x maxFeePerGas above their RPC fee cap, so
     // neither a proposed nor the default bid above it is ever offered.
     if (transaction.gasLimit * transaction.maxFeePerGas > txFeeCap) {
@@ -324,6 +381,9 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       throw new RpcError(-32603, 'Signer self-check failed');
     }
     const ambiguous = () => new RpcError(-32000, 'Transaction broadcast outcome is unknown', 'broadcast_ambiguous', { transaction_hash: hash });
+    // From here the retirement may be broadcast: it takes its budget.
+    const counted = retiredNote !== null && !retirements.has(retiredNote);
+    if (counted) retirements.set(retiredNote, now());
     let returned;
     try { returned = await rpc('eth_sendRawTransaction', [raw]); }
     catch (error) {
@@ -331,6 +391,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       if (await knownTransaction(hash)) return { hash, transaction };
       // The node's own fee-cap refusal: definitely not broadcast, so no hash.
       if (error instanceof RpcError && error.data?.reason === 'upstream_tx_fee_cap') {
+        if (counted) retirements.delete(retiredNote);
         throw new RpcError(-32003, 'Upstream RPC refused the transaction fee', 'upstream_tx_fee_cap', { gas_limit: hex(transaction.gasLimit), max_fee_per_gas: hex(transaction.maxFeePerGas) });
       }
       throw ambiguous();
@@ -341,6 +402,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
 
   return {
     sender, vault: destination, chainId, policy, checkChain, status,
+    retirementStatus: () => {
+      const { refused_recently: _, ...retirement } = retirementStatus();
+      return retirement;
+    },
     async handle(method, params) {
       requireValid(Array.isArray(params), 'Expected positional parameters');
       if (method === 'eth_sendTransaction') {

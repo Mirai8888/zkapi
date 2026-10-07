@@ -388,26 +388,47 @@ export function recordReleasedTransaction(lock, { validUntil, kind, transactionH
 }
 
 /**
+ * The local second after which every kind-0 or kind-1 proof the lock
+ * released is dead (max valid_until + 900), or null when none was released.
+ */
+export function exitLockDeadAfter(lock) {
+    const exits = releasedExitProofs(lock);
+    if (!exits.length) return null;
+    return Math.max(...exits.map(entry => Number(entry.valid_until))) + EXIT_TIMING.lockReleaseMarginSeconds;
+}
+
+/**
  * E6: whether the lock may be released.
  * - the note is Closed;
  * - no kind-0 or kind-1 proof was ever released and the user cancels;
  * - every released kind-0 or kind-1 proof is dead (a finalized block's
  *   timestamp is greater than its valid_until + 900), and the note is Active
  *   with no pending exit.
+ *
+ * A chain reading alone never releases a lock whose exit proof may still
+ * land: the local clock (`now`, seconds) must also be past every released
+ * proof's valid_until + 900. A Closed reading releases such a lock earlier
+ * only when it came from a source the operator does not control
+ * (`statusTrusted`: the user's exit RPC).
  */
-export function exitLockReleasable(lock, { noteStatus = null, finalizedTimestamp = null, cancel = false } = {}) {
+export function exitLockReleasable(lock, { noteStatus = null, finalizedTimestamp = null, cancel = false, now = null,
+    statusTrusted = false } = {}) {
     if (!lock) return { releasable: true, reason: 'no_lock' };
-    if (noteStatus === 'closed') return { releasable: true, reason: 'closed' };
-    const exits = releasedExitProofs(lock);
-    if (!exits.length) {
+    const deadAfter = exitLockDeadAfter(lock);
+    const current = now == null ? NaN : Number(now);
+    const locallyDead = deadAfter != null && Number.isSafeInteger(current) && current > deadAfter;
+    if (noteStatus === 'closed' && (deadAfter == null || statusTrusted || locallyDead)) {
+        return { releasable: true, reason: 'closed' };
+    }
+    if (deadAfter == null) {
         return cancel ? { releasable: true, reason: 'cancelled' } : { releasable: false, reason: 'held' };
     }
+    if (!locallyDead) return { releasable: false, reason: 'proof_live', releasableAfter: deadAfter };
     if (noteStatus !== 'active') return { releasable: false, reason: noteStatus === 'pending_withdrawal' ? 'pending_exit' : 'note_status_unknown' };
     const finalized = finalizedTimestamp == null ? NaN : Number(finalizedTimestamp);
     if (!Number.isSafeInteger(finalized) || finalized <= 0) return { releasable: false, reason: 'finality_unknown' };
-    const latest = Math.max(...exits.map(entry => Number(entry.valid_until)));
-    if (finalized > latest + EXIT_TIMING.lockReleaseMarginSeconds) return { releasable: true, reason: 'proofs_expired' };
-    return { releasable: false, reason: 'proof_live', releasableAfter: latest + EXIT_TIMING.lockReleaseMarginSeconds };
+    if (finalized > deadAfter) return { releasable: true, reason: 'proofs_expired' };
+    return { releasable: false, reason: 'proof_live', releasableAfter: deadAfter };
 }
 
 // ---- E5: payout matching after a raise ----

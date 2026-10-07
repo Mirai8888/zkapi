@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
     EXIT_TIMING, RECORD_CLASS, afterClearanceFailure, chooseExit, escapeAt, exitCostWarning, exitLockRefusal,
-    exitLockReleasable, exitRecordClass, lowExpiry, matchEscapePayout, mustInitiateBy, nearExpiry, newExitLock,
+    exitLockDeadAfter, exitLockReleasable, exitRecordClass, lowExpiry, matchEscapePayout, mustInitiateBy, nearExpiry, newExitLock,
     ownershipOutcome, recordClearanceOutcome, recordReleasedProof, recordReleasedTransaction, releasedExitProofs, requestRecordsAtState, stateExitStatus,
     switchExitLock, unsettledEscapeAfterSeconds
 } from '../services/zkapiExitPolicy.mjs';
@@ -200,22 +200,37 @@ test('E6: the lock is released only when the note closed, on cancel before any e
     const lock = newExitLock({ ...at, mode: 'mutual', now: 100 });
     assert.deepEqual(exitLockReleasable(lock, {}), { releasable: false, reason: 'held' });
     assert.deepEqual(exitLockReleasable(lock, { cancel: true }), { releasable: true, reason: 'cancelled' });
+    assert.equal(exitLockDeadAfter(lock), null);
     // An ownership proof alone never lands on chain.
     const owned = recordReleasedProof(lock, { kind: 2, validUntil: 3_700, at: 100 });
     assert.equal(exitLockReleasable(owned, { cancel: true }).releasable, true);
+    assert.deepEqual(exitLockReleasable(owned, { noteStatus: 'closed' }), { releasable: true, reason: 'closed' });
     const escaped = recordReleasedProof(switchExitLock(owned, 'escape'), { kind: 0, validUntil: 10_900, at: 110 });
-    assert.equal(exitLockReleasable(escaped, { cancel: true }).releasable, false, 'a released escape outlives a cancel');
-    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'active', finalizedTimestamp: 10_900 + 900 }),
+    assert.equal(exitLockDeadAfter(escaped), 11_800);
+    const late = { now: 11_801 };
+    assert.equal(exitLockReleasable(escaped, { cancel: true, ...late }).releasable, false, 'a released escape outlives a cancel');
+    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'active', finalizedTimestamp: 10_900 + 900, ...late }),
         { releasable: false, reason: 'proof_live', releasableAfter: 11_800 });
-    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'active', finalizedTimestamp: 11_801 }),
+    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'active', finalizedTimestamp: 11_801, ...late }),
         { releasable: true, reason: 'proofs_expired' });
     // Not while an exit is pending, nor without a finalized block.
-    assert.equal(exitLockReleasable(escaped, { noteStatus: 'pending_withdrawal', finalizedTimestamp: 99_999 }).releasable, false);
-    assert.equal(exitLockReleasable(escaped, { noteStatus: 'active' }).reason, 'finality_unknown');
-    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'closed' }), { releasable: true, reason: 'closed' });
+    assert.equal(exitLockReleasable(escaped, { noteStatus: 'pending_withdrawal', finalizedTimestamp: 99_999, ...late }).releasable, false);
+    assert.equal(exitLockReleasable(escaped, { noteStatus: 'active', ...late }).reason, 'finality_unknown');
+    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'closed', ...late }), { releasable: true, reason: 'closed' });
+    // A chain reading alone (a pinned RPC that lies about finality or about
+    // a close) never releases a proof the local clock still holds live; a
+    // Closed reading from the user's own exit RPC does.
+    for (const now of [null, 11_000, 11_800]) {
+        assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'active', finalizedTimestamp: 99_999, now }),
+            { releasable: false, reason: 'proof_live', releasableAfter: 11_800 }, `now ${now}`);
+        assert.equal(exitLockReleasable(escaped, { noteStatus: 'closed', now }).releasable, false, `closed at ${now}`);
+    }
+    assert.deepEqual(exitLockReleasable(escaped, { noteStatus: 'closed', now: 11_000, statusTrusted: true }),
+        { releasable: true, reason: 'closed' });
     // The latest of several released proofs decides.
     const twice = recordReleasedProof(escaped, { kind: 0, validUntil: 20_000, at: 200 });
-    assert.equal(exitLockReleasable(twice, { noteStatus: 'active', finalizedTimestamp: 11_801 }).releasable, false);
+    assert.equal(exitLockReleasable(twice, { noteStatus: 'active', finalizedTimestamp: 11_801, ...late }).releasable, false);
+    assert.equal(exitLockReleasable(twice, { noteStatus: 'active', finalizedTimestamp: 20_901, now: 20_901 }).releasable, true);
 });
 
 test('E5: payouts match B − c_final after raises, bounded by the state bound', () => {

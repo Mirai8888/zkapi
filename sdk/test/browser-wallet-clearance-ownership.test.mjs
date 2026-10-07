@@ -245,7 +245,13 @@ test('a persisted clearance is never reused after the note state changes', async
     // E6: once the close proof is dead at a finalized block, the lock is
     // released and the late successor installs.
     h.chain.finalizedTimestamp = first.public_inputs.valid_until + 901;
-    await h.runtime.cancelExit();
+    const restore = Date.now;
+    Date.now = () => (first.public_inputs.valid_until + 901) * 1_000;
+    try {
+        await h.runtime.cancelExit();
+    } finally {
+        Date.now = restore;
+    }
     assert.equal((await store.readBrowserWallet()).state.current_anchor, '0x9999');
     const second = await h.runtime.prepareWithdrawal('mutual', DESTINATION);
     assert.equal(second.public_inputs.withdrawal_nullifier, nullifierFor('0x9999'));

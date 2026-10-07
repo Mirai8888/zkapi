@@ -454,8 +454,12 @@ that state:
 - No request proofs are made there. Only proofs of the lock's mode at the
   lock's state are allowed (`exit_lock_mode`, `exit_lock_state`).
 - A prepared or cancelled exit keeps the lock until every kind-0 and kind-1
-  proof it released is past its `valid_until` (plus a margin) and none
-  landed. Only then can chats resume, and a held `late_successor` installs.
+  proof it released is past its `valid_until` plus 900 seconds, both on this
+  device's clock and at a finalized block, and none landed. Only then can
+  chats resume, and a held `late_successor` installs. The note's status and
+  the finalized block are read through the exit RPC when one is set, else
+  through the pinned RPC. A `Closed` reading releases the lock earlier only
+  when it comes from the exit RPC.
 - Escape and close proofs are valid for 3 hours. Ownership proofs are valid
   for 55 minutes: the server accepts at most an hour, and the margin absorbs a
   client clock up to five minutes fast. The SDK proves again after

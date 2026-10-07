@@ -555,16 +555,25 @@ test('E4.6 and E6: a successor after a release is archived, and installs once th
     assert.ok(late.lateResponse && late.journal.user_rerandomization, 'it keeps what an install needs');
     assert.equal((await saved()).state.current_anchor, GENESIS_ANCHOR, 'not installed while the proof can land');
 
-    // The lock holds until valid_until + 900 at a finalized block.
+    // The lock holds until valid_until + 900 at a finalized block, and on
+    // the local clock.
     await assert.rejects(h.runtime.issueLease('chat'), { code: 'exit_locked' });
-    h.chain.finalizedTimestamp = plan.public_inputs.valid_until + 900;
+    const restore = Date.now;
+    const deadAt = plan.public_inputs.valid_until + 900;
+    Date.now = () => (deadAt + 1) * 1_000;
+    h.chain.finalizedTimestamp = deadAt;
     await assert.rejects(h.runtime.cancelExit(), error => error.code === 'exit_locked'
-        && error.data.releasable_after === plan.public_inputs.valid_until + 900);
+        && error.data.releasable_after === deadAt);
     h.chain.noteStatus = 'pending_withdrawal';
-    h.chain.finalizedTimestamp = plan.public_inputs.valid_until + 901;
+    h.chain.finalizedTimestamp = deadAt + 1;
     await assert.rejects(h.runtime.cancelExit(), { code: 'exit_locked' });
     h.chain.noteStatus = 'active';
-    const released = await h.runtime.cancelExit();
+    let released;
+    try {
+        released = await h.runtime.cancelExit();
+    } finally {
+        Date.now = restore;
+    }
     assert.equal(released.released, true);
     assert.equal(released.installed, true);
     const after = await saved();
@@ -576,6 +585,48 @@ test('E4.6 and E6: a successor after a release is archived, and installs once th
     // Requests resume from the new state.
     h.server.leasePost = body => h.activeLease(body);
     await h.runtime.issueLease('chat');
+});
+
+test('E6: a lying pinned RPC cannot release a live escape early; the user\'s exit RPC is read instead when set', async () => {
+    const statusRpc = ({ status, timestamp, calls, source }) => async ({ method, params }) => {
+        calls.push([source, method]);
+        if (method === 'eth_getBlockByNumber') {
+            assert.deepEqual(params, ['finalized', false]);
+            return { number: '0x64', timestamp: `0x${timestamp.toString(16)}` };
+        }
+        assert.equal(method, 'eth_call');
+        assert.ok(params[0].data.startsWith('0x9f18e4ed'), 'the note record');
+        assert.equal(params[1], '0x64', 'read at the finalized block');
+        return `0x${[0, 0, 0, status].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}`;
+    };
+    for (const [label, status, timestamp] of [['closed', 3, 0], ['future finality', 1, 4_000_000_000]]) {
+        const h = await walletWithLiveRequest();
+        const journal = (await saved()).journal;
+        const plan = await h.runtime.prepareWithdrawal('escape', DESTINATION, { earlyConcession: 'bound' });
+        h.server.nullifier = () => ({ status: 'ok', nullifier_status: 'finalized', request_response: h.receiptFor(journal) });
+        assert.deepEqual(await h.runtime.exitBeforeBroadcast(), { checked: true, lateSuccessor: true });
+        // The real chain read, through a pinned RPC that lies.
+        delete h.runtime.exitChainStatus;
+        const calls = [];
+        h.runtime.pinnedRpc = () => statusRpc({ status, timestamp: timestamp || now(), calls, source: 'pinned' });
+        await assert.rejects(h.runtime.cancelExit(), error => error.code === 'exit_locked'
+            && error.data.reason === 'proof_live' && error.data.releasable_after === plan.public_inputs.valid_until + 900, label);
+        await assert.rejects(h.runtime.issueLease('chat'), { code: 'exit_locked' }, label);
+        assert.equal((await saved()).state.current_anchor, GENESIS_ANCHOR, `${label}: nothing installed while the proof can land`);
+        assert.ok(calls.length > 0, `${label}: the pinned RPC was read`);
+        // The same reading from the user's own exit RPC: a Closed note
+        // releases the lock (the escape can no longer land), and the read
+        // never touches the pinned RPC.
+        if (status === 3) {
+            const exitCalls = [];
+            calls.length = 0;
+            h.runtime.exitRpc = () => statusRpc({ status, timestamp: now(), calls: exitCalls, source: 'exit' });
+            const released = await h.runtime.cancelExit();
+            assert.equal(released.reason, 'closed');
+            assert.ok(exitCalls.length > 0);
+            assert.equal(calls.length, 0, 'the pinned RPC is not asked');
+        }
+    }
 });
 
 test('E6: a cancel releases a lock at once only while no escape or close proof was released', async () => {

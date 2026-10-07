@@ -19,7 +19,7 @@ import {
     unresolvedRequestArchiveAt
 } from './zkapiRequestArchive.mjs';
 import {
-    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, exitLockRefusal,
+    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, exitLockDeadAfter, exitLockRefusal,
     exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, ownershipOutcome,
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
@@ -1268,9 +1268,7 @@ class BrowserWalletRuntime extends EventTarget {
                 since: Number(lock.since) * 1_000,
                 released: (lock.released || []).length,
                 exit_proofs_released: exits.length,
-                releasable_after: exits.length
-                    ? (Math.max(...exits.map(entry => Number(entry.valid_until))) + EXIT_TIMING.lockReleaseMarginSeconds) * 1_000
-                    : null
+                releasable_after: exits.length ? exitLockDeadAfter(lock) * 1_000 : null
             } : null,
             exit_kit: { state_seq: stateSeq, exported_seq: exported ?? null, out_of_date: exported == null || exported < stateSeq },
             deposit_path_saved: Boolean(state.deposit_path),
@@ -3824,13 +3822,16 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * The note's chain status and the finalized block's timestamp, read at
-     * the finalized block through the pinned RPC (for E6).
+     * the finalized block (for E6): through the user's exit RPC when one is
+     * set (`trusted`), else through the pinned RPC, whose readings never
+     * release a lock before the local clock agrees.
      */
     async exitChainStatus(noteId) {
-        const request = this.pinnedRpc();
+        const exit = this.exitRpc();
+        const request = exit || this.pinnedRpc();
         const block = await request({ method: 'eth_getBlockByNumber', params: ['finalized', false] });
         if (!/^0x[0-9a-fA-F]+$/.test(String(block?.number || '')) || !/^0x[0-9a-fA-F]+$/.test(String(block?.timestamp || ''))) {
-            throw new Error('The pinned RPC returned no finalized block.');
+            throw new Error('The RPC returned no finalized block.');
         }
         const encoded = await request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
             data: `0x9f18e4ed${abiWordHex(noteId)}` }, block.number] });
@@ -3839,7 +3840,8 @@ class BrowserWalletRuntime extends EventTarget {
         const status = Number(BigInt(`0x${words[3]}`));
         return {
             noteStatus: status === 1 ? 'active' : status === 2 ? 'pending_withdrawal' : status === 3 ? 'closed' : 'unknown',
-            finalizedTimestamp: Number(BigInt(block.timestamp))
+            finalizedTimestamp: Number(BigInt(block.timestamp)),
+            trusted: Boolean(exit)
         };
     }
 
@@ -3862,7 +3864,8 @@ class BrowserWalletRuntime extends EventTarget {
             }
         }
         const verdict = exitLockReleasable(lock, { noteStatus: chain.noteStatus ?? null,
-            finalizedTimestamp: chain.finalizedTimestamp ?? null, cancel });
+            finalizedTimestamp: chain.finalizedTimestamp ?? null, cancel, now: nowSeconds(),
+            statusTrusted: chain.trusted === true });
         if (!verdict.releasable) return { released: false, ...verdict };
         const prepared = this.runtime.preparedWithdrawal;
         const ownershipSent = (lock.released || []).some(entry => Number(entry.kind) === WITHDRAWAL_KIND.ownership)

@@ -224,14 +224,23 @@ answers 503 otherwise; `--resync`, or a `<cursor>.resync` file before a restart,
 rebuilds it from `--from-block`. The reference gateway limits POST requests per
 source; see [request limits](../docker/aws/README.md#request-limits).
 
-For a local chain, `npm run test:e2e:v2` runs the complete lifecycle on anvil
-(chain 31337): it generates random seeds, derives the keys with
-`zkapi signing-keys`, deploys the vault with them, and starts the indexer with
-`--chain-id 31337 --max-head-age-secs 0`, the server with `--chain-id 31337`,
-and the challenger. Its native billing RPC is a loopback mock price feed that
-forwards chain ID and vault reads to anvil. Use
-[`scripts/v2-acceptance.mjs`](../scripts/v2-acceptance.mjs) as the reference for
-a local deployment.
+For a local chain, `npm run test:e2e:v2` runs the complete stack and the
+drill scenarios on Anvil ([acceptance](v2-acceptance.md)). It runs Anvil with
+Sepolia's chain ID, the only chain besides mainnet the signer sidecar signs
+for. It then:
+
+1. generates random seeds and derives the keys with `zkapi signing-keys`;
+2. deploys with `Deploy.s.sol` (`ALLOW_DEV_SETUP=1`, as for the drill vault);
+3. finalizes the manifest with `expected-codehashes.mjs --finalize`, and builds
+   the `trusted_deployment` profile from it;
+4. starts the daemons in order: the indexer
+   (`--from-block deployBlock --max-head-age-secs 0`), `zkapi db init`, the
+   signer sidecar, `zkapi-challenged` (`--deployment`,
+   `--settlement-window-seconds`), then serverd (`--deployment`).
+
+Its native billing RPC is a loopback mock price feed that forwards every other
+read to Anvil. Use [`scripts/v2-acceptance.mjs`](../scripts/v2-acceptance.mjs)
+as the reference for a local deployment.
 
 The host application packages the SDK assets for the selected network. Review
 its trusted config against finalized on-chain deployment state, the public

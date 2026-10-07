@@ -54,11 +54,16 @@ artifact hashes.
 
 ## Full local lifecycle acceptance
 
-Run `npm run test:e2e:v2` to build and test deposit, HTTP lease issuance, mocked
-provider usage, signed settlement, real-proof stale withdrawal/challenge and
-honest withdrawal on a fresh local chain. The provider and oracle are mocked;
-protocol services, wallet proofs and contracts are real. See the
-[acceptance process and coverage limits](docs/v2-acceptance.md).
+Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v1`
+end to end on a fresh local chain. It covers the honest flow and the Sepolia
+drill scenarios that run locally, and writes a gas report. The drill scenarios
+include withholding, bad successor anchors, a lying expiry check, forced and
+conceding escapes with raises and defeats, the bounded pause, and a missed
+defeat with leaf retirement.
+
+The contracts, proofs, server, indexer, challenger, signer sidecar, browser SDK
+and clientd companion are real. The provider, OA org and price feed are
+mocked. See the [acceptance process and coverage limits](docs/v2-acceptance.md).
 
 ## Operator services
 

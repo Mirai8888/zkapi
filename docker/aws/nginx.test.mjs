@@ -174,6 +174,9 @@ test('clearance, lease issuance and other /v2/ POST routes are limited', () => {
         '/v2/withdraw/clearance/': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
         '/v2/requests/request-id': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
         '/v2/nullifiers/0x1': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
+        // The stale-device evidence read is limited like recovery: a GET,
+        // so the POST-only zone never counts it.
+        '/v2/nullifiers/0x1/evidence': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
         '/v2/auth': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
         '/v2/billing/quote': ['zone=zkapi_v2_post', 'burst=200', 'nodelay'],
     };

@@ -431,8 +431,12 @@ Before proving an escape, the wallet does the following:
 
    The vault's root and logs are read through the user's exit RPC
    (`client.setExitRpcUrl(url)`, saved for this origin; `null` clears it)
-   when one is set. Otherwise they are read through the wallet provider, when
-   it is on the vault's chain, and then through the pinned RPC.
+   when one is set. Its first answer in each exit is `eth_chainId`: an exit
+   RPC on another chain than the vault's is never read further, and the
+   snapshot flags it (`exit_rpc_wrong_chain`). When no exit RPC is set, or
+   it is on another chain or fails, they are read through the wallet
+   provider, when it is on the vault's chain (each call bounded by the
+   20-second call limit), and then through the pinned RPC.
 
    After the wallet's simulation refuses a proof's root (`unknown_root`), the
    proof is made again from the indexer or the rebuild, at any root except
@@ -449,8 +453,8 @@ Before proving an escape, the wallet does the following:
    pass. A successor that arrives now is kept as `late_successor`.
 
 The wallet provider's simulation (`eth_estimateGas`) of an escape or a close
-only warns. When it refuses, the exit RPC's estimate is used if one is set,
-otherwise a fixed limit of 1,000,000 gas, and the status message explains the
+only warns. When it refuses, the exit RPC's estimate is used if one is set
+and on the vault's chain, otherwise a fixed limit of 1,000,000 gas, and the status message explains the
 refusal; the wallet still asks the user to confirm. A refusal that a new proof
 can cure (`proof_expired`, `unknown_root`) re-proves once first.
 
@@ -463,13 +467,23 @@ that state:
   proof it released is past its `valid_until` plus 900 seconds, both on this
   device's clock and at a finalized block, and none landed. Only then can
   chats resume, and a held `late_successor` installs. The note's status and
-  the finalized block are read through the exit RPC when one is set, else
-  through the pinned RPC. A `Closed` reading releases the lock earlier only
-  when it comes from the exit RPC.
+  the finalized block are read from the first of these that answers: the
+  exit RPC when one is set and on the vault's chain; the wallet provider,
+  during a withdrawal or a cancel, when it is on the vault's chain; the
+  pinned RPC. A `Closed` reading releases the lock earlier only when it comes
+  from the exit RPC. The wallet provider is read before the pinned RPC, so a
+  pinned RPC that fails or misreports cannot keep a dead lock on its own.
 - Every withdrawal first releases a lock whose proofs are all dead. A held
   `late_successor` then installs, and the decision starts again at the
   newest state, so an escape that never landed does not force another escape
   from the old state.
+- When such a lock cannot be released yet while a `late_successor` waits
+  (no RPC answered, the note reads as pending, or finality lags this
+  device's clock), a withdrawal refuses with `exit_release_pending` instead
+  of exiting from the older state, which would concede up to its last
+  request's budget. `error.data` has `reason`, `status_source`,
+  `releasable_after` and `must_initiate_by` (seconds). From
+  `must_initiate_by` on, the exit goes ahead from the older state.
 - Escape and close proofs are valid for 3 hours. Ownership proofs are valid
   for 55 minutes: the server accepts at most an hour, and the margin absorbs a
   client clock up to five minutes fast. The SDK proves again after
@@ -583,12 +597,18 @@ cannot be read.
     times an escape's estimated fee (620,000 gas at the last gas price the
     wallet provider reported), else `null`. The SDK reads the gas price after
     each deposit and at the start of each withdrawal, and both flows report
-    the warning in a status message. It never blocks anything;
-  - `deposit_path_saved`, `exit_rpc_url` and `exit_rpc_recommended`. The
-    last is true when no deposit-time path is saved and no exit RPC is set:
-    an escape's path would then come from the operator's indexer or the
-    pinned RPC's logs, so ask the user to set an exit RPC or keep an exit kit
-    from the depositing device;
+    the warning in a status message. It never blocks anything: the read ends
+    within the 20-second call limit, a deposit waits for it at most that
+    long, and a withdrawal does not wait for it at all (the warning appears
+    when the read completes);
+  - `deposit_path_saved`, `exit_rpc_url`, `exit_rpc_wrong_chain` and
+    `exit_rpc_recommended`. `exit_rpc_wrong_chain` is true once the saved
+    exit RPC answered on another chain than the vault's; exits then ignore
+    it, so ask the user to correct it. `exit_rpc_recommended` is true when
+    no deposit-time path is saved and no exit RPC is set: an escape's path
+    would then come from the operator's indexer or the pinned RPC's logs, so
+    ask the user to set an exit RPC or keep an exit kit from the depositing
+    device;
 - `unresolved_requests`, one entry per request at the selected state, with no
   proofs: `client_request_id`, `kind`, `disposition`, `class` (`terminal`,
   `resolved_unreserved`, `unresolved`), `created_at`, `server_status`,
@@ -604,7 +624,7 @@ Each of these errors carries a `shortMessage` for display.
 
 | Group | Codes |
 | --- | --- |
-| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance` |
+| Wallet | `request_settlement_pending`, `device_not_newest`, `exit_locked`, `exit_lock_mode`, `exit_lock_state`, `exit_release_pending`, `note_near_expiry`, `invalid_successor`, `receipt_unrecoverable`, `receipt_response_missing`, `receipt_pending_install`, `request_archive_limit`, `withdrawal_submission_pending`, `park_requires_clearance` |
 | Deposits | `deployment_mismatch`, `deployment_unverifiable`, `canary_cap_exceeded`, `canary_cap_unverified` |
 | Exit-only mode (deposits and chats) | `deployment_manifest_unavailable`, `deployment_manifest_mismatch`, `deployment_manifest_untrusted`, `incompatible_proof_circuit`, `native_vault_unverified` |
 | Vault reverts | `unknown_root`, `challenged_nullifier`, `superseded_state`, `proof_expired`, `wrong_withdrawal_kind`, `invalid_destination`, `vault_paused` |

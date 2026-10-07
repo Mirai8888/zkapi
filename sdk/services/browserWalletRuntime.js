@@ -78,6 +78,7 @@ const EXIT_RPC_STORAGE_KEY = 'zkapi-exit-rpc-url';
 const RECEIPT_UNRECOVERABLE_MESSAGE = 'The server reports a finalized private request for this balance that this browser cannot apply: its request journal is gone. Only withdrawing remains, conceding at most the request’s bound.';
 const DEVICE_NOT_NEWEST_MESSAGE = 'Another device spent this balance’s next state, so this device is not the newest. Restore the newest backup or exit kit before withdrawing.';
 const EXIT_LOCKED_MESSAGE = 'A withdrawal of this balance is in progress, so no new private chat can start from it. Finish the withdrawal, or cancel it; a released exit proof keeps the balance frozen until it expires.';
+const EXIT_RELEASE_PENDING_MESSAGE = 'An earlier exit proof of this balance has expired, and a newer balance state is waiting until the vault confirms that the proof can no longer land. The vault’s record of this balance could not be confirmed yet. Try again shortly, or set your own exit RPC. Close to the balance’s exit deadline the exit goes ahead from the earlier state, conceding at most its last chat’s budget.';
 const NOTE_NEAR_EXPIRY_MESSAGE = 'This balance is too close to its expiry for a new private chat: a chat now could still be settling when the balance must be withdrawn. Withdraw it instead.';
 const INVALID_SUCCESSOR_MESSAGE = 'The server settled a private request for this balance with a successor that fails this wallet’s checks. It is treated as withheld: the balance can only be withdrawn, conceding at most that request’s bound.';
 const DEPOSITS_CLOSED_MESSAGE = 'This deployment no longer accepts new deposits. Existing balances and deposits already started can still be completed, recovered and withdrawn.';
@@ -248,6 +249,39 @@ function abortable(promise, signal) {
         signal.addEventListener('abort', aborted, { once: true });
         promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
     });
+}
+
+/**
+ * `request` (EIP-1193 style) with every call bounded to `timeoutMs`; a call
+ * that does not answer in time fails with `message`.
+ */
+function boundedRequest(request, timeoutMs, message) {
+    return async payload => {
+        try {
+            return await abortable(Promise.resolve().then(() => request(payload)), AbortSignal.timeout(timeoutMs));
+        } catch (error) {
+            if (error?.name === 'TimeoutError') throw new Error(message);
+            throw error;
+        }
+    };
+}
+
+/**
+ * `request` used only on `chainId`: its first call asks eth_chainId, and on
+ * another chain that call and every later one fail with `code` before
+ * anything else is asked. `onChecked(matches)` sees the answer.
+ */
+function onChainRequest(request, chainId, { code, message, onChecked = () => {} }) {
+    let checked = null;
+    return async payload => {
+        checked ||= Promise.resolve().then(() => request({ method: 'eth_chainId', params: [] })).then(chain => {
+            const matches = BigInt(chain) === BigInt(chainId);
+            onChecked(matches);
+            if (!matches) throw Object.assign(new Error(message), { code });
+        });
+        await checked;
+        return request(payload);
+    };
 }
 
 function exactTrustedUrl(supplied, expected, label) {
@@ -1307,6 +1341,10 @@ class BrowserWalletRuntime extends EventTarget {
             deposit_path_saved: Boolean(state.deposit_path),
             exit_cost_warning: this.exitCostWarningAt(state),
             exit_rpc_url: exitRpcUrlValue,
+            // The exit RPC answered on another chain than the vault's, so
+            // exits read the wallet provider and the pinned RPC instead.
+            exit_rpc_wrong_chain: Boolean(exitRpcUrlValue) && this.exitRpcChainCheck?.url === exitRpcUrlValue
+                && this.exitRpcChainCheck.matches === false,
             // Without a saved deposit path an escape's path comes from the
             // operator's indexer or a log rebuild; the user's own exit RPC
             // (or an exit kit made on the depositing device) removes that
@@ -1337,20 +1375,20 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * Read the gas price through the user's wallet provider (on the vault's
-     * chain only) for the G1 exit-cost warning. Best effort: a failed read
+     * chain only) for the G1 exit-cost warning. Best effort and bounded: the
+     * whole read ends within E0's CALL_TIMEOUT, and a failed or late read
      * keeps the last price. Returns the selected state's warning, or null.
      */
     async refreshExitCost({ request } = {}) {
         if (typeof request === 'function' && this.config?.funding?.chain_id != null) {
             try {
-                const chain = await request({ method: 'eth_chainId', params: [] });
-                if (BigInt(chain) === BigInt(this.config.funding.chain_id)) {
-                    const price = BigInt(await request({ method: 'eth_gasPrice', params: [] }));
-                    if (price > 0n) {
-                        const changed = this.exitGasPrice?.wei !== price;
-                        this.exitGasPrice = { wei: price, at: Date.now() };
-                        if (changed) this.dispatchEvent(new Event('change'));
-                    }
+                const wallet = this.walletOnVaultChain(request);
+                const price = BigInt(await abortable(wallet({ method: 'eth_gasPrice', params: [] }),
+                    AbortSignal.timeout(this.exitTiming().callTimeoutMs)));
+                if (price > 0n) {
+                    const changed = this.exitGasPrice?.wei !== price;
+                    this.exitGasPrice = { wei: price, at: Date.now() };
+                    if (changed) this.dispatchEvent(new Event('change'));
                 }
             } catch {
                 // The warning is advisory; the last price stays.
@@ -3632,7 +3670,7 @@ class BrowserWalletRuntime extends EventTarget {
      * when none is set or it refuses (advisory only).
      */
     async exitRpcEstimateGas(transaction) {
-        const exit = this.exitRpc();
+        const exit = this.exitRpcOnVaultChain();
         if (!exit) return null;
         try {
             const estimate = BigInt(await exit({ method: 'eth_estimateGas', params: [{ from: transaction.from,
@@ -3647,6 +3685,45 @@ class BrowserWalletRuntime extends EventTarget {
     exitRpc() {
         const url = this.getExitRpcUrl();
         return url ? urlRpcRequest(url, { timeoutMs: this.exitTiming().callTimeoutMs }) : null;
+    }
+
+    /**
+     * The user's exit RPC for one exit operation, used only on the vault's
+     * chain: its first call asks eth_chainId, and an exit RPC on another
+     * chain fails every call (exit_rpc_wrong_chain) before anything else is
+     * asked, so each reader treats it as unavailable. The snapshot flags it
+     * (exit_rpc_wrong_chain). Null when none is set.
+     */
+    exitRpcOnVaultChain() {
+        const exit = this.exitRpc();
+        if (!exit) return null;
+        const url = this.getExitRpcUrl();
+        return onChainRequest(exit, this.config.funding.chain_id, {
+            code: 'exit_rpc_wrong_chain',
+            message: 'The exit RPC is on another chain than the vault.',
+            onChecked: matches => this.noteExitRpcChain(url, matches)
+        });
+    }
+
+    /** Remember whether the exit RPC at `url` answered on the vault's chain. */
+    noteExitRpcChain(url, matches) {
+        const before = this.exitRpcChainCheck;
+        this.exitRpcChainCheck = { url, matches };
+        if (before?.url !== url || before?.matches !== matches) this.dispatchEvent(new Event('change'));
+    }
+
+    /**
+     * The user's wallet provider (an EIP-1193 request function) for one exit
+     * operation: each call bounded by E0's CALL_TIMEOUT, and used only on
+     * the vault's chain (wallet_wrong_chain otherwise). Null without one.
+     */
+    walletOnVaultChain(walletRequest) {
+        if (typeof walletRequest !== 'function') return null;
+        return onChainRequest(boundedRequest(walletRequest, this.exitTiming().callTimeoutMs,
+            'The wallet provider did not answer in time.'), this.config.funding.chain_id, {
+            code: 'wallet_wrong_chain',
+            message: 'The wallet provider is on another chain than the vault.'
+        });
     }
 
     getExitRpcUrl() {
@@ -3667,16 +3744,18 @@ class BrowserWalletRuntime extends EventTarget {
         } catch {
             throw new BrowserWalletHttpError('This browser cannot save the exit RPC setting.', 409, 'exit_rpc_unsaved');
         }
+        this.exitRpcChainCheck = null;
         this.dispatchEvent(new Event('change'));
         return url;
     }
 
     /**
-     * E_low: the note's own expiry_ts, raised only when the user's exit RPC and
-     * the pinned RPC both report a later effectiveExpiry (E0).
+     * E_low: the note's own expiry_ts, raised only when the user's exit RPC
+     * (on the vault's chain) and the pinned RPC both report a later
+     * effectiveExpiry (E0).
      */
     async exitLowExpiry(state) {
-        const exit = this.exitRpc();
+        const exit = this.exitRpcOnVaultChain();
         if (!exit) return lowExpiry(state.expiry_ts);
         const read = async request => {
             try {
@@ -3800,24 +3879,20 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * The vault's currentRoot for the indexer check of E4.1: through the
-     * user's exit RPC when one is set; else through the wallet provider when
-     * it is on the vault's chain, then the pinned RPC.
+     * user's exit RPC when one is set and on the vault's chain; when it is
+     * not, or fails, through the wallet provider when it is on the vault's
+     * chain, then the pinned RPC.
      */
     async exitCurrentRoot(signal = null, walletRequest = null) {
         const call = { method: 'eth_call', params: [{ to: this.config.funding.contract_address,
             data: VAULT_SELECTORS.currentRoot }, 'latest'] };
-        const rootOf = (word, source) => {
-            if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error(`The ${source} returned an invalid vault root.`);
-            return BigInt(word);
-        };
-        const exit = this.exitRpc();
-        if (exit) return rootOf(await abortable(exit(call), signal), 'exit RPC');
-        if (walletRequest) {
+        const sources = [['exit RPC', this.exitRpcOnVaultChain()], ['wallet provider', this.walletOnVaultChain(walletRequest)]];
+        for (const [source, request] of sources) {
+            if (!request) continue;
             try {
-                const chain = await abortable(walletRequest({ method: 'eth_chainId', params: [] }), signal);
-                if (BigInt(chain) === BigInt(this.config.funding.chain_id)) {
-                    return rootOf(await abortable(walletRequest(call), signal), 'wallet provider');
-                }
+                const word = await abortable(request(call), signal);
+                if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error(`The ${source} returned an invalid vault root.`);
+                return BigInt(word);
             } catch (error) {
                 if (signal?.aborted) throw error;
             }
@@ -3827,24 +3902,15 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * §6.6: the note's path rebuilt from the vault's logs, through the
-     * user's exit RPC when one is set, else through the wallet provider and
-     * then the pinned RPC, all within one rebuild budget.
+     * user's exit RPC when one is set and on the vault's chain, then (when
+     * it is not, or fails) through the wallet provider and the pinned RPC,
+     * all within one rebuild budget.
      */
     async rebuildExitPath(state, { signal = null, walletRequest = null } = {}) {
-        const exit = this.exitRpc();
         // The wallet provider's calls get E0's per-call bound too (the exit
         // and pinned RPCs have their own), so a silent wallet leaves the
         // pinned RPC time to answer.
-        const perCall = this.exitTiming().callTimeoutMs;
-        const bounded = request => async payload => {
-            try {
-                return await abortable(request(payload), AbortSignal.timeout(perCall));
-            } catch (error) {
-                if (error?.name === 'TimeoutError') throw new Error('The wallet provider did not answer in time.');
-                throw error;
-            }
-        };
-        const requests = exit ? [exit] : [walletRequest && bounded(walletRequest), this.pinnedRpc()].filter(Boolean);
+        const requests = [this.exitRpcOnVaultChain(), this.walletOnVaultChain(walletRequest), this.pinnedRpc()].filter(Boolean);
         const deadline = Date.now() + this.exitTiming().rebuildBudgetMs;
         const trusted = this.browserConfig?.trusted_deployment || {};
         let failure = null;
@@ -3977,26 +4043,48 @@ class BrowserWalletRuntime extends EventTarget {
 
     /**
      * The note's chain status and the finalized block's timestamp, read at
-     * the finalized block (for E6): through the user's exit RPC when one is
-     * set (`trusted`), else through the pinned RPC, whose readings never
-     * release a lock before the local clock agrees.
+     * the finalized block (for E6), from the first of these that answers:
+     * - the user's exit RPC, on the vault's chain (`trusted`);
+     * - the user's wallet provider, on the vault's chain, each call bounded
+     *   by E0's CALL_TIMEOUT;
+     * - the pinned RPC, which the operator may run or influence (§2.1).
+     * Only a trusted reading releases a lock before the local clock agrees;
+     * the wallet provider comes before the pinned RPC so that the pinned RPC
+     * failing, or reporting a pending exit, cannot keep a dead lock (and the
+     * stale state it freezes) on its own.
      */
-    async exitChainStatus(noteId) {
-        const exit = this.exitRpc();
-        const request = exit || this.pinnedRpc();
-        const block = await request({ method: 'eth_getBlockByNumber', params: ['finalized', false] });
+    async exitChainStatus(noteId, { walletRequest = null, signal = null } = {}) {
+        const sources = [
+            { source: 'exit_rpc', trusted: true, request: this.exitRpcOnVaultChain() },
+            { source: 'wallet', trusted: false, request: this.walletOnVaultChain(walletRequest) },
+            { source: 'pinned_rpc', trusted: false, request: this.pinnedRpc() }
+        ].filter(entry => entry.request);
+        let failure = null;
+        for (const { source, trusted, request } of sources) {
+            try {
+                return { ...(await this.noteStatusAtFinality(request, noteId, signal)), trusted, source };
+            } catch (error) {
+                if (signal?.aborted) throw error;
+                failure = error;
+            }
+        }
+        throw failure || new Error('No RPC returned the note’s status.');
+    }
+
+    /** The note's status at the finalized block, and that block's timestamp, through `request`. */
+    async noteStatusAtFinality(request, noteId, signal = null) {
+        const block = await abortable(request({ method: 'eth_getBlockByNumber', params: ['finalized', false] }), signal);
         if (!/^0x[0-9a-fA-F]+$/.test(String(block?.number || '')) || !/^0x[0-9a-fA-F]+$/.test(String(block?.timestamp || ''))) {
             throw new Error('The RPC returned no finalized block.');
         }
-        const encoded = await request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
-            data: `0x9f18e4ed${abiWordHex(noteId)}` }, block.number] });
+        const encoded = await abortable(request({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+            data: `0x9f18e4ed${abiWordHex(noteId)}` }, block.number] }), signal);
         const words = String(encoded || '').replace(/^0x/, '').match(/.{64}/g) || [];
         if (words.length < 4) throw new Error('The vault returned a truncated note record.');
         const status = Number(BigInt(`0x${words[3]}`));
         return {
             noteStatus: status === 1 ? 'active' : status === 2 ? 'pending_withdrawal' : status === 3 ? 'closed' : 'unknown',
-            finalizedTimestamp: Number(BigInt(block.timestamp)),
-            trusted: Boolean(exit)
+            finalizedTimestamp: Number(BigInt(block.timestamp))
         };
     }
 
@@ -4006,22 +4094,25 @@ class BrowserWalletRuntime extends EventTarget {
      * dead at a finalized block. A sent ownership proof keeps the state
      * withdrawal-only (C5). Successors archived as late_successor install
      * afterwards, after S1–S6 again. Call under the wallet lock.
+     * `walletRequest` (the user's wallet provider) is read for the note's
+     * status before the pinned RPC (exitChainStatus).
      */
-    async releaseExitLockLocked({ cancel = false } = {}) {
+    async releaseExitLockLocked({ cancel = false, walletRequest = null, signal = null } = {}) {
         const lock = this.runtime?.exitLock;
         if (!lock) return { released: true, reason: 'no_lock' };
         let chain = {};
         if (releasedExitProofs(lock).length) {
             try {
-                chain = await this.exitChainStatus(lock.noteId);
-            } catch {
+                chain = await this.exitChainStatus(lock.noteId, { walletRequest, signal });
+            } catch (error) {
+                if (signal?.aborted) throw error;
                 chain = {};
             }
         }
         const verdict = exitLockReleasable(lock, { noteStatus: chain.noteStatus ?? null,
             finalizedTimestamp: chain.finalizedTimestamp ?? null, cancel, now: nowSeconds(),
             statusTrusted: chain.trusted === true });
-        if (!verdict.releasable) return { released: false, ...verdict };
+        if (!verdict.releasable) return { released: false, ...verdict, statusSource: chain.source || null };
         const prepared = this.runtime.preparedWithdrawal;
         const ownershipSent = (lock.released || []).some(entry => Number(entry.kind) === WITHDRAWAL_KIND.ownership)
             || prepared?.clearanceReserved === true;
@@ -4041,12 +4132,17 @@ class BrowserWalletRuntime extends EventTarget {
         return { released: true, reason: verdict.reason, installed };
     }
 
+    /** The successors archived as late_successor at the lock's state, which is the current one. */
+    lateSuccessorsAt(lock) {
+        const key = this.archiveKey(this.runtime?.state);
+        if (!lock || !key || Number(key.noteId) !== Number(lock.noteId) || !sameFelt(key.anchor, lock.anchor)) return [];
+        return requestRecordsAtState(this.requestArchive, key)
+            .filter(entry => entry.disposition === LATE_SUCCESSOR_DISPOSITION && entry.lateResponse);
+    }
+
     /** Install, after S1–S6 again, a successor archived while the lock was held. */
     async installLateSuccessorsLocked(lock) {
-        const key = this.archiveKey(this.runtime?.state);
-        if (!key || Number(key.noteId) !== Number(lock.noteId) || !sameFelt(key.anchor, lock.anchor)) return false;
-        const late = requestRecordsAtState(this.requestArchive, key)
-            .filter(entry => entry.disposition === LATE_SUCCESSOR_DISPOSITION && entry.lateResponse);
+        const late = this.lateSuccessorsAt(lock);
         for (const entry of late) {
             try {
                 if (await this.installRecoveredResponse(entry.clientRequestId, () => {}, { response: entry.lateResponse }) === true) {
@@ -4063,8 +4159,9 @@ class BrowserWalletRuntime extends EventTarget {
      * Cancel an exit: release the exit lock now if no escape or close proof
      * was released, otherwise once every released proof is dead (E6).
      */
-    async cancelExit() {
+    async cancelExit({ walletRequest = null } = {}) {
         await this.init();
+        if (walletRequest != null && typeof walletRequest !== 'function') throw new Error('The wallet provider must be a request function.');
         this.preemptForExit();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
@@ -4073,7 +4170,7 @@ class BrowserWalletRuntime extends EventTarget {
                 throw new BrowserWalletHttpError('A withdrawal transaction for this balance is still unresolved. Check its status first.',
                     409, 'withdrawal_submission_pending');
             }
-            const result = await this.releaseExitLockLocked({ cancel: true });
+            const result = await this.releaseExitLockLocked({ cancel: true, walletRequest });
             if (!result.released) throw this.exitLockedError(this.runtime.exitLock, result);
             return result;
         });
@@ -4217,6 +4314,7 @@ class BrowserWalletRuntime extends EventTarget {
             return existing;
         }
         const now = nowSeconds();
+        const deadline = mustInitiateBy(await this.exitLowExpiry(state));
         // E6 before any decision: a lock whose released escape or close
         // proofs are all dead is released, and a successor archived as
         // late_successor meanwhile installs (§7.5). The decision then starts
@@ -4225,10 +4323,22 @@ class BrowserWalletRuntime extends EventTarget {
         const held = this.runtime.exitLock;
         const deadAfter = exitLockDeadAfter(held);
         if (deadAfter != null && now > deadAfter) {
-            const release = await this.releaseExitLockLocked();
+            const release = await this.releaseExitLockLocked({ walletRequest, signal });
             if (release.released) return WITHDRAWAL_RESTART;
+            // A verified successor waits at the lock's state, and no reading
+            // let the lock go yet: deciding here would exit from the stale
+            // state, conceding up to its bound instead of the successor's
+            // charge. Before must_initiate_by the user is told when to retry
+            // instead; from then on the exit goes ahead from this state.
+            if (now < deadline && this.lateSuccessorsAt(held).length) {
+                throw new BrowserWalletHttpError(EXIT_RELEASE_PENDING_MESSAGE, 409, 'exit_release_pending', {
+                    reason: release.reason || null,
+                    status_source: release.statusSource || null,
+                    releasable_after: release.releasableAfter ?? deadAfter,
+                    must_initiate_by: deadline
+                });
+            }
         }
-        const deadline = mustInitiateBy(await this.exitLowExpiry(state));
         const nullifier = await this.worker.call('withdrawalNullifier', { state });
         if (existing && preparedWithdrawalNullifier(existing) != null
             && !sameFelt(preparedWithdrawalNullifier(existing), nullifier)) existing = null;

@@ -149,18 +149,31 @@ test('E4.5: with an exit RPC set, its estimate replaces a refused wallet simulat
     const { wallet, statuses, withdraw } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
     wallet.estimate = () => { throw { code: -32000, message: 'header not found' }; };
     const estimates = [];
-    runtime.exitRpc = () => async ({ method, params }) => {
+    const exitRpc = chainId => async ({ method, params }) => {
+        if (method === 'eth_chainId') return chainId;
         // E0 also reads effectiveExpiry through it.
         if (method === 'eth_call') return `0x${(2_000_000_000).toString(16).padStart(64, '0')}`;
         assert.equal(method, 'eth_estimateGas');
         estimates.push(params[0]);
         return '0x927c0';
     };
+    runtime.exitRpc = () => exitRpc('0xaa36a7');
     await assert.rejects(withdraw('escape'), refusedInWallet);
     assert.equal(estimates.length, 1);
     assert.deepEqual(estimates[0], { from: FROM, to: VAULT, data: wallet.estimates[0].data });
     assert.equal(wallet.sent[0].gas, bufferedGasLimit(0x927c0n));
     assert.ok(statuses.some(message => /your exit RPC accepts it/.test(message)));
+
+    // An exit RPC on another chain is never asked for the estimate: the
+    // exit goes out with the fixed gas limit instead.
+    const other = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+    other.wallet.estimate = () => { throw { code: -32000, message: 'header not found' }; };
+    estimates.length = 0;
+    runtime.exitRpc = () => exitRpc('0x1');
+    await assert.rejects(other.withdraw('escape'), refusedInWallet);
+    assert.equal(estimates.length, 0, 'no estimate from another chain');
+    assert.equal(other.wallet.sent[0].gas, FIXED_EXIT_GAS);
+    assert.ok(!other.statuses.some(message => /your exit RPC accepts it/.test(message)));
 });
 
 test('E4.1: an UnknownRoot simulation re-proves once at another root, and a second one only warns', async () => {
@@ -228,6 +241,58 @@ test('G1: a withdrawal warns first when the balance returns less than three esca
         }
         assert.equal(wallet.sent.length, 1, 'the warning never blocks the exit');
     }
+});
+
+test('G1: a wallet whose gas price read never answers neither delays nor blocks the exit', async () => {
+    const { wallet, statuses, withdraw } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+    const answer = globalThis.ethereum.request;
+    let asked = 0;
+    globalThis.ethereum.request = async call => {
+        if (call.method !== 'eth_gasPrice') return answer(call);
+        asked += 1;
+        return new Promise(() => {});
+    };
+    await within(4_000, assert.rejects(withdraw('escape'), refusedInWallet), 'an escape behind a silent gas price read');
+    assert.equal(asked, 1, 'the gas price was asked for');
+    assert.equal(wallet.sent.length, 1, 'the escape reached the wallet');
+    assert.ok(!statuses.some(message => /less than three times the estimated network fee/.test(message)));
+});
+
+test('E6 through the client: a cancel after a dead escape reads the note through the wallet provider when the pinned RPC fails', async () => {
+    const { client } = await scenario({ state: noteState({ deposit_path: depositPath('0x51') }) });
+    await runtime.prepareWithdrawal('escape', DESTINATION);
+    const lock = (await store.readBrowserWallet()).exitLock;
+    assert.deepEqual(lock.released.map(entry => entry.kind), [0], 'the escape proof was released');
+    const later = lock.released[0].valid_until + 901;
+    // The real E6 read: the pinned RPC refuses, the wallet reports Active
+    // at a finalized block past valid_until + 900.
+    delete runtime.exitChainStatus;
+    runtime.pinnedRpc = () => async () => { throw new Error('pinned RPC refuses'); };
+    const answer = globalThis.ethereum.request;
+    const statusReads = [];
+    globalThis.ethereum.request = async call => {
+        if (call.method === 'eth_getBlockByNumber') {
+            statusReads.push('finalized');
+            return { number: '0x64', timestamp: `0x${later.toString(16)}` };
+        }
+        if (call.method === 'eth_call' && call.params[0].data.startsWith('0x9f18e4ed')) {
+            statusReads.push('note');
+            return `0x${[0, 0, 0, 1].map(value => value.toString(16).padStart(64, '0')).join('')}`;
+        }
+        return answer(call);
+    };
+    client.config = runtime.snapshot().config;
+    const statuses = [];
+    const restore = Date.now;
+    Date.now = () => later * 1_000;
+    try {
+        assert.equal(await client.cancelPreparedWithdrawal(message => statuses.push(message)), true);
+    } finally {
+        Date.now = restore;
+    }
+    assert.deepEqual(statusReads, ['finalized', 'note']);
+    assert.equal((await store.readBrowserWallet()).exitLock, null, 'the lock is released');
+    assert.match(statuses.at(-1), /ready to use/);
 });
 
 test('a set-aside close leaves without the operator: the deposit-time path first, another root after UnknownRoot, and the saved path when no other exists', async () => {

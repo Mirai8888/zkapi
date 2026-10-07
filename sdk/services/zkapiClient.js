@@ -194,6 +194,7 @@ const WITHDRAWAL_ERROR_MESSAGES = Object.freeze({
     exit_locked: 'A withdrawal of this balance is in progress. Finish or cancel it before starting a private chat.',
     exit_lock_mode: 'An escape proof for this balance may still land, so it can only exit by escape until that proof expires.',
     exit_lock_state: 'An exit proof of another balance state may still land. Check its status first.',
+    exit_release_pending: 'An earlier exit proof of this balance has expired, and a newer balance state waits until the vault confirms that proof can no longer land. The vault could not be read yet: try again shortly, or set your own exit RPC. Close to the exit deadline the exit goes ahead from the earlier state.',
     note_near_expiry: 'This balance is too close to its expiry for a new private chat. Withdraw it instead.',
     invalid_successor: 'The server settled a private request with a successor that fails this wallet’s checks. Only withdrawing remains, conceding at most that request’s budget.',
     deployment_mismatch: 'This vault does not match the deployment this app pins, so deposits are refused. Existing balances can still be withdrawn.',
@@ -1634,7 +1635,8 @@ class ZkapiClient extends EventTarget {
             ? 'Deposit confirmed and saved. The balance display will refresh when available.'
             : 'Private balance is ready.');
         // G1: a balance smaller than three escape fees is worth less than
-        // its unilateral exit.
+        // its unilateral exit. The gas price read ends within E0's
+        // CALL_TIMEOUT, so a silent wallet cannot hold the confirmation.
         const costWarning = await browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) });
         if (costWarning) onStatus(exitCostMessage(costWarning));
         return {
@@ -2208,8 +2210,12 @@ class ZkapiClient extends EventTarget {
         onStatus('Connecting to MetaMask…');
         const from = await this.connectWallet();
         // G1: warn when this balance returns less than three escape fees.
-        const costWarning = await browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) });
-        if (costWarning) onStatus(exitCostMessage(costWarning));
+        // The gas price read is advisory and never delays the exit: the
+        // warning is shown when the read completes.
+        void browserWalletRuntime.refreshExitCost({ request: request => this.ethereum.request(request) })
+            .then(costWarning => {
+                if (costWarning) onStatus(exitCostMessage(costWarning));
+            }, () => {});
         // MetaMask connection can outlive a cross-tab update. Re-read the
         // durable plan under the wallet lock instead of trusting the UI/config
         // snapshot that existed before the prompt opened.
@@ -4991,9 +4997,13 @@ class ZkapiClient extends EventTarget {
         if (prepared) await browserWalletRuntime.clearPreparedWithdrawal();
         this.rememberWithdrawal(null);
         // E6: the exit lock is released now only if no escape or close proof
-        // was released; otherwise once every released proof is dead.
+        // was released; otherwise once every released proof is dead, read
+        // through the wallet provider before the pinned RPC.
+        const provider = this.ethereum;
         try {
-            await browserWalletRuntime.cancelExit();
+            await browserWalletRuntime.cancelExit(typeof provider?.request === 'function'
+                ? { walletRequest: request => provider.request(request) }
+                : {});
         } catch (error) {
             if (error?.code !== 'exit_locked') throw error;
             await this.refresh();

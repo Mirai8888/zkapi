@@ -150,15 +150,19 @@ refuses deposits with `deployment_mismatch`; exits stay available.
 
 `config --exit-rpc-url URL` saves your own Ethereum RPC (HTTPS, or plain HTTP
 to a node on this machine; no credentials, query or fragment). Deployment
-checks use it as well. An escape reads the chain and sends its transactions
-through it first, and through the pinned RPC only when it fails: the
-balance, nonce, fee and simulation reads, the receipts, the raise and
-finalization logs, and the wallet companion's exit state (note status, known
-roots, logs for a tree rebuild). Whether the note closed, and whether an
-escape proof that never landed is dead, is decided by your exit RPC alone, so
-a pinned RPC that is down or answers falsely can neither block an escape nor
-end one. `config --exit-rpc-url none` clears it. The companion takes the same
-setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
+checks use it as well. An escape then reads the chain and sends its
+transactions only through it: the balance, nonce, fee and simulation reads,
+the receipts, the raise and finalization logs, and the wallet companion's
+exit state (note status, known roots, logs for a tree rebuild). The pinned
+RPC, which the operator may run, is never asked in its place: a call your
+exit RPC does not answer (a timeout, a 429 rate limit, a 5xx) is retried
+twice, then the escape stops with an error naming the exit RPC, and you
+retry later or configure another one. So a pinned RPC that is down or
+answers falsely can neither block an escape nor end one, nor choose the
+nonce, gas limit or Merkle root an escape is signed with. `config
+--exit-rpc-url none` clears it; escapes then use the pinned RPC. The
+companion takes the same setting from `--exit-rpc-url` or
+`ZKAPI_EXIT_RPC_URL`.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
@@ -456,7 +460,21 @@ the transaction is checked word by word against the decision you confirmed
 signed, and is sent through your exit RPC when one is configured. Its
 simulation is advisory: when the RPC refuses to simulate or estimate it, the
 quote carries a warning and a fixed gas limit, and you may still approve it
-(an escape that would fail reverts cheaply). After the
+(an escape that would fail reverts cheaply). An escape transaction is never
+signed below its entry point's measured cost, whatever the estimate: 900,000
+gas for the initiation, 350,000 for the finalization and 150,000 for a
+claim.
+
+A signed escape transaction that can no longer be included is retired
+unmined (phase `escape_expired`; a finalization or a claim is quoted again)
+instead of being followed forever: its proof expired before inclusion,
+another transaction took its nonce in a finalized block, or its nonce stayed
+beyond the account's pending nonce for 15 minutes (it was signed at a nonce
+an RPC answered wrongly). The receipt is read again before it is retired, so
+one mined meanwhile is followed. Rerun `withdraw --escape --to` to review the
+escape: it is proved again when its proof expired, and signed at the
+account's nonce, replacing a transaction still waiting in a mempool with a
+fee cap and tip raised by more than an eighth. After the
 challenge period the same `withdraw --escape --to` quotes
 `finalizeEscapeWithdrawal`. The payout is matched as described under
 **Withdrawals** above; a credited payout is delivered with `--claim`.

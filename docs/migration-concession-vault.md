@@ -394,9 +394,10 @@ The drill vault tests the adversarial cases with short timings. It uses the
 | Setup | `mpc-1` | `mpc-1` | `dev` (`ALLOW_DEV_SETUP=1`) |
 
 The settlement check is lease TTL + grace + deadline + 2 x poll + 600; the
-raise check is `W` + raise lead + 4 x poll + 1,200. serverd and
-`zkapi-challenged` refuse to start when either fails, and `maxPauseDuration`
-must be at least twice the challenge period.
+raise check is `W` + raise lead + 4 x poll + 1,200. serverd refuses to
+start when the settlement check fails and `zkapi-challenged` when either
+fails; the vault's constructor requires `maxPauseDuration` of at least twice
+the challenge period.
 
 ### B2. Production Sepolia
 

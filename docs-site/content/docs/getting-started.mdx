@@ -17,12 +17,15 @@ cargo test --release --workspace --locked
 cargo test --release --manifest-path protocol/rust/Cargo.toml --workspace --locked
 npm ci
 npm run test:sdk
-npm run build:browser
-npm run build:mainnet
 npm run verify:assets
+npm run verify:builds
 ```
 
 Run `forge test` from `protocol/contracts/` for vault and verifier tests.
+`npm run verify:builds` checks that a `not_deployed` placeholder profile
+refuses to build and that a deployed one builds; `npm run build:browser` and
+`npm run build:mainnet` refuse the packaged placeholders until a revision-3
+vault is deployed and pinned.
 Committed proof assets are already included; consuming the SDK does not
 require generating new setup keys. The protocol source and Solidity
 dependencies are tracked under `protocol/`; no submodule initialization is

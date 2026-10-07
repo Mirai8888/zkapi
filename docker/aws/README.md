@@ -7,8 +7,10 @@ This image runs the native ETH API, indexer and escape challenger of circuit
 refuse to start until G-SETUP has committed them; a vault of circuit
 `zkapi-v2-note-bound-v1` keeps its own stack from the
 `release/v2-note-bound` branch. Supply the matching vault/signing keys, the
-deployment manifest and pinned native oracle configuration. Upgrading a running deployment to this release is
-covered in [the hardened-vault migration guide](../../docs/migration-hardened-vault.md).
+deployment manifest and pinned native oracle configuration. A revision-3
+vault is a new deployment beside the legacy one; the order of the move, the
+daemon order and the legacy drain are in
+[the concession-vault migration runbook](../../docs/migration-concession-vault.md).
 
 Build on a Linux VM with Docker Engine and Compose, from the complete source
 tree, including the in-repository `protocol/` source:
@@ -24,7 +26,7 @@ Create these root-owned, mode `0600` files without printing their contents:
 | File | Contents |
 | --- | --- |
 | `/etc/zkapi/deployment.env` | Copy `deployment.env.example`, then supply vault address, chain, deployment block, gwei request cap, `ZKAPI_NATIVE_BILLING_RPC_URL`, `ZKAPI_NATIVE_PRICE_FEED_ADDRESS`, feed decimals and freshness policy. It also sets the lease settlement deadline, the indexer's confirmation depth and head-age limit, and the challenger's transaction fee cap (`ZKAPI_CHALLENGE_TX_FEE_CAP_WEI`, below). |
-| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile `Deploy.s.sol` writes (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status": "not_deployed"` placeholder is refused. |
+| `/etc/zkapi/deployment.json` | Mode `0644`. The deployment manifest: the `trusted_deployment` profile (chain, vault, signing keys, `challenge_period`, `circuit_id`, `setup_id`, both verifying-key hashes, the adapter and Poseidon library addresses, the three runtime codehashes, `settlement_window_seconds`), written from the manifest that `scripts/expected-codehashes.mjs --finalize` produced from `Deploy.s.sol`'s provisional one, never from the `.pending` file (see [Contracts](../../docs/deployment.md#contracts)). Compose mounts it read-only into `db-init`, `server` and `challenger`. A `"deployment_status"` other than absent or `"deployed"` (a `not_deployed` placeholder, or a provisional `pending` or `simulated` manifest) is refused. |
 | `/etc/zkapi/indexer.env` | `RPC_URL`, the chain's read RPC endpoint (requirements below). |
 | `/etc/zkapi/server.env` | `ZKAPI_STATE_SEED` and `ZKAPI_CLEAR_SEED` (required, below), and `ZKAPI_OPENROUTER_MANAGEMENT_KEY` for direct leases; alternatively set `OA_ORG_URL` in deployment metadata and `ZKAPI_OA_ORG_SHARED_SECRET` here. To switch an existing database between these key sources, follow [Changing the key source](../../docs/native-eth-billing.md#changing-the-key-source): the server refuses to start while leases or key deletions of the other source still need its credential (`ZKAPI_ALLOW_KEY_SOURCE_SWITCH=true` starts anyway and strands them). For private Sepolia access, also set `ZKAPI_TESTNET_PASSWORD` here only. |
 | `/etc/zkapi/challenge.env` | `ZKAPI_CHALLENGE_RPC_URL=http://signer:8547`, `ZKAPI_CHALLENGE_SENDER` (the exclusive funded sender managed by the private sidecar), and the daemon's fee caps (below). |
@@ -246,7 +248,7 @@ critical at once, until `ZKAPI_CHALLENGE_MAX_GAS` is raised.
 | Variable | Requirement |
 | --- | --- |
 | `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI` | Required. At most the signer's `ZKAPI_CHALLENGE_MAX_FEE_PER_GAS_WEI`. |
-| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; a higher tip cap leaves more before it, within the signer's tip cap (10 gwei by default, 5 times the default priority fee; raise the signer's first). The daemon does not read the signer's fee or tip cap, so a cap above the signer's makes escalated bids fail with `fee_out_of_bounds` (`signer_refused`, critical at once) instead of bidding at the signer's cap. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-challenge)). |
+| `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI` | Required. At most the signer's tip cap and this daemon's fee cap, and at least twice the priority fee, so that replacements have room to rise. Two replacements are kept for the critical threshold; a higher tip cap leaves more before it, within the signer's tip cap (10 gwei by default, 5 times the default priority fee; raise the signer's first). The daemon does not read the signer's fee or tip cap, so a cap above the signer's makes escalated bids fail with `fee_out_of_bounds` (`signer_refused`, critical at once) instead of bidding at the signer's cap. A pending challenge that used the others is reported as `fee_reserve_held`, which escalates like any blocked obligation. Raising both caps lifts it once 100/121 of the new caps is 10% above both of its fees, and the fee cap counts only up to the ceiling / gas limit (see [challenge operation](../../docs/challenge-service.md#building-and-sending-a-transaction)). |
 | `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI` | Optional tip of a first attempt; default 2 gwei. |
 
 The challenger also reads from `deployment.env` (see
@@ -361,13 +363,12 @@ A throttled request never reaches the API. The gateway answers `429` with
 `{"status":"error","client_request_id":"","error_code":"gateway_rate_limited","error_message":"...","retriable":true,"retry_after_seconds":5}`.
 Retry the same request unchanged after the delay; nothing was processed or
 reserved. The API's own errors, including its 429s, pass through unchanged.
-The browser SDK retries a throttled clearance request within 15 seconds and
-cannot tell an honest 429 from a forged one. After a clearance request that
-carried an ownership proof, on a vault without `vault_revision` 2, it keeps the
-note withdrawal-only (`error.data.withdrawal_only: true`); retrying the close
-completes it. `zkapi-clientd` likewise keeps such a withdrawal reserved,
-whatever the answer: its **repair** cannot release it
-(`ownership_proof_sent`), and choosing **withdraw** again completes it.
+The clients' exit rules count a 429 during an exit as an unreachable server,
+and cannot tell an honest 429 from a forged one: a throttled clearance request
+turns the withdrawal into an escape conceding nothing. Size the clearance
+limit so that honest bursts, such as a wave of withdrawals during a migration,
+are never throttled. The legacy builds of the `release/v2-note-bound` line
+behave as that line's copy of this guide describes.
 
 To change a limit, edit `nginx.conf` and rebuild and restart the gateway:
 
@@ -477,19 +478,17 @@ Alert on:
   stays reserved until you repair the row: restore a saved request that cannot
   be read, or repair any other corrupt column by hand; see
   [Restoring an unreadable pending lease](../../docs/native-eth-billing.md#restoring-an-unreadable-pending-lease);
-- on a hardened vault, its owner, treasury and payout events: any
+- the vault's owner, treasury, escape and payout events: any
   `OwnershipTransferStarted` you did not send, `TreasuryChangeScheduled`,
-  `Paused`, `Unpaused`, `TreasuryPaymentDeferred` and `EscapePayoutDeferred`
-  (see the migration guide's
-  [Operations runbooks](../../docs/migration-hardened-vault.md#operations-runbooks),
-  Treasury arrears and Escape payout credits). `EscapePayoutDeferred` means an
-  escape closed without paying its destination. The browser SDK from this
-  release reports an escape it started as credited and offers its users the
-  claim, but earlier builds report such an escape as returned. Clients detect
-  a credit only for an escape that the same browser started (the browser SDK)
-  or a relayed escape whose transaction hash the user enters
-  (`zkapi-clientd`), so this alert can be the owner's only signal: announce
-  the credit as that runbook says;
+  `Paused`, `Unpaused`, `TreasuryPaymentDeferred`, `EscapePayoutDeferred`,
+  `EscapeConcessionRaised` and `ClosedLeafRetired` (see the migration
+  runbook's [Operations runbooks](../../docs/migration-concession-vault.md#operations-runbooks),
+  Pause, Treasury arrears, Escape payout credits, and Missed defeat or raise).
+  `EscapePayoutDeferred` means an escape closed without paying its
+  destination. The browser SDK reports an escape it started as credited and
+  offers its users the claim, and `zkapi-clientd` shows the claim for its own
+  escapes, but an escape started elsewhere reaches its owner only through
+  you: announce the credit as that runbook says;
 - a non-empty `warnings` list from `zkapi_signerStatus` (`base_fee_above_cap`,
   `base_fee_near_cap`, `balance_below_required`, `tx_fee_cap_below_fee_cap`;
   the challenger bids no higher than the ceiling / gas limit, so the last
@@ -521,13 +520,12 @@ sudo setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 /var/lib/zkapi/s
   "UPDATE settlement_reviews SET acknowledged_at = strftime('%s','now') WHERE review_id = REPLACE_WITH_REVIEW_ID;"
 ```
 
-A `binding_corrupt` review leaves most owners without an exit until the lease is
-reopened: browser SDK profiles without `vault_revision` 2 and `zkapi-clientd`
-cannot escape at that state, and the server grants no mutual-close clearance for
-its reserved nullifier. Only an SDK on a `vault_revision` 2 vault can escape
-there, through its explicit override once
-`unsettled_request_escape_after_seconds` has passed. Reopen the lease before the
-note expires, or its deposit goes to the treasury. With `ID` set to the
+A `binding_corrupt` review leaves its owner's request unsettled: the server
+grants no mutual-close clearance for the reserved nullifier, so the owner's
+client escapes once the request's settlement time has passed, conceding the
+state's bound, the most the challenger could raise to. Reopening the lease
+lets the owner install the real successor and pay only its charge instead.
+Reopen it before the note expires. With `ID` set to the
 review's `client_request_id`, first wait until the lease row's status is
 `cancelled`. Check the row itself: the dashboard's `pending` list holds at most
 `limit` leases, ordered by deadline, so a lease missing from it may still be
@@ -660,9 +658,8 @@ A replay costs about (head − `DEPLOY_BLOCK`) / 1000 `eth_getLogs` calls, paced
 one per 100 ms, plus verification. Start it at least twice that long before the
 nearest pending challenge deadline. Never edit the checkpoint or SQLite files by
 hand, beyond the documented `sqlite3` statements (acknowledging settlement
-reviews under Monitoring, and the
-[receipt journal missing](../../docs/migration-hardened-vault.md#operations-runbooks)
-remediation) and the hand repairs that
+reviews under Monitoring, and, on a legacy stack only, the receipt journal
+missing remediation of that line's migration guide) and the hand repairs that
 [Reopening a cancelled lease](../../docs/native-eth-billing.md#reopening-a-cancelled-lease)
 names for refusals the reopen command cannot repair, which are database
 surgery outside these runbooks; never delete `challenges.json`, and never point
@@ -673,16 +670,16 @@ checkpoint`).
 
 Upgrade a deployment in place by rebuilding from the new release with a new
 `ZKAPI_IMAGE_TAG`, so the previous images stay available for rollback. Back up
-`/var/lib/zkapi` while the services are stopped. Release-specific order and
-checks for this release are in
-[the hardened-vault migration guide](../../docs/migration-hardened-vault.md).
+`/var/lib/zkapi` while the services are stopped. The move from a legacy
+vault to a revision-3 vault is not an in-place upgrade: it is a new
+deployment, as below, run in the order of
+[the concession-vault migration runbook](../../docs/migration-concession-vault.md).
 To roll the indexer back to an earlier image, move `indexer.cursor` aside first
 so that the earlier indexer replays from `DEPLOY_BLOCK`; that replay is the
-only rollback path. An earlier indexer resumes from a checkpoint without
-verifying it against the vault, and the checkpoint this release archived at the
-upgrade (`indexer.cursor.v1-<unix_ms>.bak`) may be the diverged mirror it was
-replacing. That file has the mirror's leaves but no root, and nothing here can
-check it against the vault: keep it for forensics and never restore it.
+only rollback path. An indexer of this release archives a checkpoint of an
+earlier format (`indexer.cursor.v1-<unix_ms>.bak` or `.v2-<unix_ms>.bak`) and
+replays; such a file may be a diverged mirror and nothing here can check it
+against the vault: keep it for forensics and never restore it.
 
 A redeployed vault is a new deployment: new public manifest and hostname, a new
 signer key and exclusive sender, and a fresh data directory (database, indexer

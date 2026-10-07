@@ -23,6 +23,11 @@
 //! * Withdrawal kinds: an escape (kind 0) concedes at most `bound_at_state`;
 //!   a mutual close (kind 1) and an ownership proof (kind 2) concede nothing,
 //!   and an ownership proof has no destination ([`prepare_withdrawal`]).
+//! * Lost ε: a finalized response whose journal is lost is checked against
+//!   S1, S2, S4 and S6 ([`check_unrecoverable_response`]) before its charge
+//!   may lower an escape's concession.
+//! * A saved deposit-time path is kept only if it leads to its root
+//!   ([`note_path_matches`]); the vault accepts any root it ever held.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -809,6 +814,90 @@ pub fn complete_response(
     Ok(next)
 }
 
+/// What a finalized response proves about a state whose request journal (or
+/// its rerandomization ε) is lost: the response passes S1, S2, S4 and S6
+/// ([`check_unrecoverable_response`]), so its charge may lower an escape's
+/// concession to `min(charge, bound_at_state)` (design §6.4 E3, lost ε).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnrecoverableResponse {
+    pub charge_applied: u128,
+    pub next_anchor: Felt252,
+}
+
+/// Check a finalized response at `state` that cannot be installed because
+/// its journal is lost: S1 (it names this state's nullifier `N(s, note_id,
+/// τ)`), S2 (payload hash), S6 (the pinned state key signs the successor) and
+/// S4 (the successor is at `next_anchor(N)`). S3 and S5 need the journal.
+pub fn check_unrecoverable_response(
+    config: &BrowserWalletConfig,
+    state: &BrowserNoteState,
+    response: &RequestResponseV2,
+) -> Result<UnrecoverableResponse> {
+    validate_state(config, state)?;
+    let nullifier = withdrawal_nullifier(state);
+    // S1
+    if response.request_nullifier != nullifier {
+        return Err(refusal(
+            codes::RESPONSE_IDENTITY_MISMATCH,
+            "the response names another nullifier than this state's",
+        ));
+    }
+    // S2
+    if canonical_response_hash(response.response_payload.as_bytes()) != response.response_hash {
+        return Err(refusal(
+            codes::RESPONSE_HASH_MISMATCH,
+            "the response payload does not hash to response_hash",
+        ));
+    }
+    // S6
+    let message = core::state_message(
+        state.protocol_version,
+        state.chain_id,
+        &state.contract_address,
+        &response.next_commitment.x,
+        &response.next_commitment.y,
+        &response.next_anchor,
+    );
+    if !verify_signature(
+        &config.state_signing_key,
+        &message,
+        &response.next_state_signature,
+    )? {
+        return Err(refusal(
+            codes::SUCCESSOR_SIGNATURE_INVALID,
+            "the successor is not signed by the pinned state key",
+        ));
+    }
+    // S4
+    if response.next_anchor != core::next_anchor(&nullifier) {
+        return Err(invalid_successor(
+            "S4",
+            "the successor is not at the derived anchor next_anchor(N)",
+        ));
+    }
+    Ok(UnrecoverableResponse {
+        charge_applied: response.charge_applied,
+        next_anchor: response.next_anchor,
+    })
+}
+
+/// A Merkle path to check against a note ([`note_path_matches`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotePathArgs {
+    pub active_root: Felt252,
+    pub siblings: Vec<Felt252>,
+}
+
+/// Whether `siblings` lead from `state`'s leaf to `active_root`. The wallet
+/// keeps a deposit-time path only when it does: the vault accepts any root it
+/// ever held, so that path proves exits for the note's whole life
+/// (Amendment A1).
+pub fn note_path_matches(state: &BrowserNoteState, args: NotePathArgs) -> Result<bool> {
+    let siblings = siblings_array(args.siblings)?;
+    Ok(core::merkle_root(state.note_id, &state_note_leaf(state), &siblings) == args.active_root)
+}
+
 enum WithdrawalMode {
     Escape {
         destination: [u8; 20],
@@ -1259,6 +1348,33 @@ mod wasm {
         args_json: &str,
     ) -> std::result::Result<String, JsValue> {
         encode(&complete_response(&decode(config_json)?, decode(args_json)?).map_err(js_anyhow)?)
+    }
+
+    /// S1, S2, S4 and S6 of a response whose journal is lost; returns
+    /// `{charge_applied, next_anchor}` (JSON).
+    #[wasm_bindgen]
+    pub fn browser_check_unrecoverable_response(
+        config_json: &str,
+        state_json: &str,
+        response_json: &str,
+    ) -> std::result::Result<String, JsValue> {
+        encode(
+            &check_unrecoverable_response(
+                &decode(config_json)?,
+                &decode(state_json)?,
+                &decode(response_json)?,
+            )
+            .map_err(js_anyhow)?,
+        )
+    }
+
+    /// Whether `{active_root, siblings}` (JSON) is a path of the state's note.
+    #[wasm_bindgen]
+    pub fn browser_note_path_matches(
+        state_json: &str,
+        path_json: &str,
+    ) -> std::result::Result<bool, JsValue> {
+        note_path_matches(&decode(state_json)?, decode(path_json)?).map_err(js_anyhow)
     }
 
     #[wasm_bindgen]

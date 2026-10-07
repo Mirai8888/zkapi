@@ -952,3 +952,108 @@ fn the_rebuilt_tree_matches_the_vault_tree_after_every_event() {
     }))
     .is_err());
 }
+
+#[test]
+fn a_lost_journal_response_is_checked_against_s1_s2_s4_and_s6() {
+    let state = with_bound(&genesis(42, NOTE_ID), 100);
+    let journal = journal_at(&state, 100, "lost");
+    let honest = honest_response(&state, &journal, 60);
+    // Without the journal (ε lost), the charge is usable only after S1, S2,
+    // S4 and S6.
+    assert_eq!(
+        check_unrecoverable_response(&config(), &state, &honest).unwrap(),
+        UnrecoverableResponse {
+            charge_applied: 60,
+            next_anchor: core::next_anchor(&journal.nullifier),
+        }
+    );
+    // A charge above the bound passes these checks; the caller concedes
+    // min(charge, bound).
+    let above = honest_response(&state, &journal, 150);
+    assert_eq!(
+        check_unrecoverable_response(&config(), &state, &above)
+            .unwrap()
+            .charge_applied,
+        150
+    );
+    // S1: another state's nullifier.
+    let other = genesis(43, NOTE_ID);
+    assert_refused(
+        check_unrecoverable_response(&config(), &other, &honest),
+        codes::RESPONSE_IDENTITY_MISMATCH,
+    );
+    // S2: a changed payload.
+    let mut tampered = honest.clone();
+    tampered.response_payload = "tampered".into();
+    assert_refused(
+        check_unrecoverable_response(&config(), &state, &tampered),
+        codes::RESPONSE_HASH_MISMATCH,
+    );
+    // S6: an impostor's signature, even at the derived anchor.
+    let impostor = DevDeployment {
+        state_signer: zkapi_proof::compact::CompactSigner::from_seed(&Felt252::from_u64(9)),
+        ..deployment()
+    };
+    let unsigned = response_with(
+        &impostor,
+        &state,
+        &journal,
+        60,
+        Felt252::from_u64(77),
+        core::next_anchor(&journal.nullifier),
+    );
+    assert_refused(
+        check_unrecoverable_response(&config(), &state, &unsigned),
+        codes::SUCCESSOR_SIGNATURE_INVALID,
+    );
+    // S4: a signed successor at any other anchor.
+    let reused = response_with(
+        &deployment(),
+        &state,
+        &journal,
+        60,
+        Felt252::from_u64(77),
+        state.current_anchor,
+    );
+    assert!(
+        error_text(check_unrecoverable_response(&config(), &state, &reused))
+            .starts_with("invalid_successor: S4")
+    );
+}
+
+#[test]
+fn a_saved_path_is_kept_only_if_it_leads_to_its_root() {
+    let state = genesis(42, NOTE_ID);
+    let tree = tree_for(&state);
+    let path = |root: Felt252| NotePathArgs {
+        active_root: root,
+        siblings: tree.get_siblings(NOTE_ID).to_vec(),
+    };
+    assert!(note_path_matches(&state, path(tree.root())).unwrap());
+    // Another root, another note or another deposit amount does not match.
+    assert!(!note_path_matches(&state, path(Felt252::from_u64(5))).unwrap());
+    assert!(!note_path_matches(&genesis(42, NOTE_ID + 1), path(tree.root())).unwrap());
+    // The deposit-time path stays valid while later deposits append leaves:
+    // the vault keeps every root it held (Amendment A1).
+    let mut later = tree.clone();
+    later.set_leaf(NOTE_ID + 5, Felt252::from_u64(9));
+    assert_ne!(later.root(), tree.root());
+    assert!(note_path_matches(&state, path(tree.root())).unwrap());
+    assert!(note_path_matches(
+        &state,
+        NotePathArgs {
+            active_root: later.root(),
+            siblings: later.get_siblings(NOTE_ID).to_vec(),
+        }
+    )
+    .unwrap());
+    // A path of the wrong depth is an error, not a mismatch.
+    assert!(note_path_matches(
+        &state,
+        NotePathArgs {
+            active_root: tree.root(),
+            siblings: vec![Felt252::ZERO; 31],
+        }
+    )
+    .is_err());
+}

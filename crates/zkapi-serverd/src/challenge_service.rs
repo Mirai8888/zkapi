@@ -232,6 +232,84 @@ pub struct ChallengeTiming {
     pub settlement_poll_seconds: u64,
 }
 
+/// An `Option<u128>` field of a struct that is `#[serde(flatten)]`ed (the
+/// nonce attempts of a pending obligation or a detached nonce). Serde buffers
+/// a flattened struct's fields in its own `Content`, which has no 128-bit
+/// integers, so a plain `u128` read through it fails ("u128 is not
+/// supported"): a checkpoint holding a raise attempt would never load again,
+/// and the restarted challenger would stop. The amount is written as a
+/// number while it fits in 64 bits (as checkpoints always held it), else as a
+/// decimal string, and read through `deserialize_any`, which `Content`
+/// supports.
+mod flat_amount {
+    use std::fmt;
+
+    use serde::de::{self, Deserializer, Visitor};
+    use serde::Serializer;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<u128>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            None => serializer.serialize_none(),
+            Some(amount) => match u64::try_from(*amount) {
+                Ok(small) => serializer.serialize_some(&small),
+                Err(_) => serializer.serialize_some(&amount.to_string()),
+            },
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u128>, D::Error> {
+        deserializer.deserialize_option(Amount)
+    }
+
+    struct Amount;
+
+    impl<'de> Visitor<'de> for Amount {
+        type Value = Option<u128>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an amount: a non-negative integer, its decimal string, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(Some(value.into()))
+        }
+
+        fn visit_u128<E: de::Error>(self, value: u128) -> Result<Self::Value, E> {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            u128::try_from(value)
+                .map(Some)
+                .map_err(|_| E::custom("a negative amount"))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            value.parse::<u128>().map(Some).map_err(E::custom)
+        }
+    }
+}
+
 /// Attempts on one reserved nonce. Every field is written before a send, so a
 /// crash or ambiguous result never loses what may have been broadcast.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +355,7 @@ struct NonceAttempts {
     #[serde(default)]
     evidence_row: Option<i64>,
     /// The amount of a raise.
-    #[serde(default)]
+    #[serde(default, with = "flat_amount")]
     raise_amount: Option<u128>,
     /// A defeat replaced an unmined raise on this nonce: the one change of
     /// call a same-nonce replacement may make.
@@ -5208,6 +5286,59 @@ fn words(value: &Value) -> anyhow::Result<Vec<Felt252>> {
 
 #[cfg(test)]
 mod tests {
+    /// A checkpoint whose pending obligation or detached nonce records a
+    /// raise loads again: the amount sits in the flattened attempt record
+    /// (found by the Anvil acceptance, whose challenger restarted with a
+    /// detached raise nonce and refused its checkpoint).
+    #[test]
+    fn a_checkpoint_with_a_raise_attempt_loads_again() {
+        use super::{CallKind, DetachedNonce, Felt252, NonceAttempts, PendingChallenge};
+        for amount in [
+            400u128,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) + 1,
+            u128::MAX,
+        ] {
+            let attempt = NonceAttempts {
+                action: Some(CallKind::Raise),
+                raise_amount: Some(amount),
+                attempts: 1,
+                ..Default::default()
+            };
+            let detached = DetachedNonce {
+                note_id: 19,
+                nullifier: Felt252::from_u64(7),
+                transaction_hash: Some(format!("0x{}", "8e".repeat(32))),
+                attempt: attempt.clone(),
+            };
+            let back: DetachedNonce =
+                serde_json::from_str(&serde_json::to_string(&detached).unwrap()).unwrap();
+            assert_eq!(back.attempt, attempt, "{amount}");
+            let pending = PendingChallenge {
+                nullifier: Felt252::from_u64(7),
+                state_balance: Some(1_000_000),
+                attempt: attempt.clone(),
+                ..Default::default()
+            };
+            let back: PendingChallenge =
+                serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+            assert_eq!(back.attempt, attempt, "{amount}");
+        }
+        // A record an earlier build wrote (a numeric amount, or none) loads.
+        let earlier = format!(
+            r#"{{"note_id":19,"nullifier":"0x{}","transaction_hash":null,"attempts":1,"action":"raise","raise_amount":400}}"#,
+            "0".repeat(63) + "7"
+        );
+        let back: DetachedNonce = serde_json::from_str(&earlier).unwrap();
+        assert_eq!(back.attempt.raise_amount, Some(400));
+        let without = earlier.replace(r#","raise_amount":400"#, "");
+        let back: DetachedNonce = serde_json::from_str(&without).unwrap();
+        assert_eq!(back.attempt.raise_amount, None);
+        let null = earlier.replace(r#""raise_amount":400"#, r#""raise_amount":null"#);
+        let back: DetachedNonce = serde_json::from_str(&null).unwrap();
+        assert_eq!(back.attempt.raise_amount, None);
+    }
+
     use super::*;
     use crate::watcher::tests::{
         finalized_transcript, finalized_v2_request, two_finalized_v2_requests,

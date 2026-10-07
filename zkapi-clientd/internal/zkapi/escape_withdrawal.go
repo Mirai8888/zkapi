@@ -61,6 +61,9 @@ type escapePlan struct {
 // escapeChainStatus is the companion's /oa/v1/withdraw/escape/status answer.
 // Trusted marks a reading through the owner's exit RPC; without one every
 // reading is the pinned RPC's, which the operator may run (design §2.1).
+// DefeatChecked marks a reading that read the escape's defeat logs at a
+// finalized block: one whose logs did not load reports the phase
+// "unknown", untrusted, and decides nothing.
 type escapeChainStatus struct {
 	Phase             string `json:"phase"`
 	Payout            string `json:"payout"`
@@ -68,6 +71,7 @@ type escapeChainStatus struct {
 	ChallengeDeadline uint64 `json:"challenge_deadline"`
 	Error             string `json:"error"`
 	Trusted           bool   `json:"trusted"`
+	DefeatChecked     bool   `json:"defeat_checked"`
 	Record            *struct {
 		StartBlock uint64 `json:"start_block"`
 	} `json:"record"`
@@ -664,18 +668,29 @@ func (h *FundingHandler) finalizeEscape(ctx context.Context, config fundingConfi
 	case "expired":
 		// The companion released the escape's lock: through the owner's exit
 		// RPC, the note is Active at a finalized block with no pending exit
-		// and no defeat, and the proof is dead. The escape a receipt (or a
-		// defeat) once showed is not on chain; it is decided and proved
-		// again. A pinned-RPC reading leaves the record as it is.
-		if chain.Trusted {
+		// and no defeat in the logs it read there, and the proof is dead.
+		// The escape a receipt (or a defeat) once showed is not on chain; it
+		// is decided and proved again. A pinned-RPC reading, or one that did
+		// not read the defeat logs, leaves the record as it is.
+		if chain.Trusted && chain.DefeatChecked {
 			w.Phase, w.Binding = "escape_expired", ""
 			if err := h.saveAddress(record); err != nil {
 				return update(), err
 			}
 		}
+	case "unknown":
+		// The companion could not read whether the escape was defeated (its
+		// defeat logs did not load): nothing is decided from this reading.
+		next := update()
+		next.Message += " " + escapeUnreadNote
+		return next, nil
 	}
 	return update(), nil
 }
+
+// escapeUnreadNote is added to an escape's status when the chain reading
+// could not tell whether the escape was defeated.
+const escapeUnreadNote = "The escape's defeat logs could not be read just now, so this run decided nothing about the escape; rerun later."
 
 // findEscapeFinalization finds the transaction that finalized the note's
 // escape through the pinned RPC's logs.
@@ -721,6 +736,7 @@ func (h *FundingHandler) completeEscape(ctx context.Context, config fundingConfi
 		return update(), err
 	}
 	w.FinalizeHash, w.Payout, w.Amount, w.PayoutCredited, w.ConcessionExceededBound = strings.ToLower(hash), paid, paid, credited, matched.ExceededBound
+	w.CompletedOnPinnedRPC = config.ExitRPC == ""
 	w.SettlementHash = strings.ToLower(hash)
 	if err := h.archiveWithdrawnDepositForEscape(config, record, hash); err != nil {
 		return update(), err
@@ -900,10 +916,19 @@ func escapeStatus(status AddressWithdrawalStatus, record *addressFundingRecord, 
 	if w.Mode == "escape" && config.ExitRPC == "" && status.Phase != "complete" {
 		status.Message += " " + noExitRPCWarning
 	}
+	if w.Mode == "escape" && status.Phase == "complete" && w.CompletedOnPinnedRPC {
+		status.Message += " " + fmt.Sprintf(pinnedPayoutAdvice, w.Destination)
+	}
 	return status
 }
 
 // noExitRPCWarning is added to every open escape's status while no exit RPC
 // is configured (design §6.4 E6, §6.7): the pinned RPC then answers every
 // chain reading the escape depends on.
-const noExitRPCWarning = "No exit RPC is set: the pinned RPC, which the operator may run or influence, then sends this escape and reports its state (when its lock is released, whether it landed, whether it was defeated). Set your own Ethereum RPC first with zkapi-clientd config --exit-rpc-url URL."
+const noExitRPCWarning = "No exit RPC is set: the pinned RPC, which the operator may run or influence, then sends this escape and reports its state (when its lock is released, whether it landed, whether it was defeated, what it paid). Set your own Ethereum RPC first with zkapi-clientd config --exit-rpc-url URL."
+
+// pinnedPayoutAdvice is added to the status of an escape completed while no
+// exit RPC was set: a pinned RPC that fakes the receipts and logs makes an
+// escape look paid while the note stays open on chain, where the operator
+// can sweep it at expiry (design §6.4 E6).
+const pinnedPayoutAdvice = "No exit RPC was set when this escape completed: the pinned RPC, which the operator may run, reported its finalization and payout. Check through a source the operator does not control (your own node or a block explorer) that the payout reached %s, or for a credited payout that the vault holds it for that address. If it did not, the note may still be open on chain, where the operator can sweep it at expiry: preserve the local payment and private-note files and any exit kit, and exit the note through your own RPC before it expires (zkapi-walletd exit-kit escape --rpc URL)."

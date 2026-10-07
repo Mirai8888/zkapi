@@ -162,11 +162,15 @@ answers falsely can neither block an escape nor end one, nor choose the
 nonce, gas limit or Merkle root an escape is signed with. `config
 --exit-rpc-url none` clears it; escapes then use the pinned RPC, and every
 open escape's status warns about it: the pinned RPC then decides when the
-escape's exit lock is released and reports whether it landed or was
-defeated. Even so, no lock is released before this machine's clock says the
+escape's exit lock is released and reports whether it landed, was defeated
+or paid. Even so, no lock is released before this machine's clock says the
 released proof is dead, and a defeat it reports is read again on every run.
-Set an exit RPC before you escape. The companion takes the same setting from
-`--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
+But a pinned RPC that fakes the escape's receipts and logs can make it look
+finalized and paid while the note stays open on chain, where the operator
+can sweep it at expiry. Set an exit RPC before you escape; without one, check
+through your own node or a block explorer that the payout reached the
+destination (a completed escape's status repeats this). The companion takes
+the same setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
@@ -449,7 +453,8 @@ the vault's `EscapeWithdrawalChallenged` log in a finalized block, and it is
 never final on one reading: every `withdraw --escape --to` reads the chain
 again (through your exit RPC once one is set), follows the escape if it shows
 pending after all, and decides again if your exit RPC shows the escape never
-landed. Exit from the newest state instead (restore the newest backup, or
+landed (a reading whose logs fail to load decides nothing). Exit from the
+newest state instead (restore the newest backup, or
 `zkapi-walletd exit-kit escape` with the newest kit). `--escape --cancel`
 clears a defeated escape once the chain shows it neither pending nor closed
 and its exit lock was released (its proof is dead).

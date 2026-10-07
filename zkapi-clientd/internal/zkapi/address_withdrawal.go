@@ -100,6 +100,11 @@ type addressWithdrawalRecord struct {
 	// ConcessionExceededBound is E5's alert: the escape paid less than the
 	// state balance less the state's bound.
 	ConcessionExceededBound bool `json:"concession_exceeded_bound,omitempty"`
+	// CompletedOnPinnedRPC records an escape completed while no exit RPC was
+	// set: the pinned RPC, which the operator may run, reported its
+	// finalization and payout, so the owner is told to check the payout
+	// through an independent source.
+	CompletedOnPinnedRPC bool `json:"completed_on_pinned_rpc,omitempty"`
 }
 
 type withdrawalWallet struct {

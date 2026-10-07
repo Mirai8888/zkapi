@@ -177,6 +177,8 @@ type escapeCompanion struct {
 	payout          uint64
 	prepares        []map[string]any
 	cancels         int
+	// defeatUnread reports a reading whose defeat logs did not load.
+	defeatUnread bool
 }
 
 func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixture) *http.Response {
@@ -205,7 +207,7 @@ func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixt
 		return withdrawalJSONResponse(r, 200, map[string]any{"status": "submitted"})
 	case "/oa/v1/withdraw/escape/status":
 		e.statuses++
-		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout), "trusted": e.trusted})
+		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout), "trusted": e.trusted, "defeat_checked": !e.defeatUnread})
 	case "/oa/v1/withdraw/escape/cancel":
 		e.cancels++
 		return withdrawalJSONResponse(r, 200, map[string]any{"status": "cancelled"})
@@ -338,6 +340,12 @@ func escapeEndToEnd(t *testing.T, pinnedDown bool) *withdrawalFixture {
 	}
 	if len(f.escape.finalized) != 1 || f.active {
 		t.Fatal("the companion did not close the note")
+	}
+	// Completed through the pinned RPC (no exit RPC set), the status says to
+	// check the payout through an independent source; through the owner's
+	// exit RPC it does not.
+	if advised := strings.Contains(status.Message, "No exit RPC was set when this escape completed") && strings.Contains(status.Message, withdrawalTestDestination); advised == pinnedDown || f.journal(t).Withdrawal.CompletedOnPinnedRPC == pinnedDown {
+		t.Fatalf("payout-check advice %v with the exit RPC set %v: %s", advised, pinnedDown, status.Message)
 	}
 	// Deliver the credit.
 	f.mu.Lock()
@@ -954,6 +962,44 @@ func TestAnEscapeTheExitRPCShowsNeverLandedIsDecidedAgain(t *testing.T) {
 	prepares := len(f.escape.prepares)
 	if status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_decision" || len(f.escape.prepares) != prepares+1 {
 		t.Fatalf("no fresh decision: %+v %v", status, err)
+	}
+}
+
+// E6 with failing defeat logs: a reading that could not read whether the
+// escape was defeated decides nothing, even through the owner's exit RPC.
+// Neither "unknown" nor an "expired" without its defeat logs retires the
+// escape or clears a saved defeat; logs that load decide again.
+func TestAnEscapeReadingWithoutItsDefeatLogsDecidesNothing(t *testing.T) {
+	ctx := context.Background()
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "unknown"}
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	initiate := f.signEscape(t)
+	f.mine(t, initiate.Hash().Hex(), false)
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_initiated" || f.journal(t).Withdrawal.Phase != "escape_initiated" || !strings.Contains(status.Message, escapeUnreadNote) {
+		t.Fatalf("an unread defeat moved the escape: %+v %v", status, err)
+	}
+	f.escape.chainPhase, f.escape.trusted, f.escape.defeatUnread = "expired", true, true
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_initiated" || f.journal(t).Withdrawal.Phase != "escape_initiated" {
+		t.Fatalf("an expiry without its defeat logs retired the escape: %+v %v", status, err)
+	}
+	// A saved defeat is kept through a reading without the logs.
+	f.escape.chainPhase, f.escape.defeatUnread = "defeated", false
+	if status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); !isDeviceNotNewest(err) || status.Phase != "defeated" {
+		t.Fatalf("no defeat: %+v %v", status, err)
+	}
+	f.escape.chainPhase, f.escape.trusted, f.escape.defeatUnread = "unknown", false, true
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "defeated" || f.journal(t).Withdrawal.Phase != "defeated" || !strings.Contains(status.Message, escapeUnreadNote) {
+		t.Fatalf("an unread defeat changed the saved defeat: %+v %v", status, err)
+	}
+	// Logs that load decide: the escape never landed.
+	f.escape.chainPhase, f.escape.trusted, f.escape.defeatUnread = "expired", true, false
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_expired" || f.journal(t).Withdrawal.Phase != "escape_expired" {
+		t.Fatalf("a checked expiry was not followed: %+v %v", status, err)
 	}
 }
 

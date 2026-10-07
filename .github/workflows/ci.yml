@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Build app crates
         run: cargo build --release --workspace
@@ -60,7 +60,28 @@ jobs:
         run: cargo run --release --manifest-path protocol/rust/Cargo.toml -p zkapi-proof --example wasm_roundtrip -- "$PWD/scripts/prove-browser-fixture.mjs" "$PWD/sdk"
 
       - name: Clippy app crates
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The adversary modes (withhold, born-spent, reuse-anchor, random-anchor,
+      # overcharge, lie-expired, hang) exist only in drill builds. Check the
+      # release binary built above first: the feature build below replaces it.
+      - name: Release binaries reject the adversary flag
+        run: |
+          for args in "--adversary hang serverd" "serverd --adversary withhold"; do
+            set +e
+            output=$(./target/release/zkapi $args 2>&1)
+            status=$?
+            set -e
+            case "$status:$output" in
+              "2:"*"unexpected argument '--adversary'"*) ;;
+              *) echo "release zkapi accepted '$args' (exit $status): $output" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Test and lint the drill-only adversary feature
+        run: |
+          cargo clippy -p zkapi-serverd -p zkapi-cli --all-targets --features zkapi-cli/adversary -- -D warnings
+          cargo test --release -p zkapi-serverd -p zkapi-cli --features zkapi-cli/adversary
 
       - name: Validate operator scripts
         run: bash -n scripts/build-browser-client.sh scripts/run-v2-acceptance.sh docker/tee/attestation-hook.sh && sh -n docker/aws/run-daemon.sh
@@ -193,3 +214,14 @@ jobs:
 
       - name: Build Docker image
         run: docker build -f docker/Dockerfile -t ethereum/zkapi:ci .
+
+      - name: The image's zkapi rejects the adversary flag
+        run: |
+          set +e
+          output=$(docker run --rm --entrypoint zkapi ethereum/zkapi:ci --adversary hang serverd 2>&1)
+          status=$?
+          set -e
+          case "$status:$output" in
+            "2:"*"unexpected argument '--adversary'"*) ;;
+            *) echo "the image's zkapi accepted --adversary (exit $status): $output" >&2; exit 1 ;;
+          esac

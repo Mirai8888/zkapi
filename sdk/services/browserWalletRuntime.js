@@ -79,6 +79,13 @@ const NOTE_NEAR_EXPIRY_MESSAGE = 'This balance is too close to its expiry for a 
 const INVALID_SUCCESSOR_MESSAGE = 'The server settled a private request for this balance with a successor that fails this wallet’s checks. It is treated as withheld: the balance can only be withdrawn, conceding at most that request’s bound.';
 const DEPOSITS_CLOSED_MESSAGE = 'This deployment no longer accepts new deposits. Existing balances and deposits already started can still be completed, recovered and withdrawn.';
 const REQUEST_ARCHIVE_LIMIT_MESSAGE = 'Too many unsettled private requests are recorded for this balance state, so no new chat can start from it. Chats resume only if the server settles one of them; otherwise withdraw this balance.';
+const EXIT_ONLY_MESSAGE = 'Withdrawals work, but new deposits and private chats wait until the operator’s deployment manifest is served and matches this build again.';
+// Every operator call outside exit mode (lease issuance and retirement,
+// recovery, quotes, the indexer, the manifest) ends by this time, so no hung
+// call holds the wallet lock, and an exit queued behind it, indefinitely.
+// It is above the server's own bounds (30 s issuance lock, 45 s retirement).
+// Exit-mode calls use E0's CALL_TIMEOUT instead.
+const OPERATOR_CALL_TIMEOUT_MS = 90_000;
 const STALE_ROOT_RETRY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
 const SETTLEMENT_RETRY_MIN_MS = 2_000;
 const SETTLEMENT_RETRY_MAX_MS = 60_000;
@@ -439,6 +446,17 @@ class BrowserWalletRuntime extends EventTarget {
         this.activeLease = null;
         this.initialized = false;
         this.initPromise = null;
+        // Exit-only mode (design §1.2(6), E0): set when the operator's
+        // manifest is missing, slow or differs from the build-pinned profile.
+        // Exits run from the pins; deposits and requests are refused.
+        this.manifestUrl = null;
+        this.manifestSelectionProblem = null;
+        this.manifestProblem = null;
+        // The pinned RPC's native-ETH vault check: a promise of null or the
+        // error. Deposits and requests wait on it; exits never do.
+        this.nativeVaultCheck = null;
+        this.startupRecovery = null;
+        this.startupRecoveryController = null;
         this.leasePromise = null;
         this.leasePromiseSession = null;
         this.leasePromiseSpendingLimitUsd = null;
@@ -460,59 +478,58 @@ class BrowserWalletRuntime extends EventTarget {
     async init() {
         beginBrowserSdkInitialization();
         if (this.initPromise) return this.initPromise;
-        this.initPromise = this.initialize();
-        return this.initPromise;
+        const pending = this.initialize();
+        this.initPromise = pending;
+        // A failed initialization is not kept: the next call starts again.
+        pending.catch(() => {
+            if (this.initPromise === pending) this.initPromise = null;
+        });
+        return pending;
     }
 
+    /**
+     * Initialization never waits on the operator or on the pinned RPC
+     * (design §1.2(6), E0, §7.5 "Operator stalls HTTP"): every exit awaits it.
+     * - The build-pinned profile alone configures the wallet when the
+     *   operator's manifest is missing, slow or different (exit-only mode);
+     *   deposits and requests are refused until it matches again.
+     * - The pinned RPC's checks run in the background; deposits and requests
+     *   wait on them, exits never do.
+     * - Recovery of an interrupted request runs after initialization, bounded
+     *   like E1, and an exit started in this tab stops it.
+     */
     async initialize() {
         this.browserConfig = await this.loadBrowserConfig();
-        const allowedManifests = (this.browserConfig.allowed_deployment_manifest_urls
-            || [this.browserConfig.deployment_manifest_url])
-            .filter(Boolean)
-            .map(value => new URL(value, location.href).href);
-        const requestedManifest = new URLSearchParams(location.search).get('zkapiDeployment');
-        const storedManifest = localStorage.getItem('zkapi-browser-deployment');
-        if (requestedManifest
-            && !allowedManifests.includes(new URL(requestedManifest, location.href).href)) {
-            throw new Error('The selected deployment manifest is not trusted by this application build.');
+        // The build-pinned profile itself must be usable (fatal otherwise).
+        this.validateTrustedProfile();
+        const pinned = this.pinnedManifest();
+        this.validateManifest(pinned);
+        this.validateManifestTrust(pinned);
+        // An untrusted ?zkapiDeployment link only stops deposits and chats.
+        try {
+            this.manifestUrl = this.selectedManifestUrl();
+            this.manifestSelectionProblem = null;
+        } catch (error) {
+            this.manifestUrl = null;
+            this.manifestSelectionProblem = { code: 'deployment_manifest_untrusted', message: String(error?.message || error) };
         }
-        if (storedManifest
-            && !allowedManifests.includes(new URL(storedManifest, location.href).href)) {
-            localStorage.removeItem('zkapi-browser-deployment');
-        }
-        const configuredManifest = requestedManifest
-            || (storedManifest && allowedManifests.includes(new URL(storedManifest, location.href).href)
-                ? storedManifest
-                : null)
-            || this.browserConfig.deployment_manifest_url;
-        if (!configuredManifest) throw new Error('The website has no zkAPI deployment manifest configured.');
-        const manifestUrl = new URL(configuredManifest, location.href).href;
-        if (!allowedManifests.includes(manifestUrl)) {
-            throw new Error('The selected deployment manifest is not trusted by this application build.');
-        }
-        this.manifest = await this.directJson(manifestUrl);
-        this.validateManifest(this.manifest);
-        this.validateManifestTrust(this.manifest);
-        localStorage.setItem('zkapi-browser-deployment', manifestUrl);
+        const served = await this.loadServedManifest(this.manifestUrl);
+        this.manifest = served.manifest || pinned;
+        this.manifestProblem = served.problem || null;
+        if (served.manifest) this.rememberManifestUrl();
         this.config = this.buildClientConfig(this.manifest, this.browserConfig);
         this.testnetAuth = new TestnetPasswordAuth({
             funding: this.config.funding,
             fetch: (url, init) => this.remoteFetchRaw(url, init),
             requestPassword: browserSdkOptions().requestTestnetPassword
         });
-        await assertNativeVault(this.config.funding);
-        // Design §6.5: the pinned RPC's view of the deployment pins, checked
-        // again through the wallet provider before every deposit. A mismatch
-        // only refuses deposits; exits never depend on it.
-        this.deploymentVerification = await verifyDeployment({ request: this.pinnedRpc(),
-            trusted: this.browserConfig.trusted_deployment, chainId: Number(this.config.funding.chain_id),
-            source: 'pinned_rpc' }).then(result => ({ checkedAt: Date.now(), ok: result.ok, results: [result] }),
-            error => ({ checkedAt: Date.now(), ok: false, error: error?.code || error?.message || String(error) }));
-        this.worker = new WorkerBridge();
+        this.startPinnedRpcChecks();
+        this.worker ||= new WorkerBridge();
         await this.assertWorkerBundle();
         // Initialization participates in the same global lock as every later
         // mutation. This prevents two same-origin deployment tabs from both
         // rebinding the singleton runtime and committing stale snapshots.
+        // Nothing under it reaches the network.
         await withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             if (this.runtime.deploymentId !== this.manifest.deployment_id) {
@@ -523,9 +540,8 @@ class BrowserWalletRuntime extends EventTarget {
                 });
             }
             await this.discardClosedDepositDraftLocked();
-            await this.recoverPendingLocked({ retireLostKey: true, quiet: true });
         });
-        this.channel = createWalletChannel(this.manifest.deployment_id, () => {
+        this.channel ||= createWalletChannel(this.manifest.deployment_id, () => {
             // A channel notification can arrive while this tab is awaiting a
             // proof or server response inside a wallet mutation. Reading the
             // singleton IndexedDB snapshot outside the global lock can then
@@ -537,13 +553,213 @@ class BrowserWalletRuntime extends EventTarget {
         });
         await requestPersistentStorage();
         this.initialized = true;
+        this.startupRecovery = this.recoverOnStartup();
         return this.snapshot();
     }
 
     async loadBrowserConfig() {
-        const response = await fetch(browserConfigUrl(), { cache: 'no-store', credentials: 'omit' });
+        const signal = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+        const response = await abortable(fetch(browserConfigUrl(), { cache: 'no-store', credentials: 'omit', signal }), signal);
         if (!response.ok) throw new Error(`Unable to load browser-config.json (${response.status}).`);
-        return response.json();
+        return abortable(response.json(), signal);
+    }
+
+    /** The manifest URL this page selected: a trusted ?zkapiDeployment, the remembered one, or the build's. */
+    selectedManifestUrl() {
+        const allowedManifests = (this.browserConfig.allowed_deployment_manifest_urls
+            || [this.browserConfig.deployment_manifest_url])
+            .filter(Boolean)
+            .map(value => new URL(value, location.href).href);
+        const requestedManifest = new URLSearchParams(location.search).get('zkapiDeployment');
+        let storedManifest = null;
+        try {
+            storedManifest = localStorage.getItem('zkapi-browser-deployment');
+        } catch {
+            storedManifest = null;
+        }
+        if (requestedManifest
+            && !allowedManifests.includes(new URL(requestedManifest, location.href).href)) {
+            throw new Error('The selected deployment manifest is not trusted by this application build.');
+        }
+        if (storedManifest
+            && !allowedManifests.includes(new URL(storedManifest, location.href).href)) {
+            try { localStorage.removeItem('zkapi-browser-deployment'); } catch { /* Not remembered. */ }
+        }
+        const configuredManifest = requestedManifest
+            || (storedManifest && allowedManifests.includes(new URL(storedManifest, location.href).href)
+                ? storedManifest
+                : null)
+            || this.browserConfig.deployment_manifest_url;
+        if (!configuredManifest) return null;
+        const manifestUrl = new URL(configuredManifest, location.href).href;
+        if (!allowedManifests.includes(manifestUrl)) {
+            throw new Error('The selected deployment manifest is not trusted by this application build.');
+        }
+        return manifestUrl;
+    }
+
+    rememberManifestUrl() {
+        try {
+            if (this.manifestUrl) localStorage.setItem('zkapi-browser-deployment', this.manifestUrl);
+        } catch {
+            // Only a convenience: the build's manifest is used next time.
+        }
+    }
+
+    /**
+     * The deployment manifest as the build-pinned profile states it. A served
+     * manifest must equal it on every field an exit, a deposit or a request
+     * relies on (validateManifestTrust), so exits need nothing else.
+     */
+    pinnedManifest() {
+        const trusted = this.browserConfig?.trusted_deployment || {};
+        return {
+            protocol_version: 2,
+            proof_backend: 'groth16_bn254',
+            proof_setup: {
+                circuit_id: trusted.circuit_id,
+                setup_id: trusted.setup_id,
+                request_proving_key_sha256: trusted.request_proving_key_sha256,
+                withdrawal_proving_key_sha256: trusted.withdrawal_proving_key_sha256
+            },
+            deployment_id: trusted.deployment_id,
+            contract_address: trusted.contract_address,
+            chain_id: trusted.chain_id,
+            protocol_server_url: trusted.protocol_server_url,
+            indexer_url: trusted.indexer_url,
+            rpc_url: trusted.rpc_url,
+            billing_asset: trusted.billing_asset,
+            billing_unit: trusted.billing_unit,
+            billing_token_address: null,
+            native_asset_wei_per_unit: trusted.native_asset_wei_per_unit,
+            native_price_feed_address: trusted.native_price_feed_address,
+            native_price_feed_decimals: trusted.native_price_feed_decimals,
+            native_price_max_age_seconds: trusted.native_price_max_age_seconds,
+            request_charge_cap: trusted.request_charge_cap,
+            state_signing_key: trusted.state_signing_key,
+            clearance_signing_key: trusted.clearance_signing_key,
+            privacy_mode: {
+                openrouter_inference_base: trusted.openrouter_inference_base,
+                verifier_url: trusted.verifier_url
+            }
+        };
+    }
+
+    /**
+     * The operator's manifest, bounded by CALL_TIMEOUT: { manifest } when it
+     * loads and matches the pins, else { problem: { code, message } }.
+     */
+    async loadServedManifest(url) {
+        if (this.manifestSelectionProblem) return { problem: this.manifestSelectionProblem };
+        if (!url) {
+            return { problem: { code: 'deployment_manifest_unavailable', message: 'The website has no zkAPI deployment manifest configured.' } };
+        }
+        let manifest;
+        try {
+            manifest = await this.directJson(url, { timeoutMs: this.exitTiming().callTimeoutMs });
+        } catch (error) {
+            return { problem: { code: 'deployment_manifest_unavailable',
+                message: error?.name === 'TimeoutError' ? `Unable to load ${url} (timed out).` : String(error?.message || error) } };
+        }
+        try {
+            this.validateManifest(manifest);
+            this.validateManifestTrust(manifest);
+        } catch (error) {
+            return { problem: { code: error?.code === 'incompatible_proof_circuit' ? error.code : 'deployment_manifest_mismatch',
+                message: String(error?.message || error) } };
+        }
+        return { manifest };
+    }
+
+    /** The pinned RPC's checks, in the background: never awaited by initialization or an exit. */
+    startPinnedRpcChecks() {
+        this.nativeVaultCheck = this.checkNativeVault();
+        // Design §6.5: the pinned RPC's view of the deployment pins, checked
+        // again through the wallet provider before every deposit. A mismatch
+        // only refuses deposits; exits never depend on it.
+        this.deploymentVerification = { checkedAt: null, ok: null, pending: true };
+        void verifyDeployment({ request: this.pinnedRpc(), trusted: this.browserConfig.trusted_deployment,
+            chainId: Number(this.config.funding.chain_id), source: 'pinned_rpc' })
+            .then(result => ({ checkedAt: Date.now(), ok: result.ok, results: [result] }),
+                error => ({ checkedAt: Date.now(), ok: false, error: error?.code || error?.message || String(error) }))
+            .then(verification => { this.deploymentVerification = verification; });
+    }
+
+    checkNativeVault() {
+        return assertNativeVault(this.config.funding, { signal: AbortSignal.timeout(this.exitTiming().callTimeoutMs) })
+            .then(() => null, error => error || new Error('The pinned vault RPC check failed.'));
+    }
+
+    /** Whether deposits and requests are available, for the snapshot. */
+    serviceStatus() {
+        return this.manifestProblem
+            ? { available: false, exits: true, code: this.manifestProblem.code, message: EXIT_ONLY_MESSAGE,
+                detail: this.manifestProblem.message }
+            : { available: true, exits: true, code: null, message: null, detail: null };
+    }
+
+    /**
+     * Deposits and requests need the operator's manifest to match the pins
+     * and the pinned RPC to confirm the native-ETH vault. A failed check is
+     * retried once, bounded, before refusing. Exits never call this.
+     */
+    async assertServiceAvailable() {
+        if (this.manifestProblem) {
+            const served = await this.loadServedManifest(this.manifestUrl);
+            if (!served.manifest) {
+                this.manifestProblem = served.problem;
+                this.dispatchEvent(new Event('change'));
+                throw new BrowserWalletHttpError(`${EXIT_ONLY_MESSAGE} ${served.problem.message}`, 503, served.problem.code,
+                    { exits: true });
+            }
+            this.manifest = served.manifest;
+            this.manifestProblem = null;
+            this.config = this.buildClientConfig(served.manifest, this.browserConfig);
+            this.rememberManifestUrl();
+            this.dispatchEvent(new Event('change'));
+        }
+        if (!this.nativeVaultCheck) return;
+        if (await this.nativeVaultCheck) this.nativeVaultCheck = this.checkNativeVault();
+        const failure = await this.nativeVaultCheck;
+        if (failure) {
+            throw new BrowserWalletHttpError(failure.message || 'The pinned vault RPC check failed.', 503, 'native_vault_unverified',
+                { exits: true });
+        }
+    }
+
+    /**
+     * Startup recovery of a request journal left by a closed tab: one pass
+     * after initialization, never awaited by it. It runs under the wallet
+     * lock within RECOVERY_BUDGET (E0), and an exit started in this tab
+     * aborts it (preemptForExit), so it never holds an exit behind the
+     * operator.
+     */
+    async recoverOnStartup() {
+        if (!this.runtime?.journal) return false;
+        const controller = new AbortController();
+        this.startupRecoveryController = controller;
+        const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.exitTiming().recoveryBudgetMs)]);
+        try {
+            return await withBrowserWalletLock(this.manifest.deployment_id, async () => {
+                if (signal.aborted) return false;
+                await this.reload();
+                return this.recoverPendingLocked({ retireLostKey: true, quiet: true, signal });
+            });
+        } catch {
+            return false;
+        } finally {
+            if (this.startupRecoveryController === controller) this.startupRecoveryController = null;
+        }
+    }
+
+    /**
+     * An exit in this tab stops this tab's startup recovery, and on a
+     * withdrawal any private key being issued, so that neither holds the
+     * wallet lock ahead of it (E0). Both are journaled and resume later.
+     */
+    preemptForExit({ requests = false } = {}) {
+        this.startupRecoveryController?.abort();
+        if (requests) this.leaseAbortController?.abort();
     }
 
     deploymentProxyUrl(url) {
@@ -565,19 +781,19 @@ class BrowserWalletRuntime extends EventTarget {
         return new URL(`${target.pathname.replace(/^\/+/, '')}${target.search}`, proxyBase).href;
     }
 
-    async directJson(url) {
+    async directJson(url, { timeoutMs = this.operatorCallTimeoutMs() } = {}) {
+        const signal = AbortSignal.timeout(timeoutMs);
+        const read = target => abortable(fetch(target, { cache: 'no-store', credentials: 'omit', signal }), signal);
         const proxyUrl = this.deploymentProxyUrl(url);
-        let response = proxyUrl
-            ? await fetch(proxyUrl, { cache: 'no-store', credentials: 'omit' })
-            : null;
+        let response = proxyUrl ? await read(proxyUrl) : null;
         // Local static development servers do not necessarily provide the
         // production rewrite. Fall back to the deployment URL only for that
         // unambiguous case; Vercel serves the trusted target at the proxy URL.
         if (!response || response.status === 404) {
-            response = await fetch(url, { cache: 'no-store', credentials: 'omit' });
+            response = await read(url);
         }
         if (!response.ok) throw new Error(`Unable to load ${url} (${response.status}).`);
-        return response.json();
+        return abortable(response.json(), signal);
     }
 
     validateManifest(manifest) {
@@ -610,7 +826,12 @@ class BrowserWalletRuntime extends EventTarget {
         }
     }
 
-    validateManifestTrust(manifest) {
+    /**
+     * The build-pinned profile itself (browser-config.json's
+     * trusted_deployment). Its errors are fatal: without a usable profile
+     * there is nothing to exit from either.
+     */
+    validateTrustedProfile() {
         if (this.browserConfig.deployment_status === 'migration_required') {
             throw new Error('This application still pins a legacy vault. Configure a newly deployed note-bound vault before funding.');
         }
@@ -631,6 +852,29 @@ class BrowserWalletRuntime extends EventTarget {
         if (!BUNDLE_SETUP_IDS.includes(trusted.setup_id)) {
             throw new Error('browser-config.json contains an invalid trusted setup_id.');
         }
+        // Capabilities come only from the build-pinned trust anchor, never
+        // from the served manifest. This build supports vault revision 3 only.
+        if (trusted.vault_revision !== 3) {
+            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 3).');
+        }
+        if (trusted.clearance_ownership_proof !== 'required') {
+            throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof (this build needs "required").');
+        }
+        if (trusted.settlement_window_seconds != null
+            && (!Number.isSafeInteger(trusted.settlement_window_seconds) || trusted.settlement_window_seconds <= 0)) {
+            throw new Error('browser-config.json contains an invalid trusted settlement_window_seconds.');
+        }
+        // The deposit cutoff of a deployment being drained, also from the
+        // build-pinned profile only.
+        if (trusted.deposits != null && !['open', 'closed'].includes(trusted.deposits)) {
+            throw new Error('browser-config.json contains an invalid trusted deposits setting.');
+        }
+        return trusted;
+    }
+
+    /** A served deployment manifest against the build-pinned profile. */
+    validateManifestTrust(manifest) {
+        const trusted = this.validateTrustedProfile();
         const requireEqual = (actual, expected, label, normalize = value => String(value)) => {
             if (expected == null || normalize(actual) !== normalize(expected)) {
                 throw new Error(`The deployment manifest changed its pinned ${label}.`);
@@ -688,23 +932,6 @@ class BrowserWalletRuntime extends EventTarget {
             'OA verifier',
             normalizedUrl
         );
-        // Capabilities come only from the build-pinned trust anchor, never
-        // from the served manifest. This build supports vault revision 3 only.
-        if (trusted.vault_revision !== 3) {
-            throw new Error('browser-config.json contains an invalid trusted vault_revision (this build needs 3).');
-        }
-        if (trusted.clearance_ownership_proof !== 'required') {
-            throw new Error('browser-config.json contains an invalid trusted clearance_ownership_proof (this build needs "required").');
-        }
-        if (trusted.settlement_window_seconds != null
-            && (!Number.isSafeInteger(trusted.settlement_window_seconds) || trusted.settlement_window_seconds <= 0)) {
-            throw new Error('browser-config.json contains an invalid trusted settlement_window_seconds.');
-        }
-        // The deposit cutoff of a deployment being drained, also from the
-        // build-pinned profile only.
-        if (trusted.deposits != null && !['open', 'closed'].includes(trusted.deposits)) {
-            throw new Error('browser-config.json contains an invalid trusted deposits setting.');
-        }
     }
 
     /**
@@ -866,6 +1093,9 @@ class BrowserWalletRuntime extends EventTarget {
         const config = this.config ? {
             ...this.config,
             deposits: this.depositsClosed() ? 'closed' : 'open',
+            // Exit-only mode: withdrawals work from the build-pinned profile
+            // while deposits and private chats wait for the operator.
+            service: this.serviceStatus(),
             other_deployment_withdrawals: (this.otherDeploymentWithdrawals || []).map(record => ({
                 deployment_id: record.deploymentId,
                 record_id: record.recordId,
@@ -1215,10 +1445,17 @@ class BrowserWalletRuntime extends EventTarget {
         return browserSdkTransport(url, init, { preferProxy: true });
     }
 
-    async remoteJson(url, init = {}) {
-        const response = await this.remoteFetch(url, init);
+    /**
+     * One operator call, ended (connect and full body) by `timeoutMs` or the
+     * caller's signal, whichever comes first: no operator call made under the
+     * wallet lock can hold it indefinitely (E0).
+     */
+    async remoteJson(url, { timeoutMs = this.operatorCallTimeoutMs(), ...init } = {}) {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+        const response = await abortable(this.remoteFetch(url, { ...init, signal }), signal);
         if (response.status === 401 && this.testnetAuth?.protects(url)) throw testnetPasswordRequired();
-        let payload = await responsePayload(response);
+        let payload = await abortable(responsePayload(response), signal);
         if (!response.ok) {
             const retryAfterHeader = response.headers.get('retry-after');
             const retryAfter = retryAfterHeader == null || retryAfterHeader.trim() === ''
@@ -1285,6 +1522,8 @@ class BrowserWalletRuntime extends EventTarget {
 
     async prepareDepositQuote(amount, expectedActiveRoot) {
         await this.init();
+        // Exit-only mode refuses new deposits (initialize()).
+        await this.assertServiceAvailable();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const pending = this.runtime.pendingDeposit;
@@ -1333,6 +1572,7 @@ class BrowserWalletRuntime extends EventTarget {
 
     async prepareDeposit(amount, { preparedOperationId = null } = {}) {
         await this.init();
+        await this.assertServiceAvailable();
         const plan = await withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             if (this.runtime.state) throw new Error('This browser already has an active private note.');
@@ -2323,10 +2563,9 @@ class BrowserWalletRuntime extends EventTarget {
 
     /** One word of the pinned vault, read over the trusted deployment RPC. */
     async vaultWord(data, signal = null) {
-        const timeout = AbortSignal.timeout(20_000);
-        return readVaultWord(this.config.funding, data, {
-            signal: signal ? AbortSignal.any([signal, timeout]) : timeout
-        });
+        const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        return abortable(readVaultWord(this.config.funding, data, { signal: callSignal }), callSignal);
     }
 
     /**
@@ -2417,6 +2656,9 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     async issueLease(sessionId, onProgress = () => {}, signal = null, spendingLimitUsd = 1) {
+        // Exit-only mode refuses new private chats (initialize()).
+        await this.assertServiceAvailable();
+        throwIfAborted(signal);
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             throwIfAborted(signal);
             await this.reload();
@@ -2874,12 +3116,12 @@ class BrowserWalletRuntime extends EventTarget {
      * LATE_SUCCESSOR then. An install moves an exit lock that released no
      * exit proof to the new state.
      */
-    async installRecoveredResponse(clientRequestId, onProgress = () => {}, { response = null } = {}) {
+    async installRecoveredResponse(clientRequestId, onProgress = () => {}, { response = null, signal = null } = {}) {
         onProgress('applying', 'Updating your private balance…');
         let receipt = response;
         const fetched = !receipt;
         if (fetched) {
-            const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/requests/${encodeURIComponent(clientRequestId)}`);
+            const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/requests/${encodeURIComponent(clientRequestId)}`, { signal });
             if (!recovery.request_response) return false;
             receipt = recovery.request_response;
         }
@@ -3134,7 +3376,7 @@ class BrowserWalletRuntime extends EventTarget {
                     onProgress, signal, context: 'recovery'
                 });
             }
-            return this.installRecoveredResponse(request.client_request_id, onProgress);
+            return this.installRecoveredResponse(request.client_request_id, onProgress, { signal });
         } catch (error) {
             if (error.status === 404) {
                 const recovery = await this.remoteJson(`${this.config.funding.protocol_server_url}/v2/nullifiers/${encodeURIComponent(this.runtime.journal.nullifier)}`, { signal });
@@ -3281,6 +3523,12 @@ class BrowserWalletRuntime extends EventTarget {
     /** E0 timing, overridable per instance (tests shorten the budgets). */
     exitTiming() {
         return { ...EXIT_TIMING, ...(this.exitTimingOverrides || {}) };
+    }
+
+    /** The bound of one operator call outside exit mode (overridable per instance, like E0's). */
+    operatorCallTimeoutMs() {
+        const value = Number(this.exitTimingOverrides?.operatorCallTimeoutMs);
+        return Number.isSafeInteger(value) && value > 0 ? value : OPERATOR_CALL_TIMEOUT_MS;
     }
 
     /** The build-pinned settlement window W (E0, C4). */
@@ -3620,6 +3868,7 @@ class BrowserWalletRuntime extends EventTarget {
      */
     async cancelExit() {
         await this.init();
+        this.preemptForExit();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const prepared = this.runtime.preparedWithdrawal;
@@ -3640,6 +3889,7 @@ class BrowserWalletRuntime extends EventTarget {
      */
     async exitBeforeBroadcast({ signal = null } = {}) {
         await this.init();
+        this.preemptForExit({ requests: true });
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const state = this.runtime.state;
@@ -3679,6 +3929,7 @@ class BrowserWalletRuntime extends EventTarget {
             throw new BrowserWalletHttpError('Wait for the active model requests to finish before withdrawing.',
                 409, 'lease_requests_in_flight');
         }
+        this.preemptForExit({ requests: true });
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const lockBefore = this.runtime.exitLock;
@@ -4157,6 +4408,7 @@ class BrowserWalletRuntime extends EventTarget {
      */
     async exportExitKit({ passphrase } = {}) {
         await this.init();
+        this.preemptForExit();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const state = this.runtime.state;
@@ -4178,6 +4430,7 @@ class BrowserWalletRuntime extends EventTarget {
      * canary refusal); exits never depend on it.
      */
     async verifyDeploymentForDeposit({ walletRequest, depositWei }) {
+        await this.assertServiceAvailable();
         const trusted = this.browserConfig?.trusted_deployment;
         const chainId = Number(this.config.funding.chain_id);
         const results = await Promise.all([

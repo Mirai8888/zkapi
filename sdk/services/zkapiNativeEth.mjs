@@ -116,13 +116,27 @@ export function nativeDepositValue(amount, funding) {
     return units * NATIVE_WEI_PER_UNIT;
 }
 
+/**
+ * `promise`, or a rejection once `signal` aborts: an RPC call ends at its
+ * timeout even through a host transport that ignores the signal (E0).
+ */
+function untilAborted(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+    return new Promise((resolve, reject) => {
+        const aborted = () => reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+        signal.addEventListener('abort', aborted, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+    });
+}
+
 async function rpc(funding, method, params, signal) {
-    const response = await browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
+    const response = await untilAborted(browserSdkTransport(funding.demo_rpc_url || funding.rpc_url, {
         method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit',
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal, cache: 'no-store'
-    }, { preferProxy: true });
+    }, { preferProxy: true }), signal);
     if (!response.ok) throw new Error('The ETH price RPC is unavailable. Please check again.');
-    const body = await response.json();
+    const body = await untilAborted(response.json(), signal);
     if (body.error || body.result == null) {
         const error = new Error('The ETH price RPC could not return a verified quote.');
         // The call itself reverted (code 3 on anvil and current geth; older
@@ -187,13 +201,14 @@ export function urlRpcRequest(url, { timeoutMs = 20_000, signal = null, fetchImp
     const target = exitRpcUrl(url);
     return async ({ method, params = [] }) => {
         const timeout = AbortSignal.timeout(timeoutMs);
-        const response = await (fetchImpl || globalThis.fetch)(target, {
+        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        const response = await untilAborted((fetchImpl || globalThis.fetch)(target, {
             method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'omit', cache: 'no-store',
             body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-            signal: signal ? AbortSignal.any([signal, timeout]) : timeout
-        });
+            signal: callSignal
+        }), callSignal);
         if (!response.ok) throw new Error(`The exit RPC answered HTTP ${response.status}.`);
-        const body = await response.json();
+        const body = await untilAborted(response.json(), callSignal);
         if (body.error) {
             throw Object.assign(new Error(body.error.message || 'The exit RPC returned an error.'), {
                 code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code

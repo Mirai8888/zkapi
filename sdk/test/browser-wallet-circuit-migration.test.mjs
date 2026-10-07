@@ -69,7 +69,17 @@ test('browser requires its trusted configuration to pin the same circuit', () =>
     assert.throws(() => runtime.validateManifestTrust(deployment), /pinned proof circuit/);
 });
 
-test('funding a legacy deployment fails before any proof worker or wallet storage mutation', async t => {
+/** A build-pinned profile (browser-config.json's trusted_deployment) for a manifest. */
+function trustedFor(deployment, changes = {}) {
+    return { ...deployment, ...deployment.proof_setup, ...deployment.privacy_mode, setup_id: 'dev',
+        exit_concession: 1, vault_revision: 3, clearance_ownership_proof: 'required', ...changes };
+}
+
+// A build's own profile is checked before anything else: a profile that pins
+// a legacy circuit, or none, never initializes. (A legacy manifest served to a
+// concession build only refuses deposits and chats; exits run from the pins:
+// browser-wallet-init-exit.test.mjs.)
+test('a build pinning a legacy circuit, or no profile, never initializes: no proof worker, no wallet storage', async t => {
     const originalLocation = globalThis.location;
     const originalStorage = globalThis.localStorage;
     t.after(() => {
@@ -82,16 +92,20 @@ test('funding a legacy deployment fails before any proof worker or wallet storag
         setItem: () => assert.fail('legacy funding must not persist deployment selection'),
         removeItem: () => assert.fail('no stored selection to remove')
     };
-    const runtime = new BrowserWalletRuntime();
-    runtime.loadBrowserConfig = async () => ({ deployment_manifest_url: 'https://server.example/config.json' });
-    runtime.directJson = async () => {
-        const legacy = manifest();
-        delete legacy.proof_setup;
-        return legacy;
-    };
-    await assert.rejects(runtime.prepareDeposit(1000), { code: 'incompatible_proof_circuit' });
-    assert.equal(runtime.worker, null);
-    assert.equal(runtime.initialized, false);
+    const legacy = manifest();
+    legacy.proof_setup.circuit_id = 'zkapi-v2-note-bound-v1';
+    for (const [browserConfig, expected] of [
+        [{ deployment_manifest_url: 'https://server.example/config.json', trusted_deployment: trustedFor(legacy) },
+            { code: 'incompatible_proof_circuit' }],
+        [{ deployment_manifest_url: 'https://server.example/config.json' }, /omitted its trusted deployment pins/]
+    ]) {
+        const runtime = new BrowserWalletRuntime();
+        runtime.loadBrowserConfig = async () => browserConfig;
+        runtime.directJson = async () => assert.fail('a build that cannot run never asks the operator');
+        await assert.rejects(runtime.prepareDeposit(1000), expected);
+        assert.equal(runtime.worker, null);
+        assert.equal(runtime.initialized, false);
+    }
 });
 
 
@@ -101,7 +115,7 @@ test('historical packaged vault pins cannot be relabeled as a repaired deploymen
     assert.throws(() => runtime.validateManifestTrust({}), /newly deployed note-bound vault/);
 });
 
-test('token deployments are rejected before deployment selection, worker creation or wallet writes', async t => {
+test('a build pinning a token deployment is rejected before deployment selection, worker creation or wallet writes', async t => {
     const oldLocation = globalThis.location;
     const oldStorage = globalThis.localStorage;
     t.after(() => { globalThis.location = oldLocation; globalThis.localStorage = oldStorage; });
@@ -113,9 +127,10 @@ test('token deployments are rejected before deployment selection, worker creatio
     };
     for (const asset of ['erc20', undefined]) {
         const runtime = new BrowserWalletRuntime();
-        runtime.loadBrowserConfig = async () => ({ deployment_manifest_url: 'https://server.example/config.json' });
-        runtime.directJson = async () => ({ ...manifest(), billing_asset: asset,
-            billing_token_address: `0x${'44'.repeat(20)}` });
+        const token = { ...manifest(), billing_asset: asset, billing_token_address: `0x${'44'.repeat(20)}` };
+        runtime.loadBrowserConfig = async () => ({ deployment_manifest_url: 'https://server.example/config.json',
+            trusted_deployment: trustedFor(token) });
+        runtime.directJson = async () => assert.fail('a build that cannot run never asks the operator');
         await assert.rejects(runtime.prepareDeposit(1000), /only native ETH deployments are supported/);
         assert.equal(runtime.worker, null);
         assert.equal(runtime.initialized, false);

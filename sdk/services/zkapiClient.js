@@ -328,6 +328,9 @@ class ZkapiClient extends EventTarget {
         })().catch((error) => {
             this.lastError = error;
             this.loading = false;
+            // A failed start is not kept: the next init() (an exit, for
+            // one) starts again rather than replaying this error.
+            this.initPromise = null;
             this.emitChange('error');
             throw error;
         });

@@ -96,6 +96,9 @@ const VAULT_SELECTORS = Object.freeze({
     challengedNullifiers: '0x6cda756a'
 });
 const WITHDRAWAL_RESTART = Symbol('withdrawal-restart');
+// E4.1's path sources in order: the deposit-time path (Amendment A1), the
+// operator's indexer checked against the vault, the vault's own logs (§6.6).
+const EXIT_PATH_SOURCES = Object.freeze(['deposit', 'indexer', 'rebuild']);
 const REQUEST_PUBLIC_INPUT_FIELDS = Object.freeze([
     'request_nullifier', 'authorization_tag', 'anonymous_commitment_x', 'anonymous_commitment_y',
     'solvency_bound', 'request_time'
@@ -3698,23 +3701,41 @@ class BrowserWalletRuntime extends EventTarget {
     }
 
     /**
+     * The vault's currentRoot through the user's exit RPC when one is set,
+     * else through the pinned RPC (E4.1).
+     */
+    async exitCurrentRoot(signal = null) {
+        const exit = this.exitRpc();
+        if (!exit) return this.vaultWord(VAULT_SELECTORS.currentRoot, signal);
+        const word = await abortable(exit({ method: 'eth_call', params: [{ to: this.config.funding.contract_address,
+            data: VAULT_SELECTORS.currentRoot }, 'latest'] }), signal);
+        if (!/^0x[0-9a-fA-F]{64}$/.test(word || '')) throw new Error('The exit RPC returned an invalid vault root.');
+        return BigInt(word);
+    }
+
+    /**
      * E4.1: a path at a root the vault holds. The deposit-time path first
      * (Amendment A1), then the operator's indexer with its root checked
-     * against the vault's currentRoot, then the vault's own logs (§6.6).
+     * against the vault's currentRoot (through the exit RPC when one is set),
+     * then the vault's own logs (§6.6). `sources` narrows the order: after an
+     * UnknownRoot refusal only the logs are used.
      */
-    async exitPathLocked(state, { signal = null } = {}) {
+    async exitPathLocked(state, { signal = null, sources = EXIT_PATH_SOURCES } = {}) {
         const saved = state?.deposit_path;
-        if (saved?.active_root != null && Array.isArray(saved.siblings) && saved.siblings.length === 32) {
+        if (sources.includes('deposit')
+            && saved?.active_root != null && Array.isArray(saved.siblings) && saved.siblings.length === 32) {
             return { active_root: saved.active_root, note_id: Number(state.note_id), siblings: saved.siblings, source: 'deposit' };
         }
-        const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-        const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-        try {
-            const root = await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
-            const path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
-            if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
-        } catch (error) {
-            if (signal?.aborted) throw error;
+        if (sources.includes('indexer')) {
+            const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+            const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+            try {
+                const root = await abortable(this.exitCurrentRoot(callSignal), callSignal);
+                const path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+                if (sameFelt(path.active_root, root)) return { ...path, source: 'indexer' };
+            } catch (error) {
+                if (signal?.aborted) throw error;
+            }
         }
         const trusted = this.browserConfig?.trusted_deployment || {};
         const rebuilt = await rebuildNotePath({
@@ -3918,11 +3939,15 @@ class BrowserWalletRuntime extends EventTarget {
         expectedActiveRoot = null,
         reprove = false,
         earlyConcession = 'zero',
+        pathSource = null,
         signal = null,
         onProgress = () => {}
     } = {}) {
         await this.init();
         if (!['mutual', 'escape'].includes(mode)) throw new Error('Choose a valid withdrawal mode.');
+        // 'rebuild' after the vault refused a proof's root (UnknownRoot): the
+        // next proof takes its path from the vault's logs only (§6.6).
+        if (![null, 'rebuild'].includes(pathSource)) throw new Error('Choose a valid Merkle path source.');
         if (!['zero', 'bound'].includes(earlyConcession)) {
             throw new BrowserWalletHttpError('Choose zero or bound for a forced escape.', 400, 'invalid_concession_choice');
         }
@@ -3939,7 +3964,7 @@ class BrowserWalletRuntime extends EventTarget {
                 // preparation restarts there (E1, E3.2, E4.3).
                 for (let pass = 0; pass < 3; pass += 1) {
                     const plan = await this.prepareExitLocked(mode, destination, {
-                        expectedActiveRoot, reprove, earlyConcession, signal, onProgress
+                        expectedActiveRoot, reprove, earlyConcession, pathSource, signal, onProgress
                     });
                     if (plan !== WITHDRAWAL_RESTART) return plan;
                 }
@@ -3970,7 +3995,8 @@ class BrowserWalletRuntime extends EventTarget {
             && withdrawalProofStillValid(inputs));
     }
 
-    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, signal, onProgress }) {
+    async prepareExitLocked(requested, destination, { expectedActiveRoot, reprove, earlyConcession, pathSource = null, signal,
+        onProgress }) {
         await this.reload();
         const state = this.runtime.state;
         if (!state) throw new Error('There is no active private note to withdraw.');
@@ -4079,7 +4105,8 @@ class BrowserWalletRuntime extends EventTarget {
                 // Nothing was released yet (else the request is an escape).
                 await this.commit({ ...this.runtime, exitLock: switchExitLock(this.runtime.exitLock, 'mutual') });
             }
-            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, signal });
+            const outcome = await this.prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot,
+                pathSource, signal });
             if (outcome === WITHDRAWAL_RESTART) return outcome;
             if (outcome.plan) return outcome.plan;
             const next = afterClearanceFailure(outcome.error);
@@ -4098,7 +4125,8 @@ class BrowserWalletRuntime extends EventTarget {
                 decision = { ...next, clearanceError: outcome.error?.code || null };
             }
         }
-        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, onProgress });
+        return this.prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, pathSource,
+            signal, onProgress });
     }
 
     /** The refusal of a mutual request that waits for T (E3). */
@@ -4144,14 +4172,18 @@ class BrowserWalletRuntime extends EventTarget {
      * the kind-1 close proof, journaled with its plan. Returns { plan },
      * WITHDRAWAL_RESTART, or { error } when the clearance failed.
      */
-    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, signal }) {
+    async prepareMutualCloseLocked({ state, destination, nullifier, existing, expectedActiveRoot, pathSource = null, signal }) {
         let clearance = validClearance(existing, nullifier) ? existing.clearance : null;
         let path;
         try {
-            const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
-            const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-            const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
-            path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+            if (pathSource === 'rebuild') {
+                path = await this.exitPathLocked(state, { signal, sources: ['rebuild'] });
+            } else {
+                const timeout = AbortSignal.timeout(this.exitTiming().callTimeoutMs);
+                const callSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+                const root = expectedActiveRoot ?? await abortable(this.vaultWord(VAULT_SELECTORS.currentRoot, callSignal), callSignal);
+                path = await abortable(this.treePath(Number(state.note_id), true, root), callSignal);
+            }
         } catch (error) {
             if (signal?.aborted) throw error;
             return { error: { code: 'indexer_unavailable', message: error?.message || null } };
@@ -4176,7 +4208,7 @@ class BrowserWalletRuntime extends EventTarget {
             throw new Error('The generated withdrawal proof is of another kind.');
         }
         const decorated = this.decoratePlan(plan, { mode: 'mutual', destination, state, nullifier, existing,
-            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, pathSource: 'indexer' });
+            decision: { rule: 'E2', conceded: 0n }, clearance, validUntil, pathSource: path.source || 'indexer' });
         await this.commit({ ...this.runtime, preparedWithdrawal: decorated,
             exitLock: recordReleasedProof(this.runtime.exitLock, { kind: WITHDRAWAL_KIND.mutual, validUntil, nullifier, at: nowSeconds() }) });
         return { plan: decorated };
@@ -4257,7 +4289,8 @@ class BrowserWalletRuntime extends EventTarget {
      * the archive (abandoned_for_escape), where a later receipt can still
      * install once the lock is released.
      */
-    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, signal, onProgress }) {
+    async prepareEscapeLocked({ state, destination, nullifier, decision, existing, deadline, reprove, pathSource = null, signal,
+        onProgress }) {
         let lock = this.runtime.exitLock;
         if (lock.mode !== 'escape') {
             lock = switchExitLock(lock, 'escape');
@@ -4270,7 +4303,7 @@ class BrowserWalletRuntime extends EventTarget {
         if (refusal) throw new BrowserWalletHttpError('This escape is not allowed at this balance state.', 409, refusal);
         if (!reprove && this.reusablePlan(existing, { mode: 'escape', destination, state, nullifier, conceded })) return existing;
         onProgress('path', 'Finding this balance’s Merkle path…');
-        const path = await this.exitPathLocked(state, { signal });
+        const path = await this.exitPathLocked(state, { signal, sources: pathSource === 'rebuild' ? ['rebuild'] : EXIT_PATH_SOURCES });
         onProgress('checking', 'Checking that this device holds the newest balance state…');
         const { successor } = await this.staleDeviceCheckLocked(state, { signal });
         if (nowSeconds() < deadline) {

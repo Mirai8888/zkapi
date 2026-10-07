@@ -658,6 +658,63 @@ test('E4.1: an exit uses the deposit-time path, then the indexer checked against
     }
 });
 
+test('E4.1: with an exit RPC the indexer root is checked against it, and after UnknownRoot only the vault logs are used', async () => {
+    const logs = (h, calls, source) => async ({ method, params }) => {
+        calls.push([source, method, params?.[0]?.data ?? null]);
+        if (method === 'eth_chainId') return '0xaa36a7';
+        if (method === 'eth_getBlockByNumber') return { number: '0x64' };
+        if (method === 'eth_call') return `0x${BigInt(h.exitRoot).toString(16).padStart(64, '0')}`;
+        assert.equal(method, 'eth_getLogs');
+        return [{ address: VAULT, blockNumber: '0x10', logIndex: '0x0', removed: false,
+            topics: [ABI.noteDeposited, `0x${'0'.repeat(63)}7`, `0x${'ab'.repeat(32)}`],
+            data: `0x${[5_000_000, 2_000_000_000, 0x6161].map(value => BigInt(value).toString(16).padStart(64, '0')).join('')}` }];
+    };
+    // The indexer and the pinned RPC agree on a root the user's RPC does not
+    // report: the vault logs decide, through the exit RPC.
+    const lying = await freshWallet();
+    const lyingCalls = [];
+    lying.exitRoot = '0x88';
+    lying.runtime.exitRpc = () => logs(lying, lyingCalls, 'exit');
+    const fromLogs = await lying.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(fromLogs.pathSource, 'rebuild');
+    assert.ok(lyingCalls.some(([, method, data]) => method === 'eth_call' && data === '0xfdab463d'),
+        'the indexer root was checked through the exit RPC');
+    // An indexer path at the exit RPC's root is used, whatever the pinned RPC says.
+    const agreeing = await freshWallet();
+    agreeing.exitRoot = '0x88';
+    agreeing.runtime.exitRpc = () => logs(agreeing, [], 'exit');
+    agreeing.runtime.treePath = async noteId => ({ active_root: '0x88', note_id: noteId,
+        siblings: Array.from({ length: 32 }, (_, index) => `0x88${index.toString(16)}`) });
+    const fromIndexer = await agreeing.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(fromIndexer.pathSource, 'indexer');
+    assert.equal(fromIndexer.public_inputs.active_root, '0x88');
+
+    // After the vault refused a proof's root, the re-proof skips the saved
+    // deposit path and the indexer.
+    const refused = await freshWallet({}, noteState({ deposit_path: depositPath('0x51') }));
+    refused.runtime.treePath = () => assert.fail('no indexer after UnknownRoot');
+    const calls = [];
+    refused.runtime.pinnedRpc = () => logs(refused, calls, 'pinned');
+    const first = await refused.runtime.prepareWithdrawal('escape', DESTINATION);
+    assert.equal(first.pathSource, 'deposit');
+    const again = await refused.runtime.prepareWithdrawal('escape', DESTINATION, { reprove: true, pathSource: 'rebuild' });
+    assert.equal(again.pathSource, 'rebuild');
+    assert.equal(BigInt(again.public_inputs.active_root), 0x6161n);
+    await assert.rejects(refused.runtime.prepareWithdrawal('escape', DESTINATION, { pathSource: 'indexer' }), /path source/);
+    // A mutual close re-proved after UnknownRoot also takes the logs' path.
+    const close = await freshWallet();
+    close.server.clearance = body => ({ status: 'ok', withdrawal_nullifier: body.withdrawal_nullifier, signature: { r: '0x1', s: '0x2' } });
+    close.runtime.pinnedRpc = () => logs(close, [], 'pinned');
+    const closed = await close.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(closed.pathSource, 'indexer');
+    close.runtime.treePath = () => assert.fail('no indexer after UnknownRoot');
+    const reclosed = await close.runtime.prepareWithdrawal('mutual', DESTINATION, { reprove: true, pathSource: 'rebuild' });
+    assert.equal(reclosed.mode, 'mutual');
+    assert.equal(reclosed.pathSource, 'rebuild');
+    assert.equal(BigInt(reclosed.public_inputs.active_root), 0x6161n);
+    assert.equal(proofsOf(close, 'ownership').length, 1, 'the saved clearance is reused');
+});
+
 test('the deposit-time path is saved only when it leads to the root the deposit set (Amendment A1)', async () => {
     for (const matches of [true, false]) {
         indexedDB.clear();

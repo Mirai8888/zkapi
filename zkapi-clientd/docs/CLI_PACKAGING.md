@@ -116,7 +116,11 @@ it holds that commit and otherwise from `https://github.com/ethereum/zkapi`
 exactly that commit with a clean tree, before and after the build.
 `test-companion.sh` runs `cargo test -p zkapi-companion -p zkapi-auth` in the
 prepared root workspace and `cargo test -p zkapi-client` in `protocol/rust`,
-because the root workspace excludes that directory. `build-native.sh` builds
+because the root workspace excludes that directory. When `forge` and `anvil`
+are on `PATH` it also requires the companion's Anvil test
+(`ZKAPI_REQUIRE_ANVIL=1`), which verifies the companion's escape, close and
+ownership proofs in the generated proof adapter; without Foundry that test
+reports a skip. `build-native.sh` builds
 `cargo build --release --locked -p zkapi-companion --bin zkapi-walletd` and
 bundles `protocol/setup/v2-concession`; a release build loads only the pinned
 ceremony keys, so it stops while that directory holds none.

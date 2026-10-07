@@ -56,6 +56,7 @@ zkapi-clientd config --menu             # withdrawal and wallet actions
 zkapi-clientd config --require-api-key  # require a local inference key
 zkapi-clientd config --api-key          # show that key when requested
 zkapi-clientd config --key-reuse-window-seconds 0  # fresh key per inference request
+zkapi-clientd config --exit-rpc-url https://rpc.example  # your own RPC for exits ('none' clears it)
 ```
 
 Use the arrow keys (or `j`/`k`) and Enter to select wallet actions and networks.
@@ -100,17 +101,49 @@ the SOCKS5 relay URL above even when launching it through `torify`.
 
 ## Deployment origins
 
-The client defaults use these deployment manifests and vaults:
+This release serves only the concession-exit vault (circuit
+`zkapi-v2-concession-v1`, vault revision 3). Its embedded profiles are
+`zkapi-native-eth-mainnet-concession-v1` and
+`zkapi-native-eth-sepolia-concession-v1`. Until that vault is deployed on a
+network, its profile ships as a placeholder (`"deployment_status":
+"not_deployed"`, no contract, adapter, endpoints or signing keys) and the
+client refuses to fund, use or withdraw a note there with
+`deployment_not_deployed`. A release that pins the deployed vault replaces
+the placeholder.
 
-| Network | Manifest | Vault |
-| --- | --- | --- |
-| Mainnet | `https://zkapi-mainnet.openanonymity.ai/config.json` | `0x4386FDbdA35D995beB3BF8625118Ec5982ec81fe` |
-| Sepolia | `https://zkapi-sepolia.openanonymity.ai/config.json` | `0x49fA19f9bdECe7A48Ebc7749fD69aD40F577590F` |
+The embedded profiles pin the deployment IDs, contracts, the proof adapter
+and Poseidon library, their runtime-code hashes, signing keys, oracle,
+challenge period, note term, maximum pause, the settlement window `W`, the
+deploy block and the proof setup (circuit, setup ID and key hashes). Wallet
+funding and recovery records are bound to the configured network and
+deployment. Unknown origins or unapproved manifest differences fail closed.
+Do not delete recovery data to bypass a configuration mismatch.
 
-The embedded manifests pin the deployment IDs, contracts, signing keys, oracle
-and proof setup. Wallet funding and recovery records are bound to the configured
-network and deployment. Unknown origins or unapproved manifest differences fail
-closed. Do not delete recovery data to bypass a configuration mismatch.
+A note of the earlier vault (circuit `zkapi-v2-note-bound-v1`) lives in its
+own wallet directory, which this release never opens. When one is still open,
+startup prints a warning naming its directory: withdraw it with the earlier
+zkapi-clientd release line, which keeps that vault's exit routes, then fund
+this release.
+
+### Deployment checks and the exit RPC
+
+At startup and before every deposit, the client checks through the pinned
+RPC, and through your exit RPC when one is configured, that the deployment it
+trusts is the one on chain: the runtime code of the vault, its proof adapter
+and the Poseidon library hash to the pins, the vault's `proofAdapter()` is
+the pinned adapter, and the vault's and adapter's getters
+(`stateSigningKeyX/Y`, `clearanceSigningKeyX/Y`, `challengePeriod`,
+`noteTtl`, `maxPauseDuration`, `CONCESSION_ESCAPE_VERSION`,
+`ROOT_HISTORY_WINDOW`, `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`,
+`WITHDRAWAL_VK_HASH`) and `eth_chainId` return the pinned values. A mismatch
+refuses deposits with `deployment_mismatch`; exits stay available.
+
+`config --exit-rpc-url URL` saves your own Ethereum RPC (HTTPS, or plain HTTP
+to a node on this machine; no credentials, query or fragment). Deployment
+checks use it as well, escape transactions are sent through it, and the
+wallet companion reads exit state (note status, known roots, logs for a tree
+rebuild) through it. `config --exit-rpc-url none` clears it. The companion
+takes the same setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
 
 Stop `serve` before installing an update. The installer preserves private files;
 updating the repository alone does not update an installed binary.
@@ -201,8 +234,13 @@ private state:
   waiting. A finalized escape of the same reservation (same note, nullifier,
   payout and destination) is accepted as an independently relayed payout:
   after a reverted withdrawal, choose `confirm` in the `withdraw` menu action
-  and enter that transaction's hash. On a vault with `vault_revision` 2 such
-  an escape can close the note without paying the destination: when the
+  and enter that transaction's hash. An escape pays `B − c_final`: the
+  balance less the largest of the concession at initiation and every
+  `EscapeConcessionRaised` for the note before finalization. A payout is
+  accepted only when it equals that amount and is at most `B − c_init`; one
+  below `B − b` (more than the state's bound `b` was conceded) still closes
+  the withdrawal and is reported as `concession_exceeded_bound`. An escape
+  can also close the note without paying the destination: when the
   destination rejects ETH or needs more than 100,000 gas to receive it, the
   vault credits the balance to `escapePayoutCredits(destination)` and logs
   `EscapePayoutDeferred` in the same receipt. The withdrawal then completes
@@ -244,107 +282,81 @@ request, and it replaces an existing wallet note only when you name it and it
 is an unspent genesis note of the same amount. A withdrawal reservation of
 that note is released first through the companion's `POST /oa/v1/withdraw/release`,
 which refuses when the withdrawal has a prepared plan, when its clearance
-request carried, or may have carried, an ownership proof on a vault without
-`vault_revision` 2 (`ownership_proof_sent`, described below), or when the
+request carried, or may have carried, an ownership proof
+(`ownership_proof_sent`, described below), or when the
 protocol server knows its nullifier; any other reservation blocks the rebind. The replacement
 is saved before the wallet is reset, so an interrupted rebind resumes when
 **repair** is chosen again with both fields left blank.
 
-Every withdrawal sends the protocol server an ownership proof, a second
-withdrawal proof that shows the server the note ID, payout and destination
-before the close is on chain (see [privacy boundaries](PRIVACY.md)). A
-manifest that declares `clearance_ownership_proof` or `vault_revision` 2 or
-later requires a wallet companion whose `/oa/v1/status` reports
-`clearance_ownership_proof_version`; an older companion is refused before any
-note is reserved.
+Every withdrawal sends the protocol server an ownership proof, a kind-2
+withdrawal proof that shows the server the note ID and payout before the
+close is on chain (see [privacy boundaries](PRIVACY.md)). It names no
+destination and the vault accepts it neither as an escape nor as a close.
+The wallet
+companion must report bridge version 5 with `exit_concession: 1` and the
+deployment's setup ID in its `/oa/v1/status`; an older companion is refused
+before any note is reserved.
 
-On a vault without `vault_revision` 2, which includes both packaged
-deployments, the ownership proof is also a valid escape, and a challenge of
-that escape with a chat request from the same note state consumes the note's
-only nullifier. So once a clearance request carrying the proof has left the
-companion, the note state stays reserved for that withdrawal, whatever came
-back: a gateway's 429, a server error, or no answer at all, since whoever saw
-the request may have kept the proof. The companion records this in its
-reservation before the request leaves. It then never releases that
-reservation, even when the server reports the nullifier unknown (that answer
-is unsigned): **repair** stops, explaining that the withdrawal sent or may
-have sent its ownership proof, and the management API's error body carries
-`"code": "ownership_proof_sent"` beside that explanation. The companion
-makes no chat request from that state either (the chat API answers 409
-`withdrawal_pending` while the reservation stands, and 409
-`ownership_proof_sent` after a generic `/wallet/withdraw` close). Choose
-**withdraw** again to finish the close, which sends the proof again.
+Once a clearance request carrying the proof has left the companion, whatever
+came back (a gateway's 429, a server error, or no answer at all), the
+companion makes no chat request from that note state: the server may hold
+that state's clearance. The companion records this before the request leaves
+and never releases that reservation: **repair** stops, explaining that the
+withdrawal sent or may have sent its ownership proof, and the management
+API's error body carries `"code": "ownership_proof_sent"`. The chat API
+answers 409 `exit_locked` or `ownership_proof_sent`. Choose **withdraw**
+again to finish the close; the companion resends the same proof while it is
+valid rather than making a new one.
 
-A reservation saved before the companion recorded this does not say whether
-a proof left. No tagged release up to 0.1.6 sent one: their clearance
-requests carried only the nullifier. Development builds after 0.1.6 sent one
-whenever they could build it, which needs the note's leaf in the vault's tree
-at its note ID. So for such a reservation the release asks the indexer for
-that leaf. When the indexer holds another leaf there, as for a wrongly bound
-note, no proof was ever built, and the reservation is released on the
-server's unknown reading as before. When it holds this note's leaf, the
-reservation stays, unless its note state had an unsettled request (below)
-and you never acknowledged sending the proof. When the indexer cannot answer,
-nothing is released; try again later.
+### Exit decisions
 
-The exception is a note state from which a chat request was sent but never
-settled: the companion set the request aside into its request archive (see
-[privacy boundaries](PRIVACY.md)). On a vault without `vault_revision` 2,
-which includes both packaged deployments, an ownership proof is also a valid
-escape, and whoever kept that unsettled request could challenge the escape
-with it, which consumes the note's only nullifier. So before a withdrawal at
-such a state, the companion first asks the server whether the earlier
-request settled after all, and installs its signed response when it
-verifies; the withdrawal then closes the resulting state as usual.
-Otherwise it asks for a clearance without an ownership proof. A server that
-still allows legacy clearance grants it and the withdrawal continues. If the
-server refuses, the withdrawal stops with "zkAPI withdrawal waits for a
-settled note state". When the server reports the note state's nullifier
-unknown or owned by a request, the reservation is released and the note
-stays usable: send one chat request (its settlement moves the note to a new
-state), or wait until the earlier request settles, then choose **withdraw**
-again. The message names the note's expiry: do this before then. A chat
-request needs a note whose expiry is not yet past, so after expiry nothing
-can settle the state, and the vault's owner can claim the expired balance
-(`claimExpired`) at any time. For an expired note, **withdraw** therefore
-explains the challenge risk and asks you to type `send`: only then is the
-ownership proof sent anyway (the reservation remembers that answer for the
-rest of the withdrawal). If whoever kept the unsettled request starts the
-escape and challenges it with that request, the note's nullifier is
-consumed and the balance can no longer be withdrawn. Without the proof, the
-withdrawal waits for the earlier request to settle, if it ever does, while
-the note can be claimed. Any other answer stops without sending it. The
-acknowledgement is not offered before expiry (by this device's clock), and
-it does not help when the server reports the nullifier used by a request.
+A withdrawal first takes the note's exit lock (`exit_lock.json` in the
+companion's state directory): from then on the companion makes no request
+proof from that note state, only the withdrawal's own proofs, and the chat
+API answers 409 `exit_locked`. The lock is released when the note closes,
+when you cancel a withdrawal that released no escape or close proof, or once
+every released proof is dead (its `valid_until` plus 15 minutes is before the
+finalized block and the note is still active).
 
-If the server instead already holds a clearance for that state (an earlier
-withdrawal reserved it, or the operator released a stuck state) and allows
-no legacy clearance, no chat request can settle the state either. The
-withdrawal stays reserved, and **withdraw** offers the same acknowledgement
-before expiry too. Type `send` there only if you started that earlier
-withdrawal or asked the operator to release the note. A damaged file in the
-companion's `request_archive/` (one named like a record that cannot be read)
-also counts as an unsettled request; files not named like records
-(`<milliseconds>-<sequence>.json`) are ignored.
+Every request from one note state carries the same solvency bound `b`, the
+largest charge the state can be asked to pay; a request needing a larger one
+is refused with `bound_fixed_at_state` until the state settles. Near the
+note's expiry, new requests are refused with `note_near_expiry`, leaving time
+for a settlement window and an exit.
 
-A request that a release before this one discarded left no archive record,
-so its state is not recognized. If an earlier release discarded a request
-that the server had in fact admitted, the note is stuck at that state: the
-server refuses chat requests from it as replays, and chats and **withdraw**
-stop with `receipt_journal_missing` and the state's nullifier. (A dishonest
-server could claim the same.) Only the zkAPI operator can help with such a
-state (see "Receipt journal missing" in the
-[migration guide](../../docs/migration-hardened-vault.md)); contact them
-before the note expires and give them that nullifier, the note ID and the
-withdrawal destination, which tells them which of their requests was yours.
-Once the operator has released it, the server
-holds a withdrawal clearance for that state and refuses every chat request
-from it, so chats stop with `clearance_reserved_state` ("reserved for
-withdrawal") and send nothing new from that state. Choose **withdraw**: it
-first sets aside the retry the server refused (into `request_archive/`;
-the vault's root is not consulted for this, since a clearance blocks every
-request at that state whatever the root), then, when the server requires an
-ownership proof, asks for the acknowledgement described above.
+Before it asks for a clearance, the companion recovers every chat request
+sent from the current state that has not settled: it asks the server for
+each one's signed response (20 seconds per call, 120 seconds in all) and
+installs any that passes its checks. Then:
+
+- **Every sent request settled** (or the server can no longer admit it):
+  the mutual close proceeds, an ownership proof then a close.
+- **A sent request is still unsettled:** the companion asks for no clearance.
+  The withdrawal waits (409 `pending_settlement`) until the request's
+  settlement deadline plus 15 minutes, at most
+  `unsettled_request_escape_after_seconds` (default 12 hours) after it was
+  sent, and no later than 12 hours before the note's expiry. After that it
+  needs an escape conceding the state's bound `b`: an honest operator would
+  have settled the request by then.
+- **The server refuses the clearance or cannot be reached**, or the note is
+  less than an hour from that latest start: the withdrawal needs an escape
+  conceding nothing.
+
+A withdrawal that needs an escape stops with `escape_required` and the
+decision; continue with `withdraw --escape` (below).
+
+A request that an earlier release discarded left no archive record, so
+its state is not recognized. If an earlier release discarded a request that
+the server had in fact admitted, the note is stuck at that state: the server
+refuses chat requests from it as replays, and chats and **withdraw** stop with
+`receipt_journal_missing` and the state's nullifier. (A dishonest server
+could claim the same.) Contact the zkAPI operator before the note expires
+and give them that nullifier, the note ID and the withdrawal destination,
+which tells them which of their requests was yours. Once the operator has
+released it, the server holds a withdrawal
+clearance for that state and refuses every chat request from it, so chats
+stop with `clearance_reserved_state` ("reserved for withdrawal"); choose
+**withdraw**.
 
 ## Withdrawals
 
@@ -375,6 +387,66 @@ Returning `all` requires an ordinary Ethereum account with no deployed code.
 For a delegated or contract recipient, choose an exact ETH amount and leave
 room for the displayed maximum fee. The exact-amount path still simulates the
 transfer and requires destination, amount and fee approval.
+
+### Escape withdrawals
+
+An escape exits without the operator: the vault pays after its challenge
+period, during which the operator can raise the concession up to the state's
+bound with the signed charge of a request you sent, or defeat an escape made
+from a state that was already spent (a stale device or backup).
+
+```sh
+zkapi-clientd withdraw --escape --to 0xDESTINATION                    # show the decision
+zkapi-clientd withdraw --escape --to 0xDESTINATION --conceded 1500    # quote it
+zkapi-clientd withdraw --approve QUOTE_ID                             # sign and send
+zkapi-clientd withdraw --escape --to 0xDESTINATION                    # later: quote finalization
+zkapi-clientd withdraw --claim --to 0xDESTINATION                     # deliver a credited payout
+```
+
+The first run shows what the escape concedes (in gwei), why, and what it
+pays; nothing is signed. `--conceded` repeats the concession you reviewed
+and quotes `initiateEscapeWithdrawal`; a different amount than the exit
+rules allow now is refused with `conceded_mismatch`. While a sent request
+can still settle, the decision is to wait; `--early-exit nothing` escapes
+now conceding nothing (the operator can raise it to the request's actual
+charge), and `--early-exit bound` concedes the state's bound so the request
+never appears on chain. The guided **withdraw** menu shows the same
+decision and command when a mutual close needs an escape.
+
+Before it proves, the companion finds the note's Merkle path at a root the
+vault holds: the path it saved at deposit, then the indexer's (checked with
+the vault's `isKnownRoot`), then a rebuild from the vault's logs since its
+deploy block. It asks the server whether another device already spent the
+note's state, and refuses with `device_not_newest` when the server shows a
+valid request proof of the next state. The escape proof is valid for 3 hours;
+the transaction is checked word by word against the decision you confirmed
+(kind 0, destination, concession, `B − c` and `valid_until`) before it is
+signed, and is sent through your exit RPC when one is configured. After the
+challenge period the same `withdraw --escape --to` quotes
+`finalizeEscapeWithdrawal`. The payout is matched as described under
+**Withdrawals** above; a credited payout is delivered with `--claim`.
+
+The management API serves the same steps: `GET`/`POST /admin/escape`,
+`POST /admin/escape/quote`, `POST /admin/escape/claim/quote` and
+`POST /admin/escape/approve`. The companion's routes are
+`POST /oa/v1/withdraw/escape/prepare`, `POST /oa/v1/withdraw/escape/submit`,
+`GET /oa/v1/withdraw/escape/status` and `POST /oa/v1/withdraw/escape/finalize`.
+
+### Exit kit
+
+`zkapi-walletd exit-kit export --state-dir DIR --deployment MANIFEST --out
+FILE` writes an encrypted copy of the note (format `zkapi-exit-kit-v1`: PBKDF2-SHA256 with 600,000 iterations and
+AES-256-GCM) with the deployment profile, the note's secret and current
+state, and the state's bound. Export it again after each chat request: an
+older kit escapes from a state that was already spent, and that escape is
+defeated. `zkapi-walletd exit-kit escape --kit FILE --destination ADDRESS
+[--rpc URL] [--conceded UNITS]` checks the deployment's code hashes through
+`--rpc`, builds the escape with the companion's bundled keys, and prints the
+vault, the calldata and the payout, or signs and sends it with a key you
+supply (`--private-key-file`, with `--rpc`). `--offline` skips the
+stale-device question to the server; `--work-dir` keeps the kit's exit lock
+and released proofs between runs. The passphrase comes from
+`ZKAPI_EXIT_KIT_PASSPHRASE`, `--passphrase-file` or standard input.
 
 ## Inference and activity
 

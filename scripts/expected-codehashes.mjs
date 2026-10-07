@@ -14,7 +14,11 @@
 // --deployment reads Deploy.s.sol's manifest; flags override its fields. --artifacts DIR selects
 // the Forge out directory (default protocol/contracts/out). --check compares the result with the
 // manifest's recorded codehashes, and --rpc URL with eth_getCode at the manifest's addresses; any
-// mismatch exits 1. Prints JSON.
+// mismatch exits 1. Prints JSON; integers wider than 2^53 - 1 print as decimal strings.
+//
+// Integers are read exactly. Deploy.s.sol writes the signing-key coordinates as decimal strings and
+// every other number below 2^53; a wider bare JSON number in a manifest from elsewhere is read
+// from its source text, never rounded, and a number that is not an integer literal is refused.
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -102,7 +106,16 @@ function hexToBytes(hex) {
     return Uint8Array.from(body.match(/../g) ?? [], pair => parseInt(pair, 16));
 }
 
+/// A JavaScript number is accepted only as a safe integer: a wider one was already rounded.
+function exactNumber(value, label) {
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+        fail(`${label}: ${value} is not a safe integer (pass a decimal string or a BigInt)`);
+    }
+    return value;
+}
+
 function word(value, label) {
+    exactNumber(value, label);
     let n;
     try {
         n = BigInt(value);
@@ -120,7 +133,13 @@ function address(value, label) {
 
 function uint(value, bits, label) {
     if (value === undefined || value === null || value === '') fail(`missing ${label}`);
-    const n = BigInt(value);
+    exactNumber(value, label);
+    let n;
+    try {
+        n = BigInt(value);
+    } catch {
+        fail(`${label}: not an integer: ${value}`);
+    }
     if (n < 0n || n >= 1n << BigInt(bits)) fail(`${label}: does not fit uint${bits}`);
     return n;
 }
@@ -236,6 +255,18 @@ export function expectedCodehashes(artifactsDir, inputs) {
     };
 }
 
+/// Parses a deployment manifest without rounding: a JSON number above 2^53 - 1 becomes a BigInt
+/// read from its source text (JSON.parse source text access, Node 21 and later), and any other
+/// number that is not a safe integer (a fraction, an exponent) is refused.
+export function parseDeployment(text) {
+    return JSON.parse(text, (key, value, context) => {
+        if (typeof value !== 'number' || Number.isSafeInteger(value)) return value;
+        const source = context?.source;
+        if (typeof source === 'string' && /^(0|[1-9][0-9]*)$/.test(source)) return BigInt(source);
+        return fail(`deployment field ${key}: ${source ?? value} is not an exact integer; write it as a decimal string`);
+    });
+}
+
 // ------------------------------------------------------------------------------------- CLI
 
 const FLAGS = {
@@ -280,7 +311,7 @@ async function codehashAt(rpc, target) {
 
 async function main() {
     const args = parseArgs(process.argv.slice(2));
-    const deployment = args.deployment ? JSON.parse(readFileSync(args.deployment, 'utf8')) : {};
+    const deployment = args.deployment ? parseDeployment(readFileSync(args.deployment, 'utf8')) : {};
     const inputs = {
         poseidonLibrary: deployment.poseidonLibrary,
         proofAdapter: deployment.proofAdapter,
@@ -315,7 +346,7 @@ async function main() {
     }
     const report = { artifacts: args.artifacts, inputs, ...expected };
     if (args.check || args.rpc) report.mismatches = mismatches;
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify(report, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2));
     if (mismatches.length) process.exit(1);
 }
 

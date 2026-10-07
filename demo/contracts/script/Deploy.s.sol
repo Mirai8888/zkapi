@@ -6,6 +6,7 @@ import {console2} from "forge-std/console2.sol";
 
 import {ZkApiVault} from "zkapi-contracts/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.sol";
+import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 
 /// @title DeployScript – zkAPI vault deployment (circuit zkapi-v2-concession-v1, vault revision 3).
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
@@ -26,8 +27,13 @@ import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.
 ///                         nominates, the new owner calls acceptOwnership).
 ///           TREASURY    – operator payout address.
 ///           OUTPUT_PATH – absolute path for the deployment manifest JSON.
-///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key.
+///           STATE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key (`zkapi signing-keys`).
 ///           CLEARANCE_SIGNING_KEY_X/Y – deployment-pinned Baby-JubJub key.
+///                         Both keys must be points of Baby-JubJub's prime-order subgroup
+///                         (ark-ed-on-bn254, the circuits' curve) other than the identity, and
+///                         distinct; off local chains neither may be a published development key
+///                         (seeds 0x1 and 0x2). The vault's keys are immutable, so the script checks
+///                         them before it deploys anything.
 ///           CHALLENGE_PERIOD_SECONDS – escape delay; defaults to 24 hours.
 ///           NOTE_TTL_SECONDS – note lifetime; defaults to 30 days.
 ///           MAX_PAUSE_DURATION_SECONDS – longest a pause blocks exits; at least twice the
@@ -41,11 +47,15 @@ import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.
 ///                         must equal the compiled library's at that address. Unset deploys a
 ///                         fresh library.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
-contract DeployScript is Script {
+///         Every JSON number in the manifest is a safe integer (at most 2^53 - 1, so JavaScript
+///         reads it exactly); the four signing-key coordinates are decimal strings.
+contract DeployScript is Script, SigningKeyChecks {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
     uint256 internal constant VAULT_REVISION = 3;
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
+    /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
+    uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 
     struct Params {
         address deployer;
@@ -77,6 +87,9 @@ contract DeployScript is Script {
 
     function run() external {
         require(block.chainid == vm.envOr("CHAIN_ID", block.chainid), "CHAIN_ID does not match RPC");
+        require(
+            block.chainid <= MAX_SAFE_INTEGER && block.number <= MAX_SAFE_INTEGER, "chain ID or block above 2^53 - 1"
+        );
         bool local = block.chainid == 31337 || block.chainid == 1337;
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         string memory outputPath = vm.envString("OUTPUT_PATH");
@@ -158,19 +171,22 @@ contract DeployScript is Script {
         p.stateKeyY = vm.envUint("STATE_SIGNING_KEY_Y");
         p.clearanceKeyX = vm.envUint("CLEARANCE_SIGNING_KEY_X");
         p.clearanceKeyY = vm.envUint("CLEARANCE_SIGNING_KEY_Y");
+        _checkSigningKeys(p.stateKeyX, p.stateKeyY, p.clearanceKeyX, p.clearanceKeyY, local);
         p.challengePeriod =
-            _positiveUint64(vm.envOr("CHALLENGE_PERIOD_SECONDS", uint256(24 hours)), "CHALLENGE_PERIOD_SECONDS");
-        p.noteTtl = _positiveUint64(vm.envOr("NOTE_TTL_SECONDS", uint256(DEFAULT_NOTE_TTL)), "NOTE_TTL_SECONDS");
+            _positiveSafeInteger(vm.envOr("CHALLENGE_PERIOD_SECONDS", uint256(24 hours)), "CHALLENGE_PERIOD_SECONDS");
+        p.noteTtl = _positiveSafeInteger(vm.envOr("NOTE_TTL_SECONDS", uint256(DEFAULT_NOTE_TTL)), "NOTE_TTL_SECONDS");
         uint256 maxPause = local
             ? vm.envOr("MAX_PAUSE_DURATION_SECONDS", uint256(LOCAL_MAX_PAUSE_DURATION))
             : vm.envUint("MAX_PAUSE_DURATION_SECONDS");
-        p.maxPauseDuration = _positiveUint64(maxPause, "MAX_PAUSE_DURATION_SECONDS");
+        p.maxPauseDuration = _positiveSafeInteger(maxPause, "MAX_PAUSE_DURATION_SECONDS");
         require(
             uint256(p.maxPauseDuration) >= 2 * uint256(p.challengePeriod),
             "MAX_PAUSE_DURATION_SECONDS must be at least twice CHALLENGE_PERIOD_SECONDS"
         );
         uint256 cap = vm.envOr("REQUEST_CHARGE_CAP", uint256(1_000_000));
-        require(cap > 0 && cap <= 9_007_199_254_740_991, "REQUEST_CHARGE_CAP must be positive safe gwei units");
+        require(cap > 0 && cap <= MAX_SAFE_INTEGER, "REQUEST_CHARGE_CAP must be positive safe gwei units");
+        // casting to 'uint128' is safe because cap is at most MAX_SAFE_INTEGER
+        // forge-lint: disable-next-line(unsafe-typecast)
         p.requestChargeCap = uint128(cap);
     }
 
@@ -250,10 +266,12 @@ contract DeployScript is Script {
         vm.serializeUint(m, "treasuryChangeDelay", vault.treasuryChangeDelay());
         vm.serializeUint(m, "unpauseClaimGrace", vault.unpauseClaimGrace());
         vm.serializeUint(m, "rootHistoryWindow", vault.ROOT_HISTORY_WINDOW());
-        vm.serializeUint(m, "stateSigningKeyX", p.stateKeyX);
-        vm.serializeUint(m, "stateSigningKeyY", p.stateKeyY);
-        vm.serializeUint(m, "clearanceSigningKeyX", p.clearanceKeyX);
-        vm.serializeUint(m, "clearanceSigningKeyY", p.clearanceKeyY);
+        // serializeUint writes values up to 2^64 - 1 as bare JSON numbers, which JavaScript rounds
+        // above 2^53 - 1; key coordinates can be any field element, so they are decimal strings.
+        vm.serializeString(m, "stateSigningKeyX", vm.toString(p.stateKeyX));
+        vm.serializeString(m, "stateSigningKeyY", vm.toString(p.stateKeyY));
+        vm.serializeString(m, "clearanceSigningKeyX", vm.toString(p.clearanceKeyX));
+        vm.serializeString(m, "clearanceSigningKeyY", vm.toString(p.clearanceKeyY));
         string memory serialized = vm.serializeUint(m, "noteTtl", uint256(p.noteTtl));
         vm.writeJson(serialized, outputPath);
     }
@@ -312,8 +330,11 @@ contract DeployScript is Script {
         return string(out);
     }
 
-    function _positiveUint64(uint256 value, string memory name) internal pure returns (uint64) {
-        require(value > 0 && value <= type(uint64).max, string.concat(name, " must fit a positive uint64"));
+    /// A positive uint64 that JSON carries exactly to JavaScript (at most 2^53 - 1 seconds).
+    function _positiveSafeInteger(uint256 value, string memory name) internal pure returns (uint64) {
+        require(value > 0 && value <= MAX_SAFE_INTEGER, string.concat(name, " must be a positive safe integer"));
+        // casting to 'uint64' is safe because value is at most MAX_SAFE_INTEGER
+        // forge-lint: disable-next-line(unsafe-typecast)
         return uint64(value);
     }
 

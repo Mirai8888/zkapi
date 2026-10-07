@@ -156,27 +156,50 @@ jobs:
           FORGE_SNAPSHOT_CHECK: "true"
         run: forge test -vvv
 
-      - name: Build demo deployment script
+      # The script's signing-key checks (Forge) and the exact manifest parsing of
+      # expected-codehashes.mjs (node; its codehash case reads protocol/contracts/out).
+      - name: Build and test the demo deployment script
         working-directory: demo/contracts
-        run: forge build
+        run: |
+          forge build
+          forge test -vvv
+          node --test test/*.test.mjs
 
-      # No RPC: a local chain-31337 dry run with the public Anvil development
-      # key. The script links Bn254Poseidon itself and checks the adapter
-      # against the setup manifest and the vault's getters against its inputs;
-      # the expected codehashes are then recomputed from both projects'
-      # artifacts (the compiler settings match, so they agree).
+      # No RPC: local chain-31337 dry runs with the public Anvil development
+      # key. The script checks the signing keys, links Bn254Poseidon itself
+      # and checks the adapter against the setup manifest and the vault's
+      # getters against its inputs; the expected codehashes are then
+      # recomputed from both projects' artifacts (the compiler settings match,
+      # so they agree). The first run pins the development keys (seeds 0x1
+      # and 0x2, allowed only on local chains), the second keys with a
+      # coordinate between 2^63 and 2^64, which the manifest must carry as a
+      # decimal string, and the third keys off the curve, which it must refuse.
       - name: Simulate the demo deployment script and check its codehashes
         working-directory: demo/contracts
         run: |
           mkdir -p ../../.demo
-          PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-            OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
-            SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
-            STATE_SIGNING_KEY_X=11 STATE_SIGNING_KEY_Y=12 CLEARANCE_SIGNING_KEY_X=13 CLEARANCE_SIGNING_KEY_Y=14 \
-            forge script script/Deploy.s.sol
-          node -e 'const m = require(process.argv[1]); if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash)) { console.error(m); process.exit(1); }' "$PWD/../../.demo/deployment.json"
-          node ../../scripts/expected-codehashes.mjs --artifacts out --deployment ../../.demo/deployment.json --check
-          node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment ../../.demo/deployment.json --check
+          simulate() {
+            PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+              OUTPUT_PATH="$PWD/../../.demo/$1" \
+              SETUP_MANIFEST="$ZKAPI_SETUP_DIR/manifest.json" \
+              STATE_SIGNING_KEY_X="$2" STATE_SIGNING_KEY_Y="$3" CLEARANCE_SIGNING_KEY_X="$4" CLEARANCE_SIGNING_KEY_Y="$5" \
+              forge script script/Deploy.s.sol
+          }
+          check() {
+            node -e 'const m = require(process.argv[1]); const keys = [m.stateSigningKeyX, m.stateSigningKeyY, m.clearanceSigningKeyX, m.clearanceSigningKeyY]; if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash) || keys.some(k => typeof k !== "string" || !/^[0-9]+$/.test(k)) || keys.join() !== process.argv.slice(2).map(k => BigInt(k).toString()).join()) { console.error(m); process.exit(1); }' "$PWD/../../.demo/$1" "$2" "$3" "$4" "$5"
+            node ../../scripts/expected-codehashes.mjs --artifacts out --deployment "../../.demo/$1" --check
+            node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment "../../.demo/$1" --check
+          }
+          DEV_KEYS="0x2b8cfd91b905cae31d41e7dedf4a927ee3bc429aad7e344d59d2810d82876c32 0x2aaa6c24a758209e90aced1f10277b762a7c1115dbc0e16ac276fc2c671a861f 0x1812b84c2101217b0939a2f542535075eeaa81d07dab701a899a55db26e85be4 0x0be80d0f61a801533a94a03b12683474f86ca012941db1c568c53dc877b16fd6"
+          WIDE_KEYS="0x05503c73ffee28fcacc324d533595173a637420b99492265bf57c2c286f59cd7 9223372036854775867 9223372036854775849 0x2f46a27130a593f9edcbdaf446ca1029bb5c18d0c9a12ac3c7e9be74b61444f1"
+          simulate deployment.json $DEV_KEYS
+          check deployment.json $DEV_KEYS
+          simulate deployment-wide-keys.json $WIDE_KEYS
+          check deployment-wide-keys.json $WIDE_KEYS
+          if simulate deployment-bad-keys.json 11 12 13 14 > "$RUNNER_TEMP/bad-keys.log" 2>&1; then
+            echo "Deploy.s.sol accepted signing keys off the curve"; exit 1
+          fi
+          grep -q "STATE_SIGNING_KEY_X/Y is not a Baby-JubJub point" "$RUNNER_TEMP/bad-keys.log" || { cat "$RUNNER_TEMP/bad-keys.log"; exit 1; }
 
       - name: Test challenge signer against Anvil
         run: |

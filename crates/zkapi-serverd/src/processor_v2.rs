@@ -60,8 +60,8 @@ use crate::native_billing::{NativeBillingOracle, NativeBillingQuote};
 use crate::nullifier_store::{
     api_request_binding, lease_binding_mismatch, saved_request_mismatch, FinalizeGuard, KeyCleanup,
     LeaseFinalization, NewOpenRouterLease, NullifierStatus, NullifierStore, OaProvisioningOutcome,
-    OpenRouterLeaseRecord, SettleOutcome, SettledCharge, SettlementReview, SignatureDeferral,
-    TranscriptRecord,
+    OpenRouterLeaseRecord, SettleOutcome, SettledCharge, SettledScanKey, SettlementReview,
+    SignatureDeferral, TranscriptRecord,
 };
 use crate::oa_org::{IssuedOpenRouterLease, OaOrgProvisioner, OaOrgUsage, OaOrgUsageExpectation};
 use crate::openrouter::OpenRouterProvisioner;
@@ -354,6 +354,9 @@ pub struct RequestProcessor {
     root_agreement: Mutex<RootAgreement>,
     /// Which nullifiers are published on chain (`nullifier_published`).
     publication: Mutex<PublicationCache>,
+    /// Where the signing pass's next pages start, for requests never found
+    /// consumed and for deferred ones (`sign_settled_successors`).
+    signing_cursors: Mutex<[Option<SettledScanKey>; 2]>,
     timing: SettlementTiming,
     dashboard: Option<Arc<DashboardHub>>,
     openrouter: Option<Arc<OpenRouterProvisioner>>,
@@ -477,6 +480,7 @@ impl RequestProcessor {
             vault_root_cache: tokio::sync::Mutex::new(None),
             root_agreement: Mutex::new(RootAgreement::default()),
             publication: Mutex::new(PublicationCache::default()),
+            signing_cursors: Mutex::new([None, None]),
             timing: SettlementTiming::default(),
             dashboard: None,
             openrouter,
@@ -3285,14 +3289,44 @@ impl RequestProcessor {
     /// requests whose nullifiers are unspent, and re-check deferred ones.
     /// Each request is handled under its lease's lock; one whose lock is held
     /// (by its owner's retirement) is left to that holder.
+    ///
+    /// Requests never found consumed and deferred ones are paged separately,
+    /// up to `SIGN_BATCH` of each per pass, each page starting where the
+    /// previous one ended and wrapping around after a short page. Deferred
+    /// requests (which may stay deferred for `challengePeriod + 3600` s), or
+    /// requests that keep failing to sign, therefore never starve a newly
+    /// settled request, and every deferred request is re-checked within
+    /// `⌈deferred / SIGN_BATCH⌉ + 1` passes.
     pub async fn sign_settled_successors(&self) {
-        let records = match self.store.settled_unsigned_requests(SIGN_BATCH) {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::error!(error = %error, "settled-request scan failed");
-                return;
+        for (class, deferred) in [(0, false), (1, true)] {
+            let after = match self.signing_cursors.lock() {
+                Ok(cursors) => cursors[class].clone(),
+                Err(_) => None,
+            };
+            let records =
+                match self
+                    .store
+                    .settled_unsigned_requests(deferred, after.as_ref(), SIGN_BATCH)
+                {
+                    Ok(records) => records,
+                    Err(error) => {
+                        tracing::error!(error = %error, "settled-request scan failed");
+                        continue;
+                    }
+                };
+            let next = if records.len() < SIGN_BATCH {
+                None
+            } else {
+                records.last().map(SettledScanKey::of)
+            };
+            if let Ok(mut cursors) = self.signing_cursors.lock() {
+                cursors[class] = next;
             }
-        };
+            self.sign_settled_page(records).await;
+        }
+    }
+
+    async fn sign_settled_page(&self, records: Vec<TranscriptRecord>) {
         for record in records {
             let Some(id) = record.client_request_id.as_deref() else {
                 tracing::error!(nullifier = %record.nullifier, "a settled request has no client request id");
@@ -6339,6 +6373,80 @@ mod tests {
         assert_eq!(recovery.request_response.unwrap().charge_applied, bound);
     }
 
+    /// A full page of deferred requests, settled earlier and still consumed
+    /// on chain, does not delay the successor of a newly settled request:
+    /// the pass signs it in the same sweep.
+    #[tokio::test]
+    async fn deferred_requests_never_starve_a_newly_settled_one() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.challenge_period_seconds = Some(172_800);
+        for i in 0..SIGN_BATCH as u64 {
+            let request = overdue_lease(&processor, &format!("exiting-{i}"), 0x1000 + i);
+            processor.set_test_spent(request.public_inputs.request_nullifier, true);
+        }
+        processor.settle_due_openrouter_leases().await;
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET settled_at = settled_at - 10 WHERE exit_deferred_since IS NOT NULL",
+            rusqlite::params![],
+        );
+        let deferred = processor
+            .store
+            .settled_unsigned_requests(true, None, SIGN_BATCH + 1)
+            .unwrap();
+        assert_eq!(deferred.len(), SIGN_BATCH);
+        let honest = overdue_lease(&processor, "honest", 0x9999);
+        let before = processor.signer.state_signature_count();
+        processor.settle_due_openrouter_leases().await;
+        let record = record_of(&processor, &honest);
+        assert_eq!(record.status, NullifierStatus::Finalized);
+        assert_eq!(lease_status_of(&processor, &honest), "finalized");
+        assert_eq!(processor.signer.state_signature_count(), before + 1);
+    }
+
+    /// Deferred requests are re-checked page by page: one whose exit is
+    /// defeated is signed within two passes even behind a full page of
+    /// requests that stay deferred, and the others stay deferred.
+    #[tokio::test]
+    async fn every_deferred_request_is_rechecked_however_many_precede_it() {
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.config.challenge_period_seconds = Some(172_800);
+        let mut requests = Vec::new();
+        for i in 0..=SIGN_BATCH as u64 {
+            let request = overdue_lease(&processor, &format!("exiting-{i}"), 0x1000 + i);
+            processor.set_test_spent(request.public_inputs.request_nullifier, true);
+            requests.push(request);
+        }
+        processor.settle_due_openrouter_leases().await;
+        processor.settle_due_openrouter_leases().await;
+        let late = requests.pop().unwrap();
+        // Settled after every other one, so it sorts last.
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET settled_at = settled_at + 10 WHERE nullifier = ?1",
+            rusqlite::params![late.public_inputs.request_nullifier.to_hex()],
+        );
+        assert_eq!(lease_status_of(&processor, &late), "exit_deferred");
+        let before = processor.signer.state_signature_count();
+        // Its exit is defeated; the others stay consumed.
+        processor.set_test_spent(late.public_inputs.request_nullifier, false);
+        processor.sign_settled_successors().await;
+        processor.sign_settled_successors().await;
+        assert_eq!(
+            record_of(&processor, &late).status,
+            NullifierStatus::Finalized
+        );
+        assert_eq!(lease_status_of(&processor, &late), "finalized");
+        assert_eq!(processor.signer.state_signature_count(), before + 1);
+        for request in &requests {
+            assert_eq!(
+                record_of(&processor, request).status,
+                NullifierStatus::Reserved
+            );
+        }
+        // Further passes sign nothing else.
+        processor.sign_settled_successors().await;
+        assert_eq!(processor.signer.state_signature_count(), before + 1);
+    }
+
     /// O7: still consumed `challengePeriod + 3600` s after the first
     /// observation, the request becomes ExitedUnsigned: terminal, never
     /// signed, whatever the chain does afterwards. Without a known challenge
@@ -6779,6 +6887,14 @@ mod tests {
             processor.validate_and_reserve(&request),
             Err(ServerError::InvalidProof(_))
         ));
+        // A disagreement refuses at once, however fresh the last agreement.
+        processor.record_root_refresh(Some(Felt252::from_u64(0x6006)), root, now);
+        refused(&processor);
+        processor.record_root_refresh(Some(root), root, now);
+        assert!(matches!(
+            processor.validate_and_reserve(&request),
+            Err(ServerError::InvalidProof(_))
+        ));
         // Without an indexer, the vault's root alone counts.
         processor.record_root_refresh(None, Felt252::from_u64(0x7007), now);
         assert!(matches!(
@@ -6838,6 +6954,14 @@ mod tests {
         assert!(matches!(
             processor.validate_and_reserve(&request),
             Err(ServerError::InvalidProof(_))
+        ));
+        // The indexer diverges again: admission refuses from the next
+        // refresh, within the staleness bound of the last agreement.
+        *indexer_root.lock().unwrap() = Felt252::from_u64(0xa12);
+        processor.refresh_roots(Some(&url)).await.unwrap();
+        assert!(matches!(
+            processor.validate_and_reserve(&request),
+            Err(ServerError::RootUnavailable(_))
         ));
         server.abort();
     }

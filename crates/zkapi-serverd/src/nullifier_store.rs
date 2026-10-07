@@ -130,6 +130,23 @@ impl TranscriptRecord {
     }
 }
 
+/// Where a page of `settled_unsigned_requests` ended: the `(settled_at,
+/// nullifier)` of its last row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettledScanKey {
+    settled_at: i64,
+    nullifier: String,
+}
+
+impl SettledScanKey {
+    pub(crate) fn of(record: &TranscriptRecord) -> Self {
+        Self {
+            settled_at: record.settled_at.map(sql_time).unwrap_or(0),
+            nullifier: record.nullifier.to_hex(),
+        }
+    }
+}
+
 /// Whether an OA provisioning attempt can safely be cancelled without usage.
 /// An absent key hash does not establish non-issuance: the upstream response
 /// may have been lost after a key was created.
@@ -1345,24 +1362,43 @@ impl NullifierStore {
         })
     }
 
-    /// Settled requests whose successors are not signed yet (including those
-    /// deferred by O7), longest settled first.
+    /// One page of the settled requests whose successors are not signed yet:
+    /// those never found consumed (`deferred == false`), or those O7 deferred
+    /// (`deferred == true`). Pages run in `(settled_at, nullifier)` order,
+    /// strictly after `after` (a previous page's last `SettledScanKey`), so a
+    /// caller walking the pages visits every row however many sit before it.
     pub(crate) fn settled_unsigned_requests(
         &self,
+        deferred: bool,
+        after: Option<&SettledScanKey>,
         limit: usize,
     ) -> Result<Vec<TranscriptRecord>, ServerError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| ServerError::Database(format!("lock poisoned: {e}")))?;
+        let class = if deferred {
+            "exit_deferred_since IS NOT NULL"
+        } else {
+            "exit_deferred_since IS NULL"
+        };
         let mut statement = conn
-            .prepare(
-                "SELECT * FROM nullifiers WHERE status = 'Reserved' AND settled_charge IS NOT NULL
-                 ORDER BY settled_at ASC LIMIT ?1",
-            )
+            .prepare(&format!(
+                "SELECT * FROM nullifiers
+                 WHERE status = 'Reserved' AND settled_charge IS NOT NULL AND {class}
+                   AND (?1 IS NULL OR (COALESCE(settled_at, 0), nullifier) > (?1, ?2))
+                 ORDER BY COALESCE(settled_at, 0) ASC, nullifier ASC LIMIT ?3"
+            ))
             .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))?;
         let rows = statement
-            .query_map(params![limit as i64], row_to_record)
+            .query_map(
+                params![
+                    after.map(|key| key.settled_at),
+                    after.map(|key| key.nullifier.as_str()),
+                    limit as i64
+                ],
+                row_to_record,
+            )
             .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| ServerError::Database(format!("settled scan failed: {e}")))
@@ -4868,6 +4904,45 @@ mod tests {
         NullifierStore::new(&legacy).unwrap();
         assert_eq!(column_count(&legacy), 1);
         assert!(NullifierStore::open_read_only(&legacy).is_ok());
+    }
+
+    /// A reader refuses a database missing any column it reads, in any of
+    /// the four tables, even with every table and trigger present.
+    #[test]
+    fn read_only_store_requires_every_column_of_every_table_it_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        for (table, columns) in [
+            ("nullifiers", TRANSCRIPT_RECORD_COLUMNS),
+            ("openrouter_leases", OPENROUTER_LEASE_RECORD_COLUMNS),
+            ("request_evidence", REQUEST_EVIDENCE_COLUMNS),
+            ("deployment_binding", DEPLOYMENT_BINDING_COLUMNS),
+        ] {
+            let mut dropped = 0;
+            for column in columns {
+                let path = directory.path().join(format!("{table}-{column}.db"));
+                drop(NullifierStore::new(&path).unwrap());
+                assert!(NullifierStore::open_read_only(&path).is_ok());
+                // Key and indexed columns cannot be dropped; the others can.
+                if Connection::open(&path)
+                    .unwrap()
+                    .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                    .is_err()
+                {
+                    continue;
+                }
+                dropped += 1;
+                let error = NullifierStore::open_read_only(&path)
+                    .err()
+                    .map(|error| error.to_string());
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("run `zkapi db init` first")),
+                    "{table}.{column}: {error:?}"
+                );
+            }
+            assert!(dropped > 0, "no column of {table} could be dropped");
+        }
     }
 
     #[test]

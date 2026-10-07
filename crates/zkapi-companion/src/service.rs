@@ -909,7 +909,15 @@ impl AuthService {
                 // nullifier, at the plan's own root and path. A reservation
                 // saved before the signature was kept asks for the clearance
                 // again below (the server signs a reserved nullifier again).
-                if let Some(record) = existing.as_ref().filter(|record| !record.complete) {
+                // Only a close of the wallet's current state: a reservation
+                // of an earlier state (its closes dead, then a successor
+                // installed) is archived below by `reserve`, and the current
+                // state gets its own clearance.
+                let current = wallet.current_nullifier();
+                if let Some(record) = existing
+                    .as_ref()
+                    .filter(|record| !record.complete && Some(record.nullifier) == current)
+                {
                     if let Some(plan) = &record.plan {
                         if record.destination != destination {
                             return Err(AuthError::WithdrawalConflict);

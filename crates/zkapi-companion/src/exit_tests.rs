@@ -1331,6 +1331,74 @@ async fn an_expiring_close_is_proved_again_and_never_handed_out_stale() {
     );
 }
 
+/// A reservation that keeps its close and the clearance signature for an
+/// earlier state of the note (its closes dead, E6 released the lock, a late
+/// successor installed: a dishonest operator's O4 then E6) neither hands
+/// that close out again nor proves it again: through the route itself, it
+/// gives way to the current state's own mutual close, and is archived.
+#[tokio::test]
+async fn a_close_kept_for_an_earlier_state_gives_way_to_the_current_states_close() {
+    let harness = Harness::new(true).await;
+    // A request from this state made elsewhere, whose successor arrives late.
+    let copy = tempfile::tempdir().unwrap();
+    let (mut other, request) = harness.request_from_a_copy(copy.path());
+    harness.grant_clearance();
+    let first = harness
+        .service
+        .oa_prepare_withdrawal([0x22; 20], false)
+        .await
+        .unwrap();
+    let reservation = harness.config.state_dir.join("oa-withdrawal.json");
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&reservation).unwrap()).unwrap();
+    assert!(!saved["clearance_signature"].is_null());
+    // Every close is dead, E6 released the lock, and the successor installs.
+    saved["plan"]["public_inputs"]["valid_until"] = json!(now_seconds() - 5_000);
+    std::fs::write(&reservation, serde_json::to_vec(&saved).unwrap()).unwrap();
+    std::fs::remove_file(harness.config.state_dir.join("exit_lock.json")).unwrap();
+    other
+        .complete_pending_response(&harness.successor(&request, 40))
+        .unwrap();
+    std::fs::copy(
+        copy.path().join("note_state.json"),
+        harness.config.state_dir.join("note_state.json"),
+    )
+    .unwrap();
+    let moved = harness.nullifier();
+    assert_ne!(moved, first.public_inputs.withdrawal_nullifier);
+    harness.grant_clearance();
+    for _ in 0..2 {
+        let close = harness
+            .service
+            .oa_prepare_withdrawal([0x22; 20], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                close.public_inputs.withdrawal_nullifier,
+                close.public_inputs.final_balance,
+                close.public_inputs.kind,
+            ),
+            (moved, DEPOSIT - 40, 1)
+        );
+        assert!(close.public_inputs.valid_until >= now_seconds() + 10_000);
+        assert!(WithdrawalVerifier::load(SETUP_DIR)
+            .unwrap()
+            .verify(&close.public_inputs, &close.proof)
+            .unwrap());
+    }
+    // One clearance per state; the earlier reservation is archived.
+    assert_eq!(harness.world.lock().unwrap().clearance_calls, 2);
+    let reserved = crate::oa_withdrawal::load(&harness.config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reserved.nullifier, moved);
+    let archived = harness.config.state_dir.join("archive").join(format!(
+        "oa-withdrawal-{NOTE_ID}-{}-superseded.json",
+        first.public_inputs.withdrawal_nullifier.to_hex()
+    ));
+    assert!(archived.exists(), "{}", archived.display());
+}
+
 /// §1.2(6), §6.7: with the owner's exit RPC configured, a pinned RPC that is
 /// down blocks nothing: the escape is planned, followed and finalized
 /// through the exit RPC. A pinned RPC that lies (the note Active, a

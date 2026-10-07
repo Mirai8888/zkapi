@@ -6520,6 +6520,32 @@ mod tests {
             ),
             Err(crate::nullifier_store::ReopenRefusal::AlreadySettled)
         ));
+        // A settled reservation is never rewritten by --rebind either.
+        let payload_hash = request.payload_hash.to_hex();
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET payload_hash = '0x5' WHERE nullifier = ?1",
+            rusqlite::params![request.public_inputs.request_nullifier.to_hex()],
+        );
+        assert!(matches!(
+            reopen_unverified(
+                &processor.store,
+                "settled-then-cancelled",
+                crate::nullifier_store::ReopenOptions {
+                    zero_charge: false,
+                    rebind: true,
+                    saved_request: None,
+                },
+                current_timestamp()
+            ),
+            Err(crate::nullifier_store::ReopenRefusal::RebindSettled)
+        ));
+        processor.store.execute_for_test(
+            "UPDATE nullifiers SET payload_hash = ?1 WHERE nullifier = ?2",
+            rusqlite::params![
+                payload_hash,
+                request.public_inputs.request_nullifier.to_hex()
+            ],
+        );
         let reopened = reopen_unverified(
             &processor.store,
             "settled-then-cancelled",

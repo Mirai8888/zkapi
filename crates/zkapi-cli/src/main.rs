@@ -1381,6 +1381,144 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A deployment manifest of the development setup.
+    fn dev_manifest(
+        identity: &zkapi_serverd::nullifier_store::StatementIdentity,
+    ) -> serde_json::Value {
+        let signer = ServerSigner::new(&Felt252::from_u64(11), &Felt252::from_u64(12));
+        let hash = |byte: u8| format!("0x{}", hex_byte(byte).repeat(32));
+        serde_json::json!({
+            "trusted_deployment": {
+                "deployment_id": "cli-test",
+                "chain_id": 11155111,
+                "contract_address": "0x00000000000000000000000000000000000000aa",
+                "state_signing_key": signer.state_public_key(),
+                "clearance_signing_key": signer.clearance_public_key(),
+                "challenge_period": 43200,
+                "circuit_id": identity.circuit_id,
+                "setup_id": identity.setup_id,
+                "request_vk_keccak256": identity.request_vk_keccak256,
+                "withdrawal_vk_keccak256": identity.withdrawal_vk_keccak256,
+                "vault_runtime_codehash": hash(1),
+                "proof_adapter_address": "0x00000000000000000000000000000000000000bb",
+                "adapter_runtime_codehash": hash(2),
+                "poseidon_library_address": "0x00000000000000000000000000000000000000cc",
+                "poseidon_runtime_codehash": hash(3),
+            }
+        })
+    }
+
+    fn hex_byte(byte: u8) -> String {
+        format!("{byte:02x}")
+    }
+
+    #[test]
+    fn db_init_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "zkapi",
+            "db",
+            "init",
+            "--deployment",
+            "/srv/zkapi/deployment.json",
+            "--db",
+            "/data/server.db",
+            "--proof-setup-dir",
+            "/srv/zkapi/protocol/setup/v2-concession",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Db(DbCommand::Init {
+                deployment,
+                db,
+                proof_setup_dir,
+            }) => {
+                assert_eq!(deployment, PathBuf::from("/srv/zkapi/deployment.json"));
+                assert_eq!(db, PathBuf::from("/data/server.db"));
+                assert_eq!(
+                    proof_setup_dir.as_deref(),
+                    Some("/srv/zkapi/protocol/setup/v2-concession")
+                );
+            }
+            _ => panic!("expected db init"),
+        }
+        // No default manifest or database.
+        assert!(Cli::try_parse_from(["zkapi", "db", "init", "--db", "/data/server.db"]).is_err());
+        assert!(
+            Cli::try_parse_from(["zkapi", "db", "init", "--deployment", "/srv/d.json"]).is_err()
+        );
+    }
+
+    /// `zkapi db init` creates the schema (with the append-only evidence
+    /// table) and the deployment binding from the manifest, idempotently,
+    /// and refuses a placeholder, a manifest of other verifying keys, and a
+    /// database bound to another deployment, changing nothing.
+    #[test]
+    fn db_init_binds_a_database_to_the_manifest() {
+        use zkapi_serverd::nullifier_store::{NullifierStore, StatementIdentity};
+        let directory = scratch_directory("db-init");
+        let setup = setup_directory();
+        let identity = StatementIdentity::load(&setup).unwrap();
+        let manifest = directory.join("deployment.json");
+        let db = directory.join("server.db");
+        let write =
+            |value: &serde_json::Value| std::fs::write(&manifest, value.to_string()).unwrap();
+
+        let mut placeholder = dev_manifest(&identity);
+        placeholder["trusted_deployment"]["deployment_status"] = "not_deployed".into();
+        write(&placeholder);
+        let error = init_database(&manifest, &db, &setup).unwrap_err();
+        assert!(format!("{error:#}").contains("not_deployed"), "{error:#}");
+        let mut other_keys = dev_manifest(&identity);
+        other_keys["trusted_deployment"]["request_vk_keccak256"] =
+            format!("0x{}", "ab".repeat(32)).into();
+        write(&other_keys);
+        let error = init_database(&manifest, &db, &setup).unwrap_err();
+        assert!(format!("{error:#}").contains("do not match"), "{error:#}");
+        assert!(!db.exists());
+        let missing_setup = directory.join("no-setup");
+        write(&dev_manifest(&identity));
+        assert!(init_database(&manifest, &db, missing_setup.to_str().unwrap()).is_err());
+        assert!(!db.exists());
+
+        let report = init_database(&manifest, &db, &setup).unwrap();
+        assert_eq!(report.result, "bound");
+        assert_eq!(report.binding_source, "manifest");
+        let binding = NullifierStore::open_read_only(&db)
+            .unwrap()
+            .read_deployment_binding()
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.chain_id, 11155111);
+        assert_eq!(binding.challenge_period_seconds, 43200);
+        assert_eq!(binding.setup_id.as_deref(), Some("dev"));
+        assert_eq!(
+            binding.request_vk_keccak256.as_deref(),
+            Some(identity.request_vk_keccak256.as_str())
+        );
+        assert_eq!(
+            init_database(&manifest, &db, &setup).unwrap().result,
+            "already_bound"
+        );
+        let mut moved = dev_manifest(&identity);
+        moved["trusted_deployment"]["contract_address"] =
+            "0x00000000000000000000000000000000000000dd".into();
+        write(&moved);
+        let error = init_database(&manifest, &db, &setup).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("bound to another vault"),
+            "{error:#}"
+        );
+        assert_eq!(
+            NullifierStore::open_read_only(&db)
+                .unwrap()
+                .read_deployment_binding()
+                .unwrap()
+                .unwrap(),
+            binding
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn indexer_accepts_reorg_safety_flags() {
         let cli =

@@ -100,6 +100,7 @@ func TestEscapeCalldataChecksEveryWord(t *testing.T) {
 		"other concession":       func(p *escapePlan) { p.PublicInputs.Conceded = 699; p.PublicInputs.FinalBalance = 99300 },
 		"payout plus concession": func(p *escapePlan) { p.PublicInputs.FinalBalance = 99000 },
 		"other state balance":    func(p *escapePlan) { p.StateBalance = "100000" },
+		"another state's plan":   func(p *escapePlan) { p.StateBalance = "100700"; p.PublicInputs.FinalBalance = 100000 },
 		"other destination":      func(p *escapePlan) { p.PublicInputs.Destination = bytes.Repeat([]byte{7}, 20) },
 		"other chain":            func(p *escapePlan) { p.PublicInputs.ChainID = 11155111 },
 		"other vault":            func(p *escapePlan) { p.PublicInputs.Contract = addressTestToken },
@@ -361,7 +362,7 @@ func TestARelayedEscapePayoutAfterARaiseIsMatched(t *testing.T) {
 		accepted bool
 		// otherState records the escape at another state's balance.
 		otherState uint64
-	}{{"raised", 99999 - 900, true, 0}, {"unexplained", 99999 - 901, false, 0}, {"another state", 99999 + 1000 - 900, false, 1000}} {
+	}{{"raised", 99999 - 900, true, 0}, {"unexplained", 99999 - 901, false, 0}, {"another state", 99999 + 500 - 900, false, 500}} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newWithdrawalFixture(t)
 			original := f.withdraw(t)
@@ -532,6 +533,29 @@ func TestAnEscapeDecisionIsCancelledButASignedEscapeIsNot(t *testing.T) {
 	}
 	if _, err := f.h.CancelAddressEscape(ctx); err == nil || f.escape.cancels != 1 {
 		t.Fatal("a signed escape was cancelled")
+	}
+}
+
+// With --exit-rpc-url set, an exit RPC that fails falls back to the pinned
+// RPC: an escape is never blocked by either one alone.
+func TestAnEscapeFallsBackToThePinnedRPCWhenTheExitRPCFails(t *testing.T) {
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "pending"}
+	down := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(down.Close)
+	f.h.client.config.ExitRPCURL = down.URL
+	ctx := context.Background()
+	if _, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil || status.Phase != "escape_pending" {
+		t.Fatalf("the escape was not signed through the pinned RPC: %+v %v", status, err)
 	}
 }
 

@@ -9,16 +9,33 @@ abstract contract Events {
 
     event MutualClose(uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination);
 
+    /// @notice An escape started. Escapes do no Merkle work, so `currentRoot` is the unchanged root.
+    ///         EscapeConcessionRecorded follows in the same call.
     event EscapeWithdrawalInitiated(
         uint32 indexed noteId,
         uint256 nullifier,
         uint128 finalBalance,
         address destination,
         uint64 challengeDeadline,
-        uint256 newRoot
+        uint256 currentRoot
     );
 
-    event EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 restoredRoot);
+    /// @notice The concession side of the escape just initiated: `nextNullifier` (N_{k+1}) is the
+    ///         only nullifier whose request proof defeats it, and finalBalance + conceded == stateBalance.
+    event EscapeConcessionRecorded(
+        uint32 indexed noteId, uint256 nextNullifier, uint128 stateBalance, uint128 conceded
+    );
+
+    /// @notice A request proof at the escaped nullifier raised the concession to `conceded`;
+    ///         `finalBalance` is the new payout.
+    event EscapeConcessionRaised(uint32 indexed noteId, uint256 nullifier, uint128 conceded, uint128 finalBalance);
+
+    /// @notice A request proof at the successor nullifier defeated the escape. `currentRoot` is the
+    ///         unchanged root (the leaf was never removed).
+    event EscapeWithdrawalChallenged(uint32 indexed noteId, uint256 nullifier, uint256 currentRoot);
+
+    /// @notice A Closed note's leaf was removed from the tree.
+    event ClosedLeafRetired(uint32 indexed noteId, uint256 newRoot);
 
     /// @notice The escape closed. It does not by itself mean `destination` received
     ///         `finalBalance`: when an EscapePayoutDeferred for the same noteId and destination
@@ -28,7 +45,8 @@ abstract contract Events {
         uint32 indexed noteId, uint256 nullifier, uint128 finalBalance, address destination
     );
 
-    event ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 newRoot);
+    /// @notice `currentRoot` is the unchanged root: an expiry claim leaves the leaf in place.
+    event ExpiredClaimed(uint32 indexed noteId, uint128 depositAmount, uint256 currentRoot);
 
     event ProofAdapterSet(address indexed newAdapter);
 

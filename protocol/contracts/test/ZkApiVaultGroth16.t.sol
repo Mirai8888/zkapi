@@ -1,0 +1,489 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import {Test} from "forge-std/Test.sol";
+import {ZkApiVault} from "../src/ZkApiVault.sol";
+import {Groth16ProofAdapter} from "../src/adapters/Groth16ProofAdapter.sol";
+import {Types} from "../src/libraries/Types.sol";
+import {Errors} from "../src/libraries/Errors.sol";
+import {Bn254Poseidon} from "../src/libraries/Bn254Poseidon.sol";
+import {NoteLeafLib} from "../src/libraries/NoteLeafLib.sol";
+
+/// @dev Rust-generated proofs (CircomReduction prover, committed setup), the generated verifier and
+///      a normally deployed vault. Regenerate test/fixtures/vault-challenge.json with
+///        cargo run --release -p zkapi-proof --example vault_challenge_fixture -- \
+///          ../setup/v2-concession-dev > ../contracts/test/fixtures/vault-challenge.json
+///      Note A (id 0) has the honest chain a0 -R0-> a1 -R1-> a2 -R2-> a3 (charges 60,000, 150,000
+///      and 40,000; R2's bound is 100,000), so B2 = 790,000. Note B (id 1) shares A's secret and is
+///      at genesis. Every proof is at the root holding A and B unless named otherwise, and is valid
+///      until the fixture's valid_until (7 days after the deposits).
+contract ZkApiVaultGroth16Test is Test {
+    uint256 constant DOMAIN_NODE = 0x7a6b6170692e76322e6e6f6465;
+    uint128 constant DEPOSIT = 1_000_000;
+    uint128 constant B2 = 790_000;
+    uint128 constant SB2 = 100_000;
+    uint128 constant CHARGE2 = 40_000;
+    address constant DEPLOYER = address(0xf00d);
+    address constant USER = 0x1111111111111111111111111111111111111111;
+    address constant TREASURY = address(0xbeef);
+    address constant OPERATOR = address(0x0D0D);
+
+    Groth16ProofAdapter adapter;
+    ZkApiVault vault;
+    string fixtures;
+    uint256[32] emptySiblings;
+    mapping(uint32 => bool) retired;
+
+    function setUp() public {
+        vm.chainId(31_337);
+        fixtures = vm.readFile("test/fixtures/vault-challenge.json");
+        assertEq(vm.parseJsonString(fixtures, ".circuit_id"), "zkapi-v2-concession-v1");
+        vm.warp(vm.parseJsonUint(fixtures, ".timestamp"));
+        uint256 zero;
+        for (uint256 level = 0; level < 32; ++level) {
+            emptySiblings[level] = zero;
+            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+        }
+        adapter = new Groth16ProofAdapter();
+        (Types.WithdrawalPublicInputs memory parameters,) = _withdrawal("escape_a2");
+        vm.setNonce(DEPLOYER, 0);
+        vm.prank(DEPLOYER);
+        vault = new ZkApiVault(
+            TREASURY,
+            30 days,
+            24 hours,
+            100_000,
+            address(adapter),
+            parameters.stateSigningKeyX,
+            parameters.stateSigningKeyY,
+            parameters.clearanceSigningKeyX,
+            parameters.clearanceSigningKeyY,
+            address(this),
+            7 days
+        );
+        assertEq(address(vault), parameters.contractAddress);
+        vm.deal(USER, 10 * uint256(DEPOSIT) * 1 gwei);
+    }
+
+    // ======================================================== withholding operator
+
+    /// The operator withheld a3 after R2 and refuses clearance. The owner escapes from a2
+    /// conceding R2's bound. The operator's evidence (R2 at N2, and every older request) neither
+    /// defeats nor raises it, and the treasury gains exactly D - (B2 - sb2).
+    function test_realWithholdingConcessionExits() public {
+        _depositAB();
+        (Types.WithdrawalPublicInputs memory escape, bytes memory escapeProof) = _withdrawal("escape_a2_concede");
+        assertEq(escape.conceded, SB2);
+        assertEq(escape.finalBalance, B2 - SB2);
+        vm.prank(USER);
+        vault.initiateEscapeWithdrawal(escape, escapeProof);
+
+        vm.startPrank(OPERATOR);
+        string[3] memory archived = ["request_a0", "request_a1", "request_a2"];
+        for (uint256 i = 0; i < archived.length; ++i) {
+            (Types.RequestPublicInputs memory request, bytes memory proof) = _request(archived[i]);
+            vm.expectRevert(Errors.NotSuccessorEvidence.selector);
+            vault.challengeEscapeWithdrawal(0, request, proof);
+        }
+        (Types.RequestPublicInputs memory r2, bytes memory r2Proof) = _request("request_a2");
+        vm.expectRevert(Errors.NotARaise.selector);
+        vault.raiseEscapeConcession(0, r2, r2Proof, type(uint128).max);
+        vm.stopPrank();
+
+        uint256 treasuryBefore = TREASURY.balance;
+        vm.warp(_deadline(0));
+        vault.finalizeEscapeWithdrawal(0);
+        assertEq(USER.balance, 8 * uint256(DEPOSIT) * 1 gwei + uint256(B2 - SB2) * 1 gwei);
+        assertEq(TREASURY.balance - treasuryBefore, uint256(DEPOSIT - (B2 - SB2)) * 1 gwei);
+        assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
+    }
+
+    /// A forced early exit concedes nothing; the honest challenger raises it with R2 to the
+    /// settled charge, and a later raise is capped at R2's bound.
+    function test_realRaiseToTheChargeThenToTheBound() public {
+        _depositAB();
+        _initiate("escape_a2");
+        (Types.RequestPublicInputs memory r2, bytes memory r2Proof) = _request("request_a2");
+        vm.prank(OPERATOR);
+        vault.raiseEscapeConcession(0, r2, r2Proof, CHARGE2);
+        assertEq(_finalBalance(0), B2 - CHARGE2);
+        vm.prank(OPERATOR);
+        vault.raiseEscapeConcession(0, r2, r2Proof, type(uint128).max);
+        assertEq(_finalBalance(0), B2 - SB2);
+        (, uint128 stateBalance, uint128 conceded) = vault.pendingConcessions(0);
+        assertEq(stateBalance, B2);
+        assertEq(conceded, SB2);
+        vm.warp(_deadline(0));
+        vault.finalizeEscapeWithdrawal(0);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - (B2 - SB2)) * 1 gwei);
+    }
+
+    // ======================================================================= defeat
+
+    /// R3, spent from the successor a3, defeats the escape from a2; R2 (at a2 itself) does not.
+    function test_realSuccessorRequestDefeatsAndStateRequestDoesNot() public {
+        _depositAB();
+        (Types.WithdrawalPublicInputs memory escape,) = _initiate("escape_a2");
+        (Types.RequestPublicInputs memory r2, bytes memory r2Proof) = _request("request_a2");
+        (Types.RequestPublicInputs memory r3, bytes memory r3Proof) = _request("request_a3");
+        assertEq(r2.requestNullifier, escape.withdrawalNullifier);
+        assertEq(r3.requestNullifier, escape.nextNullifier);
+        vm.prank(OPERATOR);
+        vm.expectRevert(Errors.NotSuccessorEvidence.selector);
+        vault.challengeEscapeWithdrawal(0, r2, r2Proof);
+        // A tampered successor statement does not verify.
+        (Types.RequestPublicInputs memory forged,) = _request("request_a3");
+        forged.solvencyBound += 1;
+        vm.prank(OPERATOR);
+        vm.expectRevert(Errors.InvalidProof.selector);
+        vault.challengeEscapeWithdrawal(0, forged, r3Proof);
+
+        vm.warp(_deadline(0) - 1);
+        vm.prank(OPERATOR);
+        vault.challengeEscapeWithdrawal(0, r3, r3Proof);
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
+        assertTrue(vault.challengedNullifiers(escape.withdrawalNullifier));
+        assertFalse(vault.usedNullifiers(escape.withdrawalNullifier));
+        assertFalse(vault.usedNullifiers(escape.nextNullifier));
+        assertEq(address(vault).balance, 2 * uint256(DEPOSIT) * 1 gwei);
+        vm.warp(_deadline(0));
+        vm.expectRevert(Errors.NotPendingWithdrawal.selector);
+        vault.finalizeEscapeWithdrawal(0);
+    }
+
+    /// After the defeat: a2 again (to any destination) reverts ChallengedNullifier and a1
+    /// SupersededState, cheaply; a0 is verified and recorded, and R1 defeats it. The operator's
+    /// clearance still closes a2.
+    function test_realReEscapesAfterADefeat() public {
+        _depositAB();
+        _initiate("escape_a2");
+        _defeat("request_a3");
+        _escapeReverts("escape_a2", Errors.ChallengedNullifier.selector);
+        _escapeReverts("escape_a2_concede", Errors.ChallengedNullifier.selector);
+        _escapeReverts("escape_a2_other_destination", Errors.ChallengedNullifier.selector);
+        _escapeReverts("escape_a1", Errors.SupersededState.selector);
+
+        _initiate("escape_a0");
+        (Types.RequestPublicInputs memory r0, bytes memory r0Proof) = _request("request_a0");
+        vm.prank(OPERATOR);
+        vm.expectRevert(Errors.NotSuccessorEvidence.selector);
+        vault.challengeEscapeWithdrawal(0, r0, r0Proof);
+        _defeat("request_a1");
+        _escapeReverts("escape_a0", Errors.ChallengedNullifier.selector);
+
+        (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a2");
+        vault.mutualClose(close, closeProof);
+        assertEq(USER.balance, 8 * uint256(DEPOSIT) * 1 gwei + uint256(B2) * 1 gwei);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - B2) * 1 gwei);
+    }
+
+    // ========================================================== kinds and expiry
+
+    function test_realOwnershipProofIsRejected() public {
+        _depositAB();
+        (Types.WithdrawalPublicInputs memory ownership, bytes memory proof) = _withdrawal("ownership_a2");
+        adapter.assertValidWithdrawal(ownership, proof);
+        vm.expectRevert(Errors.WrongWithdrawalKind.selector);
+        vault.initiateEscapeWithdrawal(ownership, proof);
+        vm.expectRevert(Errors.WrongWithdrawalKind.selector);
+        vault.mutualClose(ownership, proof);
+        // A close proof is not an escape, and an escape proof is not a close.
+        _escapeReverts("close_a2", Errors.WrongWithdrawalKind.selector);
+        (Types.WithdrawalPublicInputs memory escape, bytes memory escapeProof) = _withdrawal("escape_a2");
+        vm.expectRevert(Errors.WrongWithdrawalKind.selector);
+        vault.mutualClose(escape, escapeProof);
+    }
+
+    function test_realMutualCloses() public {
+        _depositAB();
+        (Types.WithdrawalPublicInputs memory closeA, bytes memory proofA) = _withdrawal("close_a2");
+        (Types.WithdrawalPublicInputs memory closeB, bytes memory proofB) = _withdrawal("close_b0");
+        uint256 root = vault.currentRoot();
+        vault.mutualClose(closeA, proofA);
+        vault.mutualClose(closeB, proofB);
+        assertEq(USER.balance, 8 * uint256(DEPOSIT) * 1 gwei + uint256(B2 + DEPOSIT) * 1 gwei);
+        assertEq(TREASURY.balance, uint256(DEPOSIT - B2) * 1 gwei);
+        assertEq(vault.currentRoot(), root);
+        assertEq(address(vault).balance, 0);
+    }
+
+    function test_realExpiredProofIsRejected() public {
+        _depositAB();
+        _escapeReverts("escape_a2_expired", Errors.ProofExpired.selector);
+        (Types.WithdrawalPublicInputs memory escape, bytes memory proof) = _withdrawal("escape_a2");
+        vm.warp(uint256(escape.validUntil) + 1);
+        vm.expectRevert(Errors.ProofExpired.selector);
+        vault.initiateEscapeWithdrawal(escape, proof);
+        (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a2");
+        vm.expectRevert(Errors.ProofExpired.selector);
+        vault.mutualClose(close, closeProof);
+        vm.warp(escape.validUntil);
+        vault.initiateEscapeWithdrawal(escape, proof);
+    }
+
+    // ============================================================ genesis and notes
+
+    /// A genesis escape may concede part of the deposit; B's own request (bound 100,000) cannot
+    /// raise a 250,000 concession, and A's requests never touch B's escape.
+    function test_realGenesisConcession() public {
+        _depositAB();
+        (Types.WithdrawalPublicInputs memory escape,) = _initiate("escape_b0_genesis_concede");
+        assertEq(escape.noteId, 1);
+        assertEq(escape.conceded, 250_000);
+        (Types.RequestPublicInputs memory rb, bytes memory rbProof) = _request("request_b0");
+        assertEq(rb.requestNullifier, escape.withdrawalNullifier);
+        vm.prank(OPERATOR);
+        vm.expectRevert(Errors.NotARaise.selector);
+        vault.raiseEscapeConcession(1, rb, rbProof, type(uint128).max);
+        (Types.RequestPublicInputs memory ra1, bytes memory ra1Proof) = _request("request_a1");
+        vm.prank(OPERATOR);
+        vm.expectRevert(Errors.NotSuccessorEvidence.selector);
+        vault.challengeEscapeWithdrawal(1, ra1, ra1Proof);
+        vm.warp(_deadline(1));
+        vault.finalizeEscapeWithdrawal(1);
+        assertEq(USER.balance, 8 * uint256(DEPOSIT) * 1 gwei + 750_000 gwei);
+        assertEq(TREASURY.balance, 250_000 gwei);
+    }
+
+    /// A and B share a secret, but their nullifiers are disjoint: a defeat of A's escape leaves
+    /// B's escape pending, and B finalizes.
+    function test_realSameSecretNotesAreIndependent() public {
+        _depositAB();
+        assertEq(
+            vm.parseJsonBytes32(fixtures, ".note_a_registration"), vm.parseJsonBytes32(fixtures, ".note_b_registration")
+        );
+        (Types.RequestPublicInputs memory ra0,) = _request("request_a0");
+        (Types.RequestPublicInputs memory rb0,) = _request("request_b0");
+        assertNotEq(ra0.requestNullifier, rb0.requestNullifier);
+        (Types.WithdrawalPublicInputs memory escapeA,) = _initiate("escape_a2");
+        (Types.WithdrawalPublicInputs memory escapeB,) = _initiate("escape_b0_genesis_concede");
+        assertNotEq(escapeA.nextNullifier, escapeB.nextNullifier);
+        _defeat("request_a3");
+        assertEq(uint256(_status(1)), uint256(Types.NoteStatus.PendingWithdrawal));
+        vm.warp(_deadline(1));
+        vault.finalizeEscapeWithdrawal(1);
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
+        assertEq(uint256(_status(1)), uint256(Types.NoteStatus.Closed));
+    }
+
+    // ===================================================== known roots (Amendment A1)
+
+    /// The escape uses A's deposit-time root (A alone in the tree) after B's and C's deposits,
+    /// B's close and the retirement of B's leaf, and more than ROOT_HISTORY_WINDOW later.
+    function test_realEscapeAtTheDepositTimeRootAfterDepositsAndARetirement() public {
+        _depositA();
+        uint256 rootA = vault.currentRoot();
+        assertEq(rootA, vm.parseJsonUint(fixtures, ".root_a"));
+        _depositB();
+        _depositOther(2, 0x1234);
+        (Types.WithdrawalPublicInputs memory closeB, bytes memory closeProof) = _withdrawal("close_b0");
+        vault.mutualClose(closeB, closeProof);
+        _retire(1);
+        _depositOther(3, 0x5678);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertNotEq(vault.currentRoot(), rootA);
+        assertGt(vm.getBlockTimestamp(), uint256(vault.rootRetiredAt(rootA)) + vault.ROOT_HISTORY_WINDOW());
+
+        (Types.WithdrawalPublicInputs memory escape,) = _initiate("escape_a2_at_root_a");
+        assertEq(escape.activeRoot, rootA);
+        vm.warp(_deadline(0));
+        vault.finalizeEscapeWithdrawal(0);
+        assertEq(USER.balance, 6 * uint256(DEPOSIT) * 1 gwei + uint256(DEPOSIT + B2) * 1 gwei);
+    }
+
+    /// The close uses B's deposit-time root (A and B) after C's and D's deposits, A's escape and
+    /// the retirement of A's leaf, and more than ROOT_HISTORY_WINDOW later.
+    function test_realCloseAtTheDepositTimeRootAfterDepositsAndARetirement() public {
+        _depositAB();
+        uint256 rootAB = vault.currentRoot();
+        assertEq(rootAB, vm.parseJsonUint(fixtures, ".root_ab"));
+        _depositOther(2, 0x1234);
+        _initiate("escape_a2");
+        vm.warp(_deadline(0));
+        vault.finalizeEscapeWithdrawal(0);
+        _retire(0);
+        _depositOther(3, 0x5678);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertGt(vm.getBlockTimestamp(), uint256(vault.rootRetiredAt(rootAB)) + vault.ROOT_HISTORY_WINDOW());
+
+        (Types.WithdrawalPublicInputs memory close, bytes memory proof) = _withdrawal("close_b0");
+        assertEq(close.activeRoot, rootAB);
+        vault.mutualClose(close, proof);
+        assertEq(uint256(_status(1)), uint256(Types.NoteStatus.Closed));
+        assertEq(USER.balance, 6 * uint256(DEPOSIT) * 1 gwei + uint256(B2 + DEPOSIT) * 1 gwei);
+    }
+
+    // ================================================================ gas snapshot
+
+    /// Transaction gas (21,000 + calldata + execution with cold vault and adapter, refunds
+    /// ignored) of each exit entry point with real proofs, under the design's ceilings, and
+    /// pinned in snapshots/concession-exit-gas.json (checked in CI with FORGE_SNAPSHOT_CHECK).
+    function test_realExitGasSnapshot() public {
+        _depositAB();
+        uint256 snapshot = vm.snapshotState();
+
+        (Types.WithdrawalPublicInputs memory escape, bytes memory escapeProof) = _withdrawal("escape_a2");
+        uint256 escapeGas =
+            _txGas(abi.encodeCall(vault.initiateEscapeWithdrawal, (escape, escapeProof)), "initiateEscapeWithdrawal");
+        (Types.RequestPublicInputs memory r2, bytes memory r2Proof) = _request("request_a2");
+        uint256 raiseGas =
+            _txGas(abi.encodeCall(vault.raiseEscapeConcession, (0, r2, r2Proof, SB2)), "raiseEscapeConcession");
+        (Types.RequestPublicInputs memory r3, bytes memory r3Proof) = _request("request_a3");
+        uint256 defeatGas =
+            _txGas(abi.encodeCall(vault.challengeEscapeWithdrawal, (0, r3, r3Proof)), "challengeEscapeWithdrawal");
+        vm.revertToState(snapshot);
+
+        _initiate("escape_a2");
+        vm.warp(_deadline(0));
+        uint256 finalizeGas = _txGas(abi.encodeCall(vault.finalizeEscapeWithdrawal, (0)), "finalizeEscapeWithdrawal");
+        vm.revertToState(snapshot);
+
+        (Types.WithdrawalPublicInputs memory close, bytes memory closeProof) = _withdrawal("close_a2");
+        uint256 closeGas = _txGas(abi.encodeCall(vault.mutualClose, (close, closeProof)), "mutualClose");
+        vm.revertToState(snapshot);
+
+        vm.warp(vault.effectiveExpiry(0));
+        uint256 claimGas = _txGas(abi.encodeCall(vault.claimExpired, (0)), "claimExpired");
+
+        assertLe(escapeGas, 700_000, "escape");
+        assertLe(defeatGas, 500_000, "defeat");
+        assertLe(raiseGas, 400_000, "raise");
+        assertLe(closeGas, 550_000, "close");
+        assertLe(claimGas, 200_000, "claim");
+        assertLe(finalizeGas, 250_000, "finalize");
+        vm.snapshotValue("concession-exit-gas", "initiateEscapeWithdrawal", escapeGas);
+        vm.snapshotValue("concession-exit-gas", "challengeEscapeWithdrawal", defeatGas);
+        vm.snapshotValue("concession-exit-gas", "raiseEscapeConcession", raiseGas);
+        vm.snapshotValue("concession-exit-gas", "mutualClose", closeGas);
+        vm.snapshotValue("concession-exit-gas", "finalizeEscapeWithdrawal", finalizeGas);
+        vm.snapshotValue("concession-exit-gas", "claimExpired", claimGas);
+    }
+
+    /// Runs `data` against the vault (it must succeed) and returns its transaction gas.
+    function _txGas(bytes memory data, string memory label) private returns (uint256 txGas) {
+        vm.cool(address(vault));
+        vm.cool(address(adapter));
+        vm.prank(OPERATOR);
+        (bool ok,) = address(vault).call(data);
+        assertTrue(ok, label);
+        uint256 execution = vm.lastCallGas().gasTotalUsed;
+        uint256 calldataGas;
+        for (uint256 i = 0; i < data.length; ++i) {
+            calldataGas += data[i] == 0 ? 4 : 16;
+        }
+        txGas = 21_000 + calldataGas + execution;
+        emit log_named_uint(string.concat(label, " calldata bytes"), data.length);
+        emit log_named_uint(string.concat(label, " transaction gas"), txGas);
+    }
+
+    // ===================================================================== helpers
+
+    function _depositA() private {
+        bytes32 registration = vm.parseJsonBytes32(fixtures, ".note_a_registration");
+        uint256[32] memory path = _path(0);
+        vm.prank(USER);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT, path);
+        assertEq(_leafOf(0), vm.parseJsonUint(fixtures, ".note_a_leaf"));
+    }
+
+    function _depositB() private {
+        bytes32 registration = vm.parseJsonBytes32(fixtures, ".note_b_registration");
+        uint256[32] memory path = _path(1);
+        vm.prank(USER);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT, path);
+        assertEq(_leafOf(1), vm.parseJsonUint(fixtures, ".note_b_leaf"));
+    }
+
+    function _depositAB() private {
+        _depositA();
+        _depositB();
+        assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
+    }
+
+    function _depositOther(uint32 expectedId, uint256 commitment) private {
+        assertEq(vault.nextNoteId(), expectedId);
+        uint256[32] memory path = _path(expectedId);
+        vm.prank(USER);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT, path);
+    }
+
+    function _retire(uint32 noteId) private {
+        uint256[32] memory path = _path(noteId);
+        vm.prank(OPERATOR);
+        vault.retireClosedLeaf(noteId, path);
+        retired[noteId] = true;
+    }
+
+    function _leafOf(uint32 noteId) private view returns (uint256) {
+        (bytes32 commitment, uint128 amount, uint64 expiry,) = vault.notes(noteId);
+        return NoteLeafLib.computeLeaf(noteId, commitment, amount, expiry);
+    }
+
+    function _treeLeaf(uint32 index) private view returns (uint256) {
+        if (index >= vault.nextNoteId() || retired[index]) return 0;
+        return _leafOf(index);
+    }
+
+    /// Live-tree siblings for slots 0..3; later slots are empty.
+    function _path(uint32 index) private view returns (uint256[32] memory siblings) {
+        require(index < 4, "test tree");
+        siblings = emptySiblings;
+        siblings[0] = _treeLeaf(index ^ 1);
+        uint32 pair = (index >> 1) ^ 1;
+        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+    }
+
+    function _initiate(string memory name) private returns (Types.WithdrawalPublicInputs memory, bytes memory) {
+        (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal(name);
+        vm.prank(USER);
+        vault.initiateEscapeWithdrawal(inputs, proof);
+        assertEq(uint256(_status(inputs.noteId)), uint256(Types.NoteStatus.PendingWithdrawal));
+        assertTrue(vault.usedNullifiers(inputs.withdrawalNullifier));
+        assertTrue(vault.usedNullifiers(inputs.nextNullifier));
+        return (inputs, proof);
+    }
+
+    function _escapeReverts(string memory name, bytes4 err) private {
+        (Types.WithdrawalPublicInputs memory inputs, bytes memory proof) = _withdrawal(name);
+        vm.prank(USER);
+        vm.expectRevert(err);
+        vault.initiateEscapeWithdrawal(inputs, proof);
+    }
+
+    function _defeat(string memory name) private {
+        (Types.RequestPublicInputs memory request, bytes memory proof) = _request(name);
+        vm.prank(OPERATOR);
+        vault.challengeEscapeWithdrawal(0, request, proof);
+        assertEq(uint256(_status(0)), uint256(Types.NoteStatus.Active));
+    }
+
+    function _status(uint32 noteId) private view returns (Types.NoteStatus status) {
+        (,,, status) = vault.notes(noteId);
+    }
+
+    function _deadline(uint32 noteId) private view returns (uint64 deadline) {
+        (,,,,, deadline) = vault.pendingWithdrawals(noteId);
+    }
+
+    function _finalBalance(uint32 noteId) private view returns (uint128 finalBalance) {
+        (,,, finalBalance,,) = vault.pendingWithdrawals(noteId);
+    }
+
+    function _request(string memory name) private view returns (Types.RequestPublicInputs memory, bytes memory) {
+        return (
+            abi.decode(
+                vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi")), (Types.RequestPublicInputs)
+            ),
+            vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"))
+        );
+    }
+
+    function _withdrawal(string memory name) private view returns (Types.WithdrawalPublicInputs memory, bytes memory) {
+        return (
+            abi.decode(
+                vm.parseJsonBytes(fixtures, string.concat(".", name, ".inputs_abi")), (Types.WithdrawalPublicInputs)
+            ),
+            vm.parseJsonBytes(fixtures, string.concat(".", name, ".proof_hex"))
+        );
+    }
+}

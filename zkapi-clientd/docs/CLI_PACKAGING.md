@@ -169,7 +169,11 @@ The wallet companion (`zkapi-walletd`) is this repository's
 the circuit, the operator's server and the companion never come from two
 sources. Releases build it from the pinned `ZKAPI_SOURCE_COMMIT` in a separate
 build directory; move the pin to a commit holding every companion, protocol and
-`Cargo.lock` change a release must ship. Proving assets remain
+`Cargo.lock` change a release must ship. A release must pin a commit that is
+pushed to the public repository: the release workflow's shallow checkout
+fetches the pinned commit from there, and rebuilds and reviews of a release
+must be able to fetch exactly it. A local, unpushed pin serves development and
+CI from a checkout that holds it, never a release. Proving assets remain
 deployment-pinned; never regenerate them for installation.
 
 ## Checks

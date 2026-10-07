@@ -826,6 +826,53 @@ func TestAStuckEscapeIsRetiredAndSignedAgain(t *testing.T) {
 	})
 }
 
+// Design §6.4 E6: cancel releases only an escape that released no exit
+// proof. An escape on chain is refused and kept, even with no transaction
+// pending: a complete one whose payout the vault credited (dropping it would
+// lose the credit's claim, which only retiring the record keeps), and a
+// defeated one (its device_not_newest record).
+func TestAnEscapeOnChainIsNeverCancelled(t *testing.T) {
+	ctx := context.Background()
+	refused := func(t *testing.T, f *withdrawalFixture) {
+		t.Helper()
+		before, _ := json.Marshal(f.journal(t))
+		if _, err := f.h.CancelAddressEscape(ctx); err == nil || !strings.Contains(err.Error(), "on chain") {
+			t.Fatalf("an escape on chain was cancelled: %v", err)
+		}
+		after, _ := json.Marshal(f.journal(t))
+		if !bytes.Equal(before, after) || f.escape.cancels != 0 {
+			t.Fatal("a refused cancel changed the escape")
+		}
+	}
+	t.Run("complete and credited", func(t *testing.T) {
+		f := escapeEndToEnd(t, false)
+		claim := f.journal(t).Pending.Hash
+		f.mu.Lock()
+		f.receipts[claim] = map[string]any{"transactionHash": claim, "status": "0x1", "blockNumber": "0x10", "blockHash": f.canonical, "to": addressTestVault, "logs": []map[string]any{}}
+		f.nonce = fmt.Sprintf("0x%x", f.accepted[claim].Nonce()+1)
+		f.mu.Unlock()
+		if _, err := f.h.ClaimEscapePayout(ctx, withdrawalTestDestination); err != nil {
+			t.Fatal(err)
+		}
+		record := f.journal(t)
+		if record.Pending != nil || record.Withdrawal == nil || record.Withdrawal.Phase != "complete" || !record.Withdrawal.PayoutCredited {
+			t.Fatalf("not a complete credited escape: %+v", record)
+		}
+		refused(t, f)
+	})
+	t.Run("defeated", func(t *testing.T) {
+		f := newWithdrawalFixture(t, true)
+		f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "defeated"}
+		initiate := f.signEscape(t)
+		f.mine(t, initiate.Hash().Hex(), false)
+		status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+		if err == nil || status.Phase != "defeated" || f.journal(t).Pending != nil {
+			t.Fatalf("not a defeated escape: %+v %v", status, err)
+		}
+		refused(t, f)
+	})
+}
+
 // httptestTLS serves JSON-RPC answers from answer(method) over the test TLS
 // certificate the fixtures' clients trust.
 func httptestTLS(t *testing.T, answer func(method string) any) string {

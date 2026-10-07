@@ -61,6 +61,9 @@ struct World {
     exit_chain: Option<u64>,
     /// The finalized block trails the latest by this many blocks.
     finalized_lag: u64,
+    /// Every RPC fails `eth_getLogs` (a node that dropped or rate-limits
+    /// log queries).
+    logs_down: bool,
     // Chain.
     known_roots: HashSet<Felt252>,
     note_status: u8,
@@ -137,6 +140,11 @@ fn answer(world: &Shared, body: &Value, lies: bool) -> Response {
                 .cloned()
                 .unwrap_or(Value::Null),
         ),
+        "eth_getLogs" if world.logs_down => Json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32000, "message": "header not found"},
+        }))
+        .into_response(),
         "eth_getLogs" => {
             let filter = &params[0];
             let topic0: Vec<String> = match &filter["topics"][0] {
@@ -1208,6 +1216,78 @@ async fn a_lying_pinned_rpc_neither_releases_a_live_lock_nor_reports_a_defeat() 
         harness.wallet().state().unwrap().current_balance,
         balance - 40
     );
+}
+
+/// E6 with failing defeat logs: once the escape proof is dead on this
+/// device's clock too, a reading whose `eth_getLogs` fails (here through the
+/// owner's exit RPC) still releases the lock, but settles nothing about the
+/// escape. It is reported `unknown` and untrusted, never `expired`, and a
+/// saved defeat or expiry is kept as it is. Once the logs load, they decide.
+#[tokio::test]
+async fn failing_defeat_logs_settle_nothing_once_the_proof_is_dead() {
+    let phase = |harness: &Harness| load_record(&harness.config).unwrap().unwrap().phase;
+    let trust = |status: &Value| {
+        (
+            status["trusted"].as_bool(),
+            status["defeat_checked"].as_bool(),
+        )
+    };
+    let unread = |status: &Value| {
+        assert_eq!(status["phase"], "unknown", "{status}");
+        assert_eq!(
+            (
+                status["trusted"].as_bool(),
+                status["defeat_checked"].as_bool(),
+                status["defeat_logs"].as_str()
+            ),
+            (Some(false), Some(false), Some("unavailable")),
+            "{status}"
+        );
+    };
+    // A defeat saved by an earlier reading is never overwritten.
+    let harness = Harness::new(true).await.with_exit_rpc();
+    let plan = harness.prepare(Some("0"), None).await.unwrap();
+    let dead = plan["valid_until"].as_u64().unwrap() + 901;
+    let nullifier: Felt252 = serde_json::from_value(plan["withdrawal_nullifier"].clone()).unwrap();
+    harness.defeat(nullifier);
+    harness.world.lock().unwrap().now = dead;
+    let status = harness.service.escape_status_at(Some(dead)).await.unwrap();
+    assert_eq!(status["phase"], "defeated", "{status}");
+    assert_eq!(trust(&status), (Some(true), Some(true)), "{status}");
+    assert!(harness.wallet().exit_lock().unwrap().is_none());
+    assert_eq!(phase(&harness), "defeated");
+    harness.world.lock().unwrap().logs_down = true;
+    unread(&harness.service.escape_status_at(Some(dead)).await.unwrap());
+    assert_eq!(phase(&harness), "defeated");
+    harness.world.lock().unwrap().logs_down = false;
+    let status = harness.service.escape_status_at(Some(dead)).await.unwrap();
+    assert_eq!(status["phase"], "defeated", "{status}");
+
+    // An escape that never landed: the dead lock is released as before, but
+    // the escape is reported expired only from logs that loaded.
+    let harness = Harness::new(true).await.with_exit_rpc();
+    let plan = harness.prepare(Some("0"), None).await.unwrap();
+    let dead = plan["valid_until"].as_u64().unwrap() + 901;
+    {
+        let mut world = harness.world.lock().unwrap();
+        world.now = dead;
+        world.logs_down = true;
+    }
+    let status = harness.service.escape_status_at(Some(dead)).await.unwrap();
+    unread(&status);
+    assert!(status["exit_lock"].is_null(), "{status}");
+    assert!(harness.wallet().exit_lock().unwrap().is_none());
+    harness.wallet().check_request_allowed().unwrap();
+    assert_eq!(phase(&harness), "prepared");
+    harness.world.lock().unwrap().logs_down = false;
+    let status = harness.service.escape_status_at(Some(dead)).await.unwrap();
+    assert_eq!(status["phase"], "expired", "{status}");
+    assert_eq!(trust(&status), (Some(true), Some(true)), "{status}");
+    assert_eq!(phase(&harness), "expired");
+    // A saved expiry is not repeated from a reading without the logs.
+    harness.world.lock().unwrap().logs_down = true;
+    unread(&harness.service.escape_status_at(Some(dead)).await.unwrap());
+    assert_eq!(phase(&harness), "expired");
 }
 
 /// C1: two services on one state directory (the bridge and, say, the exit

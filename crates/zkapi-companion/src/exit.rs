@@ -989,7 +989,10 @@ async fn escape_status_locked(
             // Active with no pending exit: a defeat counts only from an
             // EscapeWithdrawalChallenged of this escape's nullifier in a
             // finalized block, never from a flag at the latest block.
-            let mut defeat = None;
+            // `defeat` is what those logs show, None when they were not
+            // read: logs that fail to load never count as "no defeat".
+            let mut defeat: Option<Option<String>> = None;
+            let mut logs_failed = false;
             let mut settled_at = None;
             if let Ok((block, finalized_ts)) = rpc.block("finalized").await {
                 let tag = format!("0x{block:x}");
@@ -998,7 +1001,7 @@ async fn escape_status_locked(
                     .is_ok_and(|view| view.status == 1 && view.pending.is_none())
                 {
                     settled_at = Some(finalized_ts);
-                    defeat = chain::escape_defeat(
+                    match chain::escape_defeat(
                         &rpc,
                         &vault,
                         record.note_id,
@@ -1007,14 +1010,18 @@ async fn escape_status_locked(
                         block,
                     )
                     .await
-                    .ok()
-                    .flatten();
+                    {
+                        Ok(found) => defeat = Some(found),
+                        Err(_) => logs_failed = true,
+                    }
                 }
             }
-            if let Some(hash) = &defeat {
-                status["phase"] = json!("defeated");
-                status["error"] = json!("device_not_newest");
-                status["defeat_transaction"] = json!(hash);
+            status["defeat_checked"] = json!(defeat.is_some());
+            if logs_failed {
+                // Whether the escape was defeated is unknown: nothing is
+                // decided from this reading, so the caller must not act on it.
+                status["trusted"] = json!(false);
+                status["defeat_logs"] = json!("unavailable");
             }
             // E6: release the lock once every released proof is dead: at a
             // finalized block past each valid_until + 900, the note Active
@@ -1034,16 +1041,25 @@ async fn escape_status_locked(
             if released {
                 status["exit_lock"] = Value::Null;
             }
-            // With no lock left, an escape the chain shows neither pending nor
-            // defeated never landed (a saved defeat an earlier reading
-            // reported is corrected).
-            let unlocked = released || wallet.exit_lock()?.is_none();
-            if defeat.is_none()
-                && unlocked
-                && (released || matches!(record.phase.as_str(), "defeated" | "expired"))
-            {
-                status["phase"] = json!("expired");
+            // Only the defeat logs this reading read settle the escape: with
+            // no lock left, one the chain shows neither pending nor defeated
+            // never landed (a saved defeat an earlier reading reported is
+            // corrected). Without them (unread or failing logs), or when
+            // they settle nothing, a record an earlier reading settled as
+            // defeated or expired is reported as unknown and kept as it is:
+            // never expired, and a saved defeat is never overwritten.
+            let settled_before = matches!(record.phase.as_str(), "defeated" | "expired");
+            match &defeat {
+                Some(Some(hash)) => {
+                    status["phase"] = json!("defeated");
+                    status["error"] = json!("device_not_newest");
+                    status["defeat_transaction"] = json!(hash);
+                }
+                Some(None) if released => status["phase"] = json!("expired"),
+                _ if logs_failed || settled_before => status["phase"] = json!("unknown"),
+                _ => {}
             }
+            let unlocked = released || wallet.exit_lock()?.is_none();
             let phase = status["phase"].as_str().unwrap_or("").to_string();
             if unlocked && matches!(phase.as_str(), "defeated" | "expired") && phase != record.phase
             {

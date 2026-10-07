@@ -81,6 +81,7 @@ const CLEARANCE_VERIFY_PERMITS: usize = 4;
 const CLEARANCE_PERMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const RECENT_ROOTS_CAPACITY: usize = 1024;
 const REJECTED_CLEARANCE_CAPACITY: usize = 4096;
+const KNOWN_ROOTS_CAPACITY: usize = 4096;
 const KEY_CLEANUP_BATCH: usize = 50;
 const KEY_CLEANUP_MAX_BACKOFF_SECONDS: u64 = 3_600;
 /// Longest wait honoured from an org's retry-after for a pending receipt, or
@@ -172,6 +173,45 @@ impl RecentRoots {
         self.entries
             .iter()
             .any(|(seen, at)| seen == root && at.saturating_add(window) >= now)
+    }
+}
+
+/// The vault's answers to `knownRoots(root)` (Amendment A1). A root it set
+/// stays known; one it never set is cached as unknown only while the vault's
+/// current root is the one read with the answer, since a root becomes known
+/// only by becoming the current root.
+#[derive(Default)]
+struct KnownRoots {
+    known: std::collections::HashSet<Felt252>,
+    /// The vault root under which `unknown` was read.
+    unknown_under: Felt252,
+    unknown: std::collections::HashSet<Felt252>,
+}
+
+impl KnownRoots {
+    fn lookup(&self, root: &Felt252, vault_root: &Felt252) -> Option<bool> {
+        if self.known.contains(root) {
+            Some(true)
+        } else if self.unknown_under == *vault_root && self.unknown.contains(root) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn record(&mut self, root: Felt252, vault_root: Felt252, known: bool) {
+        if known {
+            if self.known.len() >= KNOWN_ROOTS_CAPACITY {
+                self.known.clear();
+            }
+            self.known.insert(root);
+            return;
+        }
+        if self.unknown_under != vault_root || self.unknown.len() >= KNOWN_ROOTS_CAPACITY {
+            self.unknown.clear();
+            self.unknown_under = vault_root;
+        }
+        self.unknown.insert(root);
     }
 }
 
@@ -358,6 +398,8 @@ pub struct RequestProcessor {
     clearance_permits: tokio::sync::Semaphore,
     /// The last vault currentRoot() read (or its failure) and when.
     vault_root_cache: tokio::sync::Mutex<Option<(Result<Felt252, String>, Instant)>>,
+    /// The vault's knownRoots answers; held across a read (single flight).
+    vault_known_roots: tokio::sync::Mutex<KnownRoots>,
     /// O5: when the indexer and the vault last agreed on `current_root`.
     root_agreement: Mutex<RootAgreement>,
     /// Which nullifiers are published on chain (`nullifier_published`).
@@ -486,6 +528,7 @@ impl RequestProcessor {
             rejected_clearances: Mutex::new(RejectedClearances::default()),
             clearance_permits: tokio::sync::Semaphore::new(CLEARANCE_VERIFY_PERMITS),
             vault_root_cache: tokio::sync::Mutex::new(None),
+            vault_known_roots: tokio::sync::Mutex::new(KnownRoots::default()),
             root_agreement: Mutex::new(RootAgreement::default()),
             publication: Mutex::new(PublicationCache::default()),
             signing_cursors: Mutex::new([None, None]),
@@ -3559,7 +3602,7 @@ impl RequestProcessor {
         if known_root {
             return Ok(());
         }
-        // Only a verified proof reaches the vault, and the read is cached.
+        // Only a verified proof reaches the vault, and the reads are cached.
         let vault_root = match vault_root_read {
             Some(vault_root) => vault_root,
             None => self.cached_vault_root().await?,
@@ -3568,12 +3611,36 @@ impl RequestProcessor {
             self.observe_root(root, now);
             return Ok(());
         }
+        // Amendment A1: any root the vault ever held, such as the one a
+        // client saved with its deposit-time path, proves the note exists
+        // (the tree is append-only for every note that is not Closed, and a
+        // close of a Closed note reverts).
+        if self.vault_knows_root(&root, &vault_root).await? {
+            return Ok(());
+        }
         if let Ok(mut rejected) = self.rejected_clearances.lock() {
             rejected.insert(root, *nullifier, vault_root, now.saturating_add(window));
         }
         Err(ServerError::StaleRoot {
             latest_root: vault_root.to_hex(),
         })
+    }
+
+    /// Whether the vault ever set `root` (`knownRoots`), its current root
+    /// being `vault_root`. Concurrent callers wait for the one in-flight read;
+    /// a failed read is not cached.
+    async fn vault_knows_root(
+        &self,
+        root: &Felt252,
+        vault_root: &Felt252,
+    ) -> Result<bool, ServerError> {
+        let mut cache = self.vault_known_roots.lock().await;
+        if let Some(known) = cache.lookup(root, vault_root) {
+            return Ok(known);
+        }
+        let known = self.native_oracle.vault_known_root(root).await?;
+        cache.record(*root, *vault_root, known);
+        Ok(known)
     }
 
     /// The vault's currentRoot(), read at most once per TTL; concurrent
@@ -10767,21 +10834,42 @@ mod tests {
         Arc<std::sync::Mutex<usize>>,
         tokio::task::JoinHandle<()>,
     ) {
+        vault_root_rpc_with_history(processor, root, &[]).await
+    }
+
+    /// A vault RPC serving currentRoot() (`root`, changeable) and
+    /// knownRoots(r): true for its current root and every root of `history`.
+    async fn vault_root_rpc_with_history(
+        processor: &mut RequestProcessor,
+        root: Felt252,
+        history: &[Felt252],
+    ) -> (
+        Arc<std::sync::Mutex<Felt252>>,
+        Arc<std::sync::Mutex<usize>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
         let current = Arc::new(std::sync::Mutex::new(root));
         let calls = Arc::new(std::sync::Mutex::new(0usize));
+        let history: Arc<Vec<Felt252>> = Arc::new(history.to_vec());
         let (served, counted) = (current.clone(), calls.clone());
         let app = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
-                let (served, counted) = (served.clone(), counted.clone());
+                let (served, counted, history) = (served.clone(), counted.clone(), history.clone());
                 async move {
                     *counted.lock().unwrap() += 1;
+                    let data = request["params"][0]["data"].as_str().unwrap_or_default();
                     let result = if request["method"] == "eth_chainId" {
                         "0x1".to_string()
+                    } else if let Some(word) = data.strip_prefix("0x12ad7381") {
+                        assert_eq!(request["params"][1], "latest");
+                        let asked = Felt252::from_hex(word).unwrap();
+                        let known = asked == *served.lock().unwrap() || history.contains(&asked);
+                        format!("0x{:064x}", known as u8)
                     } else {
-                        assert_eq!(request["params"][0]["data"], "0xfdab463d");
+                        assert_eq!(data, "0xfdab463d");
                         assert_eq!(request["params"][1], "latest");
                         format!("0x{}", hex::encode(served.lock().unwrap().as_bytes()))
                     };
@@ -10988,18 +11076,20 @@ mod tests {
             other => panic!("expected stale root, got {other:?}"),
         }
         assert!(processor.store.get_all_nullifiers().is_empty());
-        assert_eq!(*calls.lock().unwrap(), 2);
+        // currentRoot(), then knownRoots(root), each after eth_chainId.
+        assert_eq!(*calls.lock().unwrap(), 4);
         // The indexer lags, but the vault already has the proof's root.
         *served.lock().unwrap() = fixture.root;
         let request = clearance(fixture);
         processor.process_clearance(&request).await.unwrap();
-        assert_eq!(*calls.lock().unwrap(), 4);
+        assert_eq!(*calls.lock().unwrap(), 6);
         assert!(processor.recent_roots.lock().unwrap().contains(
             &fixture.root,
             current_timestamp(),
             processor.config.clearance_root_window_seconds
         ));
-        // A root last seen longer ago than the window is no longer accepted.
+        // A root last seen longer ago than the window, or never seen, needs
+        // the vault: refused unless the vault ever held it.
         let window = processor.config.clearance_root_window_seconds;
         processor.recent_roots.lock().unwrap().entries =
             VecDeque::from([(fixture.root, current_timestamp() - window - 1)]);
@@ -11026,6 +11116,45 @@ mod tests {
         fresh_server.abort();
     }
 
+    /// Review regression (Amendment A1): an ownership proof at a root the
+    /// vault held long ago, such as the deposit-time root a client saved its
+    /// path at, is accepted once the vault's knownRoots(root) holds it, and
+    /// the answer is cached. The current root and the recent window are
+    /// unchanged.
+    #[tokio::test]
+    async fn clearance_accepts_any_root_the_vault_ever_held() {
+        let fixture = crate::test_support::ownership_fixture().await;
+        let mut processor = oa_lease_processor(Arc::new(NullifierStore::in_memory().unwrap()));
+        processor.timing.vault_root_ttl = std::time::Duration::ZERO;
+        let vault_root = Felt252::from_u64(0x7010);
+        let (_, calls, server) =
+            vault_root_rpc_with_history(&mut processor, vault_root, &[fixture.root]).await;
+        assert!(!processor.recent_roots.lock().unwrap().contains(
+            &fixture.root,
+            current_timestamp(),
+            processor.config.clearance_root_window_seconds
+        ));
+        let request = clearance(fixture);
+        processor.process_clearance(&request).await.unwrap();
+        assert_eq!(
+            processor
+                .store
+                .lookup_by_nullifier(&request.withdrawal_nullifier)
+                .unwrap()
+                .status,
+            NullifierStatus::ClearanceReserved
+        );
+        assert_eq!(*calls.lock().unwrap(), 4);
+        // Known once, known for good: a second check of the root reads only
+        // the current root.
+        assert!(processor
+            .vault_knows_root(&fixture.root, &vault_root)
+            .await
+            .unwrap());
+        assert_eq!(*calls.lock().unwrap(), 4);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn ownership_proof_replay_hits_the_negative_cache_not_the_rpc() {
         let fake = crate::test_support::fake_tree_ownership_fixture().await;
@@ -11041,8 +11170,9 @@ mod tests {
                 other => panic!("expected stale root, got {other:?}"),
             }
         }
-        // One eth_chainId + one currentRoot() for all six attempts.
-        assert_eq!(*calls.lock().unwrap(), 2);
+        // One currentRoot() and one knownRoots(), each after eth_chainId, for
+        // all six attempts.
+        assert_eq!(*calls.lock().unwrap(), 4);
         assert!(processor.store.get_all_nullifiers().is_empty());
         // Once the cached vault read expires, a replay costs one shared read
         // (still no pairing check) while the vault root is unchanged.
@@ -11051,7 +11181,7 @@ mod tests {
             processor.process_clearance(&request).await,
             Err(ServerError::StaleRoot { .. })
         ));
-        assert_eq!(*calls.lock().unwrap(), 4);
+        assert_eq!(*calls.lock().unwrap(), 6);
         // A vault that moves re-evaluates the pair rather than trusting it.
         *served.lock().unwrap() = Felt252::from_u64(0x7009);
         match processor.process_clearance(&request).await {
@@ -11060,8 +11190,9 @@ mod tests {
             }
             other => panic!("expected stale root, got {other:?}"),
         }
-        assert_eq!(*calls.lock().unwrap(), 6);
-        // Without the negative cache, concurrent readers still share one read.
+        assert_eq!(*calls.lock().unwrap(), 10);
+        // Without the negative cache, concurrent readers still share one read,
+        // and the root is still unknown under the same vault root.
         processor
             .rejected_clearances
             .lock()
@@ -11085,7 +11216,7 @@ mod tests {
             ));
         }
         // Four concurrent requests: one more eth_chainId + currentRoot().
-        assert_eq!(*calls.lock().unwrap(), 6 + 2);
+        assert_eq!(*calls.lock().unwrap(), 10 + 2);
         server.abort();
     }
 

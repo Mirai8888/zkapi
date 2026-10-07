@@ -26,6 +26,9 @@ pub const CURRENT_ROOT_SELECTOR: &str = "0xfdab463d"; // currentRoot()
 /// Nullifier flags, read before signing (O7) and before serving request data.
 pub const USED_NULLIFIERS_SELECTOR: &str = "0xaad24061"; // usedNullifiers(uint256)
 pub const CHALLENGED_NULLIFIERS_SELECTOR: &str = "0x6cda756a"; // challengedNullifiers(uint256)
+/// Every root the vault ever set (Amendment A1); read for a clearance
+/// ownership proof at a root the server has not seen recently.
+pub const KNOWN_ROOTS_SELECTOR: &str = "0x12ad7381"; // knownRoots(uint256)
 /// keccak256 of `EscapeConcessionRecorded(uint32,uint256,uint128,uint128)`,
 /// the event that names an escape's `nextNullifier` (§4.2 step 11). Its
 /// nullifier is not indexed: a scan reads every such log and compares.
@@ -347,6 +350,26 @@ impl NativeBillingOracle {
         async {
             self.assert_chain().await?;
             self.vault_word(CURRENT_ROOT_SELECTOR).await
+        }
+        .await
+        .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
+    }
+
+    /// Whether the vault ever set `root` (`knownRoots(root)`, Amendment A1)
+    /// at "latest", after an eth_chainId check.
+    pub async fn vault_known_root(&self, root: &Felt252) -> Result<bool, ServerError> {
+        async {
+            self.assert_chain().await?;
+            let data = format!("{KNOWN_ROOTS_SELECTOR}{}", hex::encode(root.as_bytes()));
+            let raw = self.call(&self.contract_address, &data).await?;
+            if raw.len() != 66 {
+                return Err(invalid("invalid vault knownRoots response length"));
+            }
+            match decode_word(&raw, 0)? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(invalid("invalid vault knownRoots boolean")),
+            }
         }
         .await
         .map_err(|error| ServerError::Internal(format!("vault read failed: {error}")))
@@ -1040,11 +1063,22 @@ mod tests {
             ("clearanceSigningKeyY()", CLEARANCE_SIGNING_KEY_Y_SELECTOR),
             ("challengePeriod()", CHALLENGE_PERIOD_SELECTOR),
             ("currentRoot()", CURRENT_ROOT_SELECTOR),
+            ("knownRoots(uint256)", KNOWN_ROOTS_SELECTOR),
         ] {
             let digest = Keccak256::digest(signature.as_bytes());
             assert_eq!(selector, format!("0x{}", hex::encode(&digest[..4])));
         }
         assert_eq!(CURRENT_ROOT_SELECTOR, "0xfdab463d");
+        assert_eq!(KNOWN_ROOTS_SELECTOR, "0x12ad7381");
+        assert_eq!(
+            ESCAPE_CONCESSION_RECORDED_TOPIC,
+            format!(
+                "0x{}",
+                hex::encode(Keccak256::digest(
+                    b"EscapeConcessionRecorded(uint32,uint256,uint128,uint128)"
+                ))
+            )
+        );
         // Independent literals from the ABI, rather than the encoder above.
         assert_eq!(
             [

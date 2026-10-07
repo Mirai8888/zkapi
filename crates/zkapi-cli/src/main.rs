@@ -131,7 +131,8 @@ enum Commands {
         )]
         request_limit_max_usd_micros: Option<u128>,
         /// How long a Merkle root the server observed stays acceptable for a
-        /// clearance ownership proof (60..=86400).
+        /// clearance ownership proof without a vault read (60..=86400); any
+        /// other root the vault ever held is accepted after one.
         #[arg(
             long,
             env = "ZKAPI_CLEARANCE_ROOT_WINDOW_SECONDS",

@@ -277,7 +277,8 @@ pub struct ServerConfig {
     /// it set.
     pub allow_legacy_clearance: bool,
     /// How long after the server last observed a Merkle root a clearance
-    /// ownership proof may still use it.
+    /// ownership proof may use it without a vault read. Any other root is
+    /// accepted once the vault's knownRoots(root) holds it (Amendment A1).
     pub clearance_root_window_seconds: u64,
     /// O5: admission refuses (`root_unavailable`) unless the indexer root and
     /// the vault's currentRoot() agreed at most this many seconds ago.

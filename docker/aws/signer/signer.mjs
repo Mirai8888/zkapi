@@ -26,9 +26,11 @@ export const ABSOLUTE_FEE_CEILING = 1_000_000n * GWEI;
 export const DEFAULT_TX_FEE_CAP = 10n ** 18n;
 export const UPSTREAM_TIMEOUT_MS = 8_000;
 // Leaf retirements (about 6M gas each) follow only a missed defeat, which is
-// rare and alarmed on, but any closed note simulates successfully. Distinct
-// notes retired per rolling day are capped so that a compromised caller
-// cannot spend the float meant for defeats and raises on them.
+// rare and alarmed on, but any closed note simulates successfully, and a
+// copy that mines after the leaf is gone still pays about 5.9M gas before it
+// reverts StaleRoot. Retirement transactions signed per rolling day, one per
+// nonce, are capped so that a compromised caller cannot spend the float
+// meant for defeats and raises on them.
 export const DEFAULT_MAX_RETIREMENTS_PER_DAY = 2n;
 export const MAX_RETIREMENTS_PER_DAY_LIMIT = 1_000n;
 export const RETIREMENT_WINDOW_MS = 86_400_000;
@@ -179,25 +181,50 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     max_retirements_per_day: Number(maxRetirementsPerDay),
   });
 
-  // The notes whose leaf retirement was broadcast (or may have been) in the
-  // last RETIREMENT_WINDOW_MS, by first signing time. A replacement or retry
-  // of a note already counted needs no new budget; a retirement refused for
-  // the budget is counted and reported (status, /health, audit log). Kept in
-  // memory: a restart of this sidecar starts a new window.
+  // The leaf retirements broadcast (or possibly broadcast) in the last
+  // RETIREMENT_WINDOW_MS, one entry per (note, nonce), by first signing time.
+  // Each entry is one unit of the budget: a nonce mines at most one
+  // transaction, and every retirement that mines costs about 6M gas, even
+  // one that reverts StaleRoot because the leaf is already gone. A fee
+  // replacement or re-send on a counted nonce therefore needs no new budget.
+  // The same note on another nonce takes a new unit, and only once every
+  // earlier counted nonce of that note is mined (retirement_in_flight):
+  // copies cannot queue behind a pending retirement, each to pay about 5.9M
+  // gas to revert once the first lands. A retirement refused for the budget
+  // is counted and reported (status, /health, audit log). Kept in memory: a
+  // restart of this sidecar starts a new window.
   const retirements = new Map();
   let retirementRefusals = 0;
   let lastRetirementRefusal = null;
+  const retirementKey = (note, nonce) => `${note}:${nonce}`;
   function retirementsInWindow() {
     const cutoff = now() - RETIREMENT_WINDOW_MS;
-    for (const [note, at] of retirements) if (at <= cutoff) retirements.delete(note);
+    for (const [key, { at }] of retirements) if (at <= cutoff) retirements.delete(key);
     return retirements.size;
   }
-  function requireRetirementBudget(note) {
-    if (retirementsInWindow() < Number(maxRetirementsPerDay) || retirements.has(note)) return;
+  // Before any upstream call. Returns whether the retirement takes a new unit.
+  function requireRetirementBudget(note, nonce) {
+    const counted = retirementsInWindow();
+    if (retirements.has(retirementKey(note, nonce))) return false;
+    if (counted < Number(maxRetirementsPerDay)) return true;
     retirementRefusals += 1;
     lastRetirementRefusal = now();
     throw new RpcError(-32003, 'Leaf retirement budget for the last 24 hours is spent', 'retirement_budget_exhausted', {
       max_retirements_per_day: hex(maxRetirementsPerDay),
+    });
+  }
+  // A note's retirement on a new nonce waits until the sender's latest nonce
+  // count is past every nonce a retirement of that note was counted on. If
+  // the earlier one retired the leaf, the simulation then refuses this one.
+  async function requireNoRetirementInFlight(note) {
+    retirementsInWindow();
+    let earlier = -1;
+    for (const entry of retirements.values()) if (entry.note === note && entry.nonce > earlier) earlier = entry.nonce;
+    if (earlier < 0) return;
+    const mined = upstreamQuantity(await rpc('eth_getTransactionCount', [sender, 'latest']), 'Upstream RPC returned an invalid nonce');
+    if (mined > BigInt(earlier)) return;
+    throw new RpcError(-32003, 'A retirement of this note may still mine on an earlier nonce', 'retirement_in_flight', {
+      retirement_nonce: hex(earlier),
     });
   }
   function retirementStatus() {
@@ -344,7 +371,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
     const transaction = validateTransaction(tx);
     const call = vaultInterface.parseTransaction({ data: transaction.data });
     const retiredNote = call.name === 'retireClosedLeaf' ? call.args.noteId.toString(10) : null;
-    if (retiredNote !== null) requireRetirementBudget(retiredNote);
+    const newRetirement = retiredNote !== null && requireRetirementBudget(retiredNote, transaction.nonce);
     // Nodes refuse a gas limit x maxFeePerGas above their RPC fee cap, so
     // neither a proposed nor the default bid above it is ever offered.
     if (transaction.gasLimit * transaction.maxFeePerGas > txFeeCap) {
@@ -354,6 +381,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       });
     }
     await checkChain();
+    if (newRetirement) await requireNoRetirementInFlight(retiredNote);
     const simulation = { from: sender, to: destination, data: transaction.data, value: '0x0' };
     await simulate(() => rpc('eth_call', [simulation, 'latest']));
     const estimate = upstreamQuantity(await simulate(() => rpc('eth_estimateGas', [simulation])), 'Upstream RPC returned an invalid gas estimate');
@@ -381,9 +409,10 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       throw new RpcError(-32603, 'Signer self-check failed');
     }
     const ambiguous = () => new RpcError(-32000, 'Transaction broadcast outcome is unknown', 'broadcast_ambiguous', { transaction_hash: hash });
-    // From here the retirement may be broadcast: it takes its budget.
-    const counted = retiredNote !== null && !retirements.has(retiredNote);
-    if (counted) retirements.set(retiredNote, now());
+    // From here the retirement may be broadcast: its nonce takes its budget.
+    const key = retiredNote === null ? null : retirementKey(retiredNote, transaction.nonce);
+    const counted = key !== null && !retirements.has(key);
+    if (counted) retirements.set(key, { note: retiredNote, nonce: transaction.nonce, at: now() });
     let returned;
     try { returned = await rpc('eth_sendRawTransaction', [raw]); }
     catch (error) {
@@ -391,7 +420,7 @@ export function createSigner({ privateKey, vault, rpc, chainId, maxGas = 12_000_
       if (await knownTransaction(hash)) return { hash, transaction };
       // The node's own fee-cap refusal: definitely not broadcast, so no hash.
       if (error instanceof RpcError && error.data?.reason === 'upstream_tx_fee_cap') {
-        if (counted) retirements.delete(retiredNote);
+        if (counted) retirements.delete(key);
         throw new RpcError(-32003, 'Upstream RPC refused the transaction fee', 'upstream_tx_fee_cap', { gas_limit: hex(transaction.gasLimit), max_fee_per_gas: hex(transaction.maxFeePerGas) });
       }
       throw ambiguous();

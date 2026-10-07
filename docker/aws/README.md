@@ -177,11 +177,16 @@ defaults to 10 gwei. The tip cap `ZKAPI_CHALLENGE_MAX_PRIORITY_FEE_PER_GAS_WEI`
 defaults to the lower of the fee cap and 10 times the default tip (10 gwei with
 the 1 gwei default tip). `ZKAPI_CHALLENGE_MAX_GAS_PRICE_WEI` is no longer
 supported, and the signer refuses to start while it is present, even empty.
-`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2) caps the distinct notes
-whose leaf it retires per rolling 24 hours, so a compromised challenger host
-cannot spend the float on closed notes; a further retirement is refused with
-`retirement_budget_exhausted` (the challenger reports `signer_refused`), and
-defeats and raises are never affected.
+`ZKAPI_CHALLENGE_MAX_RETIREMENTS_PER_DAY` (default 2) caps the nonces on which
+it signs a leaf retirement per rolling 24 hours, and a note's retirement on a
+new nonce waits until its earlier nonce is mined (`retirement_in_flight`). A
+compromised challenger host can therefore spend at most that many retirements
+(each up to `ZKAPI_CHALLENGE_MAX_GAS` x fee cap) of the float per day, whether
+they retire a leaf or revert. Fee replacements on a counted nonce are free; a
+further retirement is refused with `retirement_budget_exhausted` (the
+challenger reports `signer_refused`), and defeats and raises are never
+affected. One missed defeat takes one unit, plus one for each re-send after a
+root race.
 
 The node behind the signer refuses to relay a transaction whose gas limit x
 `maxFeePerGas` exceeds its RPC fee cap, `--rpc.txfeecap`, which is 1 ETH by

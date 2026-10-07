@@ -151,28 +151,29 @@ test('signs the three concession-exit calls by their pinned selectors', async ()
   assert.equal(calls.length, 0);
 });
 
-test('leaf retirements are capped per rolling day by distinct note, reported, and never block defeats or raises', async t => {
+// A leaf retirement of a note on a nonce (default the shared test nonce 4).
+const retire = (note, nonce = 4n) => ({ ...validTx, nonce: wei(nonce), data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, Array(32).fill(0)]) });
+
+test('leaf retirements are capped per rolling day by nonce, reported, and never block defeats or raises', async t => {
   let clock = 1_700_000_000_000;
-  const siblings = Array(32).fill(0);
-  const retire = note => ({ ...validTx, data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, siblings]) });
-  const raise = { ...validTx, data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]) };
+  const raise = { ...validTx, nonce: '0x8', data: vaultInterface.encodeFunctionData('raiseEscapeConcession', [0, inputs, proof, 5]) };
   const { signer, calls, logs } = fixture({}, { now: () => clock });
-  await signer.handle('eth_sendTransaction', [retire(9)]);
-  // A replacement of a counted retirement needs no new budget.
-  await signer.handle('eth_sendTransaction', [{ ...retire(9), ...fees(5n * GWEI, 2n * GWEI) }]);
-  await signer.handle('eth_sendTransaction', [retire(10)]);
+  await signer.handle('eth_sendTransaction', [retire(9, 4n)]);
+  // A replacement of a counted retirement on its nonce needs no new budget.
+  await signer.handle('eth_sendTransaction', [{ ...retire(9, 4n), ...fees(5n * GWEI, 2n * GWEI) }]);
+  await signer.handle('eth_sendTransaction', [retire(10, 5n)]);
   assert.equal(broadcasts(calls).length, 3);
   const before = calls.length;
   const spent = { code: -32003, message: 'Leaf retirement budget for the last 24 hours is spent', data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x2' } };
-  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11)]), spent);
-  await assert.rejects(signer.handle('eth_sendTransaction', [{ ...retire(11), nonce: '0x5' }]), spent);
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11, 6n)]), spent);
+  await assert.rejects(signer.handle('eth_sendTransaction', [retire(11, 7n)]), spent);
   assert.equal(calls.length, before, 'refused before any upstream call');
   assert.deepEqual(logs.filter(line => line.event === 'challenge_refused'), [
-    { event: 'challenge_refused', nonce: 4, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
-    { event: 'challenge_refused', nonce: 5, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
+    { event: 'challenge_refused', nonce: 6, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
+    { event: 'challenge_refused', nonce: 7, code: -32003, reason: 'retirement_budget_exhausted', message: spent.message, max_retirements_per_day: '2' },
   ]);
   // Defeats and raises still sign.
-  await signer.handle('eth_sendTransaction', [validTx]);
+  await signer.handle('eth_sendTransaction', [{ ...validTx, nonce: '0x8' }]);
   await signer.handle('eth_sendTransaction', [raise]);
   assert.equal(broadcasts(calls).length, 5);
   const status = await signer.handle('zkapi_signerStatus', []);
@@ -185,7 +186,7 @@ test('leaf retirements are capped per rolling day by distinct note, reported, an
   assert.deepEqual([health.max_retirements_per_day, health.retirements_last_24h, health.retirement_refusals], [2, 2, 2]);
   // A day after the first signing, the window frees its slot.
   clock += 86_400_000;
-  await signer.handle('eth_sendTransaction', [retire(11)]);
+  await signer.handle('eth_sendTransaction', [retire(11, 6n)]);
   assert.equal(broadcasts(calls).length, 6);
   clock += 86_400_000;
   assert.deepEqual((await signer.handle('zkapi_signerStatus', [])).warnings, []);
@@ -193,8 +194,6 @@ test('leaf retirements are capped per rolling day by distinct note, reported, an
 
 test('a retirement that is not broadcast takes no budget; zero allows none', async () => {
   const refusedFor = reason => error => error instanceof RpcError && error.data?.reason === reason;
-  const siblings = Array(32).fill(0);
-  const retire = note => ({ ...validTx, data: vaultInterface.encodeFunctionData('retireClosedLeaf', [note, siblings]) });
   const spent = { data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x1' } };
   // A failed simulation and the node's fee-cap refusal leave the budget.
   let simulation = new RpcError(-32000, 'reverted', 'upstream_rejected');
@@ -219,6 +218,72 @@ test('a retirement that is not broadcast takes no budget; zero allows none', asy
   assert.equal(none.calls.length, 0);
   await none.signer.handle('eth_sendTransaction', [validTx]);
   for (const bad of [-1n, 1_001n, 2]) assert.throws(() => fixture({}, { maxRetirementsPerDay: bad }), { message: 'Retirement budget is invalid' });
+});
+
+test('a note retires on one nonce at a time: fee replacements are free, a later nonce waits for the earlier one to mine and takes a new unit', async () => {
+  // The sender's latest nonce count; retirements on nonces at or above it may still mine.
+  let mined = 4n;
+  const { signer, calls, logs } = fixture({ eth_getTransactionCount: () => (mined instanceof Error ? (() => { throw mined; })() : wei(mined)) }, { maxRetirementsPerDay: 3n });
+  const units = async () => (await signer.handle('zkapi_signerStatus', [])).retirements_last_24h;
+  // The upstream methods one send reads, and how it ends.
+  const send = async transaction => {
+    const before = calls.length;
+    const outcome = await signer.handle('eth_sendTransaction', [transaction]).then(() => undefined, error => error);
+    const error = outcome && { code: outcome.code, message: outcome.message, data: outcome.data };
+    return { methods: calls.slice(before).map(call => call.method), error };
+  };
+  await signer.handle('eth_sendTransaction', [retire(9, 4n)]);
+  // A fee replacement on the counted nonce signs without reading the nonce count or taking a unit.
+  const replacement = await send({ ...retire(9, 4n), ...fees(5n * GWEI, 2n * GWEI) });
+  assert.equal(replacement.error, undefined);
+  assert.ok(!replacement.methods.includes('eth_getTransactionCount'));
+  assert.equal(broadcasts(calls).length, 2);
+  assert.equal(await units(), 1);
+  // While nonce 4 is unmined, the same note on later nonces is refused before any simulation.
+  const inFlight = { code: -32003, message: 'A retirement of this note may still mine on an earlier nonce', data: { reason: 'retirement_in_flight', retirement_nonce: '0x4' } };
+  for (let nonce = 5n; nonce < 54n; nonce += 1n) {
+    const copy = await send(retire(9, nonce));
+    assert.deepEqual(copy.error, inFlight);
+    assert.deepEqual(copy.methods, ['eth_chainId', 'eth_getTransactionCount']);
+  }
+  assert.deepEqual(calls.find(call => call.method === 'eth_getTransactionCount').params, [sender.toLowerCase(), 'latest']);
+  assert.equal(broadcasts(calls).length, 2);
+  assert.equal(await units(), 1);
+  assert.deepEqual(logs.find(line => line.event === 'challenge_refused'), {
+    event: 'challenge_refused', nonce: 5, code: -32003, reason: 'retirement_in_flight', message: inFlight.message, retirement_nonce: '4',
+  });
+  // An unreadable nonce count is a transient refusal that takes nothing.
+  for (const failure of [new RpcError(-32000, 'Upstream RPC request failed', 'upstream_unavailable'), '0x04']) {
+    mined = failure;
+    await assert.rejects(signer.handle('eth_sendTransaction', [retire(9, 5n)]), { code: -32000, data: { reason: 'upstream_unavailable' } });
+  }
+  assert.equal(broadcasts(calls).length, 2);
+  // Another note takes its own unit.
+  mined = 4n;
+  await signer.handle('eth_sendTransaction', [retire(10, 5n)]);
+  assert.equal(await units(), 2);
+  // Once nonce 4 is mined (say it reverted after a root race), the note is
+  // re-sent on a new nonce for a new unit; its fee replacements stay free.
+  mined = 5n;
+  await signer.handle('eth_sendTransaction', [retire(9, 6n)]);
+  await signer.handle('eth_sendTransaction', [{ ...retire(9, 6n), ...fees(6n * GWEI, 3n * GWEI) }]);
+  assert.equal(await units(), 3);
+  assert.equal(broadcasts(calls).length, 5);
+  // The budget is spent: a fourth nonce is refused before any upstream call,
+  // even once every earlier one is mined, while a counted nonce still signs.
+  mined = 7n;
+  const spent = { code: -32003, message: 'Leaf retirement budget for the last 24 hours is spent', data: { reason: 'retirement_budget_exhausted', max_retirements_per_day: '0x3' } };
+  const fourth = await send(retire(9, 7n));
+  assert.deepEqual(fourth.error, spent);
+  assert.deepEqual(fourth.methods, []);
+  await signer.handle('eth_sendTransaction', [{ ...retire(10, 5n), ...fees(7n * GWEI, 3n * GWEI) }]);
+  assert.equal(broadcasts(calls).length, 6);
+  // At a budget of one, the same note on fifty successive nonces signs once.
+  const one = fixture({ eth_getTransactionCount: '0x4' }, { maxRetirementsPerDay: 1n });
+  for (let nonce = 4n; nonce < 54n; nonce += 1n) {
+    await one.signer.handle('eth_sendTransaction', [retire(9, nonce)]).catch(error => assert.equal(error.data?.reason, 'retirement_budget_exhausted'));
+  }
+  assert.deepEqual(broadcasts(one.calls).map(call => Transaction.from(call.params[0]).nonce), [4]);
 });
 
 test('fee proposals outside 0 < tip <= max fee <= cap and tip <= tip cap are refused before any RPC', async () => {

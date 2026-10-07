@@ -62,11 +62,11 @@ test('record classes match the archive dispositions and the readings of §6.4', 
     for (const disposition of ['pending', 'evicted', 'abandoned_for_escape']) {
         assert.equal(exitRecordClass(record({ disposition })), RECORD_CLASS.UNRESOLVED, disposition);
     }
-    // A signed successor the client could not or must not install: the
-    // server finalized the nullifier.
-    for (const disposition of ['invalid_successor', 'late_successor']) {
-        assert.equal(exitRecordClass(record({ disposition })), RECORD_CLASS.UNRESOLVED, disposition);
-    }
+    // A correctly signed successor that failed S3–S5 is handled like a
+    // withheld one (§6.1); a valid one held back by an exit lock (E4.6) is
+    // settled: it installs once the lock is released (§6.4).
+    assert.equal(exitRecordClass(record({ disposition: 'invalid_successor' })), RECORD_CLASS.UNRESOLVED);
+    assert.equal(exitRecordClass(record({ disposition: 'late_successor' })), RECORD_CLASS.TERMINAL);
     // 'unknown' counts only 1,200 s after request_time.
     assert.equal(exitRecordClass(record({ readings: [['unknown', REQUEST_TIME + 1_199]] })), RECORD_CLASS.UNRESOLVED);
     assert.equal(exitRecordClass(record({ readings: [['unknown', REQUEST_TIME + 1_200]] })), RECORD_CLASS.RESOLVED);

@@ -1034,10 +1034,56 @@ mod tests {
             ),
             (Some("PBKDF2"), Some("SHA-256"))
         );
-        assert!(decrypt(&file, "not the passphrase").is_err());
+        // The shared exit-rule vectors (E7) name this kit, its passphrase and
+        // what it holds; the browser SDK opens it against the same section.
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../protocol/rust/crates/zkapi-client/tests/vectors/exit-rules.json"
+        ))
+        .unwrap();
+        let shared = &vectors["exit_kit"];
+        assert_eq!(
+            shared["fixture"],
+            "crates/zkapi-companion/tests/fixtures/sdk-exit-kit-v1.json"
+        );
+        assert_eq!(shared["passphrase"], SDK_KIT_PASSPHRASE);
+        assert!(decrypt(&file, shared["wrong_passphrase"].as_str().unwrap()).is_err());
         let kit = decrypt(&file, SDK_KIT_PASSPHRASE).unwrap();
-        assert_eq!(kit.bound_at_state, "1000000");
+        let expected = &shared["expected"];
+        assert_eq!(kit.format, expected["format"]);
+        assert_eq!(
+            kit.trusted_deployment["deployment_id"],
+            expected["deployment_id"]
+        );
+        assert_eq!(
+            kit.trusted_deployment["contract_address"],
+            expected["contract_address"]
+        );
+        assert_eq!(
+            u64::from(kit.note.note_id),
+            expected["note_id"].as_u64().unwrap()
+        );
+        assert_eq!(
+            kit.note.deposit_amount.to_string(),
+            expected["deposit_amount"]
+        );
+        assert_eq!(
+            kit.note.current_balance.to_string(),
+            expected["current_balance"]
+        );
+        assert_eq!(kit.note.current_anchor.to_hex(), expected["current_anchor"]);
+        assert_eq!(kit.bound_at_state, expected["bound_at_state"]);
+        assert_eq!(kit.state_seq, expected["state_seq"].as_u64().unwrap());
+        assert_eq!(kit.exported_at, expected["exported_at"].as_u64().unwrap());
         assert!(kit.merkle_path.is_some() && kit.deposit_path.is_none());
+        let shared_path = kit.merkle_path.as_ref().unwrap();
+        assert_eq!(
+            shared_path.active_root.to_hex(),
+            expected["merkle_path_root"]
+        );
+        assert_eq!(
+            shared_path.siblings.len() as u64,
+            expected["merkle_path_siblings"].as_u64().unwrap()
+        );
         let path = kit.path().unwrap();
         assert_eq!(path.siblings.len(), 32);
         let directory = tempfile::tempdir().unwrap();

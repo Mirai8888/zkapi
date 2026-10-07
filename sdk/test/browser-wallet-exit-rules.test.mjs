@@ -853,8 +853,10 @@ test('E6: with a verified late successor and no reading that releases its lock, 
     }
 
     // From must_initiate_by on, with still no reading, the exit goes ahead
-    // from the stale state: conceding b_k is within G1, missing the
-    // deadline is not.
+    // from the stale state: missing the deadline is not within G1. The late
+    // successor is terminal (§6.4), so the state decides as fresh and the
+    // escape concedes nothing: the operator's raise with the request at N_k
+    // takes at most that request's charge, which the late successor carries.
     const { h, later } = await deadEscapeWithLateSuccessor();
     h.runtime.pinnedRpc = failing;
     const deadline = 2_000_000_000 - 43_200;
@@ -868,7 +870,7 @@ test('E6: with a verified late successor and no reading that releases its lock, 
     }
     assert.equal(plan.mode, 'escape');
     assert.equal(plan.public_inputs.withdrawal_nullifier, nullifierFor(GENESIS_ANCHOR));
-    assert.equal(plan.public_inputs.conceded, BOUND);
+    assert.equal(BigInt(plan.public_inputs.conceded), 0n);
 });
 
 test('E6: a cancel releases a lock at once only while no escape or close proof was released', async () => {

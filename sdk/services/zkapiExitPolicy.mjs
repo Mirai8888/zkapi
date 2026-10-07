@@ -3,7 +3,10 @@
 // clock: callers pass `now` (seconds) and every server or chain reading.
 //
 // The browser runtime (browserWalletRuntime.js) applies these under its one
-// Web Lock (C1); the companion wallet implements the same table (WP-E).
+// Web Lock (C1); the companion wallet (zkapi-client exit_policy) implements
+// the same table. Both reproduce the shared vectors in
+// protocol/rust/crates/zkapi-client/tests/vectors/exit-rules.json
+// (sdk/test/zkapi-exit-rules-vectors.test.mjs).
 
 import { REQUEST_EVIDENCE_TYPE, REQUEST_JOURNAL_TYPE, lastDefinitiveObservation } from './zkapiRequestArchive.mjs';
 
@@ -37,6 +40,9 @@ export const EXIT_TIMING = Object.freeze({
     // cooperatively instead of falling back to an escape.
     ownershipProofValiditySeconds: 3_600,
     ownershipProofSkewMarginSeconds: 300,
+    // C3: a state's ownership proof is sent again only while it stays valid
+    // for longer than this; inside it the client waits for it to expire.
+    ownershipResendMarginSeconds: 5,
     // E6: a released proof is dead once a finalized block is later than
     // valid_until + 900.
     lockReleaseMarginSeconds: 900
@@ -60,11 +66,15 @@ export const RECORD_CLASS = Object.freeze({
 const RESERVING_READINGS = new Set(['reserved', 'finalized', 'exit_deferred', 'exited_unsigned']);
 const RESOLVED_DISPOSITIONS = new Set(['discarded_stale_root', 'discarded_expired_unaccepted',
     'discarded_clearance_reserved']);
-const TERMINAL_DISPOSITIONS = new Set(['installed', 'superseded']);
-// A signed successor the client could not or must not install: the server
-// finalized the nullifier, so for exit decisions the state holds a
-// reservation (E3), even though the record never installs as is.
-const FINALIZED_DISPOSITIONS = new Set(['invalid_successor', 'late_successor']);
+// installed and superseded, and late_successor: a valid successor that
+// arrived after an exit proof was released (E4.6). It is settled: it installs
+// once the lock is released (E6), and the operator's evidence at the state's
+// nullifier can raise an escape at most to its charge (§6.4 record classes).
+const TERMINAL_DISPOSITIONS = new Set(['installed', 'superseded', 'late_successor']);
+// A correctly signed successor that failed S3, S4 or S5: handled exactly like
+// a withheld successor (§6.1). The server finalized the nullifier, so for exit
+// decisions the state holds a reservation (E3).
+const FINALIZED_DISPOSITIONS = new Set(['invalid_successor']);
 
 function exitError(message, code, data = undefined) {
     return Object.assign(new Error(message), { code, ...(data ? { data } : {}) });
@@ -110,9 +120,9 @@ export function lowExpiry(expiryTs, { exitRpcExpiry = null, pinnedRpcExpiry = nu
     return exitRead > local && pinnedRead > local ? Math.min(exitRead, pinnedRead) : local;
 }
 
-/** The latest second at which an exit decision may still start: E_low − 12 h. */
+/** The latest second at which an exit decision may still start: E_low − 12 h (never below 0). */
 export function mustInitiateBy(eLow) {
-    return seconds(eLow, 'E_low') - EXIT_TIMING.mustInitiateMarginSeconds;
+    return Math.max(0, seconds(eLow, 'E_low') - EXIT_TIMING.mustInitiateMarginSeconds);
 }
 
 /** C4: a new request would leave too little time to exit after it settles. */
@@ -144,7 +154,7 @@ export function recordCreatedAtSeconds(record) {
 /**
  * The class of a request archive record for exit decisions (§6.4, matching
  * zkapiRequestArchive.mjs):
- * - terminal: installed, superseded;
+ * - terminal: installed, superseded, late_successor;
  * - resolved-unreserved: discarded_stale_root, discarded_expired_unaccepted,
  *   discarded_clearance_reserved, or a record whose newest nullifier reading
  *   is 'unknown' taken at least 1,200 s after its request_time, or
@@ -152,8 +162,7 @@ export function recordCreatedAtSeconds(record) {
  *   request can be);
  * - unresolved: everything else (pending, evicted, abandoned_for_escape, a
  *   newest reading of reserved, finalized, exit_deferred, exited_unsigned or
- *   none), and the signed successors invalid_successor and late_successor,
- *   whose server finalized the nullifier.
+ *   none), and invalid_successor (handled like a withheld successor, §6.1).
  */
 export function exitRecordClass(record) {
     if (record?.type === REQUEST_EVIDENCE_TYPE) return RECORD_CLASS.UNRESOLVED;
@@ -186,21 +195,25 @@ export function requestRecordsAtState(records, { deploymentId, noteId, anchor })
 /**
  * Whether a state is fresh for E2: no request proof left the device at it
  * (bound_at_state == 0), or every released record there is
- * resolved-unreserved. Also reports the unresolved records and the newest
- * release time (E3's created_at).
+ * resolved-unreserved. Also reports the unresolved records and the release
+ * times: `newestCreatedAt`, of every request released at the state whatever
+ * its class (E2.4 waits from it after nullifier_used), and
+ * `newestUnresolvedCreatedAt`, of the unresolved ones (E3's created_at).
  */
 export function stateExitStatus({ boundAtState, records }) {
     const bound = amount(boundAtState ?? 0, 'bound_at_state');
     const live = (records || []).filter(record => exitRecordClass(record) !== RECORD_CLASS.TERMINAL);
     const unresolved = live.filter(record => exitRecordClass(record) === RECORD_CLASS.UNRESOLVED);
     const released = live.filter(record => record.type === REQUEST_JOURNAL_TYPE);
-    const newestCreatedAt = released.reduce((newest, record) => Math.max(newest, recordCreatedAtSeconds(record)), 0) || null;
+    const newest = list => list.filter(record => record?.type === REQUEST_JOURNAL_TYPE)
+        .reduce((latest, record) => Math.max(latest, recordCreatedAtSeconds(record)), 0) || null;
     return {
         fresh: bound === 0n || unresolved.length === 0,
         boundAtState: bound,
         unresolved,
         released,
-        newestCreatedAt,
+        newestCreatedAt: newest(records || []),
+        newestUnresolvedCreatedAt: newest(unresolved),
         // A defeat at this state already flagged its nullifier: this device
         // is not the newest (EscapeWithdrawalChallenged).
         challenged: live.some(record => record.type === REQUEST_EVIDENCE_TYPE)
@@ -263,6 +276,62 @@ export function chooseExit({ request, now, mustInitiateBy: deadline, status, esc
 }
 
 /**
+ * E2 and E3 as one decision, the companion's exit_policy::decide over the
+ * browser's records (both pinned by the shared vectors). `request` is
+ * 'mutual' or 'escape'; `status` is stateExitStatus at the state;
+ * `clearanceOutcome` is how this state's clearance ended, if it was asked:
+ * 'nullifier_used' (the server claims a reservation, E2.4) or 'refused' (any
+ * other refusal or unreachability, E2.5). Returns { action: 'mutual' |
+ * 'escape' | 'wait', conceded, rule, escapeAt? }.
+ *
+ * - Lost ε (E3): a finalized response at the state the wallet cannot install
+ *   concedes min(charge, b) at once, whatever the records say.
+ * - Fresh state (E2): within an hour of must_initiate_by an escape conceding
+ *   nothing; after nullifier_used, E3 from the newest release at the state
+ *   (with none, an escape conceding b at once); after any other clearance
+ *   failure an escape conceding nothing; else a mutual close, or an escape
+ *   conceding nothing when the user asks for one.
+ * - Unresolved state (E3), from the newest unresolved release: at or after T
+ *   an escape conceding b; before T an escape the user forces concedes 0 by
+ *   default or b ('bound'), and a mutual request waits for T.
+ */
+export function decideExit({ request, now, mustInitiateBy: deadline, status, settlementWindowSeconds,
+    unsettledAfterSeconds, settlementDeadline = null, lostEpsilonCharge = null, earlyConcession = 'zero',
+    clearanceOutcome = null }) {
+    if (!['mutual', 'escape'].includes(request)) throw exitError('Choose a withdrawal mode.', 'exit_input_invalid');
+    if (!['zero', 'bound'].includes(earlyConcession)) {
+        throw exitError('Choose the forced-exit concession: zero or bound.', 'exit_input_invalid');
+    }
+    const current = seconds(now, 'now');
+    const last = seconds(deadline, 'must_initiate_by');
+    const bound = status.boundAtState;
+    if (lostEpsilonCharge != null) {
+        const charge = amount(lostEpsilonCharge, 'reported charge');
+        return { action: 'escape', conceded: charge < bound ? charge : bound, rule: 'E3.lost_epsilon' };
+    }
+    const waitOrEscape = createdAt => {
+        const T = escapeAt({ createdAt, settlementDeadline, settlementWindowSeconds, unsettledAfterSeconds,
+            mustInitiateBy: last });
+        if (current >= T) return { action: 'escape', conceded: bound, rule: 'E3.T', escapeAt: T };
+        if (request === 'escape') {
+            return { action: 'escape', conceded: earlyConcession === 'bound' ? bound : 0n, rule: 'E3.forced', escapeAt: T };
+        }
+        return { action: 'wait', conceded: null, rule: 'E3.wait', escapeAt: T };
+    };
+    if (!status.fresh) return waitOrEscape(status.newestUnresolvedCreatedAt ?? current);
+    if (current >= last - EXIT_TIMING.escapeOnlyMarginSeconds) {
+        return { action: 'escape', conceded: 0n, rule: request === 'mutual' ? 'E2.deadline' : 'E2.escape' };
+    }
+    if (clearanceOutcome === 'nullifier_used') {
+        if (status.newestCreatedAt == null) return { action: 'escape', conceded: bound, rule: 'E3.T', escapeAt: current };
+        return waitOrEscape(status.newestCreatedAt);
+    }
+    if (clearanceOutcome != null) return { action: 'escape', conceded: 0n, rule: 'E2.fallback' };
+    if (request === 'escape') return { action: 'escape', conceded: 0n, rule: 'E2.escape' };
+    return { action: 'mutual', conceded: 0n, rule: 'E2' };
+}
+
+/**
  * E2.4/E2.5: after a mutual close's clearance failed. nullifier_used means
  * the server claims a reservation: decide again as an unresolved state (E3).
  * Any other refusal or unreachability escapes with c = 0.
@@ -275,8 +344,24 @@ export function afterClearanceFailure(error) {
     return { action: 'escape', conceded: 0n, rule: 'E2.fallback' };
 }
 
-const LOCAL_CLEARANCE_REFUSALS = new Set(['ownership_proof_sent', 'exit_locked', 'exit_lock_state', 'exit_lock_mode',
-    'conceded_exceeds_bound']);
+const LOCAL_CLEARANCE_REFUSALS = new Set(['ownership_proof_sent', 'ownership_proof_wait', 'exit_locked', 'exit_lock_state',
+    'exit_lock_mode', 'conceded_exceeds_bound']);
+
+/**
+ * C3: the ownership proof (kind 2) a clearance request at a state carries,
+ * from the newest valid_until of the state's ownership proofs sent so far
+ * (null when none): at most one live proof per state, across exit locks (a
+ * user may cancel the lock one was made under, E6). 'resend' the live one
+ * while it stays valid for longer than the resend margin; 'wait' inside the
+ * margin, while the server may still accept it; 'new' once it expired.
+ */
+export function ownershipProofAction(newestValidUntil, now) {
+    const current = seconds(now, 'now');
+    if (newestValidUntil == null) return 'new';
+    const validUntil = seconds(newestValidUntil, 'valid_until');
+    if (validUntil > current + EXIT_TIMING.ownershipResendMarginSeconds) return 'resend';
+    return validUntil >= current ? 'wait' : 'new';
+}
 
 // What the server answered to a released ownership proof (kind 2).
 export const CLEARANCE_OUTCOMES = Object.freeze(['granted', 'nullifier_used', 'refused', 'unreachable', 'invalid']);

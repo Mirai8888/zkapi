@@ -19,9 +19,10 @@ import {
     unresolvedRequestArchiveAt
 } from './zkapiRequestArchive.mjs';
 import {
-    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, chooseExit, escapeAt, escapeCostUnits, exitCostWarning,
+    EXIT_TIMING, RECORD_CLASS, WITHDRAWAL_KIND, afterClearanceFailure, decideExit, escapeAt, escapeCostUnits, exitCostWarning,
     exitLockDeadAfter, exitLockRefusal,
     exitLockReleasable, exitRecordClass, lowExpiry, mustInitiateBy, nearExpiry, newExitLock, ownershipOutcome,
+    ownershipProofAction,
     recordClearanceOutcome, recordReleasedProof, releasedExitProofs, requestRecordsAtState, stateExitStatus, switchExitLock
 } from './zkapiExitPolicy.mjs';
 import { rebuildNotePath } from './zkapiTreeRebuild.mjs';
@@ -433,6 +434,17 @@ function preparedWithdrawalHasSubmission(prepared) {
 
 function preparedWithdrawalNullifier(prepared) {
     return prepared?.withdrawalNullifier ?? prepared?.public_inputs?.withdrawal_nullifier ?? null;
+}
+
+/**
+ * The ownership proof the withdrawal-only marker keeps for exactly this state
+ * nullifier (C3), or null.
+ */
+function keptOwnershipProof(prepared, nullifier) {
+    const kept = prepared?.ownershipProof;
+    if (!kept?.public_inputs || !kept.proof || nullifier == null) return null;
+    if (preparedWithdrawalNullifier(prepared) == null || !sameFelt(preparedWithdrawalNullifier(prepared), nullifier)) return null;
+    return sameFelt(kept.public_inputs.withdrawal_nullifier, nullifier) ? kept : null;
 }
 
 /** A persisted server clearance is reusable only for the exact state nullifier. */
@@ -1311,8 +1323,8 @@ class BrowserWalletRuntime extends EventTarget {
             deadline = null;
         }
         const status = stateExitStatus({ boundAtState: state.bound_at_state || 0, records: this.exitRecordsAt(state) });
-        const T = status.fresh || status.newestCreatedAt == null || deadline == null ? null : escapeAt({
-            createdAt: status.newestCreatedAt,
+        const T = status.fresh || status.newestUnresolvedCreatedAt == null || deadline == null ? null : escapeAt({
+            createdAt: status.newestUnresolvedCreatedAt,
             settlementWindowSeconds: this.settlementWindowSeconds(),
             unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds,
             mustInitiateBy: deadline
@@ -4124,6 +4136,8 @@ class BrowserWalletRuntime extends EventTarget {
                 withdrawalNullifier: prepared?.withdrawalNullifier || null, clearanceReserved: true,
                 ...(prepared?.clearance?.signature ? { clearance: prepared.clearance } : {}),
                 ...(prepared?.clearanceOutcome ? { clearanceOutcome: prepared.clearanceOutcome } : {}),
+                // C3: the state's ownership proof, sent again while it stays valid.
+                ...(prepared?.ownershipProof ? { ownershipProof: prepared.ownershipProof } : {}),
                 createdAt: Number(prepared?.createdAt || Date.now())
             };
         }
@@ -4382,20 +4396,20 @@ class BrowserWalletRuntime extends EventTarget {
             && this.reusablePlan(existing, { mode: 'mutual', destination, state, nullifier, conceded: 0n })) {
             return existing;
         }
-        const timing = { settlementWindowSeconds: this.settlementWindowSeconds(),
-            unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds, mustInitiateBy: deadline };
-        const escapeAtFor = createdAt => createdAt == null ? null : escapeAt({ createdAt,
-            settlementDeadline: recovery.reading?.settlementDeadline ?? null, ...timing });
         // E2.4 on a retry: once the server answered this state's ownership
         // proof with nullifier_used (kept with the lock, or with the
         // withdrawal-only marker after a cancel), the state is decided as
-        // unresolved (E3) and no clearance is asked again.
+        // unresolved (E3) and no clearance is asked again. Lost ε (E3) is
+        // decided at once, whatever the records say. decideExit is the
+        // companion's decision too (the shared vectors pin both).
         const clearance = this.clearanceAnswerAt(state, nullifier);
-        const decisionStatus = clearance.claimed ? { ...status, fresh: false } : status;
-        const lostEpsilonCharge = decisionStatus.fresh ? null : await this.lostEpsilonCharge(state, recovery);
-        let decision = chooseExit({ request, now, mustInitiateBy: deadline, status: decisionStatus,
-            escapeAtSeconds: escapeAtFor(status.newestCreatedAt) ?? (clearance.claimed ? now : null),
-            lostEpsilonCharge, earlyConcession });
+        const lostEpsilonCharge = await this.lostEpsilonCharge(state, recovery);
+        const decide = (decisionRequest, clearanceOutcome) => decideExit({ request: decisionRequest, now,
+            mustInitiateBy: deadline, status, settlementWindowSeconds: this.settlementWindowSeconds(),
+            unsettledAfterSeconds: this.browserConfig?.unsettled_request_escape_after_seconds,
+            settlementDeadline: recovery.reading?.settlementDeadline ?? null, lostEpsilonCharge, earlyConcession,
+            clearanceOutcome });
+        let decision = decide(request, clearance.claimed ? 'nullifier_used' : null);
         if (decision.action === 'wait') {
             if (lockSetHere && !(this.runtime.exitLock?.released || []).length) {
                 await this.commit({ ...this.runtime, exitLock: null });
@@ -4422,15 +4436,18 @@ class BrowserWalletRuntime extends EventTarget {
             if (outcome.plan) return outcome.plan;
             const next = afterClearanceFailure(outcome.error);
             if (next.action === 'refuse') {
+                if (outcome.error?.code === 'ownership_proof_wait') {
+                    // C3: the state's ownership proof expires within seconds.
+                    throw new BrowserWalletHttpError('This balance’s ownership proof expires in a few seconds. Try again then.',
+                        409, 'ownership_proof_wait', { retry_after: outcome.error.retryAfterSeconds });
+                }
                 throw new BrowserWalletHttpError('This balance’s exit is frozen at another step (C3).', 409,
                     outcome.error?.code || 'exit_locked');
             }
             if (next.action === 'reconsider') {
                 // E2.4: the server claims a reservation; decide as at an
                 // unresolved state, from the newest released record.
-                decision = chooseExit({ request: 'mutual', now, mustInitiateBy: deadline,
-                    status: { ...status, fresh: false }, escapeAtSeconds: escapeAtFor(status.newestCreatedAt) ?? now,
-                    lostEpsilonCharge });
+                decision = decide('mutual', 'nullifier_used');
                 if (decision.action === 'wait') throw this.settlementPendingError(decision, status, deadline, outcome.error);
             } else {
                 decision = { ...next, clearanceError: outcome.error?.code || null };
@@ -4534,13 +4551,31 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * The clearance of a mutual close (G6): one kind-2 ownership proof at the
      * current root, journaled in the exit lock and the withdrawal-only marker
-     * before it is sent (C5), then one bounded POST.
+     * before it is sent (C5), then one bounded POST. C3: at most one live
+     * ownership proof per state, across exit locks (a cancel releases a lock
+     * that released only an ownership proof). The marker keeps the state's
+     * newest one: it is sent again while it stays valid, the client waits
+     * while it is about to expire (ownership_proof_wait), and a new one is
+     * made only once it expired (ownershipProofAction, pinned by the shared
+     * vectors).
      */
     async requestClearanceLocked({ state, destination, nullifier, path, existing, signal }) {
         const lock = this.runtime.exitLock;
         const refusal = exitLockRefusal(lock, { noteId: state.note_id, anchor: state.current_anchor, proof: 'ownership' });
         if (refusal) return { error: { code: refusal } };
-        const ownership = await this.generateOwnershipProof({ state, nullifier, path });
+        const kept = keptOwnershipProof(this.runtime.preparedWithdrawal, nullifier);
+        const action = ownershipProofAction(kept?.public_inputs?.valid_until ?? null, nowSeconds());
+        if (action === 'wait') {
+            return { error: { code: 'ownership_proof_wait',
+                retryAfterSeconds: Number(kept.public_inputs.valid_until) + 1 - nowSeconds() } };
+        }
+        let ownership;
+        if (action === 'resend') {
+            this.assertOwnershipProof({ mode: 'ownership', ...kept }, { state, nullifier, activeRoot: kept.public_inputs.active_root });
+            ownership = kept;
+        } else {
+            ownership = await this.generateOwnershipProof({ state, nullifier, path });
+        }
         await this.commit({
             ...this.runtime,
             exitLock: recordReleasedProof(lock, { kind: WITHDRAWAL_KIND.ownership,
@@ -4549,6 +4584,7 @@ class BrowserWalletRuntime extends EventTarget {
             preparedWithdrawal: {
                 phase: 'reserving', mode: 'mutual', operationId: existing?.operationId || uuid(),
                 noteId: Number(state.note_id), destination, withdrawalNullifier: nullifier, clearanceReserved: true,
+                ownershipProof: { public_inputs: ownership.public_inputs, proof: ownership.proof },
                 createdAt: Number(existing?.createdAt || Date.now())
             }
         });

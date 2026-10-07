@@ -15,7 +15,7 @@ import (
 // between initiation and finalization; a raise never takes more than the
 // state's bound b. The same rule as the companion's
 // (zkapi-client exit_policy::match_escape_payout), checked against the shared
-// vectors in protocol/rust/crates/zkapi-client/tests/vectors/exit-policy.json.
+// vectors in protocol/rust/crates/zkapi-client/tests/vectors/exit-rules.json.
 
 var escapeConcessionRaisedTopic = crypto.Keccak256Hash([]byte("EscapeConcessionRaised(uint32,uint256,uint128,uint128)")).Hex()
 

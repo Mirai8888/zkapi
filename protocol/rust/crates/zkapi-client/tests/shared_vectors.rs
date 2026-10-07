@@ -1,14 +1,16 @@
 //! Shared vectors for SDK parity (design §11 WP-E: "S1–S6, C1–C5 and E0–E7
-//! parity with the SDK through shared vectors").
+//! parity with the SDK through shared vectors"), in one file,
+//! `vectors/exit-rules.json`, which the browser SDK
+//! (sdk/test/zkapi-exit-rules-vectors.test.mjs) and zkapi-clientd load too:
 //!
-//! - `vectors/exit-policy.json`: the exit decisions (C3's ownership proofs,
-//!   C4, E0–E6, record classes, the E5 payout matcher), hand-written from
-//!   the design.
-//! - `vectors/successor-checks.json`: one note state and request journal,
-//!   and signed responses that must install, be archived as
-//!   `invalid_successor` (S3, S4, S5) or be rejected (S1, S2, S6).
+//! - the exit decisions (C3's ownership proofs and concessions, C4, E0–E6,
+//!   record classes, the E5 payout matcher), hand-written from the design;
+//! - `successor_checks`: one note state and request journal, and signed
+//!   responses that must install, be archived as `invalid_successor` (S3,
+//!   S4, S5) or be rejected (S1, S2, S6).
 //!   `ZKAPI_WRITE_VECTORS=1 cargo test -p zkapi-client --test shared_vectors`
-//!   regenerates it.
+//!   regenerates that section;
+//! - `exit_kit` (E7), which zkapi-companion's exit-kit tests read.
 
 use std::path::{Path, PathBuf};
 
@@ -34,8 +36,11 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors")
 }
 
-fn load(name: &str) -> Value {
-    serde_json::from_slice(&std::fs::read(vectors_dir().join(name)).unwrap()).unwrap()
+/// The shared vector file.
+const VECTORS: &str = "exit-rules.json";
+
+fn load() -> Value {
+    serde_json::from_slice(&std::fs::read(vectors_dir().join(VECTORS)).unwrap()).unwrap()
 }
 
 fn opt_u64(value: &Value) -> Option<u64> {
@@ -44,7 +49,7 @@ fn opt_u64(value: &Value) -> Option<u64> {
 
 #[test]
 fn exit_policy_vectors() {
-    let vectors = load("exit-policy.json");
+    let vectors = load();
     let constants = &vectors["constants"];
     for (name, value) in [
         ("call_timeout_seconds", exit_policy::CALL_TIMEOUT_SECONDS),
@@ -208,7 +213,6 @@ fn exit_policy_vectors() {
 
 #[derive(Serialize, Deserialize)]
 struct SuccessorVectors {
-    schema: u8,
     description: String,
     /// The state signing key's public key.
     state_signing_key: CurvePointWire,
@@ -446,7 +450,6 @@ fn generate_successor_vectors() -> SuccessorVectors {
         "reject",
     );
     SuccessorVectors {
-        schema: 1,
         description: "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.".into(),
         state_signing_key: key,
         state,
@@ -502,7 +505,7 @@ fn run_case(vectors: &SuccessorVectors, case: &SuccessorCase) -> (String, Option
 
 #[test]
 fn successor_check_vectors() {
-    let path = vectors_dir().join("successor-checks.json");
+    let path = vectors_dir().join(VECTORS);
     if std::env::var_os("ZKAPI_WRITE_VECTORS").is_some() {
         let mut vectors = generate_successor_vectors();
         let installed: Vec<Option<Value>> = vectors
@@ -513,9 +516,14 @@ fn successor_check_vectors() {
         for (case, installed) in vectors.cases.iter_mut().zip(installed) {
             case.installed = installed;
         }
-        std::fs::write(&path, serde_json::to_vec_pretty(&vectors).unwrap()).unwrap();
+        let mut file = load();
+        file["successor_checks"] = serde_json::to_value(&vectors).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&file).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
     }
-    let vectors: SuccessorVectors = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vectors: SuccessorVectors =
+        serde_json::from_value(load()["successor_checks"].clone()).unwrap();
     assert!(vectors.cases.len() >= 15);
     for case in &vectors.cases {
         let (outcome, installed) = run_case(&vectors, case);

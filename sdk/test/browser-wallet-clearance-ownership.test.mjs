@@ -228,6 +228,60 @@ test('a persisted clearance is reused without a second ownership proof or server
     assert.equal(ownershipProofs(again).length, 1);
 });
 
+// The shared vectors' ownership_proof rule (C3): at most one live kind-2
+// proof per state, across exit locks.
+test('C3: under a new lock, the state\'s live ownership proof is sent again; one about to expire waits; an expired one is replaced', async () => {
+    const restore = Date.now;
+    // A first clearance whose answer is lost (the call is aborted mid-POST):
+    // the lock keeps the released ownership proof and nothing else, so the
+    // user may cancel it (E6).
+    const lostAnswer = async () => {
+        const h = await freshWallet({ clearanceOwnershipProof: 'required' });
+        const sent = [];
+        const controller = new AbortController();
+        h.server.clearance = body => {
+            sent.push(body.ownership_proof);
+            controller.abort();
+            return new Promise(() => {});
+        };
+        await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION, { signal: controller.signal }));
+        assert.deepEqual((await store.readBrowserWallet()).exitLock.released.map(entry => entry.kind), [2]);
+        assert.equal((await h.runtime.cancelExit()).reason, 'cancelled');
+        assert.equal((await store.readBrowserWallet()).exitLock, null);
+        h.server.clearance = body => { sent.push(body.ownership_proof); return clearanceFor(body); };
+        return { h, sent };
+    };
+
+    // While it stays valid, the next mutual close sends the same proof again.
+    const resent = await lostAnswer();
+    const plan = await resent.h.runtime.prepareWithdrawal('mutual', DESTINATION);
+    assert.equal(plan.mode, 'mutual');
+    assert.equal(ownershipProofs(resent.h).length, 1, 'no second ownership proof');
+    assert.equal(resent.sent.length, 2);
+    assert.deepEqual(resent.sent[1], resent.sent[0]);
+    assert.equal(mutualProofs(resent.h).length, 1);
+
+    // Within the resend margin it waits; once expired, a new one is made.
+    const expiring = await lostAnswer();
+    const validUntil = Number(expiring.sent[0].public_inputs.valid_until);
+    try {
+        Date.now = () => (validUntil - 3) * 1_000;
+        await assert.rejects(expiring.h.runtime.prepareWithdrawal('mutual', DESTINATION),
+            error => error.code === 'ownership_proof_wait' && error.data.retry_after === 4);
+        assert.equal(ownershipProofs(expiring.h).length, 1);
+        assert.equal(expiring.sent.length, 1, 'nothing was sent');
+        assert.equal((await store.readBrowserWallet()).exitLock, null, 'the refused attempt left no lock');
+        Date.now = () => (validUntil + 1) * 1_000;
+        const renewed = await expiring.h.runtime.prepareWithdrawal('mutual', DESTINATION);
+        assert.equal(renewed.mode, 'mutual');
+    } finally {
+        Date.now = restore;
+    }
+    assert.equal(ownershipProofs(expiring.h).length, 2, 'a new proof once the first expired');
+    assert.equal(expiring.sent.length, 2);
+    assert.ok(Number(expiring.sent[1].public_inputs.valid_until) > validUntil);
+});
+
 test('a persisted clearance is never reused after the note state changes', async () => {
     const h = await freshWallet({ clearanceOwnershipProof: 'required' });
     const archived = await discardFirstRequest(h);

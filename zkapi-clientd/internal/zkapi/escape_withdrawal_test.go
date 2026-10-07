@@ -27,7 +27,7 @@ import (
 // The shared vectors of the exit rules (design §6.4), which the companion's
 // Rust wallet and the browser SDK reproduce too.
 func TestEscapePayoutMatcherFollowsTheSharedVectors(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "protocol", "rust", "crates", "zkapi-client", "tests", "vectors", "exit-policy.json"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "protocol", "rust", "crates", "zkapi-client", "tests", "vectors", "exit-rules.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

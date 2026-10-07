@@ -3,7 +3,7 @@
 //!
 //! Nothing here reads the network or the clock: callers pass `now`, the
 //! server's readings and chain facts in, so the companion and the browser SDK
-//! decide identically on the same inputs. `tests/vectors/exit-policy.json`
+//! decide identically on the same inputs. `tests/vectors/exit-rules.json`
 //! holds the shared vectors both implementations must reproduce.
 
 use serde::{Deserialize, Serialize};

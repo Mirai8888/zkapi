@@ -336,7 +336,8 @@ Two dispositions end a request without installing its successor:
   `min(reported charge, bound_at_state)`.
 - `late_successor`: a verified successor that arrived after an exit proof at
   its state was released. It is held, with its journal, until the exit lock is
-  released (below), and then installs.
+  released (below), and then installs. For exit decisions it is settled
+  (terminal, design §6.4): it never makes its state unresolved.
 
 ## Exits
 
@@ -403,6 +404,10 @@ exit waits past `must_initiate_by`. The decision then depends on the state:
      cancel, decides the same way and sends no second ownership proof.
    - Any other refusal, or an unreachable server, escapes with `c = 0`. A
      retry after such an answer escapes too: a lock sends one ownership proof.
+   - A state has at most one live ownership proof, across locks (C3): after a
+     cancel, a new mutual close sends the state's live proof again; within 5
+     seconds of its expiry it refuses with `ownership_proof_wait`
+     (`error.data.retry_after`, seconds); once it expired a new one is made.
    - `withdraw('escape')`, or a fresh state within an hour of
      `must_initiate_by`, also escapes with `c = 0`.
 2. **Unresolved state**: take the newest unresolved request, with `created`
@@ -480,10 +485,11 @@ that state:
 - When such a lock cannot be released yet while a `late_successor` waits
   (no RPC answered, the note reads as pending, or finality lags this
   device's clock), a withdrawal refuses with `exit_release_pending` instead
-  of exiting from the older state, which would concede up to its last
-  request's budget. `error.data` has `reason`, `status_source`,
+  of exiting from the older state, whose escape the operator could raise up
+  to its last request's budget. `error.data` has `reason`, `status_source`,
   `releasable_after` and `must_initiate_by` (seconds). From
-  `must_initiate_by` on, the exit goes ahead from the older state.
+  `must_initiate_by` on, the exit goes ahead from the older state, conceding
+  nothing: an honest operator raises it only to the held successor's charge.
 - Escape and close proofs are valid for 3 hours. Ownership proofs are valid
   for 55 minutes: the server accepts at most an hour, and the margin absorbs a
   client clock up to five minutes fast. The SDK proves again after

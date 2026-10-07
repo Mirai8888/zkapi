@@ -966,6 +966,8 @@ impl Wallet {
             true,
             NoteChainStatus::Active,
             None,
+            now_seconds(),
+            false,
         ) {
             return Err(ClientError::ExitLockConflict(
                 "an exit proof was released; the lock is held until it is dead or the note closes"
@@ -978,13 +980,18 @@ impl Wallet {
     }
 
     /// E6: release the lock once the note is closed, or once every released
-    /// kind-0 and kind-1 proof is dead (`finalized_block_timestamp` past each
-    /// `valid_until + 900`, the note `Active` with no pending exit), then
-    /// install any late successor. Returns whether the lock was released.
+    /// kind-0 and kind-1 proof is dead (`finalized_block_timestamp` and this
+    /// device's clock `now` both past each `valid_until + 900`, the note
+    /// `Active` with no pending exit), then install any late successor.
+    /// `status_trusted` marks a reading from the owner's exit RPC: only such
+    /// a `Closed` reading releases a lock whose proof may still land.
+    /// Returns whether the lock was released.
     pub fn release_exit_lock(
         &mut self,
         note: NoteChainStatus,
         finalized_block_timestamp: Option<u64>,
+        now: u64,
+        status_trusted: bool,
     ) -> Result<bool, ClientError> {
         let Some(lock) = self.exit_lock()? else {
             return Ok(true);
@@ -994,6 +1001,8 @@ impl Wallet {
             false,
             note,
             finalized_block_timestamp,
+            now,
+            status_trusted,
         ) {
             return Ok(false);
         }
@@ -2709,18 +2718,47 @@ mod tests {
         );
         // The user cannot cancel a lock with a released escape.
         assert!(fixture.wallet.cancel_exit_lock().is_err());
+        let dead = escape.valid_until + 901;
         // Not dead yet: the finalized block is not past valid_until + 900.
         assert!(!fixture
             .wallet
-            .release_exit_lock(NoteChainStatus::Active, Some(escape.valid_until + 900))
+            .release_exit_lock(
+                NoteChainStatus::Active,
+                Some(escape.valid_until + 900),
+                dead,
+                false
+            )
             .unwrap());
         assert!(!fixture
             .wallet
-            .release_exit_lock(NoteChainStatus::PendingWithdrawal, Some(u64::MAX))
+            .release_exit_lock(
+                NoteChainStatus::PendingWithdrawal,
+                Some(u64::MAX),
+                dead,
+                true
+            )
             .unwrap());
+        // A chain that reports a finalized block far ahead (an RPC the
+        // operator influences) releases nothing while this device's clock
+        // says the escape can still land, and no untrusted Closed reading
+        // does either: the late successor stays archived.
+        for (note, trusted) in [
+            (NoteChainStatus::Active, false),
+            (NoteChainStatus::Active, true),
+            (NoteChainStatus::Closed, false),
+        ] {
+            assert!(!fixture
+                .wallet
+                .release_exit_lock(note, Some(u64::MAX), now_seconds(), trusted)
+                .unwrap());
+        }
+        assert_eq!(
+            archive_dispositions(&fixture, &second.public_inputs.request_nullifier),
+            ["late_successor"]
+        );
         assert!(fixture
             .wallet
-            .release_exit_lock(NoteChainStatus::Active, Some(escape.valid_until + 901))
+            .release_exit_lock(NoteChainStatus::Active, Some(dead), dead, false)
             .unwrap());
         assert!(fixture.wallet.exit_lock().unwrap().is_none());
         let after = fixture.state();

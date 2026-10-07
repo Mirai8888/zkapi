@@ -146,14 +146,15 @@ test('C3: the concession range and the ownership proof of a state', () => {
 });
 
 test('E6: lock release', () => {
-    // The vectors' note readings are trusted (the companion reads them through
-    // the owner's exit RPC, the SDK's statusTrusted), and the local clock
-    // stands at the finalized block, which the SDK requires too.
+    // Each vector carries the device clock (`now`) and whether the note
+    // reading came from the owner's exit RPC (`status_trusted`), so a client
+    // that releases on the chain reading alone fails here.
     for (const vector of vectors.lock_releasable) {
+        assert.ok(Number.isSafeInteger(vector.now) && typeof vector.status_trusted === 'boolean', vector.name);
         const lock = { noteId: 0, anchor: '0x1', mode: 'escape', since: 0,
             released: vector.released.map(entry => ({ kind: entry.kind, valid_until: entry.valid_until })) };
         const verdict = exitLockReleasable(lock, { noteStatus: vector.note, finalizedTimestamp: vector.finalized_block_timestamp,
-            cancel: vector.user_cancels, now: vector.finalized_block_timestamp, statusTrusted: true });
+            cancel: vector.user_cancels, now: vector.now, statusTrusted: vector.status_trusted });
         assert.equal(verdict.releasable, vector.expected, JSON.stringify(vector));
     }
 });

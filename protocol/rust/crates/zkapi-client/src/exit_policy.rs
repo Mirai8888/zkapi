@@ -429,30 +429,50 @@ pub enum NoteChainStatus {
     Closed,
 }
 
-/// E6: whether `exit_lock` may be released. `finalized_block_timestamp` is
-/// the timestamp of a finalized block at which `note` was read.
+/// E6: the local second after which every released kind-0 or kind-1 proof
+/// is dead (the largest `valid_until + 900`), or `None` when none was
+/// released.
+pub fn lock_dead_after(released: &[ReleasedExit]) -> Option<u64> {
+    released
+        .iter()
+        .filter(|proof| proof.kind <= 1)
+        .map(|proof| {
+            proof
+                .valid_until
+                .saturating_add(LOCK_RELEASE_MARGIN_SECONDS)
+        })
+        .max()
+}
+
+/// E6: whether `exit_lock` may be released. `note` was read at a finalized
+/// block whose timestamp is `finalized_block_timestamp`; `now` is this
+/// device's clock; `status_trusted` says the reading came from a source the
+/// operator does not control (the owner's exit RPC), not the pinned RPC.
+///
+/// A chain reading alone never releases a lock whose escape or close proof
+/// may still land: the device's own clock must also be past every released
+/// proof's `valid_until + 900`, whoever answered the reading. A `Closed`
+/// reading releases such a lock earlier only when it is trusted (the SDK's
+/// `exitLockReleasable`, pinned by the shared vectors).
 pub fn lock_releasable(
     released: &[ReleasedExit],
     user_cancels: bool,
     note: NoteChainStatus,
     finalized_block_timestamp: Option<u64>,
+    now: u64,
+    status_trusted: bool,
 ) -> bool {
-    if note == NoteChainStatus::Closed {
+    let dead_after = lock_dead_after(released);
+    let locally_dead = dead_after.is_some_and(|after| now > after);
+    if note == NoteChainStatus::Closed && (dead_after.is_none() || status_trusted || locally_dead) {
         return true;
     }
-    let exits: Vec<&ReleasedExit> = released.iter().filter(|proof| proof.kind <= 1).collect();
-    if exits.is_empty() {
+    let Some(dead_after) = dead_after else {
         return user_cancels;
-    }
-    note == NoteChainStatus::Active
-        && finalized_block_timestamp.is_some_and(|timestamp| {
-            exits.iter().all(|proof| {
-                timestamp
-                    > proof
-                        .valid_until
-                        .saturating_add(LOCK_RELEASE_MARGIN_SECONDS)
-            })
-        })
+    };
+    locally_dead
+        && note == NoteChainStatus::Active
+        && finalized_block_timestamp.is_some_and(|timestamp| timestamp > dead_after)
 }
 
 /// E5: what a finalized or credited escape payout shows.
@@ -530,6 +550,72 @@ mod tests {
         let by = 1_000_000;
         assert!(!note_near_expiry(by - 21_905 - 4_500, 21_905, by));
         assert!(note_near_expiry(by - 21_905 - 4_499, 21_905, by));
+    }
+
+    /// E6: a chain reading (the pinned RPC's, say) whose finalized block is
+    /// far past a released escape's valid_until never releases the lock
+    /// while this device's clock says the proof can still land.
+    #[test]
+    fn a_lock_waits_for_the_local_clock_whatever_the_chain_reports() {
+        let escape = [ReleasedExit {
+            kind: 0,
+            valid_until: 10_000,
+        }];
+        let active = NoteChainStatus::Active;
+        assert_eq!(lock_dead_after(&escape), Some(10_900));
+        assert!(!lock_releasable(
+            &escape,
+            false,
+            active,
+            Some(u64::MAX),
+            10_900,
+            false
+        ));
+        assert!(!lock_releasable(
+            &escape,
+            false,
+            active,
+            Some(u64::MAX),
+            10_900,
+            true
+        ));
+        assert!(lock_releasable(
+            &escape,
+            false,
+            active,
+            Some(10_901),
+            10_901,
+            false
+        ));
+        assert!(!lock_releasable(
+            &escape,
+            false,
+            active,
+            Some(10_900),
+            99_999,
+            false
+        ));
+        let closed = NoteChainStatus::Closed;
+        assert!(!lock_releasable(
+            &escape, false, closed, None, 10_000, false
+        ));
+        assert!(lock_releasable(&escape, false, closed, None, 10_000, true));
+        assert!(lock_releasable(&escape, false, closed, None, 10_901, false));
+        let ownership = [ReleasedExit {
+            kind: 2,
+            valid_until: 10_000,
+        }];
+        assert_eq!(lock_dead_after(&ownership), None);
+        assert!(lock_releasable(&ownership, false, closed, None, 0, false));
+        assert!(lock_releasable(&ownership, true, active, None, 0, false));
+        assert!(!lock_releasable(
+            &ownership,
+            false,
+            active,
+            Some(99_999),
+            99_999,
+            false
+        ));
     }
 
     #[test]

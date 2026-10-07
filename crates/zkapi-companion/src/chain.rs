@@ -49,6 +49,10 @@ pub fn escape_payout_deferred_topic() -> String {
     topic("EscapePayoutDeferred(uint32,address,uint128)")
 }
 
+pub fn escape_challenged_topic() -> String {
+    topic("EscapeWithdrawalChallenged(uint32,uint256,uint256)")
+}
+
 pub fn escape_initiated_topic() -> String {
     topic("EscapeWithdrawalInitiated(uint32,uint256,uint128,address,uint64,uint256)")
 }
@@ -131,18 +135,25 @@ fn failure(message: impl Into<String>) -> AuthError {
     AuthError::Wallet(message.into())
 }
 
+/// Whether `url` may serve JSON-RPC to this wallet: HTTPS, or plain HTTP to
+/// a node on this machine, with no credentials and no fragment. Every RPC
+/// the companion reads (the escape's and the cooperative close's) follows
+/// this one rule.
+pub fn rpc_url_allowed(url: &reqwest::Url) -> bool {
+    let loopback = matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+    );
+    (url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
 impl Rpc {
     pub fn new(url: &str) -> Result<Self, AuthError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| failure("the RPC URL is not a URL"))?;
-        let loopback = matches!(
-            parsed.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        );
-        if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback))
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-        {
+        if !rpc_url_allowed(&parsed) {
             return Err(failure(
                 "an RPC must be HTTPS, or plain HTTP to a node on this machine",
             ));
@@ -526,6 +537,46 @@ pub async fn raised_concessions(
     Ok(raises)
 }
 
+/// The transaction of an `EscapeWithdrawalChallenged` that defeated the
+/// escape of `note_id` at `nullifier` in `from..=to`, if any.
+pub async fn escape_defeat(
+    rpc: &Rpc,
+    vault: &[u8; 20],
+    note_id: u32,
+    nullifier: &Felt252,
+    from: u64,
+    to: u64,
+) -> Result<Option<String>, AuthError> {
+    let logs = rpc
+        .logs(
+            vault,
+            json!([
+                escape_challenged_topic(),
+                format!("0x{}", word_u64(note_id.into()))
+            ]),
+            from,
+            to,
+        )
+        .await?;
+    for log in logs {
+        if log["removed"] == true {
+            continue;
+        }
+        let data = log["data"]
+            .as_str()
+            .and_then(|text| text.strip_prefix("0x"))
+            .filter(|digits| digits.len() == 2 * 64)
+            .ok_or_else(|| failure("invalid EscapeWithdrawalChallenged log"))?;
+        if data[..64].eq_ignore_ascii_case(&word_felt(nullifier)) {
+            let hash = log["transactionHash"]
+                .as_str()
+                .ok_or_else(|| failure("invalid EscapeWithdrawalChallenged log"))?;
+            return Ok(Some(hash.to_ascii_lowercase()));
+        }
+    }
+    Ok(None)
+}
+
 pub fn vault_address(contract: &Felt252) -> Result<[u8; 20], AuthError> {
     zkapi_types::serialization::felt_to_address(contract)
         .ok_or_else(|| failure("the vault address is not an address"))
@@ -572,6 +623,34 @@ mod tests {
             escape_initiated_topic(),
             "0xb0d1eb7131bcf3c6dd53517f6fa90bf7cc94178eb0eb5e0a1f204abe3b839cdf"
         );
+        assert_eq!(
+            escape_challenged_topic(),
+            "0x5cc5343b84cd949969f3ccc4ea44315630280857b9e591cc1ab48dbb9e6a3581"
+        );
+    }
+
+    /// One URL rule for every RPC the companion reads: HTTPS, or plain HTTP
+    /// to a node on this machine, never with credentials or a fragment.
+    #[test]
+    fn rpc_urls_are_https_or_a_node_on_this_machine() {
+        let allowed = |url: &str| rpc_url_allowed(&reqwest::Url::parse(url).unwrap());
+        for url in [
+            "https://rpc.example",
+            "http://127.0.0.1:8545",
+            "http://localhost:8545",
+            "http://[::1]:8545",
+        ] {
+            assert!(allowed(url), "{url}");
+        }
+        for url in [
+            "http://rpc.example",
+            "http://10.0.0.1:8545",
+            "https://user:secret@rpc.example",
+            "https://rpc.example/#fragment",
+            "ws://127.0.0.1:8545",
+        ] {
+            assert!(!allowed(url), "{url}");
+        }
     }
 
     /// The shared withdrawal golden vector (design §11 WP-F): real kind-0

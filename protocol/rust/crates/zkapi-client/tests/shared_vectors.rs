@@ -168,6 +168,8 @@ fn exit_policy_vectors() {
                 case["user_cancels"].as_bool().unwrap(),
                 note,
                 opt_u64(&case["finalized_block_timestamp"]),
+                case["now"].as_u64().unwrap(),
+                case["status_trusted"].as_bool().unwrap(),
             ),
             case["expected"].as_bool().unwrap(),
             "{case}"

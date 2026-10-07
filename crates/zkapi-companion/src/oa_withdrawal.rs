@@ -553,14 +553,10 @@ async fn rpc(config: &AuthConfig, method: &str, params: Value) -> Result<Value, 
     };
     let url = config.demo_rpc_url.as_deref().ok_or_else(failure)?;
     let parsed = reqwest::Url::parse(url).map_err(|_| failure())?;
-    // Only this crate's unit tests may serve the RPC over loopback HTTP.
-    let loopback_test_rpc =
-        cfg!(test) && parsed.scheme() == "http" && parsed.host_str() == Some("127.0.0.1");
-    if (parsed.scheme() != "https" && !loopback_test_rpc)
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.fragment().is_some()
-    {
+    // The escape's rule (chain::rpc_url_allowed): HTTPS, or plain HTTP to a
+    // node on this machine, so a close confirms on every RPC an escape may
+    // use.
+    if !crate::chain::rpc_url_allowed(&parsed) {
         return Err(failure());
     }
     // New clients inherit the daemon's authenticated local CONNECT proxy,

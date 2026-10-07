@@ -786,20 +786,27 @@
   ],
   "lock_releasable": [
     {
+      "name": "no exit proof released: the user cancels",
       "released": [],
       "user_cancels": true,
       "note": "active",
       "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
       "expected": true
     },
     {
+      "name": "no exit proof released and no cancel: held",
       "released": [],
       "user_cancels": false,
       "note": "active",
       "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
       "expected": false
     },
     {
+      "name": "only an ownership proof released: the user cancels",
       "released": [
         {
           "kind": 2,
@@ -809,9 +816,12 @@
       "user_cancels": true,
       "note": "active",
       "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
       "expected": true
     },
     {
+      "name": "a released escape outlives a cancel",
       "released": [
         {
           "kind": 0,
@@ -821,9 +831,12 @@
       "user_cancels": true,
       "note": "active",
       "finalized_block_timestamp": null,
+      "now": 1000,
+      "status_trusted": false,
       "expected": false
     },
     {
+      "name": "the finalized block is not past valid_until + 900",
       "released": [
         {
           "kind": 0,
@@ -833,9 +846,12 @@
       "user_cancels": false,
       "note": "active",
       "finalized_block_timestamp": 1900,
+      "now": 1901,
+      "status_trusted": false,
       "expected": false
     },
     {
+      "name": "dead: the finalized block and the local clock are past valid_until + 900",
       "released": [
         {
           "kind": 0,
@@ -845,9 +861,42 @@
       "user_cancels": false,
       "note": "active",
       "finalized_block_timestamp": 1901,
+      "now": 1901,
+      "status_trusted": false,
       "expected": true
     },
     {
+      "name": "the finalized block is past valid_until + 900 but the local clock is not: an RPC never releases a live proof",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 1901,
+      "now": 1900,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "the same with a trusted reading: an Active release always waits for the local clock",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 999999,
+      "now": 1900,
+      "status_trusted": true,
+      "expected": false
+    },
+    {
+      "name": "a pending exit keeps the lock",
       "released": [
         {
           "kind": 0,
@@ -857,9 +906,12 @@
       "user_cancels": false,
       "note": "pending_withdrawal",
       "finalized_block_timestamp": 99999,
+      "now": 99999,
+      "status_trusted": false,
       "expected": false
     },
     {
+      "name": "every released proof must be dead",
       "released": [
         {
           "kind": 0,
@@ -873,9 +925,31 @@
       "user_cancels": false,
       "note": "active",
       "finalized_block_timestamp": 2000,
+      "now": 2000,
+      "status_trusted": false,
       "expected": false
     },
     {
+      "name": "every released proof is dead",
+      "released": [
+        {
+          "kind": 0,
+          "valid_until": 1000
+        },
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "active",
+      "finalized_block_timestamp": 5901,
+      "now": 5901,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "Closed through the exit RPC (trusted) releases a live lock",
       "released": [
         {
           "kind": 1,
@@ -885,6 +959,53 @@
       "user_cancels": false,
       "note": "closed",
       "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": true,
+      "expected": true
+    },
+    {
+      "name": "an untrusted Closed reading waits for the local clock",
+      "released": [
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 1000,
+      "status_trusted": false,
+      "expected": false
+    },
+    {
+      "name": "an untrusted Closed reading after the local clock passes",
+      "released": [
+        {
+          "kind": 1,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 5901,
+      "status_trusted": false,
+      "expected": true
+    },
+    {
+      "name": "Closed with only an ownership proof released",
+      "released": [
+        {
+          "kind": 2,
+          "valid_until": 5000
+        }
+      ],
+      "user_cancels": false,
+      "note": "closed",
+      "finalized_block_timestamp": null,
+      "now": 0,
+      "status_trusted": false,
       "expected": true
     }
   ],

@@ -688,6 +688,12 @@ impl AuthService {
     /// `GET /oa/v1/withdraw/escape/status`: the escape record, the exit lock
     /// and the vault's view of the note. A dead lock (E6) is released here.
     pub async fn oa_escape_status(&self) -> Result<Value, AuthError> {
+        self.escape_status_at(None).await
+    }
+
+    /// The status with this device's clock read as `clock` (tests), or the
+    /// system clock.
+    pub(crate) async fn escape_status_at(&self, clock: Option<u64>) -> Result<Value, AuthError> {
         let config = self.config.clone();
         let wallet_mutex = self.wallet_mutex.clone();
         spawn_blocking(move || {
@@ -696,7 +702,8 @@ impl AuthService {
                 .map_err(|_| AuthError::Wallet("wallet lock unavailable".into()))?;
             let _lockfile = acquire_wallet_lock(&config.state_dir)?;
             let mut wallet = load_wallet(&config)?;
-            current_thread_runtime()?.block_on(escape_status_locked(&config, &mut wallet))
+            let now = clock.unwrap_or_else(now_seconds);
+            current_thread_runtime()?.block_on(escape_status_locked(&config, &mut wallet, now))
         })
         .await
     }
@@ -920,6 +927,7 @@ async fn decide_and_prove_escape(
 async fn escape_status_locked(
     config: &AuthConfig,
     wallet: &mut Wallet,
+    now: u64,
 ) -> Result<Value, AuthError> {
     let record = load_record(config)?;
     let lock = wallet.exit_lock()?;
@@ -954,13 +962,16 @@ async fn escape_status_locked(
     };
     let Some((rpc, view)) = read else {
         status["chain"] = json!("unavailable");
+        status["trusted"] = json!(false);
         return Ok(status);
     };
-    status["chain_rpc"] = json!(if config.exit_rpc_url.as_deref() == Some(rpc.url()) {
-        "exit"
-    } else {
-        "pinned"
-    });
+    // Only the owner's exit RPC is a source the operator does not control
+    // (§2.1). Without one, every reading here is the pinned RPC's: the caller
+    // must treat it as advisory and ask again (a defeat it reports is not
+    // final), and E6 never releases a live lock on it.
+    let trusted = config.exit_rpc_url.as_deref() == Some(rpc.url());
+    status["chain_rpc"] = json!(if trusted { "exit" } else { "pinned" });
+    status["trusted"] = json!(trusted);
     match view.pending {
         Some(pending) if pending.nullifier == record.withdrawal_nullifier => {
             status["phase"] = json!("pending");
@@ -968,43 +979,77 @@ async fn escape_status_locked(
             status["conceded"] = json!(pending.conceded.to_string());
             status["challenge_deadline"] = json!(pending.deadline);
             status["finalize_calldata"] = json!(chain::finalize_calldata(record.note_id));
-            status["finalizable"] = json!(now_seconds() > pending.deadline);
+            status["finalizable"] = json!(now > pending.deadline);
         }
         Some(_) => status["phase"] = json!("other_exit_pending"),
         None if view.status == 3 => status["phase"] = json!("closed"),
         None if view.status == 1 => {
             // Defeated (another device spent the successor) or never landed.
-            if chain::challenged(&rpc, &vault, &record.withdrawal_nullifier, "latest")
-                .await
-                .unwrap_or(false)
-            {
+            // Both are read at a finalized block, where the note must be
+            // Active with no pending exit: a defeat counts only from an
+            // EscapeWithdrawalChallenged of this escape's nullifier in a
+            // finalized block, never from a flag at the latest block.
+            let mut defeat = None;
+            let mut settled_at = None;
+            if let Ok((block, finalized_ts)) = rpc.block("finalized").await {
+                let tag = format!("0x{block:x}");
+                if chain::read_note(&rpc, &vault, record.note_id, &tag)
+                    .await
+                    .is_ok_and(|view| view.status == 1 && view.pending.is_none())
+                {
+                    settled_at = Some(finalized_ts);
+                    defeat = chain::escape_defeat(
+                        &rpc,
+                        &vault,
+                        record.note_id,
+                        &record.withdrawal_nullifier,
+                        record.start_block,
+                        block,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                }
+            }
+            if let Some(hash) = &defeat {
                 status["phase"] = json!("defeated");
                 status["error"] = json!("device_not_newest");
+                status["defeat_transaction"] = json!(hash);
             }
             // E6: release the lock once every released proof is dead: at a
             // finalized block past each valid_until + 900, the note Active
-            // with no pending exit. Only the deciding RPC (the owner's exit
-            // RPC when configured) may say so: a lock released on a false
-            // answer would let a late successor install while the escape
-            // can still land.
-            if let Ok(decider) = deciding_rpc(config) {
-                if let Ok((block, finalized_ts)) = decider.block("finalized").await {
-                    let tag = format!("0x{block:x}");
-                    let settled = chain::read_note(&decider, &vault, record.note_id, &tag)
-                        .await
-                        .is_ok_and(|view| view.status == 1 && view.pending.is_none());
-                    if settled
-                        && wallet.release_exit_lock(NoteChainStatus::Active, Some(finalized_ts))?
-                    {
-                        status["exit_lock"] = Value::Null;
-                        if status["phase"] != "defeated" {
-                            status["phase"] = json!("expired");
-                        }
-                        let mut expired = record.clone();
-                        expired.phase = status["phase"].as_str().unwrap_or("expired").into();
-                        save_record(config, &expired)?;
-                    }
-                }
+            // with no pending exit, and on this device's clock too. No RPC
+            // answer alone releases it: a lock released on a false answer
+            // would let a late successor install while the escape can still
+            // land.
+            let released = match settled_at {
+                Some(finalized_ts) => wallet.release_exit_lock(
+                    NoteChainStatus::Active,
+                    Some(finalized_ts),
+                    now,
+                    trusted,
+                )?,
+                None => false,
+            };
+            if released {
+                status["exit_lock"] = Value::Null;
+            }
+            // With no lock left, an escape the chain shows neither pending nor
+            // defeated never landed (a saved defeat an earlier reading
+            // reported is corrected).
+            let unlocked = released || wallet.exit_lock()?.is_none();
+            if defeat.is_none()
+                && unlocked
+                && (released || matches!(record.phase.as_str(), "defeated" | "expired"))
+            {
+                status["phase"] = json!("expired");
+            }
+            let phase = status["phase"].as_str().unwrap_or("").to_string();
+            if unlocked && matches!(phase.as_str(), "defeated" | "expired") && phase != record.phase
+            {
+                let mut settled = record.clone();
+                settled.phase = phase;
+                save_record(config, &settled)?;
             }
         }
         None => {}

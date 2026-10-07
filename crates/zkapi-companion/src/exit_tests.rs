@@ -665,6 +665,27 @@ impl Harness {
         }));
     }
 
+    /// `challengeEscapeWithdrawal`: the escape at `nullifier` defeated in a
+    /// new block, the note Active again.
+    fn defeat(&self, nullifier: Felt252) {
+        let mut world = self.world.lock().unwrap();
+        world.pending = None;
+        world.note_status = 1;
+        world.challenged.insert(nullifier);
+        world.block += 1;
+        let block = world.block;
+        let root = world.indexer_root;
+        world.logs.push(json!({
+            "address": format!("0x{}", hex::encode(VAULT)),
+            "blockNumber": format!("0x{block:x}"),
+            "logIndex": "0x0",
+            "removed": false,
+            "transactionHash": format!("0x{}", "cd".repeat(32)),
+            "topics": [chain::escape_challenged_topic(), format!("0x{}", word(NOTE_ID))],
+            "data": format!("0x{}{}", felt_word(&nullifier), felt_word(&root)),
+        }));
+    }
+
     /// `finalizeEscapeWithdrawal`, paying or (`credited`) crediting.
     fn finalize(&self, credited: bool) -> String {
         let mut world = self.world.lock().unwrap();
@@ -1084,18 +1105,109 @@ async fn an_escape_that_never_landed_releases_the_lock_once_dead() {
         Err(zkapi_client::error::ClientError::ExitLocked)
     ));
     harness.world.lock().unwrap().now = valid_until + 901;
+    // The chain's finalized block is past the proof's life, but this
+    // device's clock is not: the proof could still land, so nothing is
+    // released (whoever answered the reading).
     let status = harness.service.oa_escape_status().await.unwrap();
+    assert_ne!(status["phase"], "expired", "{status}");
+    assert!(harness.wallet().exit_lock().unwrap().is_some());
+    let status = harness
+        .service
+        .escape_status_at(Some(valid_until + 901))
+        .await
+        .unwrap();
     assert_eq!(status["phase"], "expired");
     assert!(harness.wallet().exit_lock().unwrap().is_none());
     harness.wallet().check_request_allowed().unwrap();
-    // A defeat (another device spent the successor) is reported as such.
+    // A defeat (another device spent the successor) is reported as such,
+    // only from the defeat's log in a finalized block: the flag alone, or a
+    // log in a block not yet final, reports nothing.
     let harness = Harness::new(true).await;
     let plan = harness.prepare(Some("0"), None).await.unwrap();
     let nullifier: Felt252 = serde_json::from_value(plan["withdrawal_nullifier"].clone()).unwrap();
     harness.world.lock().unwrap().challenged.insert(nullifier);
     let status = harness.service.oa_escape_status().await.unwrap();
+    assert_ne!(status["phase"], "defeated", "{status}");
+    harness.defeat(nullifier);
+    harness.world.lock().unwrap().finalized_lag = 1;
+    let status = harness.service.oa_escape_status().await.unwrap();
+    assert_ne!(status["phase"], "defeated", "{status}");
+    harness.world.lock().unwrap().finalized_lag = 0;
+    let status = harness.service.oa_escape_status().await.unwrap();
     assert_eq!(status["phase"], "defeated");
     assert_eq!(status["error"], "device_not_newest");
+    assert_eq!(
+        status["defeat_transaction"],
+        format!("0x{}", "cd".repeat(32))
+    );
+    // Read through the pinned RPC: shown, but marked untrusted.
+    assert_eq!(
+        (status["chain_rpc"].as_str(), status["trusted"].as_bool()),
+        (Some("pinned"), Some(false))
+    );
+}
+
+/// E6 without an exit RPC (the finding of review round 8): the pinned RPC,
+/// which the operator may run, reports a finalized block far past a
+/// released escape's life, the note Active and every nullifier challenged.
+/// It neither releases the lock (this device's clock says the proof can
+/// still land) nor installs the successor that arrived late, nor reports a
+/// defeat: chats stay stopped until the proof is dead on this clock too.
+#[tokio::test]
+async fn a_lying_pinned_rpc_neither_releases_a_live_lock_nor_reports_a_defeat() {
+    let harness = Harness::new(true).await;
+    // A real request at the current state, journaled in the wallet itself.
+    let request = harness
+        .wallet()
+        .prepare_request_with_bound(
+            "{}",
+            zkapi_types::canonical_payload_hash(b"{}"),
+            harness.deposit_root,
+            harness.deposit_siblings.clone(),
+            1_000,
+        )
+        .unwrap();
+    let plan = harness
+        .prepare(Some("0"), Some(EarlyExit::ConcedeNothing))
+        .await
+        .unwrap();
+    assert_eq!(plan["status"], "prepared", "{plan}");
+    let valid_until = plan["valid_until"].as_u64().unwrap();
+    // The operator's successor arrives after the escape proof left.
+    let late = harness.successor(&request, 40);
+    let mut wallet = harness.wallet();
+    assert!(matches!(
+        wallet.complete_pending_response(&late),
+        Err(zkapi_client::error::ClientError::LateSuccessor)
+    ));
+    let balance = wallet.state().unwrap().current_balance;
+    harness.world.lock().unwrap().pinned_lies = true;
+    let status = harness.service.oa_escape_status().await.unwrap();
+    assert_eq!(
+        (status["chain_rpc"].as_str(), status["trusted"].as_bool()),
+        (Some("pinned"), Some(false))
+    );
+    assert_ne!(status["phase"], "defeated", "{status}");
+    assert_ne!(status["phase"], "expired", "{status}");
+    assert!(harness.wallet().exit_lock().unwrap().is_some());
+    assert_eq!(harness.wallet().state().unwrap().current_balance, balance);
+    assert!(matches!(
+        harness.wallet().check_request_allowed(),
+        Err(zkapi_client::error::ClientError::ExitLocked)
+    ));
+    // Once this device's clock passes valid_until + 900 too, the proof is
+    // dead: the lock is released and the late successor installs.
+    let status = harness
+        .service
+        .escape_status_at(Some(valid_until + 901))
+        .await
+        .unwrap();
+    assert_eq!(status["phase"], "expired", "{status}");
+    assert!(harness.wallet().exit_lock().unwrap().is_none());
+    assert_eq!(
+        harness.wallet().state().unwrap().current_balance,
+        balance - 40
+    );
 }
 
 /// C1: two services on one state directory (the bridge and, say, the exit

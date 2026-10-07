@@ -189,14 +189,16 @@ pub fn classify(record: &ReleasedRecord) -> RecordClass {
 
 /// E2's fresh state: nothing was released (`bound_at_state == 0`), or every
 /// released record is resolved and unreserved (terminal records at the state
-/// do not count). The records decide: by the §6.2 write order a released
-/// request always has a bound, so an unresolved record beside a zero bound is
-/// data written by an older build, and the state is not fresh.
+/// do not count). By the §6.2 write order a released request always has a
+/// bound, so a zero bound beside an unresolved record is inconsistent data;
+/// like the SDK, the bound decides. The mutual close it leads to is safe
+/// either way: a server holding a reservation answers `nullifier_used`, and
+/// the decision waits from that record (E2 step 4).
 pub fn state_is_fresh(bound_at_state: u128, records: &[ReleasedRecord]) -> bool {
-    let _ = bound_at_state;
-    records
-        .iter()
-        .all(|record| classify(record) != RecordClass::Unresolved)
+    bound_at_state == 0
+        || records
+            .iter()
+            .all(|record| classify(record) != RecordClass::Unresolved)
 }
 
 /// How the mutual close (E2 step 3) ended when it did not produce a close.
@@ -355,10 +357,17 @@ pub fn decide(facts: &ExitFacts) -> ExitDecision {
         return match facts.mutual_outcome {
             None => ExitDecision::Mutual,
             // E2 step 4: the server claims a reservation; E3 from the newest
-            // released record (or from now, when nothing was released).
-            Some(MutualOutcome::NullifierUsed) => {
-                wait_or_escape(newest_release(false).unwrap_or(facts.now))
-            }
+            // released record. With no record of a release there is nothing
+            // to wait for: T is now, and the escape concedes the bound (zero
+            // when nothing left this device), as the SDK does. Anchoring T at
+            // `now` instead would move it on every new decision.
+            Some(MutualOutcome::NullifierUsed) => match newest_release(false) {
+                Some(created_at) => wait_or_escape(created_at),
+                None => ExitDecision::Escape {
+                    conceded: bound,
+                    reason: EscapeReason::AtDeadline,
+                },
+            },
             Some(MutualOutcome::RefusedOrUnreachable) => ExitDecision::Escape {
                 conceded: 0,
                 reason: EscapeReason::MutualRefused,

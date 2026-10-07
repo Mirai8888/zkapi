@@ -372,6 +372,40 @@
    }
   },
   {
+   "name": "E2 nullifier_used with nothing released: escape at once conceding nothing",
+   "facts": {
+    "now": 1000000,
+    "must_initiate_by": 2000000,
+    "settlement_window": 21905,
+    "unsettled_escape_after": 43200,
+    "bound_at_state": 0,
+    "records": [],
+    "mutual_outcome": "nullifier_used"
+   },
+   "expected": {
+    "action": "escape",
+    "conceded": 0,
+    "reason": "at_deadline"
+   }
+  },
+  {
+   "name": "E2 nullifier_used with no record of the release: escape at once conceding the bound",
+   "facts": {
+    "now": 1000000,
+    "must_initiate_by": 2000000,
+    "settlement_window": 21905,
+    "unsettled_escape_after": 43200,
+    "bound_at_state": 1000,
+    "records": [],
+    "mutual_outcome": "nullifier_used"
+   },
+   "expected": {
+    "action": "escape",
+    "conceded": 1000,
+    "reason": "at_deadline"
+   }
+  },
+  {
    "name": "E3 pending request: wait for created_at + W + 900",
    "facts": {
     "now": 1000000,
@@ -667,7 +701,7 @@
    }
   },
   {
-   "name": "A zero bound beside an unresolved record (older data) is not fresh",
+   "name": "E2 a zero bound is fresh whatever the records say: mutual close",
    "facts": {
     "now": 1000000,
     "must_initiate_by": 2000000,
@@ -683,8 +717,7 @@
     ]
    },
    "expected": {
-    "action": "wait",
-    "until": 1021805
+    "action": "mutual"
    }
   }
  ],

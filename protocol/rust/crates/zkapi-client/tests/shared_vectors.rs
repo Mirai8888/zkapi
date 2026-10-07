@@ -208,6 +208,9 @@ struct SuccessorCase {
     response: RequestResponseV2,
     /// `install`, `invalid_successor` or `reject`.
     expected: String,
+    /// The request journal of this case, when it is not the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal: Option<PendingRequestJournal>,
     /// For `install`: the installed state's balance, anchor, prev_anchor and
     /// blinding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,13 +326,33 @@ fn generate_successor_vectors() -> SuccessorVectors {
     };
     let derived = core::next_anchor(&nullifier);
     let mut cases = Vec::new();
-    let mut case = |name: &str, response: RequestResponseV2, expected: &str| {
+    let mut case_with = |name: &str,
+                         response: RequestResponseV2,
+                         expected: &str,
+                         journal: Option<PendingRequestJournal>| {
         cases.push(SuccessorCase {
             name: name.into(),
             response,
             expected: expected.into(),
+            journal,
             installed: None,
         })
+    };
+    // S3's second clause: the journaled request must carry the state's one
+    // bound. A journal whose request has another bound is from no request
+    // this state made under C2, so its successor is not installed.
+    let mut other_bound = journal.clone();
+    if let Some(request) = other_bound.prepared_request.as_mut() {
+        request.public_inputs.solvency_bound = 900;
+    }
+    case_with(
+        "S3 the journaled request's bound is not bound_at_state: invalid_successor",
+        respond(400, derived, &signer),
+        "invalid_successor",
+        Some(other_bound),
+    );
+    let mut case = |name: &str, response: RequestResponseV2, expected: &str| {
+        case_with(name, response, expected, None)
     };
     case(
         "S1-S6 hold: install",
@@ -407,7 +430,7 @@ fn generate_successor_vectors() -> SuccessorVectors {
     );
     SuccessorVectors {
         schema: 1,
-        description: "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal`, deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.".into(),
+        description: "S1-S6 (design §6.1) for circuit zkapi-v2-concession-v1. Load `state` and `journal` (a case's own `journal` replaces it), deliver each `response` for the journal's request, and expect `install`, `invalid_successor` (a correctly signed successor failing S3, S4 or S5, archived and treated as withheld) or `reject` (S1, S2 or S6 fails; nothing changes). For `install`, `installed` is the resulting balance, anchor, prev_anchor, blinding and bound_at_state.".into(),
         state_signing_key: key,
         state,
         journal,
@@ -420,7 +443,8 @@ fn run_case(vectors: &SuccessorVectors, case: &SuccessorCase) -> (String, Option
     let dir = std::env::temp_dir().join(format!("zkapi-vectors-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     vectors.state.save(&dir.join("note_state.json")).unwrap();
-    PendingRequestJournal::write(&dir.join("pending_journal.json"), &vectors.journal).unwrap();
+    let journal = case.journal.as_ref().unwrap_or(&vectors.journal);
+    PendingRequestJournal::write(&dir.join("pending_journal.json"), journal).unwrap();
     let mut wallet = Wallet::new(successor_config(&dir, &vectors.state_signing_key)).unwrap();
     let result = wallet.complete_pending_response(&case.response);
     let outcome = match &result {
@@ -437,8 +461,7 @@ fn run_case(vectors: &SuccessorVectors, case: &SuccessorCase) -> (String, Option
         }
         Err(ClientError::InvalidSuccessor(_)) => {
             assert!(!wallet.has_pending_request());
-            let records =
-                read_archive(&dir.join("request_archive"), &vectors.journal.nullifier).unwrap();
+            let records = read_archive(&dir.join("request_archive"), &journal.nullifier).unwrap();
             assert_eq!(records.records.len(), 1);
             assert_eq!(records.records[0].disposition, "invalid_successor");
             assert_eq!(
@@ -476,7 +499,7 @@ fn successor_check_vectors() {
         std::fs::write(&path, serde_json::to_vec_pretty(&vectors).unwrap()).unwrap();
     }
     let vectors: SuccessorVectors = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(vectors.cases.len() >= 14);
+    assert!(vectors.cases.len() >= 15);
     for case in &vectors.cases {
         let (outcome, installed) = run_case(&vectors, case);
         assert_eq!(outcome, case.expected, "{}", case.name);

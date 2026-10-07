@@ -1095,12 +1095,97 @@ impl Wallet {
         merkle_siblings: Vec<Felt252>,
         before_send: impl FnOnce() -> Result<(), ClientError>,
     ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
+        self.withdrawal_mutual_close_cleared(destination, active_root, merkle_siblings, before_send)
+            .await
+            .map(|(public, proof, _)| (public, proof))
+    }
+
+    /// Like `withdrawal_mutual_close_recorded`, and also returns the verified
+    /// clearance signature, so the close can be proved again with a later
+    /// `valid_until` (`mutual_close_from_clearance`) without another
+    /// ownership proof or clearance request.
+    pub async fn withdrawal_mutual_close_cleared(
+        &self,
+        destination: [u8; 20],
+        active_root: Felt252,
+        merkle_siblings: Vec<Felt252>,
+        before_send: impl FnOnce() -> Result<(), ClientError>,
+    ) -> Result<
+        (
+            WithdrawalPublicInputsV2C,
+            Groth16ProofWire,
+            zkapi_types::SchnorrSignature,
+        ),
+        ClientError,
+    > {
         check_payout_destination(&destination)?;
         self.lock_for_proof(ExitMode::Mutual)?;
         let ownership = self.ownership_proof(active_root, merkle_siblings.clone())?;
         before_send()?;
         self.mutual_close_with_clearance(destination, active_root, merkle_siblings, ownership)
             .await
+    }
+
+    /// A fresh mutual close (kind 1) of the current state from a clearance
+    /// signature obtained earlier: the vault refuses a close after its
+    /// `valid_until` (L6), and the clearance signs only the nullifier, so an
+    /// expired close is proved again with a new lifetime, at the same root
+    /// and path (any root the vault ever held stays known, Amendment A1).
+    /// Needs the exit lock in `mutual` mode; recorded as released before it
+    /// is returned.
+    pub fn mutual_close_from_clearance(
+        &self,
+        destination: [u8; 20],
+        active_root: Felt252,
+        merkle_siblings: Vec<Felt252>,
+        clearance_signature: &zkapi_types::SchnorrSignature,
+    ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
+        check_payout_destination(&destination)?;
+        let lock = self.lock_for_proof(ExitMode::Mutual)?;
+        self.check_clearance_signature(clearance_signature)?;
+        let valid_until = now_seconds() + EXIT_PROOF_VALIDITY_SECONDS;
+        let built = self.build_withdrawal(
+            WithdrawalKind::MutualClose,
+            destination,
+            0,
+            valid_until,
+            active_root,
+            merkle_siblings,
+            Some(*clearance_signature),
+        )?;
+        self.record_release(
+            lock,
+            ReleasedProof {
+                kind: 1,
+                valid_until,
+                conceded: 0,
+                tx_hash: None,
+                ownership: None,
+            },
+        )?;
+        Ok(built)
+    }
+
+    /// The clearance key's signature over the current state's nullifier.
+    fn check_clearance_signature(
+        &self,
+        signature: &zkapi_types::SchnorrSignature,
+    ) -> Result<(), ClientError> {
+        let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+        let message = core::clearance_message(
+            state.protocol_version,
+            state.chain_id,
+            &state.contract_address,
+            &state_nullifier(state),
+        );
+        if !verify_signature(&self.config.clearance_signing_key, &message, signature)
+            .map_err(|error| ClientError::VerificationFailed(error.to_string()))?
+        {
+            return Err(ClientError::VerificationFailed(
+                "invalid clearance signature".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The ownership proof (kind 2) a clearance request carries for the
@@ -1159,49 +1244,24 @@ impl Wallet {
         active_root: Felt252,
         merkle_siblings: Vec<Felt252>,
         ownership: ClearanceOwnershipProofV2C,
-    ) -> Result<(WithdrawalPublicInputsV2C, Groth16ProofWire), ClientError> {
+    ) -> Result<
+        (
+            WithdrawalPublicInputsV2C,
+            Groth16ProofWire,
+            zkapi_types::SchnorrSignature,
+        ),
+        ClientError,
+    > {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let nullifier = state_nullifier(state);
         let clearance = self.request_clearance(&nullifier, ownership).await?;
-        let message = core::clearance_message(
-            state.protocol_version,
-            state.chain_id,
-            &state.contract_address,
-            &nullifier,
-        );
-        if !verify_signature(
-            &self.config.clearance_signing_key,
-            &message,
-            &clearance.signature,
-        )
-        .map_err(|error| ClientError::VerificationFailed(error.to_string()))?
-        {
-            return Err(ClientError::VerificationFailed(
-                "invalid clearance signature".to_string(),
-            ));
-        }
-        let lock = self.lock_for_proof(ExitMode::Mutual)?;
-        let valid_until = now_seconds() + EXIT_PROOF_VALIDITY_SECONDS;
-        let built = self.build_withdrawal(
-            WithdrawalKind::MutualClose,
+        let (public, proof) = self.mutual_close_from_clearance(
             destination,
-            0,
-            valid_until,
             active_root,
             merkle_siblings,
-            Some(clearance.signature),
+            &clearance.signature,
         )?;
-        self.record_release(
-            lock,
-            ReleasedProof {
-                kind: 1,
-                valid_until,
-                conceded: 0,
-                tx_hash: None,
-                ownership: None,
-            },
-        )?;
-        Ok(built)
+        Ok((public, proof, clearance.signature))
     }
 
     /// An escape (kind 0) from the current state that pays
@@ -2761,5 +2821,177 @@ mod tests {
             other.current_nullifier()
         );
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// L6 and §3.3: a close expires, and the clearance signs only the
+    /// nullifier, so an expired close is proved again from the kept
+    /// signature with a new lifetime, at the same root and path, without a
+    /// second ownership proof or clearance request. A signature that does
+    /// not verify proves nothing, and only the mutual lock allows it.
+    #[tokio::test]
+    async fn an_expired_close_is_proved_again_from_its_clearance() {
+        let server = MockServer::start().await;
+        let fixture = fixture(&server.url);
+        fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        server.reply(200, clearance(&fixture));
+        let (first, _, signature) = fixture
+            .wallet
+            .withdrawal_mutual_close_cleared(
+                DESTINATION,
+                fixture.root,
+                fixture.siblings.clone(),
+                || Ok(()),
+            )
+            .await
+            .unwrap();
+        let forged = fixture.state_signer.sign(&core::clearance_message(
+            2,
+            1,
+            &Felt252::from_u64(0x1234),
+            &nullifier(&fixture),
+        ));
+        assert!(matches!(
+            fixture.wallet.mutual_close_from_clearance(
+                DESTINATION,
+                fixture.root,
+                fixture.siblings.clone(),
+                &forged
+            ),
+            Err(ClientError::VerificationFailed(_))
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let (again, proof) = fixture
+            .wallet
+            .mutual_close_from_clearance(
+                DESTINATION,
+                fixture.root,
+                fixture.siblings.clone(),
+                &signature,
+            )
+            .unwrap();
+        assert!(again.valid_until > first.valid_until);
+        assert_eq!(again.withdrawal_kind(), Some(WithdrawalKind::MutualClose));
+        assert_eq!(
+            (
+                again.withdrawal_nullifier,
+                again.final_balance,
+                again.destination
+            ),
+            (
+                first.withdrawal_nullifier,
+                first.final_balance,
+                first.destination
+            )
+        );
+        assert!(WithdrawalVerifier::load(SETUP_DIR)
+            .unwrap()
+            .verify(&again, &proof)
+            .unwrap());
+        assert_eq!(server.calls().len(), 1, "no second clearance request");
+        let lock = fixture.wallet.exit_lock().unwrap().unwrap();
+        assert_eq!(
+            lock.released
+                .iter()
+                .map(|proof| (proof.kind, proof.valid_until))
+                .collect::<Vec<_>>()[1..],
+            [(1, first.valid_until), (1, again.valid_until)]
+        );
+        assert_eq!(lock.released.iter().filter(|p| p.kind == 2).count(), 1);
+        // Only under the mutual lock.
+        fixture.wallet.set_exit_lock(ExitMode::Escape).unwrap();
+        assert!(matches!(
+            fixture.wallet.mutual_close_from_clearance(
+                DESTINATION,
+                fixture.root,
+                fixture.siblings.clone(),
+                &signature
+            ),
+            Err(ClientError::ExitLockConflict(_))
+        ));
+    }
+
+    /// C3, mode mutual: at most one live ownership proof. Within the resend
+    /// margin the kept proof is no longer resent, and no second one is made
+    /// until it has expired; then one more is.
+    #[test]
+    fn a_second_ownership_proof_waits_until_the_first_expires() {
+        let fixture = fixture("http://127.0.0.1:1");
+        fixture.wallet.set_exit_lock(ExitMode::Mutual).unwrap();
+        let first = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        let resent = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        assert_eq!(resent.proof, first.proof);
+        let path = fixture.state_dir.join(EXIT_LOCK_FILE);
+        let set_valid_until = |valid_until: u64| {
+            let mut lock = ExitLock::load(&path).unwrap().unwrap();
+            lock.released[0].valid_until = valid_until;
+            lock.save(&path).unwrap();
+        };
+        // Still accepted by the server, too close to expiry to resend.
+        set_valid_until(now_seconds() + OWNERSHIP_RESEND_MARGIN_SECONDS - 1);
+        assert!(matches!(
+            fixture
+                .wallet
+                .ownership_proof(fixture.root, fixture.siblings.clone()),
+            Err(ClientError::ExitLockConflict(_))
+        ));
+        assert_eq!(
+            fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
+            1
+        );
+        set_valid_until(now_seconds() - 1);
+        let second = fixture
+            .wallet
+            .ownership_proof(fixture.root, fixture.siblings.clone())
+            .unwrap();
+        assert_ne!(second.proof, first.proof);
+        assert_eq!(
+            fixture.wallet.exit_lock().unwrap().unwrap().released.len(),
+            2
+        );
+    }
+
+    /// E3 "lost ε" takes a finalized response's charge only when it passes
+    /// S1 (the nullifier), S2, S4 and S6: a response at a non-derived anchor
+    /// or signed by another key concedes nothing on its word.
+    #[test]
+    fn a_lost_epsilon_charge_needs_the_derived_anchor_and_the_state_key() {
+        let mut fixture = fixture("http://127.0.0.1:1");
+        let request = prepare(&mut fixture);
+        let valid = signed_response(&fixture, &request, 400, None);
+        assert_eq!(
+            fixture.wallet.uninstallable_finalized_charge(&valid),
+            Some(400)
+        );
+        for anchor in [Felt252::ONE, Felt252::ZERO, Felt252::from_u64(77)] {
+            let response = signed_response(&fixture, &request, 400, Some(anchor));
+            assert_eq!(
+                fixture.wallet.uninstallable_finalized_charge(&response),
+                None
+            );
+        }
+        let mut unsigned = valid.clone();
+        unsigned.next_state_signature = fixture.clearance_signer.sign(&Felt252::ONE);
+        assert_eq!(
+            fixture.wallet.uninstallable_finalized_charge(&unsigned),
+            None
+        );
+        let mut other_state = valid.clone();
+        other_state.request_nullifier = Felt252::from_u64(3);
+        assert_eq!(
+            fixture.wallet.uninstallable_finalized_charge(&other_state),
+            None
+        );
+        let mut rehashed = valid;
+        rehashed.response_payload = "{}".into();
+        assert_eq!(
+            fixture.wallet.uninstallable_finalized_charge(&rehashed),
+            None
+        );
     }
 }

@@ -108,44 +108,73 @@ jobs:
 
   contracts:
     runs-on: ubuntu-latest
+    env:
+      # The setup whose generated adapter src/adapters/Groth16ProofAdapter.sol must be.
+      # protocol/setup/v2-concession once the ceremony keys land (G-SETUP).
+      ZKAPI_SETUP_DIR: protocol/setup/v2-concession-dev
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      # Pinned: the gas snapshot and the expected codehashes are exact.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
 
-      - name: Forge build
+      # Fails if a contract exceeds the EIP-170 runtime or EIP-3860 initcode limit.
+      - name: Forge build and contract sizes
         working-directory: protocol/contracts
-        run: forge build
+        run: forge build --sizes
 
+      - name: Forge format
+        working-directory: protocol/contracts
+        run: forge fmt --check src test
+
+      # The verifier is never hand-edited: it is the generator's output for the
+      # committed setup, after forge fmt. Its constants are checked against the
+      # setup's manifest.json by Groth16ProofAdapterTest.
+      - name: The adapter is the formatted generator output
+        working-directory: protocol/contracts
+        run: |
+          cp "../../$ZKAPI_SETUP_DIR/Groth16ProofAdapter.sol" "$RUNNER_TEMP/Groth16ProofAdapter.sol"
+          forge fmt "$RUNNER_TEMP/Groth16ProofAdapter.sol"
+          diff -u "$RUNNER_TEMP/Groth16ProofAdapter.sol" src/adapters/Groth16ProofAdapter.sol
+
+      # FORGE_SNAPSHOT_CHECK compares the gas snapshot of the exit entry points
+      # (snapshots/) with the committed one; regenerate it with forge test.
       - name: Forge test
         working-directory: protocol/contracts
+        env:
+          FORGE_SNAPSHOT_CHECK: "true"
         run: forge test -vvv
 
       - name: Build demo deployment script
         working-directory: demo/contracts
         run: forge build
 
-      # forge cannot link Bn254Poseidon through the relative ../../ remapping
-      # (see demo/contracts/foundry.toml), so the simulation passes a canonical
-      # absolute zkapi-contracts/ remapping. No RPC: a local chain-31337 dry run
-      # with the public Anvil development key.
-      - name: Simulate the demo deployment script
+      # No RPC: a local chain-31337 dry run with the public Anvil development
+      # key. The script links Bn254Poseidon itself and checks the adapter
+      # against the setup manifest and the vault's getters against its inputs;
+      # the expected codehashes are then recomputed from both projects'
+      # artifacts (the compiler settings match, so they agree).
+      - name: Simulate the demo deployment script and check its codehashes
         working-directory: demo/contracts
         run: |
           mkdir -p ../../.demo
-          FOUNDRY_REMAPPINGS="zkapi-contracts/=$(cd ../../protocol/contracts/src && pwd -P)/" \
-            PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+          PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
             OUTPUT_PATH="$PWD/../../.demo/deployment.json" \
+            SETUP_MANIFEST="../../$ZKAPI_SETUP_DIR/manifest.json" \
             STATE_SIGNING_KEY_X=11 STATE_SIGNING_KEY_Y=12 CLEARANCE_SIGNING_KEY_X=13 CLEARANCE_SIGNING_KEY_Y=14 \
             forge script script/Deploy.s.sol
-          node -e 'const m = require(process.argv[1]); if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400) { console.error(m); process.exit(1); }' "$PWD/../../.demo/deployment.json"
+          node -e 'const m = require(process.argv[1]); if (m.chainId !== 31337 || !/^0x[0-9a-fA-F]{40}$/.test(m.vault) || !/^0x[0-9a-fA-F]{40}$/.test(m.poseidonLibrary) || m.treasuryChangeDelay !== 172800 || m.rootHistoryWindow !== 86400 || m.maxPauseDuration !== 604800 || m.concessionEscapeVersion !== 1 || m.vaultRevision !== 3 || m.circuitId !== "zkapi-v2-concession-v1" || !/^0x[0-9a-f]{64}$/.test(m.vaultRuntimeCodehash)) { console.error(m); process.exit(1); }' "$PWD/../../.demo/deployment.json"
+          node ../../scripts/expected-codehashes.mjs --artifacts out --deployment ../../.demo/deployment.json --check
+          node ../../scripts/expected-codehashes.mjs --artifacts ../../protocol/contracts/out --deployment ../../.demo/deployment.json --check
 
       - name: Test challenge signer against Anvil
         run: |

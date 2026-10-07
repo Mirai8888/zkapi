@@ -17,8 +17,9 @@
 // mismatch exits 1. Prints JSON; integers wider than 2^53 - 1 print as decimal strings.
 //
 // Integers are read exactly. Deploy.s.sol writes the signing-key coordinates as decimal strings and
-// every other number below 2^53; a wider bare JSON number in a manifest from elsewhere is read
-// from its source text, never rounded, and a number that is not an integer literal is refused.
+// every other number below 2^53. A wider bare JSON number in a manifest from elsewhere is read
+// from its source text, never rounded; a number that is neither a safe integer nor an integer
+// literal (a wide fraction or exponent form) is refused.
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

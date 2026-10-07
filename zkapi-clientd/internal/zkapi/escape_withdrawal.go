@@ -59,15 +59,31 @@ type escapePlan struct {
 }
 
 // escapeChainStatus is the companion's /oa/v1/withdraw/escape/status answer.
+// Trusted marks a reading through the owner's exit RPC; without one every
+// reading is the pinned RPC's, which the operator may run (design §2.1).
 type escapeChainStatus struct {
 	Phase             string `json:"phase"`
 	Payout            string `json:"payout"`
 	Conceded          string `json:"conceded"`
 	ChallengeDeadline uint64 `json:"challenge_deadline"`
 	Error             string `json:"error"`
+	Trusted           bool   `json:"trusted"`
 	Record            *struct {
 		StartBlock uint64 `json:"start_block"`
 	} `json:"record"`
+}
+
+// escapeChain reads the companion's view of the saved escape on chain.
+func (h *FundingHandler) escapeChain(ctx context.Context) (escapeChainStatus, error) {
+	var chain escapeChainStatus
+	raw, err := h.client.request(ctx, http.MethodGet, "/oa/v1/withdraw/escape/status", nil)
+	if err != nil {
+		return chain, err
+	}
+	if json.Unmarshal(raw, &chain) != nil {
+		return chain, errors.New("invalid escape status from the companion")
+	}
+	return chain, nil
 }
 
 func parseUnits(value string) (uint64, error) {
@@ -262,10 +278,10 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		return update(), errors.New("unexpected pending payment during an escape; preserve recovery files")
 	}
 	switch w.Phase {
-	case "escape_initiated":
+	case "escape_initiated", "defeated":
+		// A defeat is never final on one reading: it is asked again on
+		// every run, through the exit RPC once one is configured.
 		return h.finalizeEscape(ctx, config, record, update)
-	case "defeated":
-		return update(), &Error{http.StatusConflict, "device_not_newest"}
 	}
 	// No escape transaction is live: decide, or prove and sign.
 	body := map[string]any{"destination": destination}
@@ -368,7 +384,10 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 // whose ownership proof was sent), and the saved escape decision is
 // cleared. It is refused once an escape transaction is signed, and by the
 // companion while a released proof may still land; that lock is released
-// only when the proof is dead or the note closes.
+// only when the proof is dead or the note closes. A defeated escape is
+// cleared too, once the chain (read again now) shows it neither pending
+// nor closed: it can pay nothing, and its record would otherwise block
+// every later exit of the note.
 func (h *FundingHandler) CancelAddressEscape(ctx context.Context) (AddressWithdrawalStatus, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -382,8 +401,16 @@ func (h *FundingHandler) CancelAddressEscape(ctx context.Context) (AddressWithdr
 	}
 	if w != nil && w.Mode == "escape" {
 		switch w.Phase {
-		case "escape_pending", "escape_initiated", "finalize_pending", "complete", "defeated":
+		case "escape_pending", "escape_initiated", "finalize_pending", "complete":
 			return status, errors.New("this escape is on chain; it cannot be cancelled")
+		case "defeated":
+			chain, err := h.escapeChain(ctx)
+			if err != nil {
+				return status, err
+			}
+			if chain.Phase == "pending" || chain.Phase == "closed" {
+				return status, errors.New("this escape is on chain; it cannot be cancelled")
+			}
 		}
 	}
 	if _, err := h.client.request(ctx, http.MethodPost, "/oa/v1/withdraw/escape/cancel", []byte("{}")); err != nil {
@@ -582,19 +609,18 @@ func (h *FundingHandler) followEscapeTransaction(ctx context.Context, config fun
 }
 
 // finalizeEscape signs finalizeEscapeWithdrawal once the challenge period
-// passed, or adopts the finalization someone else made.
+// passed, or adopts the finalization someone else made. It also follows a
+// saved defeat: one reading (through the pinned RPC, say) never makes it
+// final, so a defeat the chain no longer shows gives way to what it shows.
 func (h *FundingHandler) finalizeEscape(ctx context.Context, config fundingConfig, record *addressFundingRecord, update func() AddressWithdrawalStatus) (AddressWithdrawalStatus, error) {
 	w := record.Withdrawal
-	raw, err := h.client.request(ctx, http.MethodGet, "/oa/v1/withdraw/escape/status", nil)
+	chain, err := h.escapeChain(ctx)
 	if err != nil {
 		return update(), err
 	}
-	var chain escapeChainStatus
-	if json.Unmarshal(raw, &chain) != nil {
-		return update(), errors.New("invalid escape status from the companion")
-	}
 	switch chain.Phase {
 	case "pending":
+		w.Phase = "escape_initiated"
 		w.Deadline = chain.ChallengeDeadline
 		if payout, err := parseUnits(chain.Payout); err == nil {
 			w.Payout = payout
@@ -630,7 +656,23 @@ func (h *FundingHandler) finalizeEscape(ctx context.Context, config fundingConfi
 		if err := h.saveAddress(record); err != nil {
 			return update(), err
 		}
-		return update(), &Error{http.StatusConflict, "device_not_newest"}
+		next := update()
+		if !chain.Trusted {
+			next.Message += " This reading came through the pinned RPC, which the operator may run: it is asked again on every run, and with your own RPC set (zkapi-clientd config --exit-rpc-url URL) the escape's state is read from that RPC instead."
+		}
+		return next, &Error{http.StatusConflict, "device_not_newest"}
+	case "expired":
+		// The companion released the escape's lock: through the owner's exit
+		// RPC, the note is Active at a finalized block with no pending exit
+		// and no defeat, and the proof is dead. The escape a receipt (or a
+		// defeat) once showed is not on chain; it is decided and proved
+		// again. A pinned-RPC reading leaves the record as it is.
+		if chain.Trusted {
+			w.Phase, w.Binding = "escape_expired", ""
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+		}
 	}
 	return update(), nil
 }
@@ -855,5 +897,13 @@ func escapeStatus(status AddressWithdrawalStatus, record *addressFundingRecord, 
 	}
 	setEscapePayoutCredit(&status, w, config)
 	setWithdrawalMessage(&status)
+	if w.Mode == "escape" && config.ExitRPC == "" && status.Phase != "complete" {
+		status.Message += " " + noExitRPCWarning
+	}
 	return status
 }
+
+// noExitRPCWarning is added to every open escape's status while no exit RPC
+// is configured (design §6.4 E6, §6.7): the pinned RPC then answers every
+// chain reading the escape depends on.
+const noExitRPCWarning = "No exit RPC is set: the pinned RPC, which the operator may run or influence, then sends this escape and reports its state (when its lock is released, whether it landed, whether it was defeated). Set your own Ethereum RPC first with zkapi-clientd config --exit-rpc-url URL."

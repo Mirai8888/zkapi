@@ -454,7 +454,7 @@ func setEscapeMessage(status *AddressWithdrawalStatus) {
 	case "escape_expired":
 		status.Message = "The signed escape transaction never reached a block and can no longer be included (its proof expired, or its nonce was taken or skipped); nothing was paid. Rerun the same command to review a fresh escape: it is proved and signed again."
 	case "defeated":
-		status.Message = "device_not_newest: the escape was defeated with a request from a newer state of this note; another device or backup holds that state. Restore the newest backup."
+		status.Message = "device_not_newest: the chain shows this escape defeated with a request from a newer state of this note; another device or backup holds that state. Exit from the newest state: restore the newest backup, or run zkapi-walletd exit-kit escape with the newest exit kit. Every rerun of zkapi-clientd withdraw --escape reads the chain again, and zkapi-clientd withdraw --escape --cancel clears this record once the chain shows the escape neither pending nor closed."
 	case "complete":
 		status.Message = fmt.Sprintf("The escape finalized and paid %s; the private note is closed.", payout)
 		if status.ConcessionExceededBound {

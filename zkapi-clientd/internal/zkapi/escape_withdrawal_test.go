@@ -171,6 +171,8 @@ type escapeCompanion struct {
 	submitted       []string
 	finalized       []string
 	chainPhase      string
+	trusted         bool
+	statuses        int
 	deadline        uint64
 	payout          uint64
 	prepares        []map[string]any
@@ -202,7 +204,8 @@ func (e *escapeCompanion) serve(t *testing.T, r *http.Request, w *withdrawalFixt
 		e.submitted = append(e.submitted, fmt.Sprint(body["transaction_hash"]))
 		return withdrawalJSONResponse(r, 200, map[string]any{"status": "submitted"})
 	case "/oa/v1/withdraw/escape/status":
-		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout)})
+		e.statuses++
+		return withdrawalJSONResponse(r, 200, map[string]any{"phase": e.chainPhase, "challenge_deadline": e.deadline, "payout": fmt.Sprint(e.payout), "trusted": e.trusted})
 	case "/oa/v1/withdraw/escape/cancel":
 		e.cancels++
 		return withdrawalJSONResponse(r, 200, map[string]any{"status": "cancelled"})
@@ -830,7 +833,7 @@ func TestAStuckEscapeIsRetiredAndSignedAgain(t *testing.T) {
 // proof. An escape on chain is refused and kept, even with no transaction
 // pending: a complete one whose payout the vault credited (dropping it would
 // lose the credit's claim, which only retiring the record keeps), and a
-// defeated one (its device_not_newest record).
+// defeated one the chain (read again) shows pending after all.
 func TestAnEscapeOnChainIsNeverCancelled(t *testing.T) {
 	ctx := context.Background()
 	refused := func(t *testing.T, f *withdrawalFixture) {
@@ -869,8 +872,94 @@ func TestAnEscapeOnChainIsNeverCancelled(t *testing.T) {
 		if err == nil || status.Phase != "defeated" || f.journal(t).Pending != nil {
 			t.Fatalf("not a defeated escape: %+v %v", status, err)
 		}
+		// The defeat was one reading; the chain read again shows the
+		// escape pending, so it is on chain and kept.
+		f.escape.chainPhase = "pending"
 		refused(t, f)
 	})
+}
+
+// Design §6.4 E5 and E6, §2.1: one reading that an escape was defeated
+// (without an exit RPC, the pinned RPC's, which the operator may run) is
+// never final. Every rerun asks the companion again; once the chain, read
+// through the owner's exit RPC configured afterwards, shows the escape
+// pending, clientd follows it and finalizes it. A defeat the chain keeps
+// showing stays a device_not_newest record the owner can clear.
+func TestADefeatIsReadAgainAndNeverFinalOnOneReading(t *testing.T) {
+	ctx := context.Background()
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "defeated"}
+	initiate := f.signEscape(t)
+	f.mine(t, initiate.Hash().Hex(), false)
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if !isDeviceNotNewest(err) || status.Phase != "defeated" || !strings.Contains(status.Message, "pinned RPC") || !strings.Contains(status.Message, "exit-kit escape") {
+		t.Fatalf("no untrusted defeat: %+v %v", status, err)
+	}
+	asked := f.escape.statuses
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if !isDeviceNotNewest(err) || f.escape.statuses != asked+1 {
+		t.Fatalf("a saved defeat was not read again: %+v %v (%d readings)", status, err, f.escape.statuses)
+	}
+	// The truth, through the owner's own RPC: the escape is pending.
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	f.escape.chainPhase, f.escape.trusted, f.escape.deadline, f.escape.payout = "pending", true, uint64(time.Now().Unix())-1, 99999
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_initiated" || f.journal(t).Withdrawal.Phase != "escape_initiated" {
+		t.Fatalf("the pending escape was not followed: %+v %v", status, err)
+	}
+	quote, err := f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || quote.Kind != "escape_finalize" {
+		t.Fatalf("no finalization quote: %+v %v", quote, err)
+	}
+
+	// A defeat the chain keeps showing, through the exit RPC: kept until the
+	// owner clears it, which the chain then allows.
+	f = newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "defeated", trusted: true}
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	initiate = f.signEscape(t)
+	f.mine(t, initiate.Hash().Hex(), false)
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if !isDeviceNotNewest(err) || status.Phase != "defeated" || strings.Contains(status.Message, "pinned RPC") {
+		t.Fatalf("no trusted defeat: %+v %v", status, err)
+	}
+	if status, err := f.h.CancelAddressEscape(ctx); err != nil || status.Phase != "cancelled" || f.escape.cancels != 1 {
+		t.Fatalf("a defeated escape was not cleared: %+v %v", status, err)
+	}
+	if record := f.journal(t); record.Withdrawal != nil || record.Phase != "active" {
+		t.Fatalf("the defeated record was kept: %+v", record)
+	}
+}
+
+// An escape whose initiation receipt Go followed but which the chain, read
+// through the owner's exit RPC, shows never landed (the companion released
+// its dead lock: "expired") is decided and proved again; the same reading
+// through the pinned RPC changes nothing.
+func TestAnEscapeTheExitRPCShowsNeverLandedIsDecidedAgain(t *testing.T) {
+	ctx := context.Background()
+	f := newWithdrawalFixture(t, true)
+	f.escape = &escapeCompanion{conceded: 0, bound: 0, chainPhase: "expired"}
+	initiate := f.signEscape(t)
+	f.mine(t, initiate.Hash().Hex(), false)
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_initiated" || !strings.Contains(status.Message, "No exit RPC is set") {
+		t.Fatalf("a pinned-RPC reading moved the escape: %+v %v", status, err)
+	}
+	f.h.client.config.ExitRPCURL = f.exitRPC
+	f.escape.trusted = true
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_expired" || strings.Contains(status.Message, "No exit RPC is set") {
+		t.Fatalf("the escape was not decided again: %+v %v", status, err)
+	}
+	prepares := len(f.escape.prepares)
+	if status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_decision" || len(f.escape.prepares) != prepares+1 {
+		t.Fatalf("no fresh decision: %+v %v", status, err)
+	}
+}
+
+func isDeviceNotNewest(err error) bool {
+	var coded *Error
+	return errors.As(err, &coded) && coded.Code == "device_not_newest"
 }
 
 // httptestTLS serves JSON-RPC answers from answer(method) over the test TLS

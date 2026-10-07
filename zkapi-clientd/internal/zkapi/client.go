@@ -124,7 +124,7 @@ func (e *Error) Error() string {
 	case "conceded_mismatch":
 		return "zkAPI escape: the confirmed concession is not the one the exit rules allow now; review the escape again with zkapi-clientd withdraw --escape --to ADDRESS"
 	case "device_not_newest":
-		return "zkAPI device_not_newest: another device or backup spent the note's current state, so an escape from it would be defeated; restore the newest backup before exiting"
+		return "zkAPI device_not_newest: another device or backup spent the note's current state, so an escape from it would be defeated; exit from the newest state (restore the newest backup, or run zkapi-walletd exit-kit escape with the newest exit kit). Without --exit-rpc-url this was read through the pinned RPC, which the operator may run; zkapi-clientd config --exit-rpc-url URL makes every later reading come from your own RPC"
 	case "exit_locked":
 		return "zkAPI exit in progress: a withdrawal of this note is under way, so no chat request is made; finish it with zkapi-clientd withdraw"
 	case "note_near_expiry":

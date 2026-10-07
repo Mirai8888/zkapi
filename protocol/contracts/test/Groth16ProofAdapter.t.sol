@@ -24,11 +24,12 @@ contract Groth16ProofAdapterTest is Test {
     }
 
     /// The identity constants equal the committed setup's manifest.json: the circuit ID hash and
-    /// the keccak256 of each verifying key without its header. ZKAPI_SETUP_DIR (repository
-    /// relative, as CI sets it) selects the setup; the default is the development setup.
+    /// the keccak256 of each verifying key without its header. ZKAPI_SETUP_DIR selects the setup
+    /// as WP-A's proof tests read it (absolute, or relative to protocol/rust, where the setup
+    /// READMEs run their commands: ZKAPI_SETUP_DIR=../setup/v2-concession); the default is the
+    /// development setup. The directory must lie under protocol/setup (fs_permissions).
     function test_identityConstantsEqualTheSetupManifest() public view {
-        string memory setupDir = vm.envOr("ZKAPI_SETUP_DIR", string("protocol/setup/v2-concession-dev"));
-        string memory manifest = vm.readFile(string.concat("../../", setupDir, "/manifest.json"));
+        string memory manifest = _readSetupManifest(setupDir());
         assertEq(vm.parseJsonString(manifest, ".circuit_id"), CIRCUIT_ID);
         assertEq(vm.parseJsonString(manifest, ".setup_id"), vm.parseJsonString(fixtures, ".setup_id"));
         assertEq(adapter.CIRCUIT_ID_HASH(), keccak256(bytes(CIRCUIT_ID)));
@@ -117,6 +118,49 @@ contract Groth16ProofAdapterTest is Test {
         }
         vm.expectRevert(Errors.InvalidProof.selector);
         adapter.assertValidWithdrawal(inputs, outOfField);
+    }
+
+    /// ZKAPI_SETUP_DIR resolved by setupPath.
+    function setupDir() public view returns (string memory) {
+        return setupPath(vm.envOr("ZKAPI_SETUP_DIR", string("")));
+    }
+
+    function _readSetupManifest(string memory dir) private view returns (string memory) {
+        string memory path = string.concat(dir, "/manifest.json");
+        try vm.readFile(path) returns (string memory manifest) {
+            return manifest;
+        } catch {
+            revert(
+                string.concat(
+                    "cannot read ",
+                    path,
+                    ": ZKAPI_SETUP_DIR is absolute or relative to protocol/rust (../setup/<name>), under protocol/setup"
+                )
+            );
+        }
+    }
+
+    /// A setup directory named as zkapi-proof's tests/common/mod.rs reads ZKAPI_SETUP_DIR: an
+    /// absolute path as is, a relative one against protocol/rust (a sibling of this project, so
+    /// ../setup/... names the same directory from either); empty, the development setup.
+    function setupPath(string memory dir) public view returns (string memory) {
+        if (bytes(dir).length == 0) return string.concat(vm.projectRoot(), "/../setup/v2-concession-dev");
+        if (bytes(dir)[0] == "/") return dir;
+        return string.concat(vm.projectRoot(), "/../rust/", dir);
+    }
+
+    /// The path rules, for the forms WP-A's runbooks use and the absolute form CI uses; each reads
+    /// the same manifest.
+    function test_setupPathFollowsTheProofTestsPathRules() public view {
+        string memory root = vm.projectRoot();
+        string memory dev = string.concat(root, "/../setup/v2-concession-dev");
+        string memory expected = vm.readFile(string.concat(dev, "/manifest.json"));
+        assertEq(setupPath(""), dev);
+        assertEq(setupPath(dev), dev);
+        assertEq(setupPath("../setup/v2-concession-dev"), string.concat(root, "/../rust/../setup/v2-concession-dev"));
+        assertEq(setupPath("../setup/v2-concession"), string.concat(root, "/../rust/../setup/v2-concession"));
+        assertEq(vm.readFile(string.concat(setupPath("../setup/v2-concession-dev"), "/manifest.json")), expected);
+        assertEq(vm.readFile(string.concat(setupPath(dev), "/manifest.json")), expected);
     }
 
     function _request(string memory name) private view returns (Types.RequestPublicInputs memory, bytes memory) {

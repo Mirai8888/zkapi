@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: zkAPI v2
-  version: 2.2.0-concession
+  version: 0.2.0
   description: >-
     Native ETH lease, settlement and withdrawal Groth16 protocol API of
     circuit zkapi-v2-concession-v1 (vault revision 3). Sepolia deployments may

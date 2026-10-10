@@ -18,6 +18,10 @@ The protocol is experimental; see
 [the concession exit design](docs/design/concession-exit.md), which lets a
 user withdraw without any cooperation from the operator.
 
+Releases follow [semantic versioning](docs/versioning.md) on major version 0:
+until 1.0.0, any interface may change in any release. See the
+[changelog](CHANGELOG.md).
+
 ## Local OpenAI-compatible API
 
 Use [zkapi-clientd](zkapi-clientd/README.md) to configure an ETH wallet and serve

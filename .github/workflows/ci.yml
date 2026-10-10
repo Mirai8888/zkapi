@@ -24,6 +24,10 @@ jobs:
       - name: Install SDK test dependencies
         run: npm ci
 
+      # VERSION is the single release version (docs/versioning.md).
+      - name: Check that every file carries the release version
+        run: node scripts/version.mjs check
+
       # The gateway test runs the shipped nginx.conf against a live nginx;
       # ZKAPI_REQUIRE_NGINX=1 fails it instead of skipping it without one.
       - name: Install nginx for the gateway test

@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "num-bigint",
  "rand 0.8.5",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "reqwest",
@@ -3350,7 +3350,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-companion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3385,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-indexerd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-proof"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-serverd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "zkapi-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

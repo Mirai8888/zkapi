@@ -3,6 +3,8 @@
 > **Status:** design and migration plan for circuit `zkapi-v2-concession-v1` (vault revision 3). Implemented with the `dev` setup in `protocol/setup/v2-concession-dev`; no revision-3 vault is deployed, and the packaged profiles are `not_deployed` placeholders. The multi-party setup, external review, Sepolia drill and mainnet rollout in §10 are operational gates, not yet run. Where the implementation differs from this text, [Implementation status](#implementation-status) records it. The operator runbook is [Migrating to the concession-exit vault](../migration-concession-vault.md).
 >
 > **Amendment A1 (any known root).** §4.2 step 6 and §4.5 accept any root the vault ever held, not only the current root or one retired within 1 day. The tree is append-only for every note that is not `Closed` (`retireClosedLeaf` only removes a `Closed` note's leaf), so every root recorded since a note's deposit contains that note's leaf, and `initiateEscapeWithdrawal` and `mutualClose` require `Active`. The vault records every root it sets (`knownRoots[root] = true`, one extra SSTORE per deposit and per retirement), and a client can exit with the Merkle path it saved at deposit, with no indexer and no log rebuild. §6.6's rebuild remains the fallback for a client that has no saved path.
+>
+> **Amendment A2 (the 30-day transition).** §10.7 C5 and E2 to E3 are read with this. The deployed legacy vaults give a note a 30-day life (rounded up to a UTC midnight) and a 24-hour challenge period, and the owner never pauses them, so the drain is bounded by the note life. **Day 0** is the moment the legacy deposit routes close, in the same change window as the new vault's go-live. `N_C = nextNoteId()` read then separates transition notes (ID below `N_C`) from late notes (direct deposits after day 0). **`X` is the expiry of note `N_C - 1`**, before day 31, not Phase C + 30 days: every transition note has expired or exited by `X`, so closing legacy admission at `X` costs no owner who acted in time any service. The legacy stack retires about a day after `X` (about day 32), or, with late notes, when they too are closed or swept (before day 63). A legacy server cannot tell the two kinds of note apart, because a request hides its note ID. The runbook's [30-day transition](../migration-concession-vault.md#the-30-day-transition-for-existing-users) is the schedule.
 
 
 Baseline: repository at `ac9be63`, circuit `zkapi-v2-note-bound-v1`. Every "today" figure comes from the five maps in `scratchpad/circuit`. I computed the selectors and topics below with Foundry `cast` against the exact signatures given; implementers must re-derive them and pin them in tests. This revision answers the red-team findings. The appendix records what was done with each one.
@@ -1070,7 +1072,7 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
   - The legacy build is served at its current `publicPath` from the config-only re-cut (§10.7 E). The new build is served at `/zkapi/v2c/` on the same origin.
   - Both share IndexedDB `zkapi-browser-wallet-v1` version 3 and the lock. `reload()` refuses another deployment's runtime.
   - **Host recipe:**
-    - two package entries: `"zkapi-sdk-legacy": "git+…#legacy-recut-<n>"` and `"zkapi-sdk": "git+…#v2c-<tag>"`;
+    - two package entries: `"zkapi-sdk-legacy": "git+…#v0.1.<n>"` and `"zkapi-sdk": "git+…#v0.2.<n>"`;
     - each package resolves its own relative `../wasm/zkapi_browser.js`;
     - a tiny host loader calls `readBrowserWalletHoldings()` and `import()`s the legacy entry while a legacy runtime holds an open note, and the new entry otherwise.
 
@@ -1144,7 +1146,7 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
    - server `--request-limit-max-usd-micros 6000000`.
 
    The canary protects honest SDK users and bounds the operator's per-request exposure; direct depositors bypass the SDK caps, as documented. In the same release, publish the legacy mainnet re-cut with `deposits: "closed"`.
-5. **Announce the legacy service cutoff `X`** (Phase C + 30 days).
+5. **Announce the legacy service cutoff `X`** (the last transition note's expiry, before Phase C + 31 days; Amendment A2).
 6. **Users.** New users deposit into the new vault. Legacy browser users are routed to the legacy build to close, then deposit. A legacy note with a request in flight waits for settlement; the operator publicly commits to finalizing every legacy lease and to running the legacy challenger.
 
 **Phase D: clientd**
@@ -1158,7 +1160,7 @@ New linkage stays confined to exits, the exiting note and its last request. Clie
 **Phase E: drain and retire the legacy vault**
 1. **Legacy re-cut** (both networks): same WASM, worker and key bytes; new configs with `deposits: "closed"`; regenerated config hashes in `manifest.json` and `sdk-assets.json`; same `publicPath`. A test checks that `browser-config.json` is fetched with `cache: 'no-store'`. Confirm that every host serves this revision.
 2. **From `X`:** legacy serverd runs with `--admission closed`, refusing new requests with `deployment_retiring`. In-flight leases still settle, clearances for fresh nullifiers stay allowed, and the legacy challenger keeps running.
-3. **Retirement condition:** every legacy note deposited before `X` is `Closed` or past `effectiveExpiry`, and the last challenge deadline has passed. This is bounded by `X + noteTtl + pauses + grace + challengePeriod`.
+3. **Retirement condition:** every legacy note deposited before `X` is `Closed` or past `effectiveExpiry`, and the last challenge deadline has passed. This is bounded by `X + noteTtl + challengePeriod` with late notes, and is about `X + challengePeriod` without them (Amendment A2); `pauses` and `grace` are zero on the deployed vaults.
    - Notes deposited after `X` can only hold genesis, so they need no challenger. They exit at `D` by escape (hosted legacy build or clientd point release) or are swept at expiry.
    - The treasury sweep of stragglers is announced in advance.
 4. Keep the legacy SDK bytes and keys hosted until retirement.

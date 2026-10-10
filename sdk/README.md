@@ -792,8 +792,8 @@ Both share IndexedDB `zkapi-browser-wallet-v1` (version 3) and its lock.
 Neither rewrites the other deployment's records, and each runtime refuses a
 runtime slot that holds the other's note. The host lists two package entries,
 `zkapi-sdk-legacy` (the config-only re-cut of `release/v2-note-bound`, tagged
-`legacy-recut-<n>`, whose profiles close deposits) and `zkapi-sdk` (tagged
-`v2c-<tag>`), and each resolves its own WebAssembly, keys and worker. A small
+`v0.1.<n>`, whose profiles close deposits) and `zkapi-sdk` (tagged
+`v0.2.<n>`), and each resolves its own WebAssembly, keys and worker. A small
 loader calls `readBrowserWalletHoldings()` and `import()`s the legacy entry
 while a legacy runtime holds an open note, and this one otherwise; a legacy
 withdrawal still open while the slot is empty also needs the legacy build.

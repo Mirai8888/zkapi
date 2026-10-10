@@ -18,12 +18,13 @@ deployment's note. Neither build rewrites the other deployment's records.
 ## The recipe
 
 1. `package.json` lists the two package entries. Replace the placeholder tags
-   with the published ones (`legacy-recut-<n>` for the config-only re-cut of
-   `release/v2-note-bound`, `v2c-<tag>` for the concession release):
+   with the published ones (`v0.1.<n>` for the config-only re-cut of
+   `release/v2-note-bound`, `v0.2.<n>` for a concession release; see
+   [versioning](../../docs/versioning.md)):
 
    ```json
-   "zkapi-sdk": "git+https://github.com/ethereum/zkapi.git#v2c-<tag>",
-   "zkapi-sdk-legacy": "git+https://github.com/ethereum/zkapi.git#legacy-recut-<n>"
+   "zkapi-sdk": "git+https://github.com/ethereum/zkapi.git#v0.2.<n>",
+   "zkapi-sdk-legacy": "git+https://github.com/ethereum/zkapi.git#v0.1.<n>"
    ```
 
 2. `src/loader.mjs` reads `readBrowserWalletHoldings()` and `import()`s the

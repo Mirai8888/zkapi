@@ -11,8 +11,8 @@
     "build": "node build.mjs --out dist"
   },
   "dependencies": {
-    "zkapi-sdk": "git+https://github.com/ethereum/zkapi.git#v2c-1",
-    "zkapi-sdk-legacy": "git+https://github.com/ethereum/zkapi.git#legacy-recut-1"
+    "zkapi-sdk": "git+https://github.com/ethereum/zkapi.git#v0.2.0",
+    "zkapi-sdk-legacy": "git+https://github.com/ethereum/zkapi.git#v0.1.8"
   },
   "devDependencies": {
     "esbuild": "0.27.2"

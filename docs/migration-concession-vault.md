@@ -34,9 +34,9 @@ and deposits into the new one. The migration runs in these phases:
 | [0](#phase-0-harden-the-legacy-stack-in-place) | Upgrade the legacy stack's services in place, from `release/v2-note-bound` | None; do it now |
 | [A](#phase-a-freeze-review-and-trusted-setup) | Freeze the circuits, external review, multi-party setup (G-SETUP), regenerate and publish every pin | All suites green on the revision-3 source |
 | [B](#phase-b-sepolia) | Sepolia drill vault, then production Sepolia, then a 14-day soak | Phase A complete |
-| [C](#phase-c-mainnet) | Mainnet deployment, smoke tests, canary, legacy re-cut, cutoff `X` announced | Phase B soak and drills green; the mainnet gates below |
+| [C](#phase-c-mainnet) | Mainnet deployment, smoke tests, canary, legacy deposits closed (day 0), `X` announced | Phase B soak and drills green; the mainnet gates below |
 | [D](#phase-d-clientd-releases) | The legacy clientd point release 0.1.7, then the new clientd release | 0.1.7 before the new release; the new release after a Sepolia drill |
-| [E](#phase-e-drain-and-retire-the-legacy-vault) | Drain the legacy vault and retire its stack | The retirement condition |
+| [E](#phase-e-drain-and-retire-the-legacy-vault) | Drain the legacy vault over [the 30-day transition](#the-30-day-transition-for-existing-users) and retire its stack | Day 0 (Phase C) |
 
 Phases B to D overlap: the legacy stack keeps running, unchanged except for
 configuration, until the end of Phase E.
@@ -56,27 +56,173 @@ configuration, until the end of Phase E.
 - the daemons start in order, with the challenger healthy before the first
   deposit;
 - the canary is configured (the SDK caps and the server's lease ceiling);
-- the legacy re-cut is published and the cutoff `X` announced.
+- the legacy deposit routes are ready to close, the legacy re-cut is ready to publish, and day 0 and the cutoff `X` are announced at least 14 days ahead
+  ([the 30-day transition](#the-30-day-transition-for-existing-users)).
 
 ## Compatibility
 
 | Component | Legacy vault (`zkapi-v2-note-bound-v1`) | Concession vault (revision 3, `zkapi-v2-concession-v1`) |
 | --- | --- | --- |
-| Legacy browser SDK re-cut (existing `publicPath`, `/zkapi/`) | Requests and exits; deposits closed | Refused (`incompatible_proof_circuit`) |
-| Browser SDK from `main` (`/zkapi/v2c/`) | Refused (circuit mismatch) | Supported |
+| Legacy browser SDK re-cut (`v0.1.x`, existing `publicPath`, `/zkapi/`) | Requests and exits; deposits closed | Refused (`incompatible_proof_circuit`) |
+| Browser SDK from `main` (`0.2.x`, `/zkapi/v2c/`) | Refused (circuit mismatch) | Supported |
 | zkapi-clientd 0.1.7 (`release/v2-note-bound`) | Supported; deposits closed; mutual close and a fresh-state escape | Refused (pins) |
-| zkapi-clientd from `main` (`bridge_version` 5) | Warns and names the 0.1.7 release; never opens that wallet | Supported |
+| zkapi-clientd from `main` (`0.2.x`, `bridge_version` 5) | Warns and names the 0.1.7 release; never opens that wallet | Supported |
 | zkapi-clientd 0.1.6 and earlier | Supported, with the earlier releases' risks; no escape | Refused |
-| Legacy stack (serverd, indexer, challenger from `release/v2-note-bound`) | Supported | Refused (`deployment_binding`, circuit) |
-| New stack (from `main`) | Refused | Supported |
+| Legacy stack (`0.1.x`: serverd, indexer, challenger from `release/v2-note-bound`) | Supported | Refused (`deployment_binding`, circuit) |
+| New stack (`0.2.x`, from `main`) | Refused | Supported |
 | Request JSON (`ApiRequestV2`) | Same schema; legacy keys | Same schema; new keys |
 | Withdrawal and clearance wire | `WithdrawalPublicInputsV2` (14 fields) | `WithdrawalPublicInputsV2C` (16 fields), `deny_unknown_fields` |
 | Challenge calldata | `0x8a43467c`, evidence at `N`, with siblings | Defeat `0xda0ce43d`, evidence at `N⁺`, no siblings; raise `0xdd0064ba` |
 | Proving keys and WebAssembly | `protocol/setup/v2` | `protocol/setup/v2-concession` (`mpc-1`), new key URLs |
 
+Release versions follow [the versioning policy](versioning.md): `0.1.x` is
+the legacy line and `0.2.x` the concession line, and components of different
+lines refuse each other.
+
 The two stacks never share a database, indexer checkpoint, challenge
 checkpoint, signer key, sender, hostname or gateway image tag. Each vault has
 its own stack until the legacy one retires.
+
+## The 30-day transition for existing users
+
+The legacy vaults give every note a 30-day life, so the migration is bounded by
+it: **close legacy deposits on the day the new vault goes live (day 0), and
+every note that exists on that day has expired or exited before day 31.** The
+legacy stack keeps serving those notes, unchanged, until then. This section is
+the schedule. The phases below hold the commands.
+
+### What the deployed vaults do
+
+Both legacy vaults (Mainnet and Sepolia) have `noteTtl` 2,592,000 s (30 days)
+and `challengePeriod` 86,400 s (24 hours).
+
+- **Expiry.** A note expires `noteTtl` after its deposit, rounded up to the
+  next UTC midnight. A note deposited on day 0 therefore expires before day 31.
+- **The sweep.** From its expiry anyone can call `claimExpired`, which pays the
+  note's whole deposit to the treasury. There is no grace and no challenge
+  wait, and the owner never pauses the vault (Phase 0, step 8), so the date is
+  exact. A note that has left `Active` first, closed or with an escape
+  pending, cannot be swept. **An owner must close the note, or start an
+  escape, before its expiry.** A started escape finalizes 24 hours later.
+- **Exits need the live root.** `mutualClose` and `initiateEscapeWithdrawal`
+  revert with `StaleRoot` if a deposit, close or sweep lands between the proof
+  and the transaction. Clients re-prove and retry, and a retry succeeds unless
+  another transaction moved the root first.
+
+### Terms
+
+- **Day 0** is the moment the legacy deposit routes close at the gateway
+  (Phase E, step 1). It is the same hour as the new vault's go-live.
+- **`N_C`** is `nextNoteId()` read right after that. A note with an ID below
+  `N_C` is a **transition note**. A note with an ID of at least `N_C` is a
+  **late note**: a direct deposit that bypassed every official client.
+- **`E_last`** is the expiry of note `N_C - 1`. Expiry never decreases with
+  the note ID, so this is the last transition note's expiry, before day 31.
+- **`X`**, the moment legacy admission closes, is `E_last`.
+
+```sh
+# Day 0, right after the deposit routes close:
+N_C=$(cast call --json "$VAULT" 'nextNoteId()(uint32)' --rpc-url "$RPC_URL" | jq -r '.[0]')
+E_LAST=$(cast call --json "$VAULT" 'notes(uint32)(bytes32,uint128,uint64,uint8)' "$((N_C - 1))" --rpc-url "$RPC_URL" | jq -r '.[2]')
+echo "N_C=$N_C X=E_last=$E_LAST ($(date -u -d "@$E_LAST"))"
+```
+
+Publish `N_C` and `X`.
+
+### Schedule
+
+| When | Operator | Owners and hosts |
+| --- | --- | --- |
+| Before day 0 (from Phase B) | Finish Phase 0 and ship `zkapi-clientd` 0.1.7 ([Phase D](#phase-d-clientd-releases)). Prepare the two gateway changes of Phase E (deposit routes, then leases) and test them on a staging copy. Publish day 0, the rules below and the sweep policy at least 14 days ahead. Run the rehearsal below | Hosts deploy the two-build loader ([Side-by-side browser builds](#side-by-side-browser-builds)) and their banners |
+| Day 0 | Phase C, steps 1 to 4, then close the deposit routes and publish the legacy re-cut with `"deposits": "closed"` (Phase E, step 1). Record `N_C` and `X` | New deposits go to the new build. A legacy owner is routed to the legacy build |
+| Days 1 to `X` | Legacy chat, close and escape stay open for every note. Monitor daily (Phase E, step 3). Decide about legacy clearance on days 14 and 21 (Phase E, step 5). Clients retry `StaleRoot` reverts by themselves | Owners close when they choose, then deposit into the new vault. Hosts show each owner a "close by" date (below) and remind at 7, 3 and 1 days before it |
+| `X` | Close legacy admission at the gateway (Phase E, step 2). Every transition note has now expired or exited, so no owner who acted loses service | Chat on the legacy build ends |
+| `X` + 1 day | Finalize every escape that is past its deadline (Phase E, step 3). Sweep expired transition notes by the announced policy | |
+| After that | Retire the stack when the retirement condition holds (Phase E, step 6) | |
+
+Retirement is therefore about day 32 for the transition notes. Day 31 is the
+latest `X` and the 24-hour challenge period follows it.
+
+### Rules for the window
+
+- **Each owner has their own deadline**, the note's expiry, and the wallet
+  holds it (`expiry_ts`). Hosts show a **close by** date three days before it
+  (72 hours: a request in flight needs its settlement, a transaction can
+  revert on a moving root, and an owner may not be at their device). Reminders
+  are broadcast; the operator cannot tell who holds a note.
+- **Spread the move.** Every close and escape changes the vault's root, and
+  the next one in line must re-prove against it. Do not announce "everyone
+  move today". Announce each owner's own date and let the expiries stagger the
+  load. If owners report `StaleRoot` reverts (they show as failed
+  transactions on the vault), tell them to retry later and not to wait for
+  the last day.
+- **Service continues.** Admission stays open to every note until `X`, because
+  the legacy server cannot tell a transition note from a late note (a request
+  hides its note ID). Do not close it earlier than `X` without a notice of at
+  least 7 days.
+- **Old clients keep working while they can.** `zkapi-clientd` 0.1.6 and
+  earlier have no escape and exit only through a mutual close, which needs
+  legacy clearance. Keep legacy clearance on until the Phase E, step 5 gate
+  passes, never switch it off in the last 7 days before `X`, and tell those
+  owners to upgrade to 0.1.7, which keeps their wallet directory.
+- **The sweep policy is announced before day 0.** At `X` the treasury sweeps
+  the expired transition notes that nobody closed. State that, state whether
+  the operator refunds an owner who proves ownership afterwards (for example
+  with an escape-form ownership proof, as the clearance route checks), and
+  state until when. Sweeping at `X` is what lets the challenger retire at
+  about day 32. Waiting instead keeps those owners' escape open and keeps the
+  challenger running for as long as the wait.
+- **A griefer can slow exits.** Anyone can move the root by depositing, at the
+  price of gas and a locked deposit. Nothing on the legacy vault stops that.
+  If exits stall near a deadline, delay the sweep for the affected notes,
+  announce it, and keep the challenger up.
+
+### What an owner does
+
+| Owner | Steps |
+| --- | --- |
+| Browser SDK user | Open the host. The loader picks the legacy build for a legacy note. Withdraw (mutual close; if a request has not settled, wait for it or use the escape). Then deposit in the new build |
+| `zkapi-clientd` 0.1.7 | Withdraw (mutual close), or `withdraw --escape` from a settled state; `zkapi-clientd/docs/LEGACY_ESCAPE.md` has the steps. Then install the new release and fund it |
+| `zkapi-clientd` 0.1.6 or earlier | Install 0.1.7 first; it opens the same wallet directory. Then as above |
+| Anyone else (a direct depositor, a lost device) | The exit kit, or `LEGACY_ESCAPE.md`; the escape is started before the expiry |
+
+### Late notes
+
+A late note can hold service history, because admission is open until `X`, so
+the retirement condition has two parts. Read `nextNoteId()` daily: while it
+equals `N_C`, there are no late notes.
+
+- **None.** Retire when every transition note is `Closed` or swept and the last
+  escape deadline has passed: about day 32.
+- **Some.** Record their IDs and expiries. A late note deposited before `X` may
+  have history, so the challenger runs until each one is closed, or swept, and
+  its last escape deadline has passed: before day 63. A late note deposited after `X` holds only its genesis state and
+  needs no challenger (Phase E, step 6). The operator may instead retire at
+  about day 32 and accept the exposure: a late owner who consumed service and
+  then escaped from an older state is paid more than they should be, by at
+  most the service they consumed.
+
+### Server readiness
+
+Nothing on the legacy line needs new code. For day 0 the legacy services are
+ready when:
+
+| Piece | Ready means |
+| --- | --- |
+| Legacy serverd, indexerd, challenger and signer | Built from `ac9be63` or later (Phase 0), healthy, and running side by side with the new stack under their own database, checkpoints, signer key, sender, hostname and image tag |
+| Legacy challenger | Funded for the whole window and its retries (about 35 days), because it must run until about day 32 |
+| Legacy clearance | On (`ZKAPI_ALLOW_LEGACY_CLEARANCE=true`) until the gate of Phase E, step 5 |
+| Legacy gateway | The deposit-route block is built and tested for day 0, and the lease-route block for `X` (Phase E, steps 1 and 2); each is one new gateway image tag |
+| New stack | Refuses the legacy vault (`deployment_binding`) and never serves a legacy note |
+
+### Rehearsal
+
+Deposit a note on the legacy Sepolia vault at the start of Phase A, 31 days or
+more before Phase C. Run on Sepolia, with that note and the gateway blocks:
+the deposit-route block, a mutual close, an escape with its finalization, the
+lease-route block, the sweep at expiry and the refund policy. The Sepolia
+vault has the same 30-day note life, so this is the one rehearsal of the expiry
+and the sweep.
 
 ## Before you start
 
@@ -626,9 +772,14 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
    bypass them. Build with `node scripts/sync-sdk-assets.mjs --setup mpc-1 --network mainnet`,
    `npm run verify:assets` and `npm run build:mainnet`, which refuses
    anything but an `mpc-1` bundle. In the same host release, publish the
-   legacy mainnet re-cut with `"deposits": "closed"`.
-5. **Announce the legacy cutoff `X`** (Phase C + 30 days), and the treasury
-   sweep of legacy stragglers that Phase E describes.
+   legacy mainnet re-cut with `"deposits": "closed"` and close the legacy
+   deposit routes at the gateway (Phase E, step 1). That moment is **day 0**
+   of [the 30-day transition](#the-30-day-transition-for-existing-users):
+   record `N_C` and `X` as described there.
+5. **Announce day 0, the legacy cutoff `X`** (the last transition note's
+   expiry, before day 31) **and the sweep policy** at least 14 days before
+   day 0, and repeat them at day 0. Each owner's own deadline is their note's
+   expiry.
 6. **Users.** New users deposit into the new vault. Browser users with a
    legacy note are routed to the legacy build to close it, then deposit.
    A legacy note with a request in flight waits for its settlement: publicly
@@ -664,13 +815,16 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
 
 ## Phase E: drain and retire the legacy vault
 
-1. **Legacy re-cut** for each network, from `release/v2-note-bound`: the same
+1. **Legacy re-cut and deposit routes (day 0).** Do this in the same change
+   window as the new vault's go-live (Phase C, step 4). The re-cut, for each network, from `release/v2-note-bound`: the same
    WebAssembly, worker and key bytes, with only the profiles changed to
    `"deposits": "closed"` in `trusted_deployment` (and
    `"clearance_ownership_proof": "optional"` if not set yet). On that branch,
    regenerate the config hashes (`node scripts/sync-sdk-assets.mjs`), check
    them (`npm run verify:assets`), build (`npm run build:browser`,
-   `npm run build:mainnet`), and tag it `legacy-recut-<n>`. It keeps the
+   `npm run build:mainnet`), and tag it with the legacy line's next patch
+   version, `v0.1.<n>` (0.1.7 is the clientd point release; the first re-cut is
+   `v0.1.8`; see [versioning](versioning.md)). It keeps the
    existing `publicPath`. The runtime fetches `browser-config.json` with
    `cache: 'no-store'`, so a host that serves the new file reaches every
    loaded tab; confirm that every host serves this revision. The SDK then
@@ -692,10 +846,13 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
    Put it before `location /v1/tree/` in the `nginx.conf` of the legacy
    checkout, build the legacy gateway under a new legacy `ZKAPI_IMAGE_TAG`,
    and recreate it. Never pause the legacy vault to stop deposits; anyone can
-   still deposit directly, and such notes drain like any other.
-2. **From `X`: close legacy admission at the gateway.** The design closes
-   legacy admission at `X` (`--admission closed`, refusing new requests with
-   `deployment_retiring`). The legacy serverd has no such switch, so the
+   still deposit directly, and such notes drain like any other. Then read
+   `N_C` and `X` as in [the 30-day transition](#the-30-day-transition-for-existing-users)
+   and publish them.
+2. **From `X`: close legacy admission at the gateway.** `X` is the expiry of the
+   last transition note (note `N_C - 1`), before day 31, so no owner who acted
+   in time loses service. The design closes legacy admission at `X`
+   (`--admission closed`, refusing new requests with `deployment_retiring`). The legacy serverd has no such switch, so the
    legacy gateway refuses new requests instead. `POST /v2/openrouter/leases`
    is the only route that admits a request; in the `nginx.conf` of the legacy
    checkout, replace its `location = /v2/openrouter/leases` block with:
@@ -751,7 +908,10 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
    operator does with deposits it claims (for example, a refund on request
    outside the protocol).
 5. **Disable legacy clearance** once the legacy re-cut and 0.1.7 are adopted
-   and owners of older releases were warned: remove
+   and owners of older releases were warned. In the 30-day transition, decide
+   on day 14 and again on day 21, switch it off only if the count below is 0,
+   and never in the last 7 days before `X`: an owner of an older release has no
+   time left to move then. Remove
    `ZKAPI_ALLOW_LEGACY_CLEARANCE` from the legacy `deployment.env`, recreate
    the legacy server, and check that `/health` reports
    `clearance_ownership_proof_required: true` and
@@ -767,10 +927,15 @@ and defeat counters, and the settlement dashboard's `exit_deferred` and
    browser build cannot mutual-close a state whose request proof left the
    device and never settled; such an owner exits after a chat from that state
    settles.
-6. **Retire the legacy stack** when every legacy note deposited before `X` is
-   `Closed` or past its `effectiveExpiry`, and the last challenge deadline
-   has passed: at most `X` + `noteTtl` + pauses + post-challenge grace +
-   `challengePeriod`, with `X` the moment admission closed (step 2). Notes
+6. **Retire the legacy stack** when every transition note (ID below `N_C`) is
+   `Closed` or swept, no late note (ID of at least `N_C`) deposited before `X`
+   is still `Active`, and the last challenge deadline has passed. With no late
+   note that is about day 32: `X` plus the 24-hour `challengePeriod`. With late
+   notes it is at most `X` + `noteTtl` + `challengePeriod`, before day 63
+   (the older form of the bound, `X` + `noteTtl` + pauses + post-challenge
+   grace + `challengePeriod`, has two more terms that are zero on the deployed
+   vaults: the owner never pauses them and they have no grace), with `X` the
+   moment admission closed (step 2). Notes
    deposited after that moment hold only their genesis state, because the
    gateway admitted no request for them, so they need no challenger; they
    exit at their deposit by escape (the legacy build or 0.1.7) or are swept
@@ -790,8 +955,8 @@ same origin. Both share IndexedDB `zkapi-browser-wallet-v1` (version 3) and its
 Web Lock; each runtime refuses a runtime slot holding the other deployment's
 note, and neither rewrites the other's records.
 
-- The host lists two package entries, `zkapi-sdk-legacy` (`#legacy-recut-<n>`)
-  and `zkapi-sdk` (`#v2c-<tag>`); each resolves its own WebAssembly, keys and
+- The host lists two package entries, `zkapi-sdk-legacy` (`#v0.1.<n>`)
+  and `zkapi-sdk` (`#v0.2.<n>`); each resolves its own WebAssembly, keys and
   worker.
 - A small loader calls `readBrowserWalletHoldings()` from the store export and
   `import()`s the legacy entry while a legacy runtime holds an open note, and
@@ -1112,10 +1277,16 @@ refuses them everywhere.
 - **Destinations that reject ETH** lock a legacy escape until they accept.
 - **Root races.** Legacy exits and challenges need siblings at the live root,
   so an unrelated deposit can revert them; the challenger retries with fresh
-  siblings.
+  siblings. During the 30-day transition every close and escape moves the
+  root, and a determined depositor can keep it moving, so a stalled exit near
+  a note's expiry is possible; the answer is the spread-out announcements, the
+  72-hour "close by" margin and the delayed sweep of the transition section.
 - **The legacy clearance budget** is one shared pool while legacy clearance
   is on.
 - **Admission closes at the gateway.** The legacy serverd has no admission
   switch; from `X` the legacy gateway refuses new leases (Phase E, step 2).
   The retirement bound depends on it: a note that could still buy service
-  after `X` would need the legacy challenger until its own expiry.
+  after `X` would need the legacy challenger until its own expiry. A legacy
+  server cannot tell a late note (a direct deposit after day 0) from a
+  transition note, since a request hides its note ID, so admission stays open
+  to both until `X`; late notes are tracked by ID instead.

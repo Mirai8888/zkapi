@@ -144,6 +144,10 @@ async function rpc(funding, method, params, signal) {
         // not an unavailable RPC.
         if (body.error && (Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')))) {
             error.code = 'rpc_call_reverted';
+            // The revert data (a custom error, FailedOp of an EntryPoint dry
+            // run): what a sponsored withdrawal decodes.
+            if (body.error.data != null) error.data = body.error.data;
+            error.rpcMessage = body.error.message || null;
         }
         throw error;
     }
@@ -211,7 +215,10 @@ export function urlRpcRequest(url, { timeoutMs = 20_000, signal = null, fetchImp
         const body = await untilAborted(response.json(), callSignal);
         if (body.error) {
             throw Object.assign(new Error(body.error.message || 'The exit RPC returned an error.'), {
-                code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code
+                code: Number(body.error.code) === 3 || /revert/i.test(String(body.error.message || '')) ? 'rpc_call_reverted' : body.error.code,
+                // The revert data (a custom error, FailedOp of an EntryPoint
+                // dry run): what a sponsored withdrawal decodes.
+                ...(body.error.data != null ? { data: body.error.data } : {})
             });
         }
         return body.result;

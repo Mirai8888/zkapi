@@ -4,8 +4,13 @@
 // and the build-pinned RPC each run them. A mismatch, or a read that fails,
 // refuses deposits with deployment_mismatch; exits never depend on it.
 
-import { ABI } from '../wallet.js';
+import { ABI, GASLESS_ABI } from '../wallet.js';
 import { codehash } from './zkapiKeccak.mjs';
+import {
+    decodeAddressWord, decodeGasPolicy, decodeWord, encodeGetAddress, gaslessPins, sameGasPolicy, transitAccountAddress
+} from './zkapiGasless.mjs';
+
+export { gaslessPins };
 
 // keccak256("zkapi-v2-concession-v1"), the adapter's CIRCUIT_ID_HASH.
 export const CONCESSION_CIRCUIT_ID_HASH = '0xf464f910d858a070b2f88db1049aab19d8fabeed1e527920be90dc0c950b0687';
@@ -119,6 +124,98 @@ export async function verifyDeployment({ request, trusted, chainId, source = 'rp
     await call('REQUEST_VK_HASH', adapter, ABI.REQUEST_VK_HASH, BigInt(pins.request_vk_keccak256));
     await call('WITHDRAWAL_VK_HASH', adapter, ABI.WITHDRAWAL_VK_HASH, BigInt(pins.withdrawal_vk_keccak256));
     return { ok: mismatches.length === 0, source, mismatches };
+}
+
+// ---- gasless withdrawals (design §4.4) ----
+
+/** A fixed (owner, payee) sample whose CREATE2 address the factory must reproduce. */
+export const GASLESS_SAMPLE_OWNER = `0x${'0'.repeat(39)}1`;
+export const GASLESS_SAMPLE_PAYEE = `0x${'0'.repeat(39)}2`;
+
+/**
+ * Compare the gasless contracts with their pins through `request`: the
+ * codehashes of the EntryPoint, the SenderCreator, the paymaster and the
+ * factory; the paymaster's vault, factory, EntryPoint and WEI_PER_UNIT; the
+ * factory's paymaster and account creation code hash; the paymaster's gas
+ * policy against the profile's; and factory.getAddress of a sample tuple
+ * against the local CREATE2. Returns { ok, source, mismatches } like
+ * verifyDeployment. A profile without gasless pins is `ok: false` with a
+ * single `gasless` mismatch. Deposits and wallet-paid exits never depend on it.
+ */
+export async function verifyGaslessDeployment({ request, trusted, chainId, source = 'rpc' }) {
+    let pins;
+    try {
+        pins = gaslessPins(trusted);
+    } catch (error) {
+        return { ok: false, source, mismatches: [{ field: 'gasless', expected: 'valid pins', actual: null, error: error?.message || String(error) }] };
+    }
+    if (!pins) return { ok: false, source, mismatches: [{ field: 'gasless', expected: 'pinned', actual: null }] };
+    const mismatches = [];
+    const read = async (field, operation) => {
+        try {
+            return await operation();
+        } catch (error) {
+            mismatches.push({ field, expected: 'readable', actual: null, error: error?.message || String(error) });
+            return undefined;
+        }
+    };
+    const chain = await read('chain_id', () => request({ method: 'eth_chainId', params: [] }));
+    if (chain !== undefined && BigInt(chain) !== BigInt(chainId)) {
+        mismatches.push({ field: 'chain_id', expected: String(chainId), actual: String(BigInt(chain)) });
+        return { ok: false, source, mismatches };
+    }
+    const code = async (field, address, expected) => {
+        const value = await read(field, () => request({ method: 'eth_getCode', params: [address, 'latest'] }));
+        if (value === undefined) return;
+        const actual = !value || value === '0x' ? null : codehash(value);
+        if (lower(actual) !== lower(expected)) mismatches.push({ field, expected: lower(expected), actual });
+    };
+    const call = async (field, to, selector, decode, expected, data = '') => {
+        const value = await read(field, () => request({ method: 'eth_call', params: [{ to, data: `0x${selector}${data}` }, 'latest'] }));
+        if (value === undefined) return;
+        let actual;
+        try {
+            actual = decode(value);
+        } catch (error) {
+            mismatches.push({ field, expected: String(expected.label ?? ''), actual: value ?? null, error: error?.message || String(error) });
+            return;
+        }
+        if (!expected(actual)) mismatches.push({ field, expected: String(expected.label ?? ''), actual: typeof actual === 'bigint' ? actual.toString() : actual });
+    };
+    const equals = (label, test) => Object.assign(test, { label });
+    const addressEquals = expected => equals(lower(expected), actual => lower(actual) === lower(expected));
+    await code('entry_point_runtime_codehash', pins.entryPoint, pins.entryPointCodehash);
+    await code('sender_creator_runtime_codehash', pins.senderCreator, pins.senderCreatorCodehash);
+    await code('withdrawal_paymaster_runtime_codehash', pins.paymaster, pins.paymasterCodehash);
+    await code('withdrawal_account_factory_runtime_codehash', pins.factory, pins.factoryCodehash);
+    if (pins.implementation && pins.implementationCodehash) {
+        await code('withdrawal_account_implementation_runtime_codehash', pins.implementation, pins.implementationCodehash);
+    }
+    await call('paymaster.vault', pins.paymaster, GASLESS_ABI.vault, decodeAddressWord, addressEquals(trusted.contract_address));
+    await call('paymaster.factory', pins.paymaster, GASLESS_ABI.factory, decodeAddressWord, addressEquals(pins.factory));
+    await call('paymaster.entryPoint', pins.paymaster, GASLESS_ABI.entryPoint, decodeAddressWord, addressEquals(pins.entryPoint));
+    const weiPerUnit = BigInt(trusted.native_asset_wei_per_unit ?? 1_000_000_000);
+    await call('paymaster.WEI_PER_UNIT', pins.paymaster, GASLESS_ABI.WEI_PER_UNIT, decodeWord, equals(weiPerUnit.toString(), actual => actual === weiPerUnit));
+    await call('factory.paymaster', pins.factory, GASLESS_ABI.paymaster, decodeAddressWord, addressEquals(pins.paymaster));
+    await call('factory.accountCreationCodeHash', pins.factory, GASLESS_ABI.accountCreationCodeHash,
+        value => { if (!WORD.test(value || '')) throw new Error('not a word'); return lower(value); },
+        equals(pins.accountCreationCodeKeccak256, actual => actual === pins.accountCreationCodeKeccak256));
+    await call('paymaster.gasPolicy', pins.paymaster, GASLESS_ABI.gasPolicy, decodeGasPolicy,
+        equals('the profile’s gas_policy', actual => sameGasPolicy(actual, pins.gasPolicy)));
+    const sample = transitAccountAddress({
+        factory: pins.factory, creationCodeHex: pins.accountCreationCode, entryPoint: pins.entryPoint, vault: trusted.contract_address,
+        paymaster: pins.paymaster, owner: GASLESS_SAMPLE_OWNER, payee: GASLESS_SAMPLE_PAYEE
+    });
+    await call('factory.getAddress', pins.factory, GASLESS_ABI.getAddress, decodeAddressWord, addressEquals(sample),
+        encodeGetAddress(GASLESS_SAMPLE_OWNER, GASLESS_SAMPLE_PAYEE).slice(10));
+    return { ok: mismatches.length === 0, source, mismatches };
+}
+
+/** The refusal of the gasless path after failed checks: `gasless_unavailable`, with the mismatching fields. */
+export function gaslessDeploymentError(results) {
+    const mismatches = results.flatMap(result => (result.mismatches || []).map(entry => ({ ...entry, source: result.source })));
+    return checkError(`The gasless contracts do not match the deployment this app pins (${mismatches.map(entry => `${entry.source}: ${entry.field}`).join(', ')}). The network fee can only be paid from a wallet.`,
+        'gasless_unavailable', { reason: 'gasless_deployment_mismatch', mismatches });
 }
 
 /** The refusal of a deposit after failed checks. */

@@ -2326,10 +2326,68 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
         delete next.finalizeSubmissionFrom;
         delete next.finalizeSubmissionNonce;
         delete next.finalizeSubmissionError;
+        // A sponsored (gasless) record keeps its transit identity, amounts
+        // and operation hashes; the signed operation bodies go with the
+        // other recovery material (GASLESS_WITHDRAWAL_FIELDS).
+        delete next.finalizeUserOp;
+        delete next.forwardUserOp;
     }
     store.put(next);
     await transactionDone(transaction);
     return next;
+}
+
+/**
+ * The fields a sponsored (gasless, design §3.2) withdrawal adds to the
+ * durable journal. On `runtime.preparedWithdrawal` (the selected plan):
+ * `feePayer: 'payout'`, `payout` (the payout address Y), `transit`
+ * ({ factory, paymaster, entryPoint, account (S), owner, creationCodeKeccak }),
+ * `userOp` (the full unpacked operation incl. its signature), `userOpHash`,
+ * `userOpHashes[]`, `userOpNonce`, `userOpInitCode`, `bundlerUrl`,
+ * `userOpBuiltAt`, `submittedAtBlock`, `userOpSubmittedAt`, `userOpFollowedAt`
+ * (the following client's heartbeat, which keeps its claim live), `userOpAmbiguous`,
+ * `userOpPhase` ('op_built' before the first eth_sendUserOperation,
+ * 'op_submitted' after the bundler answered or timed out; the plan's own
+ * `phase` stays 'awaiting_wallet' until the bundle transaction is known, then
+ * 'submitted' as for a wallet-paid exit), `staleUserOpHashes[]` (the hashes
+ * of operations released before inclusion, kept across a re-proof, with
+ * `staleSubmittedAtBlock`, the earliest block their inclusion is searched
+ * from), and after
+ * the receipt `userOpSuccess`, `chargedWei`, `owedPaidWei`, `receivedWei`,
+ * `paidOutWei`, `paymasterCredited`, `paymasterCreditedWei`,
+ * `initiationDebtWei`. On a `withdrawals[]` record: `feePayer`, `payout`,
+ * `transit`, `userOpHash`, `userOpHashes`, the amounts, `initiationDebtWei`,
+ * `finalizeUserOp`, `finalizeUserOpHash`, `finalizeUserOpHashes[]`,
+ * `finalizeUserOpPhase`, `finalizeUserOpFollowedAt`, `forwardUserOp`, `forwardUserOpHash`,
+ * `forwardUserOpHashes[]`, `forwardUserOpPhase`, `forwardTransactionHash`,
+ * `sweepTransactionHash`, `transitCreateTransactionHash`,
+ * `creditClaimTransactionHash`, `fundsWaitingInTransit`, `transitBalanceWei`.
+ * A paymaster credit uses its own fields (`paymasterCredited`), never the
+ * vault's `payoutCredited`, so the vault's claim flow never acts on it.
+ * Amounts are decimal wei strings.
+ */
+export const GASLESS_WITHDRAWAL_FIELDS = Object.freeze([
+    'feePayer', 'payout', 'transit', 'userOpHash', 'userOpHashes', 'staleUserOpHashes', 'userOpSuccess', 'chargedWei', 'owedPaidWei',
+    'receivedWei', 'paidOutWei', 'paymasterCredited', 'paymasterCreditedWei', 'initiationDebtWei', 'finalizeUserOpHash',
+    'finalizeUserOpHashes', 'finalizeUserOpPhase', 'forwardUserOpHash', 'forwardUserOpHashes', 'forwardUserOpPhase',
+    'forwardTransactionHash', 'sweepTransactionHash', 'transitCreateTransactionHash', 'creditClaimTransactionHash',
+    'fundsWaitingInTransit', 'transitBalanceWei'
+]);
+
+/** Whether a prepared plan or a record pays its network fee from the payout through a transit account. */
+export function isGaslessWithdrawal(value) {
+    return value?.feePayer === 'payout' && /^0x[0-9a-fA-F]{40}$/.test(value?.transit?.account || '');
+}
+
+/** The gasless fields of a plan or record a detached record carries over (none for a wallet-paid one). */
+export function gaslessRecordFields(source) {
+    if (!isGaslessWithdrawal(source)) return {};
+    const fields = {};
+    for (const field of ['feePayer', 'payout', 'transit', 'userOpHash', 'userOpHashes', 'staleUserOpHashes', 'userOpSuccess', 'chargedWei',
+        'owedPaidWei', 'receivedWei', 'paidOutWei', 'paymasterCredited', 'paymasterCreditedWei', 'initiationDebtWei']) {
+        if (source[field] !== undefined) fields[field] = structuredClone(source[field]);
+    }
+    return fields;
 }
 
 const FINALIZATION_TERMINAL_PHASES = new Set(['closed', 'restored', 'parked']);
@@ -2376,7 +2434,10 @@ function matchesFinalizationClaim(record, reference) {
             === String(record.destination || '').toLowerCase());
 }
 
-export async function claimBrowserWithdrawalFinalization(recordId, ownerId) {
+/** The refusal of a finalization claim another client (or tab) still holds. */
+export const FINALIZATION_CLAIM_LIVE_MESSAGE = 'This escape is already awaiting MetaMask in this or another tab.';
+
+export async function claimBrowserWithdrawalFinalization(recordId, ownerId, { takeOver = null } = {}) {
     const database = await openDatabase();
     const transaction = durableTransaction(database, WITHDRAWAL_STORE);
     const store = transaction.objectStore(WITHDRAWAL_STORE);
@@ -2409,8 +2470,33 @@ export async function claimBrowserWithdrawalFinalization(recordId, ownerId) {
         throw new Error('The previous MetaMask request has an unknown result. Check its status, then explicitly retry if the escape is still pending.');
     }
     if (current.finalizeSubmissionId) {
+        // A journaled sponsored finalization (its signed operation is in the
+        // record) is resumed without a prompt: the claim moves to the caller
+        // when `takeOver(record)` says no one follows it any more.
+        if (typeof takeOver === 'function' && current.finalizeUserOp && current.finalizeUserOpHash && takeOver(current)) {
+            const now = Date.now();
+            const next = {
+                ...current,
+                finalizeSubmissionId: crypto.randomUUID(),
+                finalizeSubmissionOwner: ownerId,
+                finalizeSubmissionStartedAt: now,
+                revision: Number(current.revision || 0) + 1,
+                updatedAt: now
+            };
+            store.put(next);
+            await transactionDone(transaction);
+            return {
+                status: 'resumed',
+                transactionHash: null,
+                ...finalizationIdentity(next),
+                submissionId: next.finalizeSubmissionId,
+                operationId: next.finalizeOperationId,
+                generation: Number(next.finalizeGeneration || 0),
+                record: next
+            };
+        }
         transaction.abort();
-        throw new Error('This escape is already awaiting MetaMask in this or another tab.');
+        throw new Error(FINALIZATION_CLAIM_LIVE_MESSAGE);
     }
     const now = Date.now();
     const submissionId = crypto.randomUUID();

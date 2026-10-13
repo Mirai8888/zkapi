@@ -182,3 +182,102 @@ test('canary caps bound each deposit and the vault total while they apply', () =
     assert.equal(canaryRefusal({ limits, depositWei: 1n, vaultBalanceWei: null }).code, 'canary_cap_unverified');
     assert.throws(() => canaryLimits({ canary: { per_note_max_wei: '1.5' } }, 1), { code: 'canary_invalid' });
 });
+
+// ---- gasless withdrawals: the pins of design §4.3 and the checks of §4.4 ----
+
+test('the gasless pins and the deployment check of the EntryPoint, SenderCreator, paymaster and factory', async () => {
+    const { ENTRY_POINT_RUNTIME, FAKE_CODE, SENDER_CREATOR_RUNTIME, VECTORS, create2TransitAccount, gaslessProfileFromVectors } =
+        await import('./helpers/fake-bundler.mjs');
+    const { GASLESS_SAMPLE_OWNER, GASLESS_SAMPLE_PAYEE, gaslessDeploymentError, gaslessPins, verifyGaslessDeployment } =
+        await import('../services/zkapiDeploymentCheck.mjs');
+    const { GASLESS_ABI } = await import('../wallet.js');
+    const gasless = gaslessProfileFromVectors({ spelling: 'profile' });
+    const profile = trusted({ gasless, native_asset_wei_per_unit: '1000000000' });
+    const pins = gaslessPins(profile);
+    assert.equal(pins.paymaster, VECTORS.paymaster);
+    assert.equal(gaslessPins(trusted()), null, 'a profile without the object');
+    assert.equal(gaslessPins(trusted({ gasless: null })), null);
+    const policyWords = (() => {
+        const gp = gasless.gas_policy;
+        return [...gp.call_floor, ...gp.call_cap, gp.postop_floor, gp.postop_cap, gp.verification_floor, gp.verification_floor_init,
+            gp.verification_cap, gp.pvg_floor, gp.pvg_cap, gp.pm_verification_floor, gp.pm_verification_cap, gp.postop_base_gas,
+            gp.postop_escape_gas, gp.postop_finalize_extra_gas, gp.postop_escape_forward_gas, gp.eoa_push_gas, gp.new_account_gas,
+            gp.payout_push_gas, gp.credit_gas, gp.account_call_overhead_gas, gp.account_call_overhead_escape_gas, gp.margin_gas,
+            gp.finalize_reserve_gas, gp.max_attempts].map(value => BigInt(value).toString(16).padStart(64, '0')).join('');
+    })();
+    const sample = create2TransitAccount({ factory: VECTORS.factory, creationCode: VECTORS.account_creation_code, entryPoint: VECTORS.entry_point,
+        vault: VAULT, paymaster: VECTORS.paymaster, owner: GASLESS_SAMPLE_OWNER, payee: GASLESS_SAMPLE_PAYEE });
+    const low = value => String(value).toLowerCase();
+    const addressWord = value => word(BigInt(value));
+    /** The gasless contracts answering their pinned getters, with overrides. */
+    function gaslessChain({ code = {}, getters = {}, chainId = 1 } = {}) {
+        const codes = {
+            [low(VECTORS.entry_point)]: ENTRY_POINT_RUNTIME, [low(VECTORS.sender_creator)]: SENDER_CREATOR_RUNTIME,
+            [low(VECTORS.paymaster)]: FAKE_CODE.paymaster, [low(VECTORS.factory)]: FAKE_CODE.factory,
+            [low(VECTORS.implementation)]: FAKE_CODE.implementation, ...code
+        };
+        const values = {
+            [`${low(VECTORS.paymaster)}:${GASLESS_ABI.vault}`]: addressWord(VAULT),
+            [`${low(VECTORS.paymaster)}:${GASLESS_ABI.factory}`]: addressWord(VECTORS.factory),
+            [`${low(VECTORS.paymaster)}:${GASLESS_ABI.entryPoint}`]: addressWord(VECTORS.entry_point),
+            [`${low(VECTORS.paymaster)}:${GASLESS_ABI.WEI_PER_UNIT}`]: word(1_000_000_000n),
+            [`${low(VECTORS.paymaster)}:${GASLESS_ABI.gasPolicy}`]: `0x${policyWords}`,
+            [`${low(VECTORS.factory)}:${GASLESS_ABI.paymaster}`]: addressWord(VECTORS.paymaster),
+            [`${low(VECTORS.factory)}:${GASLESS_ABI.accountCreationCodeHash}`]: low(VECTORS.account_creation_code_keccak256),
+            [`${low(VECTORS.factory)}:${GASLESS_ABI.getAddress}`]: addressWord(sample),
+            ...getters
+        };
+        const calls = [];
+        const request = async ({ method, params }) => {
+            calls.push(method);
+            if (method === 'eth_chainId') return `0x${chainId.toString(16)}`;
+            if (method === 'eth_getCode') return codes[low(params[0])] ?? '0x';
+            if (method === 'eth_call') {
+                const key = `${low(params[0].to)}:${params[0].data.slice(2, 10)}`;
+                if (!(key in values)) throw Object.assign(new Error('execution reverted'), { code: 3 });
+                return values[key];
+            }
+            throw new Error(`unexpected ${method}`);
+        };
+        return { request, calls };
+    }
+    const ok = await verifyGaslessDeployment({ request: gaslessChain().request, trusted: profile, chainId: 1, source: 'read_rpc' });
+    assert.deepEqual(ok, { ok: true, source: 'read_rpc', mismatches: [] });
+    // The vendored canonical runtimes hash to the pins (identical on every chain).
+    assert.equal(codehash(ENTRY_POINT_RUNTIME), VECTORS.entry_point_codehash);
+    assert.equal(codehash(SENDER_CREATOR_RUNTIME), VECTORS.sender_creator_codehash);
+    const cases = [
+        [{ code: { [low(VECTORS.entry_point)]: '0x6002' } }, ['entry_point_runtime_codehash']],
+        [{ code: { [low(VECTORS.sender_creator)]: '0x' } }, ['sender_creator_runtime_codehash']],
+        [{ code: { [low(VECTORS.paymaster)]: '0x6003' } }, ['withdrawal_paymaster_runtime_codehash']],
+        [{ code: { [low(VECTORS.factory)]: '0x6004' } }, ['withdrawal_account_factory_runtime_codehash']],
+        [{ code: { [low(VECTORS.implementation)]: '0x6005' } }, ['withdrawal_account_implementation_runtime_codehash']],
+        [{ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.vault}`]: addressWord(ADAPTER) } }, ['paymaster.vault']],
+        [{ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.factory}`]: addressWord(ADAPTER) } }, ['paymaster.factory']],
+        [{ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.entryPoint}`]: addressWord(ADAPTER) } }, ['paymaster.entryPoint']],
+        [{ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.WEI_PER_UNIT}`]: word(1n) } }, ['paymaster.WEI_PER_UNIT']],
+        [{ getters: { [`${low(VECTORS.factory)}:${GASLESS_ABI.paymaster}`]: addressWord(ADAPTER) } }, ['factory.paymaster']],
+        [{ getters: { [`${low(VECTORS.factory)}:${GASLESS_ABI.accountCreationCodeHash}`]: `0x${'11'.repeat(32)}` } }, ['factory.accountCreationCodeHash']],
+        [{ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.gasPolicy}`]: `0x${policyWords.slice(0, -1)}2` } }, ['paymaster.gasPolicy']],
+        [{ getters: { [`${low(VECTORS.factory)}:${GASLESS_ABI.getAddress}`]: addressWord(ADAPTER) } }, ['factory.getAddress']]
+    ];
+    for (const [overrides, fields] of cases) {
+        const result = await verifyGaslessDeployment({ request: gaslessChain(overrides).request, trusted: profile, chainId: 1 });
+        assert.equal(result.ok, false, fields.join());
+        assert.deepEqual(result.mismatches.map(entry => entry.field), fields, fields.join());
+    }
+    // A getter the paymaster lacks is a mismatch; another chain stops the check; no pins cannot pass.
+    const missing = gaslessChain({ getters: { [`${low(VECTORS.paymaster)}:${GASLESS_ABI.WEI_PER_UNIT}`]: undefined } });
+    const lacking = await verifyGaslessDeployment({ request: async args => (args.params?.[0]?.data === `0x${GASLESS_ABI.WEI_PER_UNIT}`
+        ? Promise.reject(Object.assign(new Error('execution reverted'), { code: 3 })) : missing.request(args)), trusted: profile, chainId: 1 });
+    assert.deepEqual(lacking.mismatches.map(entry => entry.field), ['paymaster.WEI_PER_UNIT']);
+    const wrong = await verifyGaslessDeployment({ request: gaslessChain({ chainId: 5 }).request, trusted: profile, chainId: 1 });
+    assert.deepEqual(wrong.mismatches.map(entry => entry.field), ['chain_id']);
+    const none = await verifyGaslessDeployment({ request: gaslessChain().request, trusted: trusted(), chainId: 1 });
+    assert.deepEqual(none.mismatches.map(entry => entry.field), ['gasless']);
+    const error = gaslessDeploymentError([wrong]);
+    assert.equal(error.code, 'gasless_unavailable');
+    assert.equal(error.data.reason, 'gasless_deployment_mismatch');
+    assert.match(error.message, /rpc: chain_id/);
+    assert.match(error.message, /only be paid from a wallet/);
+});

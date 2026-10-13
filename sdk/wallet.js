@@ -72,6 +72,127 @@ const ABI = Object.freeze({
   escapePayoutCredits: "91f6e93a",
 });
 
+// The ERC-4337 (EntryPoint v0.7.0) packed user operation, as handleOps and
+// getUserOpHash take it.
+const PACKED_USER_OPERATION_TUPLE = "(address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes)";
+
+// Gasless withdrawals (protocol/contracts/src/gasless): the transit account
+// S, its factory, the withdrawal paymaster P and the canonical EntryPoint.
+// Every selector and topic is derived from the signature beside it
+// (sdk/test/wallet.test.mjs recomputes each one); none belongs to the vault.
+const GASLESS_ABI = Object.freeze({
+  // ---- ZkApiWithdrawalAccount (S) ----
+  // withdraw(bytes): the only sponsored entry point
+  withdraw: "0968f264",
+  // owner()
+  owner: "8da5cb5b",
+  // payee()
+  payee: "ae90b213",
+  // sweep()
+  sweep: "35faa416",
+  // ---- ZkApiWithdrawalAccountFactory ----
+  // createAccount(address,address)
+  createAccount: "133572ba",
+  // getAddress(address,address)
+  getAddress: "5191620b",
+  // accountCreationCodeHash()
+  accountCreationCodeHash: "08a1a807",
+  // accountCreationCode()
+  accountCreationCode: "31c884df",
+  // implementation()
+  implementation: "5c60da1b",
+  // ---- ZkApiWithdrawalPaymaster (P) ----
+  // paymaster() (factory), factory(), entryPoint(), vault(), WEI_PER_UNIT()
+  paymaster: "16e4cbf9",
+  factory: "c45a0155",
+  entryPoint: "b0d691fe",
+  vault: "fbfa77cf",
+  WEI_PER_UNIT: "a3bea703",
+  // policy(): 5 words (maxSponsoredCost, flatFeeWei, minEscapeNetWei, escapesEnabled, sponsorshipPaused)
+  policy: "0505c8c9",
+  maxFeeCeiling: "981df567",
+  priorityFeeCeiling: "c8fcbcdd",
+  // callCap(uint8)
+  callCap: "6e202337",
+  // attempts(bytes32)
+  attempts: "f6829c37",
+  // owed(address)
+  owed: "df18e047",
+  // stranded(address)
+  stranded: "97b69f6a",
+  // escapeNotePlusOne(address)
+  escapeNotePlusOne: "c72bb484",
+  // escapeSponsored(uint32)
+  escapeSponsored: "2f17904b",
+  // credits(address)
+  credits: "fe5ff468",
+  // quote(uint8,address,uint32,uint256,uint256,uint256): 6 words
+  quote: "e948303d",
+  // gasPolicy(): 30 words (two uint256[4] then 22 scalars)
+  gasPolicy: "3a5dbdc2",
+  // chargeFor(uint8,uint256,uint256,uint256,uint256,bool,bool,uint256)
+  chargeFor: "64452fce",
+  // keyFor(uint8,uint256,uint32,address)
+  keyFor: "15be61e4",
+  // transitAccount(address,address)
+  transitAccount: "d7734557",
+  // FORWARD_NONCE_KEY()
+  FORWARD_NONCE_KEY: "f0000eab",
+  // claimCredit(address)
+  claimCredit: "60e27464",
+  // ---- EntryPoint v0.7.0 ----
+  // handleOps(PACKED_USER_OPERATION_TUPLE[],address)
+  handleOps: "765e827f",
+  // getNonce(address,uint192)
+  getNonce: "35567e1a",
+  // getUserOpHash(PACKED_USER_OPERATION_TUPLE)
+  getUserOpHash: "22cdde4c",
+  // balanceOf(address)
+  balanceOf: "70a08231",
+  // getDepositInfo(address): 5 words
+  getDepositInfo: "5287ce12",
+  // ---- vault reads of the gasless pre-flight ----
+  // paused(), pausedAt()
+  paused: "5c975abb",
+  pausedAt: "2e55d0f2",
+  // ---- EntryPoint errors ----
+  // FailedOp(uint256,string)
+  failedOpError: "220266b6",
+  // FailedOpWithRevert(uint256,string,bytes)
+  failedOpWithRevertError: "65c8fd4d",
+  // ---- topics ----
+  // UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster,
+  // uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)
+  userOperationEvent: "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f",
+  // AccountDeployed(bytes32 indexed userOpHash, address indexed sender, address factory, address paymaster)
+  accountDeployedEvent: "0xd51a9c61267aa6196961883ecf5ff2da6619c37dac0fa92122513fb32c032d2d",
+  // UserOperationRevertReason(bytes32 indexed userOpHash, address indexed sender, uint256 nonce, bytes revertReason)
+  userOperationRevertReasonEvent: "0x1c4fada7374c0a9ee8841fc38afe82932dc0f8e69012e927f061a8bae611a201",
+  // PostOpRevertReason(bytes32 indexed userOpHash, address indexed sender, uint256 nonce, bytes revertReason)
+  postOpRevertReasonEvent: "0xf62676f440ff169a3a9afdbf812e89e7f95975ee8e5c31214ffdef631c5f4792",
+  // Sponsored(bytes32 indexed key, address indexed sender, address indexed payee, uint8 kind, uint32 noteId, uint256 maxCost)
+  sponsoredEvent: "0x4435f72baae96daeef8324fb3ed1d4f4d5978280cb6c5f9fdf74b64d467ee3c0",
+  // Settled(bytes32 indexed key, address indexed sender, address indexed payee, uint8 kind, uint32 noteId,
+  // uint256 received, uint256 charged, uint256 owedPaid, uint256 paidOut)
+  settledEvent: "0xd42d05cc535635a5dda37221df3418f706f9917ccea103d9b084ec88c57493d7",
+  // SponsorshipFailed(bytes32 indexed key, address indexed sender, uint8 kind, uint32 noteId, uint256 actualGasCost)
+  sponsorshipFailedEvent: "0x96b6440447f40d6d398b5b5c86e4fbe9444a326945cbbd866acd96b8d71f9bde",
+  // EscapeInitiationOwed(address indexed sender, uint32 indexed noteId, uint256 owedWei)
+  escapeInitiationOwedEvent: "0xdba5f4325096f8184591cb09c50465f50cbb6583b018bd47baee376d31e034f7",
+  // Shortfall(address indexed sender, uint32 noteId, uint256 shortfallWei)
+  shortfallEvent: "0xa0b29cff3dff5187dcf13b9afbbe4060f1fb0b6458edebfd6781feb30aeceb82",
+  // PayoutCredited(address indexed payee, uint256 amount)
+  payoutCreditedEvent: "0xfa0ea8a012f094d1b6f48df9238391dcbfbbda9acf72c5fa9b26c32451e98a61",
+  // CreditClaimed(address indexed payee, uint256 amount)
+  creditClaimedEvent: "0x87e12c2565042763daa6bf5842ed2b6447f17f7e28f9a4905fe3959581396ead",
+  // Collected(address indexed sender, address indexed payee, uint256 received, uint256 owedPaid, uint256 paidOut)
+  collectedEvent: "0x91b3a0728743b4fa9ade16f0aa193f1e25f6ecd35942b9dfb43a7c6eac383955",
+  // Stranded(address indexed sender)
+  strandedEvent: "0x2795e7f49cdf8dc290338b2d31bac28df8bbfe68c3822ffc39789c5c77b472cf",
+  // AccountCreated(address indexed account, address indexed owner, address indexed payee)
+  accountCreatedEvent: "0x9db37ffcb3d1eadb0306e35c0453e35a675f2e80757b09251d848185ac5cc22a",
+});
+
 // Withdrawal proof kinds (public input 12). The vault accepts kind 0 only in
 // initiateEscapeWithdrawal and kind 1 only in mutualClose; an ownership proof
 // (kind 2) goes only to the server and is never encoded for the vault.
@@ -312,6 +433,49 @@ function encodeEscapePayoutCredits(destination) {
   return callData(ABI.escapePayoutCredits, [destinationWord(destination)]);
 }
 
+// ---- Gasless withdrawals: the transit account, factory and paymaster calls ----
+
+function transitAddressWord(address, label) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address || "")) throw new Error(`The ${label} is not a valid address.`);
+  return abiWord(address);
+}
+
+/**
+ * Calldata of ZkApiWithdrawalAccount.withdraw(bytes vaultCall) in the strict
+ * layout the paymaster accepts: the offset word 0x20, the length, the bytes
+ * and zero padding to a word. `vaultCall` is empty (a forward of the transit
+ * account's balance), 36 bytes (finalizeEscapeWithdrawal) or 836 bytes (a
+ * mutual close or an escape initiation whose destination is the account).
+ */
+function encodeTransitWithdraw(vaultCall = "0x") {
+  const hex = String(vaultCall ?? "0x").replace(/^0x/i, "").toLowerCase();
+  if (hex.length % 2 || !/^[0-9a-f]*$/.test(hex)) throw new Error("The sponsored vault call is not a hex byte string.");
+  const length = hex.length / 2;
+  if (![0, 36, WITHDRAWAL_CALLDATA_BYTES].includes(length)) {
+    throw new Error("A sponsored vault call is empty, a finalization (36 bytes) or an exit (836 bytes).");
+  }
+  const padded = hex.padEnd(Math.ceil(length / 32) * 64, "0");
+  return callData(GASLESS_ABI.withdraw, [abiWord(0x20), abiWord(length), padded]);
+}
+
+/** ZkApiWithdrawalAccountFactory.createAccount(owner, payee). */
+function encodeCreateAccount(owner, payee) {
+  return callData(GASLESS_ABI.createAccount, [
+    transitAddressWord(owner, "transit account owner"),
+    transitAddressWord(payee, "payout address"),
+  ]);
+}
+
+/** ZkApiWithdrawalAccount.sweep(): permissionless, forwards the balance through the paymaster. */
+function encodeSweep() {
+  return `0x${GASLESS_ABI.sweep}`;
+}
+
+/** ZkApiWithdrawalPaymaster.claimCredit(payee): anyone pays the payee its credited payouts. */
+function encodeClaimCredit(payee) {
+  return callData(GASLESS_ABI.claimCredit, [transitAddressWord(payee, "payout address")]);
+}
+
 function vaultLog(log, vaultAddress) {
   return log?.removed !== true
     && String(log?.address || "").toLowerCase() === String(vaultAddress || "").toLowerCase();
@@ -372,17 +536,24 @@ function parseEscapePayoutClaim(receipt, vaultAddress, destination) {
   return null;
 }
 
-function parseWithdrawalReceipt(receipt, vaultAddress, mode) {
+/**
+ * The vault's withdrawal event of `mode` in a receipt. By default the first
+ * one; with `noteId` only this note's, because a receipt that settles a
+ * bundle of sponsored operations carries other notes' vault logs too.
+ */
+function parseWithdrawalReceipt(receipt, vaultAddress, mode, { noteId = null } = {}) {
   const expectedTopic = mode === "mutual" ? ABI.mutualCloseEvent
     : mode === "escape" ? ABI.escapeInitiatedEvent
       : mode === "finalize" ? ABI.escapeFinalizedEvent : null;
   if (!expectedTopic) throw new Error("Unknown withdrawal receipt mode.");
+  const expectedNoteId = noteId == null ? null : BigInt(noteId);
   for (const log of receipt?.logs || []) {
     if (log.address?.toLowerCase() !== vaultAddress.toLowerCase()
         || log.topics?.[0]?.toLowerCase() !== expectedTopic) continue;
     const data = String(log.data || "").replace(/^0x/, "");
     const minimumWords = mode === "escape" ? 5 : 3;
     if (log.topics.length < 2 || data.length < minimumWords * 64) continue;
+    if (expectedNoteId != null && BigInt(log.topics[1]) !== expectedNoteId) continue;
     const result = {
       noteId: BigInt(log.topics[1]),
       finalBalance: BigInt(`0x${data.slice(64, 128)}`),
@@ -619,6 +790,8 @@ function decodeChallengeEscapeWithdrawal(calldata) {
 const walletCodec = Object.freeze({
   ABI,
   ESCAPE_PAYOUT_GAS,
+  GASLESS_ABI,
+  PACKED_USER_OPERATION_TUPLE,
   REQUEST_TUPLE,
   WITHDRAWAL_CALLDATA_BYTES,
   WITHDRAWAL_KIND,
@@ -635,10 +808,14 @@ const walletCodec = Object.freeze({
   abiWord,
   addressWord,
   callData,
+  encodeClaimCredit,
   encodeClaimEscapePayout,
+  encodeCreateAccount,
   encodeDeposit,
   encodeEscapePayoutCredits,
   encodeFinalizeEscape,
+  encodeSweep,
+  encodeTransitWithdraw,
   encodeWithdrawal,
   escapePeriodBadge,
   escapePeriodLabel,
@@ -650,7 +827,10 @@ const walletCodec = Object.freeze({
 
 export default walletCodec;
 export {
-  ABI, ESCAPE_PAYOUT_GAS, REQUEST_TUPLE, WITHDRAWAL_CALLDATA_BYTES, WITHDRAWAL_KIND, WITHDRAWAL_TUPLE,
+  ABI, ESCAPE_PAYOUT_GAS, GASLESS_ABI, PACKED_USER_OPERATION_TUPLE, REQUEST_TUPLE, WITHDRAWAL_CALLDATA_BYTES, WITHDRAWAL_KIND,
+  WITHDRAWAL_TUPLE,
   decodeChallengeEscapeWithdrawal, decodePendingConcessions, decodePendingWithdrawals, decodeRaiseEscapeConcession,
   decodeVaultEvent, encodePendingConcessions, encodePendingWithdrawals, escapeConcessionRaises,
-  escapeConcessionRecorded, abiWord, addressWord, callData, encodeClaimEscapePayout, encodeDeposit, encodeEscapePayoutCredits, encodeFinalizeEscape, encodeWithdrawal, escapePeriodBadge, escapePeriodLabel, escapePeriodPhrase, parseEscapePayoutClaim, parseNoteDeposited, parseWithdrawalReceipt };
+  escapeConcessionRecorded, abiWord, addressWord, callData, encodeClaimCredit, encodeClaimEscapePayout, encodeCreateAccount,
+  encodeDeposit, encodeEscapePayoutCredits, encodeFinalizeEscape, encodeSweep, encodeTransitWithdraw, encodeWithdrawal,
+  escapePeriodBadge, escapePeriodLabel, escapePeriodPhrase, parseEscapePayoutClaim, parseNoteDeposited, parseWithdrawalReceipt };

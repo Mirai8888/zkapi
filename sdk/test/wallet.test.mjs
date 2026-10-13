@@ -538,3 +538,124 @@ test("only an exact EscapePayoutClaimed log for the destination proves a claim",
     assert.equal(wallet.parseEscapePayoutClaim({ logs: [log] }, PAYOUT_VAULT, PAYOUT_DESTINATION), null);
   }
 });
+
+// ---- Gasless withdrawals (protocol/contracts/src/gasless): a separate table,
+// GASLESS_ABI, because none of these selectors and topics is the vault's. ----
+
+test("every gasless selector and event topic is the keccak of its signature", () => {
+  const { GASLESS_ABI, PACKED_USER_OPERATION_TUPLE } = wallet;
+  assert.equal(PACKED_USER_OPERATION_TUPLE, "(address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes)");
+  const selectors = {
+    withdraw: "withdraw(bytes)",
+    owner: "owner()",
+    payee: "payee()",
+    sweep: "sweep()",
+    createAccount: "createAccount(address,address)",
+    getAddress: "getAddress(address,address)",
+    accountCreationCodeHash: "accountCreationCodeHash()",
+    accountCreationCode: "accountCreationCode()",
+    implementation: "implementation()",
+    paymaster: "paymaster()",
+    factory: "factory()",
+    entryPoint: "entryPoint()",
+    vault: "vault()",
+    WEI_PER_UNIT: "WEI_PER_UNIT()",
+    policy: "policy()",
+    maxFeeCeiling: "maxFeeCeiling()",
+    priorityFeeCeiling: "priorityFeeCeiling()",
+    callCap: "callCap(uint8)",
+    attempts: "attempts(bytes32)",
+    owed: "owed(address)",
+    stranded: "stranded(address)",
+    escapeNotePlusOne: "escapeNotePlusOne(address)",
+    escapeSponsored: "escapeSponsored(uint32)",
+    credits: "credits(address)",
+    quote: "quote(uint8,address,uint32,uint256,uint256,uint256)",
+    gasPolicy: "gasPolicy()",
+    chargeFor: "chargeFor(uint8,uint256,uint256,uint256,uint256,bool,bool,uint256)",
+    keyFor: "keyFor(uint8,uint256,uint32,address)",
+    transitAccount: "transitAccount(address,address)",
+    FORWARD_NONCE_KEY: "FORWARD_NONCE_KEY()",
+    claimCredit: "claimCredit(address)",
+    handleOps: `handleOps(${PACKED_USER_OPERATION_TUPLE}[],address)`,
+    getNonce: "getNonce(address,uint192)",
+    getUserOpHash: `getUserOpHash(${PACKED_USER_OPERATION_TUPLE})`,
+    balanceOf: "balanceOf(address)",
+    getDepositInfo: "getDepositInfo(address)",
+    paused: "paused()",
+    pausedAt: "pausedAt()",
+    failedOpError: "FailedOp(uint256,string)",
+    failedOpWithRevertError: "FailedOpWithRevert(uint256,string,bytes)",
+  };
+  const topics = {
+    userOperationEvent: "UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)",
+    accountDeployedEvent: "AccountDeployed(bytes32,address,address,address)",
+    userOperationRevertReasonEvent: "UserOperationRevertReason(bytes32,address,uint256,bytes)",
+    postOpRevertReasonEvent: "PostOpRevertReason(bytes32,address,uint256,bytes)",
+    sponsoredEvent: "Sponsored(bytes32,address,address,uint8,uint32,uint256)",
+    settledEvent: "Settled(bytes32,address,address,uint8,uint32,uint256,uint256,uint256,uint256)",
+    sponsorshipFailedEvent: "SponsorshipFailed(bytes32,address,uint8,uint32,uint256)",
+    escapeInitiationOwedEvent: "EscapeInitiationOwed(address,uint32,uint256)",
+    shortfallEvent: "Shortfall(address,uint32,uint256)",
+    payoutCreditedEvent: "PayoutCredited(address,uint256)",
+    creditClaimedEvent: "CreditClaimed(address,uint256)",
+    collectedEvent: "Collected(address,address,uint256,uint256,uint256)",
+    strandedEvent: "Stranded(address)",
+    accountCreatedEvent: "AccountCreated(address,address,address)",
+  };
+  let checked = 0;
+  for (const [name, signature] of Object.entries(selectors)) {
+    assert.equal(GASLESS_ABI[name], selector(signature), signature);
+    checked += 1;
+  }
+  for (const [name, signature] of Object.entries(topics)) {
+    assert.equal(GASLESS_ABI[name], keccak256(signature), signature);
+    checked += 1;
+  }
+  assert.equal(checked, Object.keys(GASLESS_ABI).length, "every entry of GASLESS_ABI is checked");
+  // The vault's table is untouched by the new one.
+  assert.equal(Object.keys(wallet.ABI).some((name) => name in GASLESS_ABI), false);
+  // The paymaster's selectors for the vault's own calls are the vault's.
+  assert.equal(selector("withdraw(bytes)"), "0968f264");
+});
+
+test("the transit account, factory and paymaster calls encode their exact calldata", () => {
+  const owner = "0xe05fcC23807536bEe418f142D19fa0d21BB0cfF7";
+  const payee = "0x000000000000000000000000000000000009A7Ee";
+  assert.equal(wallet.encodeCreateAccount(owner, payee), `0x133572ba${wallet.abiWord(owner)}${wallet.abiWord(payee)}`);
+  assert.equal(wallet.encodeSweep(), "0x35faa416");
+  assert.equal(wallet.encodeClaimCredit(payee), `0x60e27464${wallet.abiWord(payee)}`);
+  assert.throws(() => wallet.encodeCreateAccount("0x12", payee), /owner/);
+  assert.throws(() => wallet.encodeClaimCredit("0x12"), /payout address/);
+  // withdraw(bytes) in the paymaster's strict layout: offset 0x20, length, bytes, zero padding.
+  const vectors = JSON.parse(readFileSync(new URL("../../protocol/contracts/test/fixtures/transit-vectors.json", import.meta.url), "utf8"));
+  assert.equal(wallet.encodeTransitWithdraw(vectors.close.vault_calldata), vectors.close.call_data.toLowerCase());
+  const forward = wallet.encodeTransitWithdraw("0x");
+  assert.equal(forward, `0x0968f264${wallet.abiWord(0x20)}${wallet.abiWord(0)}`);
+  const finalize = wallet.encodeTransitWithdraw(wallet.encodeFinalizeEscape(21));
+  assert.equal(finalize.slice(10, 74), wallet.abiWord(0x20));
+  assert.equal(finalize.slice(74, 138), wallet.abiWord(36));
+  assert.equal(finalize.slice(138, 138 + 72), wallet.encodeFinalizeEscape(21).slice(2));
+  assert.equal(finalize.slice(138 + 72), "0".repeat(56), "padded to a word with zeros");
+  assert.throws(() => wallet.encodeTransitWithdraw("0x1234"), /empty, a finalization \(36 bytes\) or an exit \(836 bytes\)/);
+  assert.throws(() => wallet.encodeTransitWithdraw("0x123"), /hex byte string/);
+});
+
+test("parseWithdrawalReceipt filters by noteId when asked and is unchanged otherwise", () => {
+  const vault = "0x590df9abbfb21074016daa486c771ae0af729ee2";
+  const close = (noteId, destination) => ({
+    address: vault,
+    topics: [wallet.ABI.mutualCloseEvent, `0x${wallet.abiWord(noteId)}`],
+    data: `0x${wallet.abiWord(0x16n)}${wallet.abiWord(1_850_000n)}${wallet.addressWord(destination)}`,
+  });
+  const receipt = { logs: [close(9n, ESCAPE_DESTINATION), close(21n, MUTUAL_DESTINATION)] };
+  assert.equal(wallet.parseWithdrawalReceipt(receipt, vault, "mutual").noteId, 9n, "the first vault log, as before");
+  assert.deepEqual(wallet.parseWithdrawalReceipt(receipt, vault, "mutual", { noteId: 21 }),
+    { noteId: 21n, finalBalance: 1_850_000n, destination: MUTUAL_DESTINATION });
+  assert.deepEqual(wallet.parseWithdrawalReceipt(receipt, vault, "mutual", { noteId: "21" }).noteId, 21n);
+  assert.equal(wallet.parseWithdrawalReceipt(receipt, vault, "mutual", { noteId: 22 }), null);
+  assert.equal(wallet.parseWithdrawalReceipt(receipt, vault, "mutual", { noteId: null }).noteId, 9n, "null means no filter");
+  const finalized = { logs: [deferredLog({ noteId: 3n }), finalizedLog(PAYOUT_DESTINATION, 3n), finalizedLog(PAYOUT_DESTINATION, 0n)] };
+  assert.equal(wallet.parseWithdrawalReceipt(finalized, PAYOUT_VAULT, "finalize", { noteId: 0 }).payoutCredited, false);
+  assert.equal(wallet.parseWithdrawalReceipt(finalized, PAYOUT_VAULT, "finalize", { noteId: 3 }).payoutCredited, true);
+});

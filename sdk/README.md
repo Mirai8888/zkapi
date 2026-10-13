@@ -170,6 +170,18 @@ Resumption is idempotent when a previous journal write succeeded but host
 acknowledgement was interrupted. The host owns the public pending-send record;
 private wallet material and all settlement and payout decisions stay in the SDK.
 
+A sponsored withdrawal (`fees: 'payout'`, [Paying the fee from the
+payout](#paying-the-fee-from-the-payout)) never calls `eth_sendTransaction`,
+so `zkapiRecovery`, `acknowledgeTransaction` and the hooks below are not
+involved: the provider receives only `personal_sign` requests, each for the
+32 raw bytes of a user operation hash (an EIP-191 signature from the
+connected account, which must be the owner of the plan's transit account),
+and the SDK's own journal owns the resumption. A manual signer shows the
+hash, signs it with the owner key and returns the 65-byte signature. The
+wallet-paid fallbacks of that section (`selfBundle`, `fees: 'wallet'`,
+`sweepTransit`, `claimGaslessCredit`) go through the ordinary
+`eth_sendTransaction` path described here.
+
 To recover fee speed-ups while a transaction is still awaiting its receipt,
 providers may implement `getVerifiedTransactionHashes(originalHash)`,
 `beginTransactionReceiptWait(originalHash)`, and
@@ -500,6 +512,198 @@ that state:
   client clock up to five minutes fast. The SDK proves again after
   `proof_expired` or `unknown_root`.
 
+#### Paying the fee from the payout
+
+On a deployment whose profile pins the gasless contracts (`trusted_deployment.
+gasless`: the canonical ERC-4337 EntryPoint v0.7.0, the withdrawal paymaster,
+its account factory and the transit account creation code; `null` on the
+shipped placeholders), a withdrawal can pay its network fee out of the payout
+instead of from the connected account, so the payout address needs no ETH:
+
+```js
+await client.withdraw(mode, onStatus, {
+  destination,            // the payout address Y; default: the connected account
+  fees: 'payout',         // 'wallet' (the default) is today's path, unchanged
+  feeCapWei: null,        // refuse a paymaster flat fee above this (wei)
+  bundlerUrl: null,       // this call's bundler; default: setBundlerUrl, then the profile's
+  allowExpensiveGas: false,
+  selfBundle: false       // a funded wallet sends handleOps itself (see fallbacks)
+});
+```
+
+The proof then names a transit account `S` as its destination: the CREATE2
+address, from the pinned creation code, of (EntryPoint, vault, paymaster,
+owner = the connected account, payee = `destination`). `S` has no storage and
+no keys: it only forwards what it receives to the paymaster, which keeps a
+measured gas charge and pushes the rest to the payee, so nobody can redirect
+the payout. The vault call runs inside a user operation sent from `S`; the
+connected account signs the operation's 32-byte hash with `personal_sign`
+(an EIP-191 signature, the only wallet request this path makes) and never
+sends a transaction. The SDK derives `S` locally and cross-checks it with
+`factory.getAddress`; a mismatch is `gasless_unavailable`
+(`error.data.reason: "gasless_deployment_mismatch"`), which disables only
+this path, never deposits or wallet-paid exits.
+
+Privacy: the connected account becomes the on-chain owner of `S` (it appears
+in the account's creation data) and, by default, the payout address. A fresh
+account, which needs no ETH, breaks the link to any funding history. The
+reads of this path (the account's code and nonce, the paymaster's policy, the
+dry run, the logs, the bundle receipt) go to the exit RPC when one is set and
+on the vault's chain, then to the pinned RPC, never to the wallet provider,
+so `S` and `Y` do not reach the wallet vendor; a host that wants the wallet
+provider read as a last resort sets `client.gaslessReadsViaWallet = true`.
+
+Before signing, `onStatus` shows the only statement the SDK can make: the
+payout address receives at least `payout − maxCost − flatFee − owed`, where
+`maxCost` is the sum of the operation's five gas fields (from the profile's
+pinned policy, never from a bundler estimate, each within the paymaster's
+floor and cap; `preVerificationGas` is the rule zkapi-clientd shares,
+`clamp(max(A, ceil(1.1 × B), C), pvg_floor, pvg_cap)` on the operation as
+built: A is ERC-7562 LIM-070's minimum at its worst, the calldata cost of
+`handleOps` with a 65-byte signature and both fee fields at `2^128 − 1`, plus
+50,000 and a 2,000 margin; B the standard bundler minimum, `21,000 + 18,300 +
+4 per word + 4 / 16 per zero / non-zero byte` of the encoded operation; C
+`21,000 + 16 × handleOps bytes + 10,000`; and a bundler estimate that asks for
+more within the paymaster's cap is adopted before the prompt) times
+`maxFeePerGas` (`min(2 × baseFee + tip, the paymaster's ceiling)`), `flatFee` the paymaster's flat fee (signed into the operation as
+the cap the user accepted) and `owed` what `S` still owes from an earlier
+sponsored escape. An escape initiation has no such floor: nothing is paid
+when it starts, and its finalization is charged at its own fees when it is
+sent (possibly days later), so before an escape is signed the status names
+only the most this start can add to the debt (`initiationDebtMax = maxCost +
+flatFee`) and an estimate at current fees (`amounts.estimatedReceived`, with
+`amounts.minimumReceived` null); the floor is stated when the finalization
+is signed. The payload `onStatus(message, { amounts })` carries them
+as decimal wei strings. After settlement the statuses and the result carry
+`amounts.chargedWei` (the measured charge), `owedPaidWei`, `paidOutWei` and
+`receivedWei`, read from the paymaster's `Settled` event in the bundle
+receipt. Every number is cross-checked against the paymaster's `quote`
+(`gasless_policy_mismatch` otherwise). A payout below the fee is refused
+(`payout_below_gas`); a fee above 25% of the payout (the profile's
+`uneconomic_fraction_percent`) is refused with `gasless_uneconomic` unless
+the host passes `allowExpensiveGas: true`. The rule is
+`(maxCost + flatFee) × 100 / payout > uneconomic_fraction_percent`; with the
+committed policy's default limits (about 1.5–1.8 million gas in all, more
+with the account's creation) and `maxFeePerGas = 2 × 30 gwei + tip`, `maxCost`
+is about 0.1 ETH at a 30 gwei base fee, so payouts under about 0.4 ETH keep
+the wallet path by default; the exact threshold for the current fees comes
+from the quote below. `client.gaslessWithdrawalQuote(mode, { destination, feeCapWei,
+allowExpensiveGas })` returns these numbers (`available`, `reason`,
+`transitAccount`, `amounts`, `fees`, `gas`, `minimumReceivedWei`, which is
+null for an escape, and `estimatedReceivedWei`, set only for one) without
+proving or prompting, and `client.gaslessAvailability({ mode, destination })`
+runs the pre-flight alone: the deployment check, the bundler (`eth_chainId`
+when served, then `eth_supportedEntryPoints`), the paymaster's policy and
+gas policy, the fees within its ceilings (`gas_above_paymaster_ceiling`), the
+prefund of a draft operation of this kind against the policy
+(`max_cost_above_policy`) and against the float (`paymaster_underfunded`),
+the vault's pause and the attempts left for this state. Every one of these
+refusals comes before a proof is requested, because the proof binds the
+transit account; the same pre-flight runs inside `withdraw` and
+`finalizeEscape`, and the snapshot's `gasless.max_cost_wei` carries the
+prefund it priced.
+
+The bundler: `client.setBundlerUrl(url)` saves the user's own (per origin,
+HTTPS or loopback HTTP without credentials, `bundler_url_invalid` otherwise;
+`null` clears it) and `client.getBundlerUrl()` reads it; without one the
+profile's `gasless.bundler_url` (the operator's, which whitelists the
+paymaster) is used; `provider.zkapiBundler` with `sendUserOperation`,
+`getUserOperationReceipt`, `getUserOperationByHash` and
+`estimateUserOperationGas` lets a host supply its own transport. The
+operation is dry-run through the EntryPoint (`eth_call handleOps`) before
+any prompt and again after signing, journaled in full before
+`eth_sendUserOperation`, then followed by the bundler's receipt and by the
+EntryPoint's `UserOperationEvent` logs. The tip is the bundler's own
+suggestion when it offers one (`rundler_maxPriorityFeePerGas`, the standard
+tier of `pimlico_getUserOperationGasPrice`, or a host transport's
+`maxPriorityFeePerGas()`), else the read RPC's, always within the paymaster's
+tip ceiling. A bundler that forgets the operation is replaced by the logs;
+after five minutes unknown the identical bytes are sent again; a bundler that
+refuses a send for its fee (on the first send as on a re-send; decided by
+the refusal's wording, never for an `AA..` code nor ERC-7769's `-32507`
+signature or `-32508` paymaster-balance refusals) gets the
+operation signed again with both fee fields raised by 12.5% within the
+ceilings (one more signature per raise, every hash journaled), and
+`gasless_fee_bump_exhausted` once no raise of at least 10% fits under them;
+the submission stops 60 seconds before the proof's `valid_until` and proves
+again, but only once the operation already sent is included (which settles
+the withdrawal), unknown to the bundler, or past `valid_until` on chain, and
+the next run looks for the released hashes and nonce on chain before it
+builds a replacement; a replacement of an operation already sent (a fee
+raise, a rebuild) that cannot be prepared (its nonce moved, a dry run
+refused it, or its prompt was canceled) first looks for the earlier
+operation on chain, which then settles the withdrawal, and is otherwise
+refused as sent (`error.userOpSent`, `withdrawalNeedsAction`, the earlier
+operation still journaled); an inclusion the bundler names under its own
+hash (`bundler_hash_mismatch`) is settled under the hash the EntryPoint
+emitted for the account's operation; before every prompt the latest block's timestamp is checked against
+the paymaster's time window, because the unsigned dry run's `AA24` masks
+`AA32` (a close or escape stops with `gasless_op_expired` once the chain is
+past `valid_until − 60 s`, and a finalization waits for a block at the
+escape deadline; a close or escape whose signed dry run answers `AA32`
+because the chain passed `valid_until` while the prompt was open is proved
+again the same way, nothing having been sent); the inclusion search of a plan starts at the earliest block any of its
+operations, released ones included, was tracked from. A reload resumes from the journal without a new signature,
+and looks before it sends: the EntryPoint's logs for every hash the plan ever
+sent (`userOpHashes` and the `staleUserOpHashes` of operations released
+earlier), then the account's nonce (moved past the journaled one, the
+inclusion is found by sender and nonce), and only then the identical bytes
+again. A bundler that answers a send with `AA25`/`AA10` is checked against the
+read RPC: an unmoved nonce or a still-absent account makes the refusal the
+bundler's (`bundler_rejected` with `error.data.aa`), never a second prompt,
+and a rebuild for a nonce or account that did move is attempted at most twice.
+A journaled operation belongs to the client following it: another client of
+the same runtime, or another tab within five minutes of the claim's last
+sign of life (its claim, its last send, or the heartbeat the following
+client writes on every poll while the operation is pending:
+`userOpFollowedAt` on the plan, `finalizeUserOpFollowedAt` on a record), is
+refused with `withdrawal_wallet_pending` (409, a `BrowserWalletHttpError`,
+for `withdraw` and `finalizeEscape` alike), as on the wallet path, however
+long the operation stays pending; a claim no one follows any more (the tab
+gave up, crashed or reloaded, so its heartbeat stopped five minutes ago) is
+taken over without a prompt. `finalizeEscape` resumes a journaled sponsored finalization
+the same way, and looks for its own operation on chain first: a finalization
+included while no one followed it settles as the record's own (its `Settled`
+amounts), never as a third party's.
+The background passes (`syncWithdrawal`, `syncEscapeWithdrawals`) settle a
+sponsored record only from the paymaster's `Settled`/`PayoutCredited` in its
+bundle receipt: a credited payout stays `paymasterCredited` until
+`claimGaslessCredit` delivers it, and a sponsored escape a third party
+finalized is reported with `fundsWaitingInTransit`/`transitBalanceWei` until
+`finalizeEscape` (now a FORWARD), `collectTransitBalance` or `sweepTransit`
+collects it.
+
+Fallbacks keep the proof (it is bound to `S`): `bundler_unavailable` names
+them in `error.data.fallbacks`. With `selfBundle: true` a funded connected
+account sends `handleOps([op], beneficiary = itself)` through the ordinary
+transaction path (the paymaster still pays and refunds the beneficiary).
+`withdraw(mode, onStatus, { fees: 'wallet' })` on the prepared plan sends the
+vault call from the wallet to `S` as today (its `destination` may be omitted,
+or name the payout address `Y` of the sponsored attempt, or `S`; any other
+address is refused as a different destination); the payout then waits in `S`
+(`fundsWaitingInTransit: true` on the record) until
+`client.sweepTransit(recordId, onStatus)` sends `factory.createAccount` (when
+`S` has no code yet) and `S.sweep()`, two wallet-paid transactions by any
+ETH-holding account; the paymaster deducts what `S` owes and pushes the rest.
+
+Escapes: `withdraw('escape', …, { fees: 'payout' })` sponsors the initiation
+only while the operator enables it (`escapes_disabled` otherwise; the
+finalization can still be sponsored after a wallet-paid start to `S`). An
+initiation pays nothing now: its charge is recorded as `S`'s debt
+(`initiationDebtWei` on the record) and deducted at finalization, together
+with the finalization's own charge. `client.finalizeEscape(recordId,
+onStatus, { fees })` defaults to `'payout'` for such a record, runs only
+after the safety deadline, and goes straight to `collectTransitBalance` when
+someone else finalized first. `client.collectTransitBalance(recordId,
+onStatus)` is the sponsored forward of a balance sitting in `S` (after an
+operation whose vault call reverted because the close was replayed, or an
+escape a third party finalized); it needs the paymaster's own evidence
+(`transit_not_stranded` otherwise: use `sweepTransit`). A payee that rejects
+ETH is credited by the paymaster (`paymasterCredited: true`,
+`paymasterCreditedWei` on the record; `client.paymasterCreditedPayouts` lists
+them) and anyone delivers the credit with `client.claimGaslessCredit(payee,
+onStatus)`, a wallet-paid transaction.
+
 ### Setting a balance aside
 
 `client.parkPreparedWithdrawal()` sets a withdrawal-only balance aside so the
@@ -625,7 +829,29 @@ cannot be read.
   `resolved_unreserved`, `unresolved`), `created_at`, `server_status`,
   `server_status_at` and `escape_at`;
 - `last_settlement` (`client_request_id`, `charge_applied`, `charge_basis`,
-  `settlement_reason`, `installed_at`).
+  `settlement_reason`, `installed_at`);
+- `gasless` ([Paying the fee from the payout](#paying-the-fee-from-the-payout)):
+  `supported` (the profile pins the gasless contracts), `bundler_url` (the
+  effective one), `bundler_wrong_chain`, and from the last pre-flight
+  `paymaster_deposit_wei`, `policy` (`max_sponsored_cost_wei`, `flat_fee_wei`,
+  `min_escape_net_wei`, `escapes_enabled`, `sponsorship_paused`,
+  `max_fee_ceiling_wei`, `priority_fee_ceiling_wei`), `attempts_left`,
+  `max_cost_wei` (the prefund the pre-flight priced), `available` and
+  `reason`;
+- `prepared_withdrawal` gains `fee_payer` (`"wallet"` or `"payout"`),
+  `payout` (Y; `destination` stays the transit account S for a sponsored
+  plan), `transit` (`factory`, `paymaster`, `entryPoint`, `account`,
+  `owner`, `payee`, `creationCodeKeccak`), `user_op_hash` and
+  `user_op_phase` (`op_built` before the first `eth_sendUserOperation`,
+  `op_submitted` after).
+
+A sponsored withdrawal record (`snapshot().withdrawals[]`) carries
+`feePayer`, `payout`, `transit`, `userOpHash`, `userOpHashes`,
+`userOpSuccess`, `chargedWei`, `owedPaidWei`, `receivedWei`, `paidOutWei`,
+`initiationDebtWei`, `fundsWaitingInTransit`, `transitBalanceWei`,
+`paymasterCredited`, `paymasterCreditedWei`, `finalizeUserOpHash`,
+`forwardUserOpHash`, `sweepTransactionHash`, `transitCreateTransactionHash`
+and `creditClaimTransactionHash` (wei as decimal strings).
 
 Receipts are installed against the proof-bound billing quote, never
 re-validated against changed manifest price pins. A worst-case charge equal
@@ -642,6 +868,8 @@ Each of these errors carries a `shortMessage` for display.
 | Exit kit | `exit_kit_invalid`, `exit_kit_passphrase`, `exit_kit_passphrase_weak` |
 | Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `tree_rebuild_timeout`, `tree_root_refused`, `wrong_network` (each with `error.data.exit_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
+| Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling`, `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gasless_plan_mismatch`, `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
+| Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting`, `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
 
 ## Credited escape payouts
 

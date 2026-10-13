@@ -59,9 +59,11 @@
     "adapter_runtime_keccak256": null,
     "poseidon_runtime_keccak256": null
   },
+  "gasless": null,
   "models": [],
   "limitations": [
     "Placeholder: the concession-exit vault (revision 3, circuit zkapi-v2-concession-v1) is not deployed on this network yet. The proof pins name the development setup until the ceremony keys (setup mpc-1) replace them.",
+    "Placeholder: the gasless withdrawal paymaster (ERC-4337, EntryPoint v0.7.0) is not deployed on this network yet; a withdrawal pays its own network fee from the signing address.",
     "Deposits are permissionless and no application-enforced deposit or TVL cap exists.",
     "ETH balances fluctuate in USD value; the latest finalized ETH/USD oracle round may lag the market."
   ]

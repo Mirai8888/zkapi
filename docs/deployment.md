@@ -105,9 +105,13 @@ its vault's, treat it as compromised and follow
 library, deploys the circuit's Groth16 adapter and the native-only vault with
 its 11 constructor arguments, and checks the adapter's circuit and
 verifying-key hashes against the setup manifest and the vault's getters
-against the inputs. Its header lists the environment it reads, and
-`demo/contracts/foundry.toml` notes how to run it with `forge script`. The
-script links the library itself; no `FOUNDRY_REMAPPINGS` override is needed.
+against the inputs. Unless `GASLESS=0`, the same broadcast then deploys the
+gasless-withdrawal paymaster against the canonical ERC-4337 EntryPoint
+v0.7.0, stakes it and its transit-account factory, funds its deposit and
+checks its getters ([below](#gasless-withdrawals)). Its header lists the
+environment it reads, and `demo/contracts/foundry.toml` notes how to run it
+with `forge script`. The script links the library itself; no
+`FOUNDRY_REMAPPINGS` override is needed.
 
 | Variable | Meaning |
 | --- | --- |
@@ -124,6 +128,18 @@ script links the library itself; no `FOUNDRY_REMAPPINGS` override is needed.
 | `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains: the Sepolia drill vault only, never Mainnet, which refuses it. Recorded as `allowDevSetup`; default 0 |
 | `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
+| `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
+| `ENTRY_POINT` | The ERC-4337 EntryPoint v0.7.0; default the canonical `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Its runtime must hash to `0x8db5ff69…fc58`, and the SenderCreator at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C` to `0x283c9d14…a7689`; on Anvil etch both first (`cast rpc anvil_setCode` from `protocol/contracts/test/fixtures/*.runtime.hex`, as CI does) |
+| `PAYMASTER_OWNER` | Owner of the paymaster (policy, fee ceilings, call caps, key release, stake and deposit withdrawals); default `OWNER`. When it is not the deployer, the script deploys the paymaster with the deployer as owner (only the owner may set the first stake), stakes and funds it, and nominates `PAYMASTER_OWNER`, which must call `acceptOwnership()` on the paymaster; the manifest records this as `paymasterOwnershipTransferPending` |
+| `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` | EntryPoint stakes of the paymaster and the factory (positive, at most 2^112 - 1). Local chains default to 0.1 ether each; required off local chains. Plan 1 ether each on Mainnet and 0.1 ether on Sepolia |
+| `PAYMASTER_UNSTAKE_DELAY_SECONDS` | Unstake delay of both stakes; default 86,400 |
+| `PAYMASTER_DEPOSIT_WEI` | Initial EntryPoint deposit of the paymaster, the float that pays sponsored gas (positive). Local default 1 ether; required off local chains. Plan 0.5 ETH on Sepolia and 2 ETH on Mainnet |
+| `PAYMASTER_MAX_SPONSORED_COST_WEI` | Most one sponsored operation may cost the float; default 0.05 ether, at most 0.25 ether |
+| `PAYMASTER_FLAT_FEE_WEI` | Flat fee kept per sponsored operation; default 0, at most 0.001 ether |
+| `PAYMASTER_MIN_ESCAPE_NET_WEI` | Least net payout a sponsored escape must leave; default 0.01 ether, at most 2^64 - 1 |
+| `PAYMASTER_ESCAPES` | `1` sponsors escape initiations; default `0` (finalizations are always sponsored) |
+| `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (Sepolia: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
+| `PAYMASTER_FEE_KEEPER` | Optional key that may re-set the fee ceilings (`setFeeCeilings`) |
 
 The setup policy is enforced by the script: off local chains a single-party
 setup needs `ALLOW_DEV_SETUP=1` and Mainnet refuses it, and an `mpc-1` setup
@@ -150,13 +166,15 @@ which is not the vault's creation block. The deployment is final only after
 `--broadcast`: it reads the creation receipts from forge's broadcast log
 (`demo/contracts/broadcast/Deploy.s.sol/<chain>/run-latest.json`, or
 `--broadcast-log FILE`), requires each creation to have succeeded at the
-manifest's address, the runtime code hashes on chain to be the expected ones,
-and the vault's owner and treasury to be the manifest's, and only then writes
-`$OUTPUT_PATH` with `deploymentStatus: "deployed"`, `deployBlock` (the block
-that created the vault) and `deployTransactions`. A mismatch exits 1 and any
-other failure 2, and neither writes the output. Finalize after finality, for
-example `--confirmations 64` on Sepolia and Mainnet (the default is 1), and
-keep the broadcast log until then. Re-audit a deployment later with
+manifest's address, every runtime code hash on chain to be the expected one
+(the vault's three, and the paymaster deployment's five more), the vault's
+owner and treasury to be the manifest's and, with the paymaster, its deposit,
+stakes, policy and owner too, and only then writes `$OUTPUT_PATH` with
+`deploymentStatus: "deployed"`, `deployBlock` (the block that created the
+vault) and `deployTransactions`. A mismatch exits 1 and any other failure 2,
+and neither writes the output. Finalize after finality, for example
+`--confirmations 64` on Sepolia and Mainnet (the default is 1), and keep the
+broadcast log until then. Re-audit a deployment later with
 `node scripts/expected-codehashes.mjs --deployment .demo/deployment.json --check --rpc "$RPC_URL"`,
 which compares the code hashes only.
 
@@ -170,7 +188,8 @@ default), the SDK config (`--format sdk`) and clientd's packaged profile under
 its own field names (`--format clientd`). It checks the setup directory's
 verifying keys against the manifest, refuses a legacy `deployment_id`, and
 writes the signing-key coordinates, decimal strings in the manifest, as the
-`0x` hex every consumer parses. The
+`0x` hex every consumer parses; `--bundler-url URL` names the operator's
+bundler in the profiles' `gasless` object ([below](#gasless-withdrawals)). The
 [migration runbook](migration-concession-vault.md#b2-production-sepolia), step
 5, gives the commands.
 
@@ -239,6 +258,109 @@ and the migration runbook.
 Use a fresh directory when intentionally generating a new Groth16 setup.
 Keep challenger coverage and persistent server/indexer state available whenever
 the vault holds funds.
+
+### Gasless withdrawals
+
+With `GASLESS=1` (the default) the script deploys, in the same broadcast as
+the vault, `ZkApiWithdrawalPaymaster` (whose constructor deploys
+`ZkApiWithdrawalAccountFactory`, whose constructor deploys the
+`ZkApiWithdrawalAccount` logic every transit account delegates to). It
+requires the canonical EntryPoint v0.7.0 runtime at `ENTRY_POINT` and the
+SenderCreator runtime at `0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C`, both
+pinned by keccak256, before it deploys anything: a public chain has them; on
+Anvil etch them with `cast rpc anvil_setCode <address> "$(cat
+protocol/contracts/test/fixtures/<name>.runtime.hex)"` first (the `contracts`
+job in `.github/workflows/ci.yml` shows both commands); a `forge script` dry
+run without an RPC has neither and needs `GASLESS=0`. The script decides
+"local" by chain ID alone (31337, 1337), so an Anvil started with a public
+chain ID needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`,
+`FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI` as well. The paymaster is
+constructed with `PAYMASTER_OWNER` (or, when that is not the deployer, with
+the deployer, which stakes it, funds it and then nominates `PAYMASTER_OWNER`
+by `transferOwnership`; the nominee must `acceptOwnership()` on the
+paymaster, and until it does the deployer keeps the owner's powers), the
+policy and the fee ceilings from the `PAYMASTER_*` variables; the script
+then calls `addStake` on the paymaster and on the factory
+(`PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI`, both at
+`PAYMASTER_UNSTAKE_DELAY_SECONDS`), `deposit` (`PAYMASTER_DEPOSIT_WEI`) and,
+if set, `setFeeKeeper`.
+
+Post-checks, before the manifest is written: the paymaster's
+`ENTRY_POINT_V070_CODEHASH` is the pin above; `entryPoint()`, `vault()` and
+`adapter()` are the deployed ones; `factory().paymaster()` is the paymaster
+and the factory's `entryPoint()` and `vault()` are the same; the factory's
+`implementation()` is its nonce-1 creation; `WEI_PER_UNIT()` equals the
+vault's `nativeAssetWeiPerUnit()`, `MAX_PAUSE_DURATION()` the vault's
+`maxPauseDuration()`, and `STATE_X/Y`, `CLEAR_X/Y` the vault's signing keys;
+`accountCreationCodeHash()` of both contracts is `keccak256(accountCreationCode())`;
+`policy()`, `maxFeeCeiling()`, `priorityFeeCeiling()` and `feeKeeper()` are
+the inputs; `owner()` and `pendingOwner()` are as recorded;
+`entryPoint.balanceOf(paymaster)` is at least the deposit;
+`getDepositInfo(paymaster)` and `getDepositInfo(factory)` are staked with at
+least the stake at the delay; and `factory.getAddress(deployer, deployer)`
+equals a CREATE2 computed locally from the creation code (the derivation
+every client performs).
+
+Manifest fields of the block (every wei amount a decimal string, every gas
+figure a JSON number): `entryPoint`, `entryPointRuntimeCodehash`,
+`senderCreator`, `senderCreatorRuntimeCodehash`, `withdrawalPaymaster`,
+`withdrawalAccountFactory`, `withdrawalAccountImplementation`,
+`paymasterRuntimeCodehash`, `factoryRuntimeCodehash`,
+`accountImplementationRuntimeCodehash`, `accountCreationCode` (hex, 74
+bytes), `accountCreationCodeKeccak256`, `paymasterOwner`,
+`paymasterOwnershipTransferPending`, `paymasterDeployer`,
+`paymasterFeeKeeper` (zero when unset), `paymasterStakeWei`,
+`factoryStakeWei`, `paymasterUnstakeDelaySeconds`,
+`paymasterInitialDepositWei`, `paymasterPolicy { maxSponsoredCostWei,
+flatFeeWei, minEscapeNetWei, escapesEnabled }`, `paymasterFeeCeilings {
+maxFeeWei, priorityFeeWei }` and `paymasterGasPolicy`, the paymaster's
+`gasPolicy()` with its field names (`callFloor[4]`, `callCap[4]` (the hard
+caps; the live `callCap(kind)` starts there and the owner may only lower
+it), `postOpFloor`, `postOpCap`, `verificationFloor`,
+`verificationFloorInit`, `verificationCap`, `pvgFloor`, `pvgCap`,
+`pmVerificationFloor`, `pmVerificationCap`, `postOpBaseGas`,
+`postOpEscapeGas`, `postOpFinalizeExtraGas`, `postOpEscapeForwardGas`,
+`eoaPushGas`, `newAccountGas`, `payoutPushGas`, `creditGas`,
+`accountCallOverheadGas`, `accountCallOverheadEscapeGas`, `marginGas`,
+`finalizeReserveGas`, `maxAttempts`). With `GASLESS=0` the manifest carries
+`withdrawalPaymaster: null` and none of the others.
+
+`expected-codehashes.mjs` derives the paymaster's, the factory's and the
+account logic's runtime code from the artifacts with their immutables filled
+from the manifest (the EntryPoint, vault, adapter, factory, unit size, keys,
+pause bound and creation-code hash; the factory's paymaster and logic; the
+logic's own address), and pins the EntryPoint's and SenderCreator's runtimes
+as constants, so `--check` and `--rpc` cover eight code hashes. `--finalize`
+additionally requires the paymaster's creation receipt (the factory and the
+logic are constructor creations, checked by their code), the deposit of at
+least `paymasterInitialDepositWei`, both stakes, and `gasPolicy()`,
+`policy()`, the ceilings, the fee keeper and the owner (or the nominated
+owner) to be the manifest's.
+
+Profiles: `trusted_deployment` (and so `sdk/assets/config/*.json`) and the
+clientd profile gain a `gasless` object: `entry_point_address`,
+`entry_point_runtime_codehash`, `sender_creator_address`,
+`sender_creator_runtime_codehash`, `withdrawal_paymaster_address`,
+`withdrawal_paymaster_runtime_codehash`,
+`withdrawal_account_factory_address`,
+`withdrawal_account_factory_runtime_codehash`,
+`withdrawal_account_implementation_address`,
+`withdrawal_account_implementation_runtime_codehash`,
+`account_creation_code`, `account_creation_code_keccak256`, `bundler_url`
+(from `--bundler-url`; `null` when none is published), `gas_policy` (the
+manifest's gas policy in snake_case, `call_cap` for the caps, plus the
+defaults clients sign: `call_default[4]`, `postop_default`,
+`verification_default`, `verification_default_init`,
+`pm_verification_default`, each inside its floor and cap), `policy`
+(`max_sponsored_cost_wei`, `flat_fee_wei`, `min_escape_net_wei`,
+`escapes_enabled`: the deployment-time values; clients read the live ones),
+`fee_ceilings` (`max_fee_wei`, `priority_fee_wei`) and
+`uneconomic_fraction_percent` (25). The clientd profile also gets
+`deployment_evidence.{entry_point,sender_creator,paymaster,factory,account_implementation}_runtime_keccak256`.
+A deployment made with `GASLESS=0` gives `gasless: null`, as the
+`not_deployed` placeholders have. `node scripts/paymaster-status.mjs
+--deployment "$OUTPUT_PATH" --rpc "$RPC_URL"` prints the float, stakes,
+policy, loss metrics and open debts of a finalized deployment as JSON.
 
 ## Runtime
 

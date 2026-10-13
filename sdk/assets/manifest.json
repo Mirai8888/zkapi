@@ -19,7 +19,7 @@
     "assets/proofs/request.pk": "99155d9863693ab4bcb70459563f21e19c7fd55f40a3c87733fbea8de715ab56",
     "assets/proofs/withdrawal.pk": "b9b94b9fcd6ac96c2539d396ee583e8968299a51ca2b13cb2035e62085ab0c30",
     "assets/proofs/request.vk": "2f0d787b32ee7e153dda038443eef4463dd59accd1d27eb751061b6a053aef81",
-    "assets/config/sepolia.json": "57d45c703fe2c2eb22d463af5f5d66581c6d3cf61351a85a1443825d3f7ebd7f",
-    "assets/config/mainnet.json": "2ba3990711f025cf6742f5f34e14dab53873483194ad8bf727e136bb8c1ffaa7"
+    "assets/config/sepolia.json": "7d9f2671ce135b0a4ca353c8ccfe41b2b054d94ef47be150d3704a6d45b489a1",
+    "assets/config/mainnet.json": "fb8c580a56c27accad2394c35a32bd46336892830f657b8fa5d30f24ae2849d7"
   }
 }

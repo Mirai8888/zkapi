@@ -3,21 +3,27 @@
 // pinned-compiler Forge artifacts alone: the vault's deployedBytecode with the Bn254Poseidon
 // link applied and its immutableReferences filled from the constructor arguments, the adapter's
 // deployedBytecode, and the library's deployedBytecode (with its own address in a call-protection
-// prefix, if the compiler emitted one). Anyone can rebuild the artifacts from source
-// (protocol/contracts/foundry.toml pins solc, via_ir, 10,000 runs, bytecode_hash "none" and
-// cbor_metadata false) and audit a deployment.
+// prefix, if the compiler emitted one). A deployment with the gasless-withdrawal paymaster adds
+// the paymaster's, the transit-account factory's and the account logic's deployedBytecode with
+// their immutables filled the same way, and the two canonical ERC-4337 v0.7.0 runtimes (the
+// EntryPoint and its SenderCreator), which are pinned constants. Anyone can rebuild the artifacts
+// from source (protocol/contracts/foundry.toml pins solc, via_ir, 10,000 runs, bytecode_hash
+// "none" and cbor_metadata false) and audit a deployment.
 //
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json [--check] [--rpc URL]
 //   node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending --rpc URL \
 //     --finalize .demo/deployment.json [--broadcast-log FILE] [--confirmations N]
 //   node scripts/expected-codehashes.mjs --poseidon 0x.. --note-ttl 2592000 --challenge-period 172800 \
 //     --max-pause-duration 3888000 --request-charge-cap 50000 --proof-adapter 0x.. \
-//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y ..
+//     --state-key-x .. --state-key-y .. --clearance-key-x .. --clearance-key-y .. \
+//     [--vault 0x.. --entry-point 0x.. --paymaster 0x.. --factory 0x.. --account-implementation 0x.. \
+//      --wei-per-unit 1000000000 --creation-code-keccak 0x..]
 //
 // --deployment reads Deploy.s.sol's manifest; flags override its fields. --artifacts DIR selects
 // the Forge out directory (default protocol/contracts/out). --check compares the result with the
-// manifest's recorded codehashes, and --rpc URL with eth_getCode at the manifest's addresses; any
-// mismatch exits 1. Prints JSON; integers wider than 2^53 - 1 print as decimal strings.
+// manifest's recorded codehashes, and --rpc URL with eth_getCode at the manifest's addresses (the
+// EntryPoint's and SenderCreator's included); any mismatch exits 1. Prints JSON; integers wider
+// than 2^53 - 1 print as decimal strings.
 //
 // --finalize OUT turns Deploy.s.sol's provisional manifest (OUTPUT_PATH.pending, deploymentStatus
 // "pending") into the deployment manifest, once the broadcast is checked on chain. forge writes the
@@ -26,16 +32,21 @@
 // from the receipts in forge's broadcast log (--broadcast-log; default
 // demo/contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json), and requires, through the RPC:
 // the manifest's chain; each receipt on chain, successful and creating the manifest's address; at
-// least --confirmations (default 1) blocks on the vault's creation; the three runtime codehashes
-// (the manifest's, and on chain); and the vault's owner and treasury. Only then does it write OUT:
-// the manifest with deploymentStatus "deployed", deployBlock (the block that created the vault, the
-// indexer's and the profiles' deploy_block) and deployTransactions. Any mismatch exits 1 and any
-// other failure exits 2; neither writes OUT.
+// least --confirmations (default 1) blocks on the newest creation; every runtime codehash (the
+// manifest's, and on chain); and the vault's owner and treasury. With the paymaster it also
+// requires its creation receipt (the factory and the account logic are created by constructors
+// and are checked by their code), its EntryPoint deposit of at least the manifest's initial
+// deposit, its stake and the factory's, and its policy, fee ceilings, gas policy, fee keeper and
+// owner (or nominated owner) to be the manifest's. Only then does it write OUT: the manifest with
+// deploymentStatus "deployed", deployBlock (the block that created the vault, the indexer's and the
+// profiles' deploy_block) and deployTransactions. Any mismatch exits 1 and any other failure exits
+// 2; neither writes OUT. A manifest with withdrawalPaymaster null (GASLESS=0) carries no gasless
+// field and finalizes on the vault's checks alone.
 //
-// Integers are read exactly. Deploy.s.sol writes the signing-key coordinates as decimal strings and
-// every other number below 2^53. A wider bare JSON number in a manifest from elsewhere is read
-// from its source text, never rounded; a number that is neither a safe integer nor an integer
-// literal (a wide fraction or exponent form) is refused.
+// Integers are read exactly. Deploy.s.sol writes the signing-key coordinates and every wei amount
+// as decimal strings and every other number below 2^53. A wider bare JSON number in a manifest
+// from elsewhere is read from its source text, never rounded; a number that is neither a safe
+// integer nor an integer literal (a wide fraction or exponent form) is refused.
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -117,7 +128,7 @@ function fail(message) {
     throw new Error(message);
 }
 
-function hexToBytes(hex) {
+export function hexToBytes(hex) {
     const body = hex.startsWith('0x') ? hex.slice(2) : hex;
     if (!/^([0-9a-fA-F]{2})*$/.test(body)) fail(`not hex bytes: ${hex.slice(0, 80)}...`);
     return Uint8Array.from(body.match(/../g) ?? [], pair => parseInt(pair, 16));
@@ -145,6 +156,11 @@ function word(value, label) {
 
 function address(value, label) {
     if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value)) fail(`${label}: not an address: ${value}`);
+    return value.toLowerCase();
+}
+
+function bytes32(value, label) {
+    if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) fail(`${label}: not a 32-byte hex string: ${value}`);
     return value.toLowerCase();
 }
 
@@ -192,6 +208,26 @@ function patch(code, start, length, hexValue) {
     return code.slice(0, at) + hexValue + code.slice(at + 2 * length);
 }
 
+/// `contract`'s deployedBytecode with every immutable reference filled from `values`, a map from
+/// the immutable's AST name to its 32-byte hex word. Every reference must have a value and every
+/// value an immutable: a contract whose immutables changed fails here instead of hashing wrongly.
+function filledRuntimeCode(contract, art, values) {
+    const refs = art.deployedBytecode;
+    if (Object.keys(refs.linkReferences ?? {}).length) fail(`${contract} is expected to link no library`);
+    let code = refs.object.replace(/^0x/, '');
+    const names = immutableNames(art.ast);
+    const filled = new Set();
+    for (const [id, places] of Object.entries(refs.immutableReferences ?? {})) {
+        const name = names.get(id) ?? fail(`${contract}: immutable reference ${id} has no declaration in the AST`);
+        const value = values[name] ?? fail(`${contract} immutable ${name} is not derived by this script`);
+        for (const ref of places) code = patch(code, ref.start, ref.length, value);
+        filled.add(name);
+    }
+    for (const name of Object.keys(values)) if (!filled.has(name)) fail(`${contract} has no immutable ${name}`);
+    if (/[^0-9a-fA-F]/.test(code)) fail(`${contract} runtime code still has an unlinked placeholder`);
+    return code;
+}
+
 // ------------------------------------------------------------------------------- codehashes
 
 /// The constructor-derived immutables of ZkApiVault, by name, as 32-byte hex words.
@@ -215,6 +251,118 @@ export function vaultImmutables(inputs) {
         clearanceSigningKeyY: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
         maxPauseDuration: word(maxPauseDuration, 'maxPauseDuration'),
     };
+}
+
+// ------------------------------------------------------------- gasless withdrawals (ERC-4337)
+
+/// The canonical EntryPoint v0.7.0 and the SenderCreator it created (its nonce 1, an immutable of
+/// its runtime), pinned by the keccak256 of their runtime code; identical on every chain.
+export const CANONICAL_ENTRY_POINT = '0x0000000071727de22e5e9d8baf0edac6f37da032';
+export const ENTRY_POINT_V070_CODEHASH = '0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58';
+export const SENDER_CREATOR = '0xefc2c1444ebcc4db75e7613d20c6a62ff67a167c';
+export const SENDER_CREATOR_V070_CODEHASH = '0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689';
+// ZkApiWithdrawalAccountFactory's constants: every transit account's creation code is
+// CREATION_STUB ‖ PROXY_HEAD ‖ <account logic address> ‖ PROXY_TAIL (74 bytes).
+const CREATION_STUB = '600d80380380916000396000f3';
+const PROXY_HEAD = '36600060003760a0603d36396000600060a03601600073';
+const PROXY_TAIL = '5af43d600060003e3d600082603b57fd5bf3';
+/// ZkApiWithdrawalPaymaster.GasPolicy after its two uint256[4] arrays (callFloor, callHardCap),
+/// in ABI order; the manifest's paymasterGasPolicy names them the same, with callHardCap as callCap.
+export const GAS_POLICY_SCALARS = Object.freeze([
+    'postOpFloor', 'postOpCap', 'verificationFloor', 'verificationFloorInit', 'verificationCap', 'pvgFloor', 'pvgCap',
+    'pmVerificationFloor', 'pmVerificationCap', 'postOpBaseGas', 'postOpEscapeGas', 'postOpFinalizeExtraGas',
+    'postOpEscapeForwardGas', 'eoaPushGas', 'newAccountGas', 'payoutPushGas', 'creditGas', 'accountCallOverheadGas',
+    'accountCallOverheadEscapeGas', 'marginGas', 'finalizeReserveGas', 'maxAttempts',
+]);
+
+function rlpInteger(n) {
+    if (n === 0n) return '80';
+    let hex = n.toString(16);
+    if (hex.length % 2) hex = `0${hex}`;
+    const length = hex.length / 2;
+    if (length === 1 && n < 0x80n) return hex;
+    if (length > 55) fail('rlp: integer too wide');
+    return (0x80 + length).toString(16) + hex;
+}
+
+/// The address CREATE gives the contract `deployer` creates at `nonce`.
+export function createAddress(deployer, nonce) {
+    const payload = `94${address(deployer, 'deployer').slice(2)}${rlpInteger(uint(nonce, 64, 'nonce'))}`;
+    const rlp = `${(0xc0 + payload.length / 2).toString(16)}${payload}`;
+    return `0x${keccak256(hexToBytes(rlp)).slice(26)}`;
+}
+
+/// The 74-byte creation code of every transit account of a factory whose account logic is at
+/// `implementation` (ZkApiWithdrawalAccountFactory.accountCreationCode()).
+export function accountCreationCode(implementation) {
+    return `0x${CREATION_STUB}${PROXY_HEAD}${address(implementation, 'implementation').slice(2)}${PROXY_TAIL}`;
+}
+
+/// The 30 words ZkApiWithdrawalPaymaster.gasPolicy() returns, from a manifest's paymasterGasPolicy.
+export function gasPolicyWords(policy) {
+    if (!policy || typeof policy !== 'object') fail('missing paymasterGasPolicy');
+    const words = [];
+    for (const key of ['callFloor', 'callCap']) {
+        if (!Array.isArray(policy[key]) || policy[key].length !== 4) fail(`paymasterGasPolicy.${key} must list four kinds`);
+        for (let kind = 0; kind < 4; kind++) words.push(uint(policy[key][kind], 256, `paymasterGasPolicy.${key}[${kind}]`));
+    }
+    for (const key of GAS_POLICY_SCALARS) words.push(uint(policy[key], 256, `paymasterGasPolicy.${key}`));
+    return words;
+}
+
+/// The immutables of the paymaster, the factory and the account logic, by name, as 32-byte hex
+/// words, from a manifest's gasless fields; checks the fields against each other first (the logic
+/// is the factory's nonce-1 creation, the creation code is the factory's constants around it, and
+/// its keccak256 is both contracts' accountCreationCodeHash).
+export function gaslessImmutables(inputs) {
+    const entryPoint = address(inputs.entryPoint, 'entryPoint');
+    const vault = address(inputs.vault, 'vault');
+    const paymaster = address(inputs.withdrawalPaymaster, 'withdrawalPaymaster');
+    const factory = address(inputs.withdrawalAccountFactory, 'withdrawalAccountFactory');
+    const implementation = address(inputs.withdrawalAccountImplementation, 'withdrawalAccountImplementation');
+    const derived = createAddress(factory, 1);
+    if (implementation !== derived) {
+        fail(`withdrawalAccountImplementation ${implementation} is not the factory's nonce-1 creation ${derived}`);
+    }
+    const creation = accountCreationCode(implementation);
+    if (inputs.accountCreationCode !== undefined && String(inputs.accountCreationCode).toLowerCase() !== creation) {
+        fail(`accountCreationCode is not the factory's creation code for the logic at ${implementation}`);
+    }
+    const creationHash = keccak256(hexToBytes(creation));
+    if (inputs.accountCreationCodeKeccak256 !== undefined
+        && bytes32(inputs.accountCreationCodeKeccak256, 'accountCreationCodeKeccak256') !== creationHash) {
+        fail(`accountCreationCodeKeccak256 is not keccak256 of the creation code (${creationHash})`);
+    }
+    const hashWord = creationHash.slice(2);
+    return {
+        paymaster: {
+            entryPoint: word(entryPoint, 'entryPoint'),
+            vault: word(vault, 'vault'),
+            adapter: word(address(inputs.proofAdapter, 'proofAdapter'), 'proofAdapter'),
+            factory: word(factory, 'withdrawalAccountFactory'),
+            WEI_PER_UNIT: word(uint(inputs.nativeAssetWeiPerUnit, 256, 'nativeAssetWeiPerUnit'), 'nativeAssetWeiPerUnit'),
+            STATE_X: word(inputs.stateSigningKeyX, 'stateSigningKeyX'),
+            STATE_Y: word(inputs.stateSigningKeyY, 'stateSigningKeyY'),
+            CLEAR_X: word(inputs.clearanceSigningKeyX, 'clearanceSigningKeyX'),
+            CLEAR_Y: word(inputs.clearanceSigningKeyY, 'clearanceSigningKeyY'),
+            MAX_PAUSE_DURATION: word(uint(inputs.maxPauseDuration, 64, 'maxPauseDuration'), 'maxPauseDuration'),
+            accountCreationCodeHash: hashWord,
+        },
+        factory: {
+            entryPoint: word(entryPoint, 'entryPoint'),
+            vault: word(vault, 'vault'),
+            paymaster: word(paymaster, 'withdrawalPaymaster'),
+            implementation: word(implementation, 'withdrawalAccountImplementation'),
+            accountCreationCodeHash: hashWord,
+        },
+        implementation: { self: word(implementation, 'withdrawalAccountImplementation') },
+        accountCreationCode: creation,
+    };
+}
+
+/// Whether `inputs` describe a deployment with the paymaster (withdrawalPaymaster set, not null).
+export function hasGasless(inputs) {
+    return inputs.withdrawalPaymaster !== undefined && inputs.withdrawalPaymaster !== null;
 }
 
 export function expectedRuntimeCode(artifactsDir, inputs) {
@@ -260,16 +408,30 @@ export function expectedRuntimeCode(artifactsDir, inputs) {
     // depend on its address.
     if (library.startsWith('73' + '0'.repeat(40))) library = patch(library, 1, 20, poseidon);
 
-    return { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${library}` };
+    const code = { vault: `0x${vault}`, adapter: `0x${adapter}`, poseidon: `0x${library}` };
+    if (!hasGasless(inputs)) return code;
+    const immutables = gaslessImmutables(inputs);
+    code.paymaster = `0x${filledRuntimeCode('ZkApiWithdrawalPaymaster', artifact(artifactsDir, 'ZkApiWithdrawalPaymaster'), immutables.paymaster)}`;
+    code.factory = `0x${filledRuntimeCode('ZkApiWithdrawalAccountFactory', artifact(artifactsDir, 'ZkApiWithdrawalAccountFactory'), immutables.factory)}`;
+    code.implementation = `0x${filledRuntimeCode('ZkApiWithdrawalAccount', artifact(artifactsDir, 'ZkApiWithdrawalAccount'), immutables.implementation)}`;
+    return code;
 }
 
 export function expectedCodehashes(artifactsDir, inputs) {
     const code = expectedRuntimeCode(artifactsDir, inputs);
-    return {
+    const hashes = {
         vault_runtime_codehash: keccak256(hexToBytes(code.vault)),
         adapter_runtime_codehash: keccak256(hexToBytes(code.adapter)),
         poseidon_runtime_codehash: keccak256(hexToBytes(code.poseidon)),
     };
+    if (code.paymaster) {
+        hashes.paymaster_runtime_codehash = keccak256(hexToBytes(code.paymaster));
+        hashes.factory_runtime_codehash = keccak256(hexToBytes(code.factory));
+        hashes.account_implementation_runtime_codehash = keccak256(hexToBytes(code.implementation));
+        hashes.entry_point_runtime_codehash = ENTRY_POINT_V070_CODEHASH;
+        hashes.sender_creator_runtime_codehash = SENDER_CREATOR_V070_CODEHASH;
+    }
+    return hashes;
 }
 
 /// Parses a deployment manifest without rounding: a JSON number above 2^53 - 1 becomes a BigInt
@@ -308,7 +470,7 @@ async function codehashAt(rpc, target) {
     return keccak256(hexToBytes(code));
 }
 
-function selector(signature) {
+export function selector(signature) {
     return keccak256(new TextEncoder().encode(signature)).slice(0, 10);
 }
 
@@ -317,9 +479,30 @@ function quantity(value, label) {
     return BigInt(value);
 }
 
+/// Calldata of `signature` with `args`, each a 32-byte word (an address, an integer or a bytes32).
+export function encodeCall(signature, args = []) {
+    return selector(signature) + args.map((value, i) => {
+        if (typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value)) return value.slice(2).toLowerCase();
+        return word(value, `${signature} argument ${i}`);
+    }).join('');
+}
+
+/// `to`'s answer to `signature(args)` through `rpc`, as the `count` 32-byte words it returns.
+export async function callWords(rpc, to, signature, args, count) {
+    const data = await rpc('eth_call', [{ to, data: encodeCall(signature, args) }, 'latest']);
+    if (typeof data !== 'string' || !/^0x([0-9a-fA-F]{64})*$/.test(data) || (data.length - 2) / 64 !== count) {
+        fail(`${signature} at ${to}: unexpected return ${data}`);
+    }
+    const words = [];
+    for (let i = 0; i < count; i++) words.push(BigInt(`0x${data.slice(2 + 64 * i, 66 + 64 * i)}`));
+    return words;
+}
+
+const addressOf = value => `0x${value.toString(16).padStart(40, '0')}`;
+
 /// The constructor-derived inputs of a manifest, with `overrides` (CLI flags) applied.
 export function deploymentInputs(deployment, overrides = {}) {
-    return {
+    const inputs = {
         poseidonLibrary: deployment.poseidonLibrary,
         proofAdapter: deployment.proofAdapter,
         noteTtl: deployment.noteTtl,
@@ -330,8 +513,22 @@ export function deploymentInputs(deployment, overrides = {}) {
         stateSigningKeyY: deployment.stateSigningKeyY,
         clearanceSigningKeyX: deployment.clearanceSigningKeyX,
         clearanceSigningKeyY: deployment.clearanceSigningKeyY,
+        withdrawalPaymaster: deployment.withdrawalPaymaster ?? null,
         ...overrides,
     };
+    if (hasGasless(inputs)) {
+        Object.assign(inputs, {
+            vault: deployment.vault,
+            entryPoint: deployment.entryPoint ?? CANONICAL_ENTRY_POINT,
+            withdrawalAccountFactory: deployment.withdrawalAccountFactory,
+            withdrawalAccountImplementation: deployment.withdrawalAccountImplementation,
+            nativeAssetWeiPerUnit: deployment.nativeAssetWeiPerUnit,
+            accountCreationCode: deployment.accountCreationCode,
+            accountCreationCodeKeccak256: deployment.accountCreationCodeKeccak256,
+            ...overrides,
+        });
+    }
+    return inputs;
 }
 
 /// The expected codehashes of `deployment`, compared with its recorded ones (`check`) and with the
@@ -339,6 +536,7 @@ export function deploymentInputs(deployment, overrides = {}) {
 export async function auditDeployment({ artifacts, deployment, overrides = {}, check = false, rpc = null }) {
     const inputs = deploymentInputs(deployment, overrides);
     const expected = expectedCodehashes(artifacts, inputs);
+    const gasless = hasGasless(inputs);
     const mismatches = [];
     const compare = (source, field, actual) => {
         if (typeof actual !== 'string' || actual.toLowerCase() !== expected[field]) {
@@ -349,14 +547,99 @@ export async function auditDeployment({ artifacts, deployment, overrides = {}, c
         compare('deployment', 'vault_runtime_codehash', deployment.vaultRuntimeCodehash);
         compare('deployment', 'adapter_runtime_codehash', deployment.adapterRuntimeCodehash);
         compare('deployment', 'poseidon_runtime_codehash', deployment.poseidonRuntimeCodehash);
+        if (gasless) {
+            compare('deployment', 'paymaster_runtime_codehash', deployment.paymasterRuntimeCodehash);
+            compare('deployment', 'factory_runtime_codehash', deployment.factoryRuntimeCodehash);
+            compare('deployment', 'account_implementation_runtime_codehash', deployment.accountImplementationRuntimeCodehash);
+            compare('deployment', 'entry_point_runtime_codehash', deployment.entryPointRuntimeCodehash);
+            compare('deployment', 'sender_creator_runtime_codehash', deployment.senderCreatorRuntimeCodehash);
+        }
     }
     if (rpc) {
         const vault = deployment.vault ?? fail('--rpc needs the vault address from --deployment');
         compare('rpc', 'vault_runtime_codehash', await codehashAt(rpc, address(vault, 'vault')));
         compare('rpc', 'adapter_runtime_codehash', await codehashAt(rpc, address(inputs.proofAdapter, 'proofAdapter')));
         compare('rpc', 'poseidon_runtime_codehash', await codehashAt(rpc, address(inputs.poseidonLibrary, 'poseidonLibrary')));
+        if (gasless) {
+            compare('rpc', 'paymaster_runtime_codehash', await codehashAt(rpc, address(inputs.withdrawalPaymaster, 'withdrawalPaymaster')));
+            compare('rpc', 'factory_runtime_codehash', await codehashAt(rpc, address(inputs.withdrawalAccountFactory, 'withdrawalAccountFactory')));
+            compare('rpc', 'account_implementation_runtime_codehash',
+                await codehashAt(rpc, address(inputs.withdrawalAccountImplementation, 'withdrawalAccountImplementation')));
+            compare('rpc', 'entry_point_runtime_codehash', await codehashAt(rpc, address(inputs.entryPoint, 'entryPoint')));
+            compare('rpc', 'sender_creator_runtime_codehash', await codehashAt(rpc, address(deployment.senderCreator ?? SENDER_CREATOR, 'senderCreator')));
+        }
     }
     return { inputs, expected, mismatches };
+}
+
+/// The paymaster's state the codehashes do not cover, read through `rpc` and compared with the
+/// manifest: the EntryPoint deposit (at least the initial one), both stakes, the policy, the fee
+/// ceilings, the gas policy, the fee keeper and the owner. With paymasterOwnershipTransferPending
+/// the deployer owns the paymaster until the recorded owner accepts, so either the pending or the
+/// accepted state passes. Mismatches are appended to `mismatches`.
+export async function checkPaymasterState(rpc, deployment, mismatches) {
+    const paymaster = address(deployment.withdrawalPaymaster, 'withdrawalPaymaster');
+    const factory = address(deployment.withdrawalAccountFactory, 'withdrawalAccountFactory');
+    const entryPoint = address(deployment.entryPoint ?? CANONICAL_ENTRY_POINT, 'entryPoint');
+    const mismatch = (field, expected, actual) => mismatches.push({ source: 'rpc', field, expected, actual });
+
+    const deposit = uint(deployment.paymasterInitialDepositWei, 256, 'paymasterInitialDepositWei');
+    const [balance] = await callWords(rpc, entryPoint, 'balanceOf(address)', [paymaster], 1);
+    if (balance < deposit) mismatch('paymaster_deposit', `>= ${deposit}`, balance.toString());
+
+    const delay = uint(deployment.paymasterUnstakeDelaySeconds, 32, 'paymasterUnstakeDelaySeconds');
+    for (const [field, target, key] of [['paymaster_stake', paymaster, 'paymasterStakeWei'], ['factory_stake', factory, 'factoryStakeWei']]) {
+        const wanted = uint(deployment[key], 112, key);
+        const [, staked, stake, unstakeDelay] = await callWords(rpc, entryPoint, 'getDepositInfo(address)', [target], 5);
+        if (staked !== 1n || stake < wanted || unstakeDelay !== delay) {
+            mismatch(field, { staked: true, stake: `>= ${wanted}`, unstakeDelaySec: delay.toString() },
+                { staked: staked === 1n, stake: stake.toString(), unstakeDelaySec: unstakeDelay.toString() });
+        }
+    }
+
+    const expectedPolicy = gasPolicyWords(deployment.paymasterGasPolicy);
+    const actualPolicy = await callWords(rpc, paymaster, 'gasPolicy()', [], expectedPolicy.length);
+    const names = [...[0, 1, 2, 3].map(k => `callFloor[${k}]`), ...[0, 1, 2, 3].map(k => `callCap[${k}]`), ...GAS_POLICY_SCALARS];
+    for (let i = 0; i < names.length; i++) {
+        if (actualPolicy[i] !== expectedPolicy[i]) mismatch(`paymaster_gas_policy.${names[i]}`, expectedPolicy[i].toString(), actualPolicy[i].toString());
+    }
+
+    const policy = deployment.paymasterPolicy ?? fail('missing paymasterPolicy');
+    const [maxCost, flatFee, minEscapeNet, escapes, paused] = await callWords(rpc, paymaster, 'policy()', [], 5);
+    const wantedPolicy = {
+        maxSponsoredCostWei: uint(policy.maxSponsoredCostWei, 128, 'paymasterPolicy.maxSponsoredCostWei'),
+        flatFeeWei: uint(policy.flatFeeWei, 64, 'paymasterPolicy.flatFeeWei'),
+        minEscapeNetWei: uint(policy.minEscapeNetWei, 64, 'paymasterPolicy.minEscapeNetWei'),
+        escapesEnabled: policy.escapesEnabled === true ? 1n : 0n,
+    };
+    const actual = { maxSponsoredCostWei: maxCost, flatFeeWei: flatFee, minEscapeNetWei: minEscapeNet, escapesEnabled: escapes };
+    for (const [key, wanted] of Object.entries(wantedPolicy)) {
+        if (actual[key] !== wanted) mismatch(`paymaster_policy.${key}`, wanted.toString(), actual[key].toString());
+    }
+    if (paused !== 0n) mismatch('paymaster_policy.sponsorshipPaused', 'false', 'true');
+
+    const ceilings = deployment.paymasterFeeCeilings ?? fail('missing paymasterFeeCeilings');
+    for (const [key, signature] of [['maxFeeWei', 'maxFeeCeiling()'], ['priorityFeeWei', 'priorityFeeCeiling()']]) {
+        const wanted = uint(ceilings[key], 256, `paymasterFeeCeilings.${key}`);
+        const [value] = await callWords(rpc, paymaster, signature, [], 1);
+        if (value !== wanted) mismatch(`paymaster_fee_ceilings.${key}`, wanted.toString(), value.toString());
+    }
+
+    const keeper = address(deployment.paymasterFeeKeeper ?? `0x${'0'.repeat(40)}`, 'paymasterFeeKeeper');
+    const [keeperWord] = await callWords(rpc, paymaster, 'feeKeeper()', [], 1);
+    if (addressOf(keeperWord) !== keeper) mismatch('paymaster_fee_keeper', keeper, addressOf(keeperWord));
+
+    const owner = address(deployment.paymasterOwner, 'paymasterOwner');
+    const [ownerWord] = await callWords(rpc, paymaster, 'owner()', [], 1);
+    const [pendingWord] = await callWords(rpc, paymaster, 'pendingOwner()', [], 1);
+    const current = addressOf(ownerWord);
+    const pending = addressOf(pendingWord);
+    if (deployment.paymasterOwnershipTransferPending === true) {
+        // Accepted meanwhile, or still nominated: both are the recorded owner.
+        if (current !== owner && pending !== owner) mismatch('paymaster_owner', `${owner} (owner or pendingOwner)`, { owner: current, pendingOwner: pending });
+    } else if (current !== owner) {
+        mismatch('paymaster_owner', owner, current);
+    }
 }
 
 /// forge's broadcast log of Deploy.s.sol on `chainId`, relative to the repository root.
@@ -373,6 +656,10 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
     if (deployment.deploymentStatus !== 'pending') {
         fail(`deploymentStatus is ${JSON.stringify(deployment.deploymentStatus ?? null)}: finalize takes the provisional manifest of a broadcast run ("pending"); a dry run deploys nothing`);
     }
+    if (!('withdrawalPaymaster' in deployment)) {
+        fail('the provisional manifest has no withdrawalPaymaster field (an address, or null with GASLESS=0): it was not written by the current Deploy.s.sol');
+    }
+    const gasless = hasGasless(deployment);
     const chainId = uint(deployment.chainId, 64, 'chainId');
     const rpcChain = quantity(await rpc('eth_chainId', []), 'eth_chainId');
     if (rpcChain !== chainId) fail(`the RPC serves chain ${rpcChain}, the manifest is for chain ${chainId}`);
@@ -381,6 +668,7 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
 
     const creations = { vault: deployment.vault, proofAdapter: deployment.proofAdapter };
     if (deployment.poseidonLibraryReused !== true) creations.poseidonLibrary = deployment.poseidonLibrary;
+    if (gasless) creations.withdrawalPaymaster = deployment.withdrawalPaymaster;
     const transactions = {};
     const blocks = {};
     for (const [role, target] of Object.entries(creations)) {
@@ -405,10 +693,14 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
     }
     const deployBlock = blocks.vault;
     if (deployBlock > BigInt(Number.MAX_SAFE_INTEGER)) fail(`deployBlock ${deployBlock} is above 2^53 - 1`);
+    // Confirmations count from the newest creation (nonce-ordered sends can land in later
+    // blocks than the vault's), so every creation, and the state read at the head below, has at
+    // least `confirmations`.
+    const [newestRole, newestBlock] = Object.entries(blocks).reduce((newest, entry) => (entry[1] > newest[1] ? entry : newest));
     const latest = quantity(await rpc('eth_blockNumber', []), 'eth_blockNumber');
-    const seen = latest >= deployBlock ? latest - deployBlock + 1n : 0n;
+    const seen = latest >= newestBlock ? latest - newestBlock + 1n : 0n;
     if (seen < BigInt(confirmations)) {
-        fail(`the vault's creation has ${seen} confirmations, ${confirmations} required: finalize again later`);
+        fail(`the ${newestRole}'s creation (block ${newestBlock}) has ${seen} confirmations, ${confirmations} required: finalize again later`);
     }
 
     const { expected, mismatches } = await auditDeployment({ artifacts, deployment, check: true, rpc });
@@ -420,6 +712,9 @@ export async function finalizeDeployment({ artifacts, deployment, broadcastLog, 
         const wanted = address(deployment[field], field);
         if (actual !== wanted || BigInt(word) >> 160n !== 0n) mismatches.push({ source: 'rpc', field, expected: wanted, actual: word });
     }
+    // The paymaster's deposit, stakes, policy and owner are storage of the paymaster and the
+    // EntryPoint; the factory and the account logic have no state of their own.
+    if (gasless) await checkPaymasterState(rpc, deployment, mismatches);
     if (mismatches.length) return { mismatches, expected };
     const manifest = {
         ...deployment,
@@ -443,6 +738,13 @@ const FLAGS = {
     '--state-key-y': 'stateSigningKeyY',
     '--clearance-key-x': 'clearanceSigningKeyX',
     '--clearance-key-y': 'clearanceSigningKeyY',
+    '--vault': 'vault',
+    '--entry-point': 'entryPoint',
+    '--paymaster': 'withdrawalPaymaster',
+    '--factory': 'withdrawalAccountFactory',
+    '--account-implementation': 'withdrawalAccountImplementation',
+    '--wei-per-unit': 'nativeAssetWeiPerUnit',
+    '--creation-code-keccak': 'accountCreationCodeKeccak256',
 };
 
 function parseArgs(argv) {

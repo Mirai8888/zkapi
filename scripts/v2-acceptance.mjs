@@ -24,6 +24,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
 // Anvil with Sepolia's chain ID: the signer sidecar refuses any other chain
@@ -177,9 +179,118 @@ export function drillTiming(timing = TIMING) {
     return { ...checks, ok: Object.entries(checks).every(([key, value]) => key === 'settlement_window_seconds' || value) };
 }
 
+// The `gasless` object of a profile (gasless withdrawals over ERC-4337,
+// design §4.3): the pins of the EntryPoint, its SenderCreator, the paymaster,
+// the transit-account factory and the account logic, the 74-byte creation
+// code clients derive transit accounts from, the operator's bundler (null
+// when none is published), the paymaster's pinned gas policy with the
+// defaults clients sign (each inside its [floor, cap], as
+// GaslessTestBase._gas derives them and transit-vectors.json pins them), the
+// deployment-time policy and fee ceilings (clients read the live ones) and
+// the uneconomic rule. Null for a deployment without the paymaster.
+export function gaslessProfile(finalized, bundlerUrl = null) {
+    if (finalized.withdrawalPaymaster == null) return null;
+    assert.ok(bundlerUrl === null || (typeof bundlerUrl === 'string' && /^https?:\/\//.test(bundlerUrl)), 'bundler_url is null or an http(s) URL');
+    const gp = finalized.paymasterGasPolicy;
+    const policy = finalized.paymasterPolicy;
+    const ceilings = finalized.paymasterFeeCeilings;
+    assert.ok(gp && policy && ceilings, 'a paymaster manifest carries paymasterGasPolicy, paymasterPolicy and paymasterFeeCeilings');
+    const gas = (value, name) => {
+        assert.ok(Number.isSafeInteger(value) && value >= 0, `paymasterGasPolicy.${name} is a gas figure`);
+        return value;
+    };
+    const wei = (value, name) => {
+        assert.match(String(value), /^(0|[1-9][0-9]*)$/, `${name} is a wei amount`);
+        return String(value);
+    };
+    const within = (value, floor, cap, name) => {
+        assert.ok(floor <= value && value <= cap, `${name} default ${value} is outside [${floor}, ${cap}]`);
+        return value;
+    };
+    const floors = [0, 1, 2, 3].map(k => gas(gp.callFloor?.[k], `callFloor[${k}]`));
+    const caps = [0, 1, 2, 3].map(k => gas(gp.callCap?.[k], `callCap[${k}]`));
+    const scalar = name => gas(gp[name], name);
+    // Every pin is checked by shape before it is published: finalize treats
+    // some of these manifest fields as optional, and a missing one must fail
+    // here by name, not reach a profile as the string "undefined".
+    const pinned = (name, pattern, what) => {
+        const value = finalized[name];
+        assert.ok(typeof value === 'string' && pattern.test(value), `${name} is not ${what}`);
+        return value.toLowerCase();
+    };
+    const addr = name => pinned(name, /^0x[0-9a-fA-F]{40}$/, 'an address');
+    const hash = name => pinned(name, /^0x[0-9a-fA-F]{64}$/, 'a keccak256');
+    const implementation = addr('withdrawalAccountImplementation');
+    const creation = pinned('accountCreationCode', /^0x[0-9a-fA-F]{148}$/, 'the 74-byte creation code');
+    assert.equal(creation, accountCreationCode(implementation), 'accountCreationCode is not the factory\'s creation code for the account logic');
+    assert.equal(hash('accountCreationCodeKeccak256'), keccak256(hexToBytes(creation)), 'accountCreationCodeKeccak256 is not keccak256 of the creation code');
+    return {
+        entry_point_address: addr('entryPoint'),
+        entry_point_runtime_codehash: hash('entryPointRuntimeCodehash'),
+        sender_creator_address: addr('senderCreator'),
+        sender_creator_runtime_codehash: hash('senderCreatorRuntimeCodehash'),
+        withdrawal_paymaster_address: addr('withdrawalPaymaster'),
+        withdrawal_paymaster_runtime_codehash: hash('paymasterRuntimeCodehash'),
+        withdrawal_account_factory_address: addr('withdrawalAccountFactory'),
+        withdrawal_account_factory_runtime_codehash: hash('factoryRuntimeCodehash'),
+        withdrawal_account_implementation_address: implementation,
+        withdrawal_account_implementation_runtime_codehash: hash('accountImplementationRuntimeCodehash'),
+        account_creation_code: creation,
+        account_creation_code_keccak256: hash('accountCreationCodeKeccak256'),
+        bundler_url: bundlerUrl,
+        gas_policy: {
+            call_floor: floors,
+            call_cap: caps,
+            call_default: floors.map((floor, k) => within(floor + Math.floor((caps[k] - floor) / 4), floor, caps[k], `call[${k}]`)),
+            postop_floor: scalar('postOpFloor'),
+            postop_cap: scalar('postOpCap'),
+            postop_default: within(scalar('postOpFloor') + 20_000, scalar('postOpFloor'), scalar('postOpCap'), 'postop'),
+            verification_floor: scalar('verificationFloor'),
+            verification_floor_init: scalar('verificationFloorInit'),
+            verification_cap: scalar('verificationCap'),
+            verification_default: within(scalar('verificationFloor') + 20_000, scalar('verificationFloor'), scalar('verificationCap'), 'verification'),
+            verification_default_init: within(scalar('verificationFloorInit') + 40_000, scalar('verificationFloorInit'), scalar('verificationCap'),
+                'verification_init'),
+            pvg_floor: scalar('pvgFloor'),
+            pvg_cap: scalar('pvgCap'),
+            pm_verification_floor: scalar('pmVerificationFloor'),
+            pm_verification_cap: scalar('pmVerificationCap'),
+            pm_verification_default: within(scalar('pmVerificationFloor') + 30_000, scalar('pmVerificationFloor'), scalar('pmVerificationCap'),
+                'pm_verification'),
+            postop_base_gas: scalar('postOpBaseGas'),
+            postop_escape_gas: scalar('postOpEscapeGas'),
+            postop_finalize_extra_gas: scalar('postOpFinalizeExtraGas'),
+            postop_escape_forward_gas: scalar('postOpEscapeForwardGas'),
+            eoa_push_gas: scalar('eoaPushGas'),
+            new_account_gas: scalar('newAccountGas'),
+            payout_push_gas: scalar('payoutPushGas'),
+            credit_gas: scalar('creditGas'),
+            account_call_overhead_gas: scalar('accountCallOverheadGas'),
+            account_call_overhead_escape_gas: scalar('accountCallOverheadEscapeGas'),
+            margin_gas: scalar('marginGas'),
+            finalize_reserve_gas: scalar('finalizeReserveGas'),
+            max_attempts: scalar('maxAttempts'),
+        },
+        policy: {
+            max_sponsored_cost_wei: wei(policy.maxSponsoredCostWei, 'paymasterPolicy.maxSponsoredCostWei'),
+            flat_fee_wei: wei(policy.flatFeeWei, 'paymasterPolicy.flatFeeWei'),
+            min_escape_net_wei: wei(policy.minEscapeNetWei, 'paymasterPolicy.minEscapeNetWei'),
+            escapes_enabled: policy.escapesEnabled === true,
+        },
+        fee_ceilings: {
+            max_fee_wei: wei(ceilings.maxFeeWei, 'paymasterFeeCeilings.maxFeeWei'),
+            priority_fee_wei: wei(ceilings.priorityFeeWei, 'paymasterFeeCeilings.priorityFeeWei'),
+        },
+        uneconomic_fraction_percent: 25,
+    };
+}
+
 // The deployment profile (§10.3 `trusted_deployment`) of a finalized
 // Deploy.s.sol manifest, as serverd, zkapi-challenged, the SDK and the
-// companion read it. Only a finalized manifest is a deployment.
+// companion read it. Only a finalized manifest is a deployment. The `gasless`
+// object (services.bundlerUrl names the operator's bundler) is null for a
+// deployment made with GASLESS=0; serverd, the indexer and the challenger
+// ignore it.
 export function trustedDeployment(finalized, services) {
     assert.equal(finalized.deploymentStatus, 'deployed', 'profiles come only from a finalized manifest');
     assert.ok(Number.isSafeInteger(finalized.deployBlock) && finalized.deployBlock > 0, 'finalized manifests carry deployBlock');
@@ -230,6 +341,7 @@ export function trustedDeployment(finalized, services) {
         // not OA-verifier-backed ones, but the profile pins a verifier origin.
         verifier_url: services.verifierUrl,
         openrouter_inference_base: services.inferenceBase,
+        gasless: gaslessProfile(finalized, services.bundlerUrl ?? null),
     };
 }
 

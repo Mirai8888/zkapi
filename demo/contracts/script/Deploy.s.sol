@@ -7,6 +7,9 @@ import {console2} from "forge-std/console2.sol";
 
 import {ZkApiVault} from "zkapi-contracts/ZkApiVault.sol";
 import {Groth16ProofAdapter} from "zkapi-contracts/adapters/Groth16ProofAdapter.sol";
+import {IEntryPoint} from "zkapi-contracts/gasless/IERC4337.sol";
+import {ZkApiWithdrawalAccountFactory} from "zkapi-contracts/gasless/ZkApiWithdrawalAccountFactory.sol";
+import {ZkApiWithdrawalPaymaster} from "zkapi-contracts/gasless/ZkApiWithdrawalPaymaster.sol";
 import {SigningKeyChecks} from "./SigningKeyChecks.sol";
 import {SetupPolicy} from "./SetupPolicy.sol";
 
@@ -14,8 +17,11 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 /// @notice Links (or deploys) the Bn254Poseidon library, deploys the circuit-specific Groth16
 ///         verifier and the native ETH ZkApiVault with its 11 constructor arguments, checks the
 ///         adapter's circuit and verifying-key hashes against the setup manifest and the vault's
-///         getters against the inputs, then writes the provisional deployment manifest, including
-///         the linked addresses and the three runtime codehashes, to $OUTPUT_PATH.pending.
+///         getters against the inputs, then (unless GASLESS=0) deploys the gasless-withdrawal
+///         paymaster against the canonical ERC-4337 EntryPoint v0.7.0 in the same broadcast, stakes
+///         it and its transit-account factory, funds its deposit and checks its getters, and writes
+///         the provisional deployment manifest, including the linked addresses and every runtime
+///         codehash, to $OUTPUT_PATH.pending.
 /// @dev    forge runs run() locally before it sends any transaction, so every check here and the
 ///         provisional manifest describe the simulated deployment: its addresses assume the
 ///         deployer's nonces at simulation time, and deployBlockLowerBound is the chain head the
@@ -25,12 +31,22 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///             --rpc $RPC_URL --finalize $OUTPUT_PATH
 ///         It reads the creation receipts from forge's broadcast log, requires each creation to
 ///         have succeeded at the manifest's address and the runtime codehashes, owner and treasury
-///         on chain to be the expected ones, and only then writes $OUTPUT_PATH with deployBlock
-///         (the block that created the vault) and deploymentStatus "deployed". Profiles take their
-///         pins and deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes
-///         deploymentStatus "simulated", which finalize refuses.
+///         on chain to be the expected ones (and, with the paymaster, its deposit, both stakes, its
+///         policy and gas policy), and only then writes $OUTPUT_PATH with deployBlock (the block
+///         that created the vault) and deploymentStatus "deployed". Profiles take their pins and
+///         deploy_block from $OUTPUT_PATH only. A dry run (no --broadcast) writes deploymentStatus
+///         "simulated", which finalize refuses.
 ///         The script links the vault itself (creation code from out/ZkApiVault.sol/ZkApiVault.json
 ///         with the library placeholder replaced), so forge never links it.
+///         The gasless block needs the canonical EntryPoint v0.7.0 runtime at ENTRY_POINT and the
+///         SenderCreator runtime at 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C, both pinned by
+///         keccak256 (the paymaster's constructor pins the EntryPoint the same way): on a public
+///         chain they are deployed already; on Anvil etch them first with anvil_setCode from
+///         protocol/contracts/test/fixtures/*.runtime.hex (CI shows the commands); a forge dry run
+///         without an RPC has neither, so pass GASLESS=0 there. "Local" is decided by chain ID alone
+///         (31337, 1337): an Anvil started with a public chain ID needs the etched runtimes and the
+///         explicit stake and deposit amounts (PAYMASTER_STAKE_WEI, FACTORY_STAKE_WEI,
+///         PAYMASTER_DEPOSIT_WEI), or GASLESS=0.
 ///         Reads these environment variables:
 ///           PRIVATE_KEY – deployer key (also the vault owner on local chains
 ///                         unless OWNER is set).
@@ -68,8 +84,41 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         must equal the compiled library's at that address. Unset deploys a
 ///                         fresh library.
 ///           CHAIN_ID – optional expected chain ID; mismatches abort deployment.
+///         Gasless withdrawals (ERC-4337):
+///           GASLESS     – 1 (default) deploys ZkApiWithdrawalPaymaster after the vault; 0 skips
+///                         the block and writes withdrawalPaymaster: null.
+///           ENTRY_POINT – the EntryPoint v0.7.0; defaults to the canonical
+///                         0x0000000071727De22E5E9d8BAf0edAc6f37da032 and must carry its runtime.
+///           PAYMASTER_OWNER – owner of the paymaster (policy, fee ceilings, call caps, key
+///                         release, stake and deposit withdrawals); defaults to OWNER. The first
+///                         stake may only be set by the owner, so when it is not the deployer the
+///                         paymaster is deployed with the deployer as owner, staked and funded, and
+///                         PAYMASTER_OWNER is nominated (transferOwnership): it must call
+///                         acceptOwnership() on the paymaster, as the manifest's
+///                         paymasterOwnershipTransferPending records.
+///           PAYMASTER_STAKE_WEI, FACTORY_STAKE_WEI – the EntryPoint stakes of the paymaster and
+///                         the factory (positive, at most 2^112 - 1). Local chains default to
+///                         0.1 ether each; public chains require them (plan 1 ether on mainnet,
+///                         0.1 ether on Sepolia).
+///           PAYMASTER_UNSTAKE_DELAY_SECONDS – the stakes' unstake delay; default 86,400.
+///           PAYMASTER_DEPOSIT_WEI – the paymaster's initial EntryPoint deposit, the float that
+///                         pays sponsored gas (positive). Local default 1 ether; required off
+///                         local chains.
+///           PAYMASTER_MAX_SPONSORED_COST_WEI – the most one operation may cost the float
+///                         (maxCost); default 0.05 ether, at most 0.25 ether.
+///           PAYMASTER_FLAT_FEE_WEI – flat fee kept per sponsored operation; default 0, at most
+///                         0.001 ether.
+///           PAYMASTER_MIN_ESCAPE_NET_WEI – least net payout of a sponsored escape; default
+///                         0.01 ether, at most 2^64 - 1.
+///           PAYMASTER_ESCAPES – 1 sponsors escape initiations; default 0 (finalizations are
+///                         always sponsored).
+///           PAYMASTER_MAX_FEE_CEILING_WEI, PAYMASTER_PRIORITY_FEE_CEILING_WEI – the fee
+///                         ceilings per gas (defaults 100 gwei and 3 gwei; at most 500 gwei and
+///                         20 gwei, and the priority ceiling must not exceed the max ceiling).
+///           PAYMASTER_FEE_KEEPER – optional key that may re-set the fee ceilings.
 ///         Every JSON number in the manifest is a safe integer (at most 2^53 - 1, so JavaScript
-///         reads it exactly); the four signing-key coordinates are decimal strings.
+///         reads it exactly); the four signing-key coordinates and every wei amount of the
+///         paymaster block are decimal strings.
 contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     uint64 internal constant DEFAULT_NOTE_TTL = 30 days;
     uint64 internal constant LOCAL_MAX_PAUSE_DURATION = 7 days;
@@ -77,6 +126,24 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
     string internal constant DEFAULT_SETUP_MANIFEST = "../../protocol/setup/v2-concession-dev/manifest.json";
     /// Largest integer a JSON number carries exactly in JavaScript (Number.MAX_SAFE_INTEGER).
     uint256 internal constant MAX_SAFE_INTEGER = 9_007_199_254_740_991;
+
+    /// The canonical ERC-4337 EntryPoint v0.7.0 and the SenderCreator it created (its nonce 1,
+    /// an immutable of its runtime), pinned by the keccak256 of their runtime code on every chain.
+    address internal constant CANONICAL_ENTRY_POINT = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
+    bytes32 internal constant ENTRY_POINT_V070_CODEHASH =
+        0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58;
+    address internal constant SENDER_CREATOR = 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C;
+    bytes32 internal constant SENDER_CREATOR_V070_CODEHASH =
+        0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689;
+    /// The paymaster's policy and ceiling bounds (its private constants; the constructor reverts
+    /// PolicyOutOfBounds / CeilingOutOfRange above them, these checks say which variable).
+    uint256 internal constant MAX_SPONSORED_COST_HARD_CAP = 0.25 ether;
+    uint256 internal constant FLAT_FEE_HARD_CAP = 0.001 ether;
+    uint256 internal constant MAX_FEE_HARD_CAP = 500 gwei;
+    uint256 internal constant PRIORITY_FEE_HARD_CAP = 20 gwei;
+    /// Placeholder the manifest serializer writes for withdrawalPaymaster with GASLESS=0; it is
+    /// replaced by a JSON null before the file is written (vm.serialize* has no null).
+    string internal constant NULL_PLACEHOLDER = "__null__";
 
     struct Params {
         address deployer;
@@ -100,11 +167,32 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         bool allowDevSetup;
     }
 
+    /// The gasless block's inputs (GASLESS and the PAYMASTER_* variables).
+    struct Gasless {
+        bool enabled;
+        IEntryPoint entryPoint;
+        address owner;
+        address feeKeeper;
+        uint256 stakeWei;
+        uint256 factoryStakeWei;
+        uint32 unstakeDelay;
+        uint256 depositWei;
+        ZkApiWithdrawalPaymaster.Policy policy;
+        uint256 maxFeeCeiling;
+        uint256 priorityFeeCeiling;
+    }
+
     struct Deployed {
         address poseidon;
         bool poseidonReused;
         Groth16ProofAdapter adapter;
         ZkApiVault vault;
+        ZkApiWithdrawalPaymaster paymaster;
+        ZkApiWithdrawalAccountFactory factory;
+        /// The transit-account logic the factory deployed (its nonce 1).
+        address implementation;
+        /// The deployer still owns the paymaster and PAYMASTER_OWNER must accept the transfer.
+        bool paymasterOwnershipPending;
     }
 
     function run() external {
@@ -117,6 +205,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         string memory outputPath = vm.envString("OUTPUT_PATH");
         Params memory p = _params(vm.addr(deployerKey), local);
         Setup memory setup = _setup(local);
+        Gasless memory g = _gasless(p, local);
 
         address poseidonIn = vm.envOr("POSEIDON_ADDRESS", address(0));
         bytes memory poseidonRuntime = vm.getDeployedCode("Bn254Poseidon.sol:Bn254Poseidon");
@@ -152,15 +241,17 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
                 )
             )
         );
+        if (g.enabled) _deployGasless(d, p, g);
         vm.stopBroadcast();
 
         require(d.poseidon.codehash == _libraryCodehash(poseidonRuntime, d.poseidon), "linked library codehash");
         _checkAdapter(d.adapter, setup);
         _checkVault(d, p);
+        if (g.enabled) _checkGasless(d, p, g);
         bool broadcast =
             vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume);
         string memory pendingPath = string.concat(outputPath, ".pending");
-        _writeManifest(pendingPath, d, p, setup, broadcast ? "pending" : "simulated");
+        _writeManifest(pendingPath, d, p, setup, g, broadcast ? "pending" : "simulated");
 
         console2.log("vault        ", address(d.vault));
         console2.log("treasury     ", p.treasury);
@@ -180,6 +271,8 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.logBytes32(address(d.adapter).codehash);
         console2.log("poseidon codehash");
         console2.logBytes32(d.poseidon.codehash);
+        if (g.enabled) _logGasless(d, g);
+        else console2.log("gasless      none (GASLESS=0): withdrawalPaymaster is null");
         console2.log("provisional manifest", pendingPath);
         if (broadcast) {
             console2.log("Not final until checked on chain. After the broadcast, run from the repository root:");
@@ -259,6 +352,106 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         _checkSetupPolicy(facts, block.chainid, local, setup.allowDevSetup);
     }
 
+    /// The gasless block's inputs. The variables are read and bounded before the EntryPoint is
+    /// looked at, so a public-chain run that lacks a required amount says so whether or not the
+    /// chain is reachable; the EntryPoint and SenderCreator runtimes are then required to be the
+    /// canonical v0.7.0 ones, before anything is deployed.
+    function _gasless(Params memory p, bool local) internal view returns (Gasless memory g) {
+        uint256 flag = vm.envOr("GASLESS", uint256(1));
+        require(flag <= 1, "GASLESS must be 0 or 1");
+        g.enabled = flag == 1;
+        if (!g.enabled) return g;
+        g.entryPoint = IEntryPoint(vm.envOr("ENTRY_POINT", CANONICAL_ENTRY_POINT));
+        g.owner = vm.envOr("PAYMASTER_OWNER", p.owner);
+        require(g.owner != address(0), "PAYMASTER_OWNER must be nonzero");
+        g.feeKeeper = vm.envOr("PAYMASTER_FEE_KEEPER", address(0));
+        g.stakeWei = local ? vm.envOr("PAYMASTER_STAKE_WEI", uint256(0.1 ether)) : vm.envUint("PAYMASTER_STAKE_WEI");
+        g.factoryStakeWei = local ? vm.envOr("FACTORY_STAKE_WEI", uint256(0.1 ether)) : vm.envUint("FACTORY_STAKE_WEI");
+        g.depositWei = local ? vm.envOr("PAYMASTER_DEPOSIT_WEI", uint256(1 ether)) : vm.envUint("PAYMASTER_DEPOSIT_WEI");
+        require(
+            g.stakeWei > 0 && g.stakeWei <= type(uint112).max,
+            "PAYMASTER_STAKE_WEI must be positive (at most 2^112 - 1)"
+        );
+        require(
+            g.factoryStakeWei > 0 && g.factoryStakeWei <= type(uint112).max,
+            "FACTORY_STAKE_WEI must be positive (at most 2^112 - 1)"
+        );
+        require(g.depositWei > 0, "PAYMASTER_DEPOSIT_WEI must be positive");
+        uint256 delay = vm.envOr("PAYMASTER_UNSTAKE_DELAY_SECONDS", uint256(1 days));
+        require(
+            delay > 0 && delay <= type(uint32).max,
+            "PAYMASTER_UNSTAKE_DELAY_SECONDS must be positive (at most 2^32 - 1)"
+        );
+        // casting to 'uint32' is safe because delay is at most type(uint32).max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        g.unstakeDelay = uint32(delay);
+
+        uint256 maxCost = vm.envOr("PAYMASTER_MAX_SPONSORED_COST_WEI", uint256(0.05 ether));
+        require(
+            maxCost > 0 && maxCost <= MAX_SPONSORED_COST_HARD_CAP,
+            "PAYMASTER_MAX_SPONSORED_COST_WEI must be positive and at most 0.25 ether"
+        );
+        uint256 flatFee = vm.envOr("PAYMASTER_FLAT_FEE_WEI", uint256(0));
+        require(flatFee <= FLAT_FEE_HARD_CAP, "PAYMASTER_FLAT_FEE_WEI must be at most 0.001 ether");
+        uint256 minEscapeNet = vm.envOr("PAYMASTER_MIN_ESCAPE_NET_WEI", uint256(0.01 ether));
+        require(minEscapeNet <= type(uint64).max, "PAYMASTER_MIN_ESCAPE_NET_WEI must be at most 2^64 - 1");
+        uint256 escapes = vm.envOr("PAYMASTER_ESCAPES", uint256(0));
+        require(escapes <= 1, "PAYMASTER_ESCAPES must be 0 or 1");
+        // The casts are safe: each value was bounded above.
+        // forge-lint: disable-start(unsafe-typecast)
+        g.policy = ZkApiWithdrawalPaymaster.Policy({
+            maxSponsoredCost: uint128(maxCost),
+            flatFeeWei: uint64(flatFee),
+            minEscapeNetWei: uint64(minEscapeNet),
+            escapesEnabled: escapes == 1,
+            sponsorshipPaused: false
+        });
+        // forge-lint: disable-end(unsafe-typecast)
+        g.maxFeeCeiling = vm.envOr("PAYMASTER_MAX_FEE_CEILING_WEI", uint256(100 gwei));
+        g.priorityFeeCeiling = vm.envOr("PAYMASTER_PRIORITY_FEE_CEILING_WEI", uint256(3 gwei));
+        require(
+            g.maxFeeCeiling > 0 && g.maxFeeCeiling <= MAX_FEE_HARD_CAP,
+            "PAYMASTER_MAX_FEE_CEILING_WEI must be positive and at most 500 gwei"
+        );
+        require(
+            g.priorityFeeCeiling > 0 && g.priorityFeeCeiling <= PRIORITY_FEE_HARD_CAP,
+            "PAYMASTER_PRIORITY_FEE_CEILING_WEI must be positive and at most 20 gwei"
+        );
+        require(
+            g.priorityFeeCeiling <= g.maxFeeCeiling,
+            "PAYMASTER_PRIORITY_FEE_CEILING_WEI must not exceed PAYMASTER_MAX_FEE_CEILING_WEI"
+        );
+
+        require(
+            address(g.entryPoint).codehash == ENTRY_POINT_V070_CODEHASH,
+            "ENTRY_POINT is not EntryPoint v0.7.0 (no canonical runtime at that address; etch it on Anvil, or pass GASLESS=0)"
+        );
+        require(
+            SENDER_CREATOR.codehash == SENDER_CREATOR_V070_CODEHASH,
+            "SenderCreator v0.7.0 runtime missing at 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C (etch it on Anvil, or pass GASLESS=0)"
+        );
+    }
+
+    /// Deploys the paymaster (which deploys the factory, which deploys the account logic), stakes
+    /// both with the EntryPoint and funds the float, inside the broadcast. The first stake may only
+    /// be set by the paymaster's owner, so when PAYMASTER_OWNER is not the deployer the paymaster
+    /// starts with the deployer as owner and the transfer is nominated last (Ownable2Step: the
+    /// nominee accepts it; until then the deployer keeps the owner's powers).
+    function _deployGasless(Deployed memory d, Params memory p, Gasless memory g) internal {
+        bool handover = g.owner != p.deployer;
+        d.paymaster = new ZkApiWithdrawalPaymaster(
+            g.entryPoint, d.vault, handover ? p.deployer : g.owner, g.policy, g.maxFeeCeiling, g.priorityFeeCeiling
+        );
+        d.factory = d.paymaster.factory();
+        d.implementation = address(d.factory.implementation());
+        d.paymaster.addStake{value: g.stakeWei}(g.unstakeDelay);
+        d.factory.addStake{value: g.factoryStakeWei}(g.unstakeDelay);
+        d.paymaster.deposit{value: g.depositWei}();
+        if (g.feeKeeper != address(0)) d.paymaster.setFeeKeeper(g.feeKeeper);
+        if (handover) d.paymaster.transferOwnership(g.owner);
+        d.paymasterOwnershipPending = handover;
+    }
+
     /// The adapter compiled into this script verifies the setup in SETUP_MANIFEST.
     function _checkAdapter(Groth16ProofAdapter adapter, Setup memory setup) internal view {
         require(adapter.CIRCUIT_ID_HASH() == keccak256(bytes(setup.circuitId)), "adapter CIRCUIT_ID_HASH != manifest");
@@ -287,6 +480,70 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         require(vault.isKnownRoot(vault.currentRoot()), "empty root not recorded");
     }
 
+    /// Post-deploy checks of the gasless block: the paymaster's and the factory's pins equal the
+    /// vault's and the EntryPoint's, the policy and ceilings equal the inputs, the deposit and
+    /// both stakes are in place, the ownership is as recorded, and a transit address computed
+    /// locally equals the factory's CREATE2 (a self-test of the creation code clients carry).
+    function _checkGasless(Deployed memory d, Params memory p, Gasless memory g) internal view {
+        ZkApiWithdrawalPaymaster pm = d.paymaster;
+        ZkApiWithdrawalAccountFactory factory = d.factory;
+        require(pm.ENTRY_POINT_V070_CODEHASH() == ENTRY_POINT_V070_CODEHASH, "EntryPoint codehash pin");
+        require(address(pm.entryPoint()) == address(g.entryPoint), "paymaster entryPoint");
+        require(address(pm.vault()) == address(d.vault), "paymaster vault");
+        require(address(pm.adapter()) == address(d.adapter), "paymaster adapter");
+        require(address(pm.factory()) == address(factory) && factory.paymaster() == address(pm), "paymaster factory");
+        require(factory.entryPoint() == address(g.entryPoint) && factory.vault() == address(d.vault), "factory pins");
+        require(address(factory.implementation()) == d.implementation, "factory implementation");
+        require(d.implementation == vm.computeCreateAddress(address(factory), 1), "implementation address");
+        require(pm.WEI_PER_UNIT() == d.vault.nativeAssetWeiPerUnit(), "WEI_PER_UNIT");
+        require(pm.MAX_PAUSE_DURATION() == d.vault.maxPauseDuration(), "MAX_PAUSE_DURATION");
+        require(
+            pm.STATE_X() == p.stateKeyX && pm.STATE_Y() == p.stateKeyY && pm.CLEAR_X() == p.clearanceKeyX
+                && pm.CLEAR_Y() == p.clearanceKeyY,
+            "paymaster signing keys"
+        );
+        bytes memory creation = factory.accountCreationCode();
+        require(
+            pm.accountCreationCodeHash() == factory.accountCreationCodeHash()
+                && factory.accountCreationCodeHash() == keccak256(creation),
+            "accountCreationCodeHash"
+        );
+        (uint128 maxSponsoredCost, uint64 flatFeeWei, uint64 minEscapeNetWei, bool escapesEnabled, bool paused) =
+            pm.policy();
+        require(
+            maxSponsoredCost == g.policy.maxSponsoredCost && flatFeeWei == g.policy.flatFeeWei
+                && minEscapeNetWei == g.policy.minEscapeNetWei && escapesEnabled == g.policy.escapesEnabled && !paused,
+            "paymaster policy"
+        );
+        require(
+            pm.maxFeeCeiling() == g.maxFeeCeiling && pm.priorityFeeCeiling() == g.priorityFeeCeiling, "fee ceilings"
+        );
+        require(pm.feeKeeper() == g.feeKeeper, "fee keeper");
+        require(pm.owner() == (d.paymasterOwnershipPending ? p.deployer : g.owner), "paymaster owner");
+        require(pm.pendingOwner() == (d.paymasterOwnershipPending ? g.owner : address(0)), "paymaster pending owner");
+        require(g.entryPoint.balanceOf(address(pm)) >= g.depositWei, "paymaster deposit");
+        IEntryPoint.DepositInfo memory info = g.entryPoint.getDepositInfo(address(pm));
+        require(info.staked && info.stake >= g.stakeWei && info.unstakeDelaySec == g.unstakeDelay, "paymaster stake");
+        info = g.entryPoint.getDepositInfo(address(factory));
+        require(
+            info.staked && info.stake >= g.factoryStakeWei && info.unstakeDelaySec == g.unstakeDelay, "factory stake"
+        );
+        // CREATE2 self-test of the transit account of (deployer, deployer).
+        bytes32 initCodeHash = keccak256(
+            abi.encodePacked(
+                creation, abi.encode(address(g.entryPoint), address(d.vault), address(pm), p.deployer, p.deployer)
+            )
+        );
+        address expected = address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(factory), bytes32(0), initCodeHash))))
+        );
+        require(
+            factory.getAddress(p.deployer, p.deployer) == expected
+                && pm.transitAccount(p.deployer, p.deployer) == expected,
+            "transit account CREATE2"
+        );
+    }
+
     /// Writes the provisional manifest. `status` is "pending" (broadcast: the transactions are
     /// about to be sent) or "simulated" (dry run: nothing is sent). deployBlockLowerBound is the
     /// head of the chain the simulation ran on: every creation lands in a later block, and the
@@ -296,6 +553,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         Deployed memory d,
         Params memory p,
         Setup memory setup,
+        Gasless memory g,
         string memory status
     ) internal {
         ZkApiVault vault = d.vault;
@@ -338,8 +596,114 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         vm.serializeString(m, "stateSigningKeyY", vm.toString(p.stateKeyY));
         vm.serializeString(m, "clearanceSigningKeyX", vm.toString(p.clearanceKeyX));
         vm.serializeString(m, "clearanceSigningKeyY", vm.toString(p.clearanceKeyY));
+        if (g.enabled) _serializeGasless(m, d, p, g);
+        else vm.serializeString(m, "withdrawalPaymaster", NULL_PLACEHOLDER);
         string memory serialized = vm.serializeUint(m, "noteTtl", uint256(p.noteTtl));
+        if (!g.enabled) {
+            // vm.serialize* cannot write a JSON null; the placeholder becomes one here.
+            string memory quoted = string.concat("\"withdrawalPaymaster\":\"", NULL_PLACEHOLDER, "\"");
+            require(vm.indexOf(serialized, quoted) != type(uint256).max, "withdrawalPaymaster placeholder");
+            serialized = vm.replace(serialized, quoted, "\"withdrawalPaymaster\":null");
+        }
         vm.writeJson(serialized, path);
+    }
+
+    /// The manifest's gasless block: the EntryPoint and SenderCreator pins, the three deployed
+    /// contracts with their runtime codehashes, the creation code clients carry, the owner, the
+    /// policy, ceilings and gas policy (every pinned constant of the paymaster), and the stake and
+    /// deposit amounts. Wei amounts exceed 2^53 - 1, so they are decimal strings; gas figures are
+    /// numbers.
+    function _serializeGasless(string memory m, Deployed memory d, Params memory p, Gasless memory g) internal {
+        ZkApiWithdrawalPaymaster pm = d.paymaster;
+        vm.serializeAddress(m, "entryPoint", address(g.entryPoint));
+        vm.serializeBytes32(m, "entryPointRuntimeCodehash", address(g.entryPoint).codehash);
+        vm.serializeAddress(m, "senderCreator", SENDER_CREATOR);
+        vm.serializeBytes32(m, "senderCreatorRuntimeCodehash", SENDER_CREATOR.codehash);
+        vm.serializeAddress(m, "withdrawalPaymaster", address(pm));
+        vm.serializeAddress(m, "withdrawalAccountFactory", address(d.factory));
+        vm.serializeAddress(m, "withdrawalAccountImplementation", d.implementation);
+        vm.serializeBytes32(m, "paymasterRuntimeCodehash", address(pm).codehash);
+        vm.serializeBytes32(m, "factoryRuntimeCodehash", address(d.factory).codehash);
+        vm.serializeBytes32(m, "accountImplementationRuntimeCodehash", d.implementation.codehash);
+        vm.serializeBytes(m, "accountCreationCode", d.factory.accountCreationCode());
+        vm.serializeBytes32(m, "accountCreationCodeKeccak256", d.factory.accountCreationCodeHash());
+        vm.serializeAddress(m, "paymasterOwner", g.owner);
+        vm.serializeBool(m, "paymasterOwnershipTransferPending", d.paymasterOwnershipPending);
+        vm.serializeAddress(m, "paymasterDeployer", p.deployer);
+        vm.serializeAddress(m, "paymasterFeeKeeper", g.feeKeeper);
+        vm.serializeString(m, "paymasterStakeWei", vm.toString(g.stakeWei));
+        vm.serializeString(m, "factoryStakeWei", vm.toString(g.factoryStakeWei));
+        vm.serializeUint(m, "paymasterUnstakeDelaySeconds", g.unstakeDelay);
+        vm.serializeString(m, "paymasterInitialDepositWei", vm.toString(g.depositWei));
+
+        string memory pol = "paymasterPolicy";
+        vm.serializeString(pol, "maxSponsoredCostWei", vm.toString(g.policy.maxSponsoredCost));
+        vm.serializeString(pol, "flatFeeWei", vm.toString(g.policy.flatFeeWei));
+        vm.serializeString(pol, "minEscapeNetWei", vm.toString(g.policy.minEscapeNetWei));
+        vm.serializeString(m, "paymasterPolicy", vm.serializeBool(pol, "escapesEnabled", g.policy.escapesEnabled));
+
+        string memory fees = "paymasterFeeCeilings";
+        vm.serializeString(fees, "maxFeeWei", vm.toString(g.maxFeeCeiling));
+        vm.serializeString(
+            m, "paymasterFeeCeilings", vm.serializeString(fees, "priorityFeeWei", vm.toString(g.priorityFeeCeiling))
+        );
+
+        ZkApiWithdrawalPaymaster.GasPolicy memory gp = pm.gasPolicy();
+        string memory o = "paymasterGasPolicy";
+        uint256[] memory floors = new uint256[](4);
+        uint256[] memory caps = new uint256[](4);
+        for (uint256 k = 0; k < 4; ++k) {
+            floors[k] = _safe(gp.callFloor[k], "callFloor");
+            caps[k] = _safe(gp.callHardCap[k], "callCap");
+        }
+        vm.serializeUint(o, "callFloor", floors);
+        // The hard caps: the live callCap(kind) starts there and the owner may only lower it.
+        vm.serializeUint(o, "callCap", caps);
+        vm.serializeUint(o, "postOpFloor", _safe(gp.postOpFloor, "postOpFloor"));
+        vm.serializeUint(o, "postOpCap", _safe(gp.postOpCap, "postOpCap"));
+        vm.serializeUint(o, "verificationFloor", _safe(gp.verificationFloor, "verificationFloor"));
+        vm.serializeUint(o, "verificationFloorInit", _safe(gp.verificationFloorInit, "verificationFloorInit"));
+        vm.serializeUint(o, "verificationCap", _safe(gp.verificationCap, "verificationCap"));
+        vm.serializeUint(o, "pvgFloor", _safe(gp.pvgFloor, "pvgFloor"));
+        vm.serializeUint(o, "pvgCap", _safe(gp.pvgCap, "pvgCap"));
+        vm.serializeUint(o, "pmVerificationFloor", _safe(gp.pmVerificationFloor, "pmVerificationFloor"));
+        vm.serializeUint(o, "pmVerificationCap", _safe(gp.pmVerificationCap, "pmVerificationCap"));
+        vm.serializeUint(o, "postOpBaseGas", _safe(gp.postOpBaseGas, "postOpBaseGas"));
+        vm.serializeUint(o, "postOpEscapeGas", _safe(gp.postOpEscapeGas, "postOpEscapeGas"));
+        vm.serializeUint(o, "postOpFinalizeExtraGas", _safe(gp.postOpFinalizeExtraGas, "postOpFinalizeExtraGas"));
+        vm.serializeUint(o, "postOpEscapeForwardGas", _safe(gp.postOpEscapeForwardGas, "postOpEscapeForwardGas"));
+        vm.serializeUint(o, "eoaPushGas", _safe(gp.eoaPushGas, "eoaPushGas"));
+        vm.serializeUint(o, "newAccountGas", _safe(gp.newAccountGas, "newAccountGas"));
+        vm.serializeUint(o, "payoutPushGas", _safe(gp.payoutPushGas, "payoutPushGas"));
+        vm.serializeUint(o, "creditGas", _safe(gp.creditGas, "creditGas"));
+        vm.serializeUint(o, "accountCallOverheadGas", _safe(gp.accountCallOverheadGas, "accountCallOverheadGas"));
+        vm.serializeUint(
+            o, "accountCallOverheadEscapeGas", _safe(gp.accountCallOverheadEscapeGas, "accountCallOverheadEscapeGas")
+        );
+        vm.serializeUint(o, "marginGas", _safe(gp.marginGas, "marginGas"));
+        vm.serializeUint(o, "finalizeReserveGas", _safe(gp.finalizeReserveGas, "finalizeReserveGas"));
+        vm.serializeString(
+            m, "paymasterGasPolicy", vm.serializeUint(o, "maxAttempts", _safe(gp.maxAttempts, "maxAttempts"))
+        );
+    }
+
+    function _logGasless(Deployed memory d, Gasless memory g) internal view {
+        console2.log("entryPoint   ", address(g.entryPoint));
+        console2.log("paymaster    ", address(d.paymaster));
+        console2.log("factory      ", address(d.factory));
+        console2.log("accountLogic ", d.implementation);
+        console2.log("paymasterOwner", g.owner);
+        if (d.paymasterOwnershipPending) {
+            console2.log("WARNING: the deployer owns the paymaster until PAYMASTER_OWNER calls acceptOwnership() on it");
+        }
+        console2.log("paymaster deposit (wei)", g.depositWei);
+        console2.log("paymaster stake (wei)  ", g.stakeWei);
+        console2.log("factory stake (wei)    ", g.factoryStakeWei);
+        console2.log("escapes sponsored      ", g.policy.escapesEnabled);
+        console2.log("paymaster codehash");
+        console2.logBytes32(address(d.paymaster).codehash);
+        console2.log("factory codehash");
+        console2.logBytes32(address(d.factory).codehash);
     }
 
     /// ZkApiVault's creation code with every Bn254Poseidon placeholder replaced by `poseidon`.
@@ -402,5 +766,11 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         // casting to 'uint64' is safe because value is at most MAX_SAFE_INTEGER
         // forge-lint: disable-next-line(unsafe-typecast)
         return uint64(value);
+    }
+
+    /// A gas figure the manifest writes as a bare JSON number: at most 2^53 - 1.
+    function _safe(uint256 value, string memory name) internal pure returns (uint256) {
+        require(value <= MAX_SAFE_INTEGER, string.concat("paymaster gas policy ", name, " above 2^53 - 1"));
+        return value;
     }
 }

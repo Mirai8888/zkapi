@@ -6,7 +6,8 @@
 //   node scripts/deployment-profile.mjs --finalized deployment.json \
 //     --deployment-id zkapi-native-eth-sepolia-concession-v1 \
 //     --protocol-server-url https://... --indexer-url https://... --rpc-url https://... \
-//     --verifier-url https://... [--format trusted|sdk|clientd] [--base FILE] [--out FILE]
+//     --verifier-url https://... [--bundler-url https://...] [--format trusted|sdk|clientd] \
+//     [--base FILE] [--out FILE]
 //
 // - `trusted` (the default) prints `{ "trusted_deployment": ... }`: the
 //   manifest serverd, `zkapi db init` and zkapi-challenged read with
@@ -20,7 +21,12 @@
 // It refuses a pending or simulated manifest, a missing or legacy
 // deployment ID, and a setup whose verifying keys are not the vault's; it
 // writes the signing-key coordinates (decimal strings in the manifest) as
-// 0x hex, as every consumer parses them.
+// 0x hex, as every consumer parses them. A manifest deployed with the gasless
+// withdrawal paymaster gives every profile its `gasless` object (the pins,
+// the creation code, the gas policy and `bundler_url`, the operator's bundler
+// from --bundler-url, null when none is published); one deployed with
+// GASLESS=0 gives `gasless: null`, and the clientd profile says so in its
+// limitations.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -64,7 +70,7 @@ export function setupPins(setupDir, finalized) {
  * both builds' wallets in one store keyed by that ID.
  */
 export function deploymentProfile(finalized, { deploymentId, protocolServerUrl, indexerUrl, rpcUrl, verifierUrl,
-    inferenceBase = 'https://openrouter.ai/api/v1', priceFeed, settlementWindowSeconds, keyHashes, canary = null }) {
+    inferenceBase = 'https://openrouter.ai/api/v1', priceFeed, settlementWindowSeconds, keyHashes, canary = null, bundlerUrl = null }) {
     assert.ok(typeof deploymentId === 'string' && /^[a-z0-9][a-z0-9.-]{2,127}$/.test(deploymentId),
         'name the deployment with a new deployment ID (lowercase letters, digits, dots and dashes)');
     assert.ok(!deploymentId.includes('note-bound'), 'a deployment ID of the legacy vault cannot name the concession vault');
@@ -72,8 +78,11 @@ export function deploymentProfile(finalized, { deploymentId, protocolServerUrl, 
         assert.ok(typeof value === 'string' && value, `${name} is required`);
     }
     assert.ok(Number.isSafeInteger(settlementWindowSeconds) && settlementWindowSeconds > 0, 'settlementWindowSeconds is required');
+    assert.ok(bundlerUrl === null || (typeof bundlerUrl === 'string' && /^https:\/\/|^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(bundlerUrl)),
+        '--bundler-url is an https URL (or loopback http)');
+    assert.ok(bundlerUrl === null || finalized.withdrawalPaymaster != null, '--bundler-url names a bundler for a deployment without the paymaster');
     const profile = trustedDeployment(finalized, { deploymentId, protocolServerUrl, indexerUrl, rpcUrl, priceFeed, keyHashes,
-        settlementWindowSeconds, inferenceBase, verifierUrl });
+        settlementWindowSeconds, inferenceBase, verifierUrl, bundlerUrl });
     return { ...profile, canary };
 }
 
@@ -108,7 +117,14 @@ export function clientdProfile(base, profile, finalized, keyHashes) {
             vault_runtime_keccak256: finalized.vaultRuntimeCodehash,
             adapter_runtime_keccak256: finalized.adapterRuntimeCodehash,
             poseidon_runtime_keccak256: finalized.poseidonRuntimeCodehash,
+            // The gasless pins, checked before a `--fees payout` withdrawal; null without the paymaster.
+            entry_point_runtime_keccak256: profile.gasless?.entry_point_runtime_codehash ?? null,
+            sender_creator_runtime_keccak256: profile.gasless?.sender_creator_runtime_codehash ?? null,
+            paymaster_runtime_keccak256: profile.gasless?.withdrawal_paymaster_runtime_codehash ?? null,
+            factory_runtime_keccak256: profile.gasless?.withdrawal_account_factory_runtime_codehash ?? null,
+            account_implementation_runtime_keccak256: profile.gasless?.withdrawal_account_implementation_runtime_codehash ?? null,
         },
+        gasless: profile.gasless,
     });
     filled.proof_setup = { ...base.proof_setup, repository_path: SETUP_DIRS[finalized.setupId] ?? base.proof_setup?.repository_path,
         circuit_id: profile.circuit_id, setup_id: profile.setup_id,
@@ -116,8 +132,12 @@ export function clientdProfile(base, profile, finalized, keyHashes) {
         withdrawal_proving_key_sha256: keyHashes.withdrawalPk, withdrawal_verifying_key_sha256: keyHashes.withdrawalVk,
         request_vk_keccak256: profile.request_vk_keccak256, withdrawal_vk_keccak256: profile.withdrawal_vk_keccak256 };
     filled.privacy_mode = { ...base.privacy_mode, verifier_url: profile.verifier_url };
-    // The placeholder's own limitation goes; the others stay for review.
+    // The placeholder's own limitations go; the others stay for review. A
+    // deployment without the paymaster says so, as the placeholder did.
     filled.limitations = (base.limitations ?? []).filter(text => !/^Placeholder:/.test(text));
+    if (profile.gasless === null) {
+        filled.limitations.push('The gasless withdrawal paymaster (ERC-4337) is not deployed with this vault; a withdrawal pays its own network fee from the signing address.');
+    }
     return filled;
 }
 
@@ -125,7 +145,7 @@ function options(args) {
     const flags = { '--finalized': 'finalized', '--deployment-id': 'deploymentId', '--protocol-server-url': 'protocolServerUrl',
         '--indexer-url': 'indexerUrl', '--rpc-url': 'rpcUrl', '--verifier-url': 'verifierUrl', '--inference-base': 'inferenceBase',
         '--price-feed': 'priceFeed', '--settlement-window-seconds': 'settlementWindowSeconds', '--setup-dir': 'setupDir',
-        '--canary': 'canary', '--format': 'format', '--base': 'base', '--out': 'out' };
+        '--canary': 'canary', '--format': 'format', '--base': 'base', '--out': 'out', '--bundler-url': 'bundlerUrl' };
     const parsed = { format: 'trusted' };
     for (let i = 0; i < args.length; i += 2) {
         const key = flags[args[i]];
@@ -154,6 +174,7 @@ function main(args) {
         priceFeed: opts.priceFeed ?? baseProfile?.native_price_feed_address,
         settlementWindowSeconds: settlement == null ? undefined : Number(settlement), keyHashes,
         canary: opts.canary ? JSON.parse(opts.canary) : (baseProfile?.canary ?? null),
+        bundlerUrl: opts.bundlerUrl ?? null,
     });
     let output;
     if (opts.format === 'trusted') output = { trusted_deployment: profile };

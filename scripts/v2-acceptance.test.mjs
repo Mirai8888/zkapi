@@ -4,9 +4,11 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
-    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, localJSON, mockOaOrg, mockProvider,
-    proxyAuthorized, proxyJsonRpc, trustedDeployment,
+    CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, gaslessProfile, localJSON, mockOaOrg,
+    mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
 } from './v2-acceptance.mjs';
+import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
+    accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
 
 test('provider mock accounts only accepted calls against the issued child key', async () => {
     const mock = mockProvider('test-management');
@@ -300,6 +302,14 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
     assert.equal(clientd.proof_setup.withdrawal_verifying_key_sha256, setup.files['withdrawal.vk']);
     assert.deepEqual(clientd.state_signing_key, profile.state_signing_key);
     assert.ok(!clientd.limitations.some(text => text.startsWith('Placeholder:')));
+    // Without the paymaster: gasless null in both shapes, the evidence pins null, and clientd says so.
+    assert.equal(profile.gasless, null);
+    assert.equal(clientd.gasless, null);
+    for (const key of GASLESS_EVIDENCE_KEYS) assert.equal(clientd.deployment_evidence[key], null, key);
+    assert.ok(clientd.limitations.includes(
+        'The gasless withdrawal paymaster (ERC-4337) is not deployed with this vault; a withdrawal pays its own network fee from the signing address.'));
+    assert.throws(() => deploymentProfile(finalized, { ...services, deploymentId: 'zkapi-native-eth-sepolia-concession-v1',
+        bundlerUrl: 'https://bundler.example/rpc' }), /without the paymaster/);
     // The command line, in each format.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkapi-profile-'));
     const file = path.join(dir, 'deployment.json');
@@ -325,5 +335,143 @@ test('deployment profiles: hex keys, a new deployment ID, the vault\'s setup, an
         '--rpc-url', 'https://d', '--price-feed', '0x1', '--settlement-window-seconds', '1'], { encoding: 'utf8' });
     assert.notEqual(refused.status, 0);
     assert.match(refused.stderr, /finalized manifest/);
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const GASLESS_KEYS = ['entry_point_address', 'entry_point_runtime_codehash', 'sender_creator_address', 'sender_creator_runtime_codehash',
+    'withdrawal_paymaster_address', 'withdrawal_paymaster_runtime_codehash', 'withdrawal_account_factory_address',
+    'withdrawal_account_factory_runtime_codehash', 'withdrawal_account_implementation_address',
+    'withdrawal_account_implementation_runtime_codehash', 'account_creation_code', 'account_creation_code_keccak256', 'bundler_url',
+    'gas_policy', 'policy', 'fee_ceilings', 'uneconomic_fraction_percent'];
+const GASLESS_EVIDENCE_KEYS = ['entry_point_runtime_keccak256', 'sender_creator_runtime_keccak256', 'paymaster_runtime_keccak256',
+    'factory_runtime_keccak256', 'account_implementation_runtime_keccak256'];
+
+// The gasless object (design §4.3) in both profile shapes, from a Sepolia-chain
+// manifest deployed with the paymaster.
+test('deployment profiles: the gasless object of a paymaster deployment, in the trusted and clientd shapes', async () => {
+    const { clientdProfile, deploymentProfile, setupPins } = await import('./deployment-profile.mjs');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { spawnSync } = await import('node:child_process');
+    const root = new URL('..', import.meta.url).pathname;
+    const setupDir = path.join(root, 'protocol/setup/v2-concession-dev');
+    const setup = JSON.parse(fs.readFileSync(path.join(setupDir, 'manifest.json'), 'utf8'));
+    const vectors = JSON.parse(fs.readFileSync(path.join(root, 'protocol/contracts/test/fixtures/transit-vectors.json'), 'utf8'));
+    const snake = name => name.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+    const gasPolicy = { callFloor: vectors.gas_policy.call_floor.map(Number), callCap: vectors.gas_policy.call_hard_cap.map(Number) };
+    for (const name of GAS_POLICY_SCALARS) gasPolicy[name] = Number(vectors.gas_policy[snake(name)]);
+    const implementation = '0xAbCd000000000000000000000000000000000006';
+    const creation = accountCreationCode(implementation);
+    const finalized = {
+        deploymentStatus: 'deployed', deployBlock: 9_100_000, chainId: 11_155_111, vaultRevision: 3, concessionEscapeVersion: 1,
+        vault: '0xAbCd000000000000000000000000000000000001', proofAdapter: '0xAbCd000000000000000000000000000000000002',
+        poseidonLibrary: '0xAbCd000000000000000000000000000000000003', requestChargeCap: 50_000, nativeAssetWeiPerUnit: 1_000_000_000,
+        billing_asset: 'native_eth', billing_unit: 'gwei', circuitId: 'zkapi-v2-concession-v1', setupId: 'dev', allowDevSetup: true,
+        requestVkKeccak256: setup.vk_keccak256.request, withdrawalVkKeccak256: setup.vk_keccak256.withdrawal,
+        vaultRuntimeCodehash: `0x${'33'.repeat(32)}`, adapterRuntimeCodehash: `0x${'44'.repeat(32)}`, poseidonRuntimeCodehash: `0x${'55'.repeat(32)}`,
+        challengePeriod: 43_200, noteTtl: 2_592_000, maxPauseDuration: 604_800,
+        stateSigningKeyX: '1', stateSigningKeyY: '2', clearanceSigningKeyX: '3', clearanceSigningKeyY: '4',
+        // The gasless block, as Deploy.s.sol writes it (checksummed addresses, wei as decimal strings).
+        entryPoint: '0x0000000071727De22E5E9d8BAf0edAc6f37da032', entryPointRuntimeCodehash: ENTRY_POINT_V070_CODEHASH,
+        senderCreator: '0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C', senderCreatorRuntimeCodehash: SENDER_CREATOR_V070_CODEHASH,
+        withdrawalPaymaster: '0xAbCd000000000000000000000000000000000004', withdrawalAccountFactory: '0xAbCd000000000000000000000000000000000005',
+        withdrawalAccountImplementation: implementation,
+        paymasterRuntimeCodehash: `0x${'66'.repeat(32)}`, factoryRuntimeCodehash: `0x${'77'.repeat(32)}`,
+        accountImplementationRuntimeCodehash: `0x${'88'.repeat(32)}`,
+        accountCreationCode: creation, accountCreationCodeKeccak256: keccak256(hexToBytes(creation)),
+        paymasterOwner: '0xAbCd000000000000000000000000000000000009', paymasterOwnershipTransferPending: false,
+        paymasterDeployer: '0xAbCd000000000000000000000000000000000009', paymasterFeeKeeper: `0x${'0'.repeat(40)}`,
+        paymasterStakeWei: '100000000000000000', factoryStakeWei: '100000000000000000', paymasterUnstakeDelaySeconds: 86_400,
+        paymasterInitialDepositWei: '500000000000000000',
+        paymasterPolicy: { maxSponsoredCostWei: '50000000000000000', flatFeeWei: '0', minEscapeNetWei: '10000000000000000', escapesEnabled: false },
+        paymasterFeeCeilings: { maxFeeWei: '200000000000', priorityFeeWei: '3000000000' },
+        paymasterGasPolicy: gasPolicy,
+    };
+    const keyHashes = setupPins(setupDir, finalized);
+    const services = { deploymentId: 'zkapi-native-eth-sepolia-concession-v1', protocolServerUrl: 'https://api.example',
+        indexerUrl: 'https://indexer.example', rpcUrl: 'https://rpc.example', verifierUrl: 'https://verifier.example',
+        priceFeed: '0x694AA1769357215DE4FAC081bf1f309aDC325306', settlementWindowSeconds: 14_705, keyHashes };
+    const profile = deploymentProfile(finalized, { ...services, bundlerUrl: 'https://bundler.example/rpc' });
+    const gasless = profile.gasless;
+    assert.deepEqual(Object.keys(gasless), GASLESS_KEYS);
+    assert.equal(gasless.entry_point_address, CANONICAL_ENTRY_POINT);
+    assert.equal(gasless.sender_creator_address, SENDER_CREATOR);
+    assert.equal(gasless.entry_point_runtime_codehash, ENTRY_POINT_V070_CODEHASH);
+    assert.equal(gasless.sender_creator_runtime_codehash, SENDER_CREATOR_V070_CODEHASH);
+    assert.equal(gasless.withdrawal_paymaster_address, '0xabcd000000000000000000000000000000000004');
+    assert.equal(gasless.withdrawal_paymaster_runtime_codehash, finalized.paymasterRuntimeCodehash);
+    assert.equal(gasless.withdrawal_account_factory_address, '0xabcd000000000000000000000000000000000005');
+    assert.equal(gasless.withdrawal_account_factory_runtime_codehash, finalized.factoryRuntimeCodehash);
+    assert.equal(gasless.withdrawal_account_implementation_address, implementation.toLowerCase());
+    assert.equal(gasless.withdrawal_account_implementation_runtime_codehash, finalized.accountImplementationRuntimeCodehash);
+    assert.equal(gasless.account_creation_code, creation);
+    assert.match(gasless.account_creation_code, /^0x[0-9a-f]{148}$/);
+    assert.equal(gasless.account_creation_code_keccak256, finalized.accountCreationCodeKeccak256);
+    assert.equal(gasless.bundler_url, 'https://bundler.example/rpc');
+    const gp = gasless.gas_policy;
+    assert.deepEqual(gp.call_floor, gasPolicy.callFloor);
+    assert.deepEqual(gp.call_cap, gasPolicy.callCap);
+    for (let kind = 0; kind < 4; kind++) {
+        assert.ok(gp.call_floor[kind] <= gp.call_default[kind] && gp.call_default[kind] <= gp.call_cap[kind], `call_default[${kind}]`);
+    }
+    for (const [name, floor, cap] of [['postop_default', 'postop_floor', 'postop_cap'],
+        ['verification_default', 'verification_floor', 'verification_cap'],
+        ['verification_default_init', 'verification_floor_init', 'verification_cap'],
+        ['pm_verification_default', 'pm_verification_floor', 'pm_verification_cap']]) {
+        assert.ok(gp[floor] <= gp[name] && gp[name] <= gp[cap], `${name} ${gp[name]} is outside [${gp[floor]}, ${gp[cap]}]`);
+    }
+    for (const name of GAS_POLICY_SCALARS) assert.equal(gp[snake(name).replace(/post_op/g, 'postop')], gasPolicy[name], name);
+    assert.equal(gp.max_attempts, 3);
+    assert.deepEqual(gasless.policy, { max_sponsored_cost_wei: '50000000000000000', flat_fee_wei: '0', min_escape_net_wei: '10000000000000000',
+        escapes_enabled: false });
+    assert.deepEqual(gasless.fee_ceilings, { max_fee_wei: '200000000000', priority_fee_wei: '3000000000' });
+    assert.equal(gasless.uneconomic_fraction_percent, 25);
+    // bundler_url: null when none is published, https or loopback http only.
+    assert.equal(deploymentProfile(finalized, services).gasless.bundler_url, null);
+    assert.equal(deploymentProfile(finalized, { ...services, bundlerUrl: 'http://127.0.0.1:4337' }).gasless.bundler_url, 'http://127.0.0.1:4337');
+    assert.throws(() => deploymentProfile(finalized, { ...services, bundlerUrl: 'http://bundler.example/rpc' }), /https URL/);
+    assert.throws(() => deploymentProfile(finalized, { ...services, bundlerUrl: 'ftp://bundler.example' }), /https URL/);
+    // A pin that is missing or malformed fails by name instead of reaching a profile.
+    for (const name of ['entryPoint', 'senderCreator', 'withdrawalAccountFactory', 'paymasterRuntimeCodehash', 'factoryRuntimeCodehash',
+        'accountImplementationRuntimeCodehash', 'accountCreationCode', 'accountCreationCodeKeccak256']) {
+        const missing = { ...finalized };
+        delete missing[name];
+        assert.throws(() => gaslessProfile(missing), new RegExp(name), `${name} missing`);
+        assert.throws(() => gaslessProfile({ ...finalized, [name]: '0x1234' }), new RegExp(name), `${name} malformed`);
+    }
+    assert.throws(() => gaslessProfile({ ...finalized, accountCreationCode: accountCreationCode(finalized.vault) }), /creation code for the account logic/);
+    assert.throws(() => gaslessProfile({ ...finalized, accountCreationCodeKeccak256: `0x${'11'.repeat(32)}` }), /keccak256 of the creation code/);
+    // clientd's shape: the same object, and the evidence pins beside the vault's.
+    const placeholder = JSON.parse(fs.readFileSync(path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'), 'utf8'));
+    const clientd = clientdProfile(placeholder, profile, finalized, keyHashes);
+    assert.deepEqual(clientd.gasless, gasless);
+    assert.deepEqual(Object.keys(clientd.deployment_evidence),
+        ['vault_runtime_keccak256', 'adapter_runtime_keccak256', 'poseidon_runtime_keccak256', ...GASLESS_EVIDENCE_KEYS]);
+    assert.deepEqual(clientd.deployment_evidence, {
+        vault_runtime_keccak256: finalized.vaultRuntimeCodehash,
+        adapter_runtime_keccak256: finalized.adapterRuntimeCodehash,
+        poseidon_runtime_keccak256: finalized.poseidonRuntimeCodehash,
+        entry_point_runtime_keccak256: ENTRY_POINT_V070_CODEHASH,
+        sender_creator_runtime_keccak256: SENDER_CREATOR_V070_CODEHASH,
+        paymaster_runtime_keccak256: finalized.paymasterRuntimeCodehash,
+        factory_runtime_keccak256: finalized.factoryRuntimeCodehash,
+        account_implementation_runtime_keccak256: finalized.accountImplementationRuntimeCodehash,
+    });
+    assert.ok(!clientd.limitations.some(text => /paymaster .* is not deployed/.test(text)));
+    // The command line writes the same objects in the clientd and SDK formats.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkapi-profile-gasless-'));
+    const file = path.join(dir, 'deployment.json');
+    fs.writeFileSync(file, JSON.stringify(finalized));
+    const run = (...args) => spawnSync(process.execPath, [path.join(root, 'scripts/deployment-profile.mjs'), '--finalized', file,
+        '--deployment-id', services.deploymentId, '--protocol-server-url', services.protocolServerUrl, '--indexer-url', services.indexerUrl,
+        '--verifier-url', services.verifierUrl, '--bundler-url', 'https://bundler.example/rpc', ...args], { encoding: 'utf8' });
+    const clientdOut = run('--format', 'clientd', '--base', path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'));
+    assert.equal(clientdOut.status, 0, clientdOut.stderr);
+    assert.deepEqual(JSON.parse(clientdOut.stdout).gasless, gasless);
+    assert.deepEqual(JSON.parse(clientdOut.stdout).deployment_evidence, clientd.deployment_evidence);
+    const sdkOut = run('--format', 'sdk', '--base', path.join(root, 'sdk/assets/config/sepolia.json'));
+    assert.equal(sdkOut.status, 0, sdkOut.stderr);
+    assert.deepEqual(JSON.parse(sdkOut.stdout).trusted_deployment.gasless, gasless);
     fs.rmSync(dir, { recursive: true, force: true });
 });

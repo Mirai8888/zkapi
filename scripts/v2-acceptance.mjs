@@ -24,7 +24,9 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
+import { decodeFailedOp, encodeHandleOps, packUserOperation, startMiniBundler, userOperationHash, vaultCallOf } from './acceptance/mini-bundler.mjs';
+import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH, accountCreationCode, hexToBytes,
+    keccak256 } from './expected-codehashes.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(ROOT, 'protocol/setup/v2-concession-dev');
@@ -76,6 +78,14 @@ const CHALLENGE_MAX_PRIORITY_FEE_PER_GAS = 10n * GWEI;
 const CHALLENGE_PRIORITY_FEE_PER_GAS = 2n * GWEI;
 // Anvil's mnemonic: public test keys, funded only on a disposable chain.
 const MNEMONIC = 'test test test test test test test test test test test junk';
+// Every role has its own account: the deployer/owner, the challenger, the
+// treasury, the clients, destinations, a third party and, for gasless
+// withdrawals, the mini bundler's sender, the gasless SDK owner and a griefer.
+const ANVIL_ACCOUNTS = 13;
+// The paymaster's and the factory's EntryPoint stakes and the paymaster's
+// initial float (Deploy.s.sol requires them explicitly off local chain IDs).
+const PAYMASTER_STAKE_WEI = 100_000_000_000_000_000n;
+const PAYMASTER_DEPOSIT_WEI = 1_000_000_000_000_000_000n;
 const ANVIL_KEYS = Object.freeze([
     '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
     '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
@@ -538,11 +548,12 @@ async function main() {
         console.log('Usage: node scripts/v2-acceptance.mjs [--bin-dir target/acceptance/release] [--output-dir .zkapi/acceptance] [--stop-after STEP]\n'
             + 'Runs only disposable loopback services, with mock provider, OA org and price feed. See docs/v2-acceptance.md.\n'
             + '--stop-after ends a development run early, after one of: deploy, stack, honest, stale, clients, mismatch, sdk-honest,\n'
-            + 'sdk-close, raise, companion, companion-close, pause, pause-max, anchors, lie-expired, withhold, rebuild, hang, missed,\n'
-            + 'late-successor.');
+            + 'sdk-close, raise, companion, companion-close, gasless-close, gasless-bundler, gasless-griefing, gasless-replay,\n'
+            + 'gasless-fallback, gasless-escape, gasless-sdk-escape, pause, gasless-pause, pause-max, gasless-reopen, anchors,\n'
+            + 'lie-expired, withhold, rebuild, hang, missed, late-successor.');
         return;
     }
-    const { AbiCoder, Interface } = await import(
+    const { AbiCoder, Interface, Wallet, getBytes } = await import(
         pathToFileURL(path.join(ROOT, 'docker/aws/signer/node_modules/ethers/lib.esm/index.js')).href);
     const coder = AbiCoder.defaultAbiCoder();
     const started = Date.now();
@@ -711,15 +722,16 @@ async function main() {
         const rpcUrl = `http://127.0.0.1:${anvilPort}`;
         const genesisTimestamp = Math.floor(Date.now() / 1000) - CHAIN_LAG_SECONDS;
         launch('anvil', ['--host', '127.0.0.1', '--port', String(anvilPort), '--chain-id', String(CHAIN_ID),
-            '--mnemonic', MNEMONIC, '--timestamp', String(genesisTimestamp), '--slots-in-an-epoch', '1', '--silent'],
+            '--mnemonic', MNEMONIC, '--accounts', String(ANVIL_ACCOUNTS), '--timestamp', String(genesisTimestamp), '--slots-in-an-epoch', '1', '--silent'],
             'anvil.log', { env: toolEnv() });
         await waitFor('Anvil startup', async () => await rpcAt(rpcUrl, 'eth_chainId') === hex(CHAIN_ID));
         const rpc = (method, params) => rpcAt(rpcUrl, method, params);
         const accounts = await rpc('eth_accounts');
         const [owner, challengerAccount, treasury] = accounts;
         // Each client and destination has its own account.
-        const account = Object.fromEntries(['driver', 'companion', 'sdk', 'destination', 'thirdParty', 'sdkDestination', 'companionDestination']
-            .map((name, index) => [name, accounts[3 + index]]));
+        const account = Object.fromEntries(['driver', 'companion', 'sdk', 'destination', 'thirdParty', 'sdkDestination', 'companionDestination',
+            'bundler', 'gaslessSdk', 'griefer'].map((name, index) => [name, accounts[3 + index]]));
+        assert.ok(Object.values(account).every(Boolean), 'Anvil serves an account for every role');
         // Mines a block every second, so block time follows the wall clock
         // (CHAIN_LAG_SECONDS behind it) and confirmations and the finalized
         // tag (two blocks with --slots-in-an-epoch 1) keep advancing.
@@ -746,6 +758,24 @@ async function main() {
         }
         const balance = address => rpc('eth_getBalance', [address, 'latest']).then(BigInt);
 
+        // The canonical ERC-4337 EntryPoint v0.7.0 and the SenderCreator it
+        // created, etched at their canonical addresses from the pinned
+        // runtime fixtures (protocol/VENDORED.md), as on every public chain;
+        // Deploy.s.sol, the paymaster's constructor and finalize pin both by
+        // keccak256.
+        const etched = {};
+        for (const [name, address, file, codehash] of [
+            ['entry_point', CANONICAL_ENTRY_POINT, 'entrypoint-v0.7.0.runtime.hex', ENTRY_POINT_V070_CODEHASH],
+            ['sender_creator', SENDER_CREATOR, 'sender-creator-v0.7.0.runtime.hex', SENDER_CREATOR_V070_CODEHASH]]) {
+            const text = (await fs.readFile(path.join(ROOT, 'protocol/contracts/test/fixtures', file), 'utf8')).trim();
+            const code = text.startsWith('0x') ? text : `0x${text}`;
+            assert.equal(keccak256(hexToBytes(code)), codehash, `${file} is the pinned runtime`);
+            await rpc('anvil_setCode', [address, code]);
+            const onChain = await rpc('eth_getCode', [address, 'latest']);
+            assert.equal(keccak256(hexToBytes(onChain)), codehash, `eth_getCode(${name}) hashes to the pin`);
+            etched[name] = { address, runtime_keccak256: codehash, bytes: (onChain.length - 2) / 2 };
+        }
+
         // ---------------------------------------------------------------- deployment
         log('Deploying with demo/contracts/script/Deploy.s.sol and finalizing its manifest on chain.');
         const deployDir = path.join(ROOT, '.demo', `acceptance-${runId}`);
@@ -762,6 +792,11 @@ async function main() {
             // Off a local chain (this Anvil has Sepolia's ID) the single-party
             // dev setup deploys only as a drill vault.
             ALLOW_DEV_SETUP: '1',
+            // The gasless-withdrawal paymaster in the same broadcast. Off a
+            // local chain (by chain ID) the stakes and the float are explicit;
+            // the drill sponsors escape initiations too.
+            GASLESS: '1', PAYMASTER_STAKE_WEI: String(PAYMASTER_STAKE_WEI), FACTORY_STAKE_WEI: String(PAYMASTER_STAKE_WEI),
+            PAYMASTER_DEPOSIT_WEI: String(PAYMASTER_DEPOSIT_WEI), PAYMASTER_ESCAPES: '1',
         };
         const deployed = await runToExit('forge', ['script', 'script/Deploy.s.sol', '--rpc-url', rpcUrl, '--broadcast'],
             'deploy.log', deployEnv, { cwd: path.join(ROOT, 'demo/contracts') });
@@ -824,7 +859,13 @@ async function main() {
             vault: vaultAddress, deploy_block: deployBlock, deploy_block_lower_bound: pending.deployBlockLowerBound,
             setup_id: finalized.setupId, allow_dev_setup: finalized.allowDevSetup, circuit_id: finalized.circuitId,
             codehashes: { vault: finalized.vaultRuntimeCodehash, adapter: finalized.adapterRuntimeCodehash,
-                poseidon: finalized.poseidonRuntimeCodehash }, deploy_transactions: finalized.deployTransactions };
+                poseidon: finalized.poseidonRuntimeCodehash, entry_point: finalized.entryPointRuntimeCodehash,
+                sender_creator: finalized.senderCreatorRuntimeCodehash, paymaster: finalized.paymasterRuntimeCodehash,
+                factory: finalized.factoryRuntimeCodehash, account_implementation: finalized.accountImplementationRuntimeCodehash },
+            etched, gasless: { paymaster: finalized.withdrawalPaymaster, factory: finalized.withdrawalAccountFactory,
+                policy: finalized.paymasterPolicy, fee_ceilings: finalized.paymasterFeeCeilings,
+                stake_wei: finalized.paymasterStakeWei, deposit_wei: finalized.paymasterInitialDepositWei },
+            deploy_transactions: finalized.deployTransactions };
         stopAfter('deploy');
 
         // ---------------------------------------------------------------- mocks and profiles
@@ -907,11 +948,18 @@ async function main() {
         });
         const indexerPort = await freePort();
         const indexerUrl = `http://127.0.0.1:${indexerPort}`;
+        // The operator's bundler (scripts/acceptance/mini-bundler.mjs): every
+        // profile publishes it as gasless.bundler_url; it bundles from its
+        // own Anvil account against the etched EntryPoint.
+        const bundler = await startMiniBundler({ rpcUrl, entryPoint: CANONICAL_ENTRY_POINT, account: account.bundler.toLowerCase(), serve,
+            gasPolicy: gaslessProfile(finalized).gas_policy, chainId: CHAIN_ID });
         const services = { deploymentId: `acceptance-${CHAIN_ID}-${runId.slice(-8)}`, protocolServerUrl: gateUrl, indexerUrl,
             rpcUrl: pinnedRpcUrl, priceFeed: feed, keyHashes, settlementWindowSeconds: W, inferenceBase: `${providerUrl}/v1`,
-            verifierUrl: `${providerUrl}/verifier` };
+            verifierUrl: `${providerUrl}/verifier`, bundlerUrl: bundler.url };
         const trusted = trustedDeployment(finalized, services);
         assert.deepEqual(trusted.state_signing_key, { x: felt(signingKeys.state_signing_key.x), y: felt(signingKeys.state_signing_key.y) });
+        assert.equal(trusted.gasless?.bundler_url, bundler.url, 'every profile names the operator\'s bundler');
+        assert.equal(trusted.gasless.policy.escapes_enabled, true, 'the drill sponsors escape initiations');
         const manifestPath = path.join(runDir, 'trusted-deployment.json');
         await save('trusted-deployment.json', { trusted_deployment: trusted });
 
@@ -1065,7 +1113,11 @@ async function main() {
         assert.equal(BigInt(attestation.state_signing_key.x), BigInt(signingKeys.state_signing_key.x));
         assert.equal(BigInt(attestation.clearance_signing_key.y), BigInt(signingKeys.clearance_signing_key.y));
         evidence.stack = { signer_health: signerHealth, server_health: serverHealth, refused_server_starts: refusedStarts,
-            db_init: 'bound', timing: { ...TIMING, ...timing } };
+            db_init: 'bound', timing: { ...TIMING, ...timing },
+            // serverd, the indexer and the challenger read a profile that
+            // carries the gasless object and ignore it.
+            profile_gasless: { bundler_url: trusted.gasless.bundler_url, paymaster: trusted.gasless.withdrawal_paymaster_address,
+                read_by: ['zkapi db init', 'zkapi-challenged', 'zkapi serverd'] } };
         stopAfter('stack');
 
         // ---------------------------------------------------------------- client drivers
@@ -1811,15 +1863,15 @@ async function main() {
         // of the companion's wallet taken before two requests is the stale
         // device, and its escape is refused before any proof leaves it.
         const companionError = answer => answer.value?.error?.code ?? answer.value?.code ?? null;
-        async function companionDeposit(companion) {
-            const plan = await companion.call('POST', '/deposit/prepare', { amount: DEPOSIT });
+        async function companionDeposit(companion, amount = DEPOSIT) {
+            const plan = await companion.call('POST', '/deposit/prepare', { amount });
             assert.equal(plan.status, 200, json(plan.value));
-            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), DEPOSIT, plan.value.zero_path],
-                { value: BigInt(DEPOSIT) * GWEI, operation: 'deposit' });
+            const receipt = await vaultSend(account.companion, 'deposit', [felt(plan.value.commitment), amount, plan.value.zero_path],
+                { value: BigInt(amount) * GWEI, operation: 'deposit' });
             const deposited = eventOf(receipt, 'NoteDeposited');
             const noteId = Number(deposited.args.noteId);
             const note = await noteView(noteId);
-            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount: DEPOSIT,
+            const confirmed = await companion.call('POST', '/deposit/confirm', { secret: plan.value.secret, note_id: noteId, amount,
                 expiry_ts: note.expiry, deposit_root: felt(deposited.args.newRoot), deposit_siblings: plan.value.zero_path });
             assert.equal(confirmed.status, 200, json(confirmed.value));
             await synchronizedTree();
@@ -1915,6 +1967,628 @@ async function main() {
                 confirm: confirmed.status ?? confirmed, client_final_state: { has_note: wallet.value.has_note }, traffic };
         });
         stopAfter('companion-close');
+
+        // ================================================================ gasless withdrawals (ERC-4337, EntryPoint v0.7.0)
+        // A withdrawal whose fee is paid from the payout: the proof names a
+        // transit account S = CREATE2(owner, payee); a user operation from S
+        // runs the vault call, the paymaster sponsors it (after re-running the
+        // vault's checks in validation) and pushes the payout less its
+        // measured charge to the payee, which needs no ETH. The operator's
+        // bundler is the mini bundler; the SDK and the harness as zkapi-clientd
+        // (an ephemeral owner key per withdrawal) are the clients.
+        const gaslessPins = trusted.gasless;
+        const entryPointAddress = gaslessPins.entry_point_address;
+        const paymasterAddress = gaslessPins.withdrawal_paymaster_address;
+        const factoryAddress = gaslessPins.withdrawal_account_factory_address;
+        const gasPolicy = gaslessPins.gas_policy;
+        const artifact = async (file, name) => (await readJSON(path.join(ROOT, 'protocol/contracts/out', file, `${name}.json`)));
+        const paymaster = new Interface((await artifact('ZkApiWithdrawalPaymaster.sol', 'ZkApiWithdrawalPaymaster')).abi);
+        const accountFactory = new Interface((await artifact('ZkApiWithdrawalAccountFactory.sol', 'ZkApiWithdrawalAccountFactory')).abi);
+        const transitAbi = new Interface((await artifact('ZkApiWithdrawalAccount.sol', 'ZkApiWithdrawalAccount')).abi);
+        // The Forge suite's self-funded account (test/gasless/GaslessTestBase.sol):
+        // a griefer's ERC-4337 account that pays its own gas and calls anything.
+        const selfFundedArtifact = await artifact('GaslessTestBase.sol', 'SelfFundedAccount');
+        const selfFunded = new Interface(selfFundedArtifact.abi);
+        const entryPoint = new Interface([
+            'event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)',
+            'event UserOperationRevertReason(bytes32 indexed userOpHash, address indexed sender, uint256 nonce, bytes revertReason)',
+            'event PostOpRevertReason(bytes32 indexed userOpHash, address indexed sender, uint256 nonce, bytes revertReason)',
+            'event UserOperationPrefundTooLow(bytes32 indexed userOpHash, address indexed sender, uint256 nonce)',
+            'event AccountDeployed(bytes32 indexed userOpHash, address indexed sender, address factory, address paymaster)',
+            'function balanceOf(address account) view returns (uint256)',
+            'function getNonce(address sender, uint192 key) view returns (uint256)',
+            'error FailedOp(uint256 opIndex, string reason)',
+            'error FailedOpWithRevert(uint256 opIndex, string reason, bytes inner)',
+        ]);
+        async function contractRead(iface, to, name, args = []) {
+            const result = iface.decodeFunctionResult(name, await rpc('eth_call', [{ to, data: iface.encodeFunctionData(name, args) }, 'latest']));
+            return result.length === 1 ? result[0] : result;
+        }
+        const pmRead = (name, args) => contractRead(paymaster, paymasterAddress, name, args);
+        const floatWei = () => contractRead(entryPoint, entryPointAddress, 'balanceOf', [paymasterAddress]);
+        const transitOf = async (owner, payee) => {
+            const S = (await contractRead(accountFactory, factoryAddress, 'getAddress', [owner, payee])).toLowerCase();
+            assert.equal((await pmRead('transitAccount', [owner, payee])).toLowerCase(), S, 'the paymaster derives the same transit account');
+            return S;
+        };
+        const parsedLogs = (iface, address, receipt) => receipt.logs.filter(entry => entry.address.toLowerCase() === address)
+            .map(entry => { try { return iface.parseLog(entry); } catch { return null; } }).filter(Boolean);
+        // The EntryPoint's and the paymaster's account of one sponsored
+        // operation of S in a bundle transaction.
+        function sponsoredOutcome(receipt, sender) {
+            const own = event => event.args.sender?.toLowerCase() === sender.toLowerCase();
+            const ep = parsedLogs(entryPoint, entryPointAddress, receipt);
+            const pm = parsedLogs(paymaster, paymasterAddress, receipt);
+            const found = (list, name) => list.find(event => event.name === name && own(event)) ?? null;
+            return { op: found(ep, 'UserOperationEvent'), revert: found(ep, 'UserOperationRevertReason'), deployed: found(ep, 'AccountDeployed'),
+                postOpFailure: ep.find(event => ['PostOpRevertReason', 'UserOperationPrefundTooLow'].includes(event.name)) ?? null,
+                sponsored: found(pm, 'Sponsored'), settled: found(pm, 'Settled'), failed: found(pm, 'SponsorshipFailed'),
+                stranded: pm.some(event => event.name === 'Stranded' && own(event)), owed: found(pm, 'EscapeInitiationOwed'),
+                shortfall: found(pm, 'Shortfall'), credited: pm.find(event => event.name === 'PayoutCredited') ?? null,
+                collected: found(pm, 'Collected'), paymasterEvents: pm.map(event => event.name) };
+        }
+        // The measured charge sits within MARGIN_GAS of what the EntryPoint
+        // took from the float (Settled.charged − actualGasCost, at the op's gas price).
+        function chargeWithinMargin(outcome) {
+            const cost = outcome.op.args.actualGasCost;
+            const price = cost / outcome.op.args.actualGasUsed;
+            const over = outcome.settled.args.charged - cost;
+            assert.ok(over >= 0n, `the charge ${outcome.settled.args.charged} covers the float's cost ${cost}`);
+            assert.ok(over <= BigInt(gasPolicy.margin_gas) * price, `the charge exceeds the cost by ${over} wei, more than MARGIN_GAS × ${price}`);
+            return { actual_gas_cost: cost.toString(), actual_gas_used: Number(outcome.op.args.actualGasUsed), gas_price: price.toString(),
+                charged: outcome.settled.args.charged.toString(), over_cost_wei: over.toString(), margin_wei: (BigInt(gasPolicy.margin_gas) * price).toString() };
+        }
+        const maxCostOf = op => (BigInt(op.preVerificationGas) + BigInt(op.verificationGasLimit) + BigInt(op.callGasLimit)
+            + BigInt(op.paymasterVerificationGasLimit) + BigInt(op.paymasterPostOpGasLimit)) * BigInt(op.maxFeePerGas);
+        const freshAddress = () => `0x${randomBytes(20).toString('hex')}`;
+        const GASLESS_CLOSE_ETH = '0.02';
+        const GASLESS_ESCAPE_UNITS = 50_000_000; // gwei: an escape's payout must also cover the finalization reserve and the minimum net
+        // An SDK whose connected account is a fresh role (it owns the transit
+        // accounts), with the submission loop's waits shortened as the SDK's
+        // own tests shorten them.
+        async function gaslessAgent(name) {
+            const sdk = await sdkAgent(name, { walletAccount: account.gaslessSdk });
+            await sdk('init');
+            await sdk('gasless_timing', { timing: { receiptPollMs: 500, logPollMs: 2_000, resendAfterMs: 8_000 } });
+            return sdk;
+        }
+        async function gaslessDeposit(sdk, amount = GASLESS_CLOSE_ETH) {
+            const deposited = await sdk('deposit', { amount });
+            assert.ok(deposited.note, json(deposited.statuses));
+            return { noteId: Number(deposited.note.note_id), units: Number(deposited.note.current_balance),
+                deposit: Number(deposited.note.current_balance), sent: deposited.sent.length,
+                signatures: deposited.signatures.length };
+        }
+        const sdkRecord = (state, noteId) => state.withdrawals.find(item => Number(item.noteId) === noteId) ?? null;
+        async function sdkClosedRecord(sdk, noteId) {
+            return waitFor('the SDK closes the sponsored record', async () => {
+                const state = await sdk('sync');
+                const record = sdkRecord(state, noteId);
+                return record?.phase === 'closed' && { state, record };
+            }, 90_000, 2_000);
+        }
+        // A sponsored close through the SDK and its settlement, asserted the
+        // way scenario 24 states it: no wallet transaction, one signature over
+        // the operation hash, the vault's MutualClose to S, the paymaster's
+        // Settled with the payee paid in the same transaction.
+        async function sdkSponsoredClose(sdk, note, payee, { operation, options = {} } = {}) {
+            const before = await balances(vaultAddress, treasury, payee, account.gaslessSdk);
+            const floatBefore = await floatWei();
+            const closed = await sdk('withdraw', { mode: 'mutual', destination: payee, fees: 'payout', ...options });
+            assert.equal(closed.result?.status, 'closed', json(closed.result));
+            const S = closed.result.transitAccount.toLowerCase();
+            assert.equal(closed.sent.length, note.sent, 'the wallet sent no transaction (fees: payout)');
+            const signatures = closed.signatures.length - note.signatures;
+            assert.ok(signatures >= 1, 'the owner signed the operation (personal_sign)');
+            const signedHashes = closed.signatures.slice(note.signatures).map(item => item.message.toLowerCase());
+            assert.ok(signedHashes.includes(closed.result.userOpHash), 'personal_sign signed the operation hash');
+            const receipt = await rpc('eth_getTransactionReceipt', [closed.result.transactionHash]);
+            assert.equal(receipt.status, '0x1');
+            assert.equal(receipt.to.toLowerCase(), entryPointAddress, 'a handleOps bundle');
+            const outcome = sponsoredOutcome(receipt, S);
+            assert.ok(outcome.op?.args.success, `the sponsored close succeeded: ${json(outcome.paymasterEvents)}`);
+            assert.equal(outcome.op.args.paymaster.toLowerCase(), paymasterAddress);
+            assert.equal(outcome.op.args.userOpHash.toLowerCase(), closed.result.userOpHash);
+            assert.equal(outcome.postOpFailure, null, 'postOp never reverts');
+            const event = eventOf(receipt, 'MutualClose');
+            assert.equal(Number(event.args.noteId), note.noteId);
+            assert.equal(event.args.destination.toLowerCase(), S, 'the proof names the transit account');
+            const payout = event.args.finalBalance * GWEI;
+            const settled = outcome.settled.args;
+            assert.equal(Number(settled.kind), 1);
+            assert.equal(settled.payee.toLowerCase(), payee.toLowerCase());
+            assert.equal(settled.received, payout, 'S forwarded the whole payout');
+            assert.equal(settled.owedPaid, 0n);
+            assert.equal(settled.paidOut, payout - settled.charged, 'the payee gets P − charged');
+            const margin = chargeWithinMargin(outcome);
+            const after = await balances(vaultAddress, treasury, payee, account.gaslessSdk);
+            assert.equal(after[payee] - before[payee], settled.paidOut, 'the payout address received Settled.paidOut');
+            assert.equal(after[account.gaslessSdk], before[account.gaslessSdk], 'the connected account paid nothing');
+            assert.equal(before[vaultAddress] - after[vaultAddress], BigInt(note.deposit) * GWEI, 'the vault paid out the whole deposit');
+            assert.equal(after[treasury] - before[treasury], BigInt(note.deposit) * GWEI - payout);
+            const floatAfter = await floatWei();
+            assert.ok(floatAfter >= floatBefore, `the float is replenished: ${floatBefore} → ${floatAfter}`);
+            assert.equal(await balance(S), 0n, 'nothing stays in the transit account');
+            assert.equal(await pmRead('received', [S]), 0n);
+            assert.deepEqual(closed.result.amounts && { charged: closed.result.amounts.chargedWei, paid: closed.result.amounts.paidOutWei },
+                { charged: settled.charged.toString(), paid: settled.paidOut.toString() }, 'the SDK reports the settled amounts');
+            if (operation) gas.record(operation, receipt, { client: 'sdk', note_id: note.noteId, user_op_hash: closed.result.userOpHash, ...margin });
+            const synced = await sdkClosedRecord(sdk, note.noteId);
+            assert.equal(synced.state.note, null, 'the SDK holds no note after the close');
+            assert.equal(synced.state.exit_lock, null, 'no exit lock is left');
+            return { closed, receipt, outcome, S, payout, settled, margin, floatBefore, floatAfter, record: synced.record, signatures,
+                walletTransactions: closed.sent.length - note.sent };
+        }
+        // One SDK (one browser) for the sponsored closes and the SDK escape.
+        let gaslessSdk = null;
+        const gaslessClient = async () => (gaslessSdk ??= await gaslessAgent('gasless'));
+        const gaslessPayee = freshAddress();
+
+        await scenario('gasless close (SDK, fees: payout): a payout address with no ETH receives P − charged; no wallet transaction; the float is replenished', async () => {
+            await gaslessClient();
+            const note = await gaslessDeposit(gaslessSdk);
+            const chat = await gaslessSdk('chat', { sessionId: 'acceptance-gasless', model: MODEL, prompt: PROMPT });
+            assert.equal(chat.status, 200, json(chat));
+            const settledRequest = await gaslessSdk('settle');
+            note.units = Number(settledRequest.note.current_balance);
+            note.sent = settledRequest.sent.length;
+            note.signatures = settledRequest.signatures.length;
+            assert.equal(await balance(gaslessPayee), 0n, 'the payout address holds no ETH');
+            assert.equal(await rpc('eth_getCode', [gaslessPayee, 'latest']), '0x');
+            const availability = await gaslessSdk('availability', { mode: 'mutual', destination: gaslessPayee });
+            assert.equal(availability.result.available, true, json(availability.result));
+            assert.equal(availability.result.bundlerUrl, bundler.url);
+            const quote = await gaslessSdk('quote', { mode: 'mutual', destination: gaslessPayee });
+            assert.equal(quote.result.available, true, json(quote.result));
+            const S = await transitOf(account.gaslessSdk, gaslessPayee);
+            assert.equal(availability.result.transitAccount?.toLowerCase(), S, 'availability derives S as the factory does');
+            assert.equal(quote.result.transitAccount.toLowerCase(), S, 'the quote derives S as the factory does');
+            assert.equal(await rpc('eth_getCode', [S, 'latest']), '0x', 'first use: S is created by the operation');
+            const result = await sdkSponsoredClose(gaslessSdk, note, gaslessPayee, { operation: 'gasless_close_first' });
+            assert.ok(result.outcome.deployed, 'the operation created S (initCode)');
+            assert.equal(result.signatures, 1, 'one personal_sign, over the operation hash');
+            assert.notEqual(await rpc('eth_getCode', [S, 'latest']), '0x');
+            assert.ok(BigInt(quote.result.minimumReceivedWei) <= result.settled.paidOut, 'the payee got at least the quoted minimum');
+            const send = bundler.sends.find(item => item.hash === result.closed.result.userOpHash);
+            assert.equal(send?.outcome, 'included', json(bundler.sends));
+            return { note_id: note.noteId, payee: gaslessPayee, transit_account: S, user_op_hash: result.closed.result.userOpHash,
+                bundle: result.receipt.transactionHash, payout_wei: result.payout.toString(), charged_wei: result.settled.charged.toString(),
+                paid_out_wei: result.settled.paidOut.toString(), quoted_minimum_wei: quote.result.minimumReceivedWei, ...result.margin,
+                float_before_wei: result.floatBefore.toString(), float_after_wei: result.floatAfter.toString(), wallet_transactions: result.walletTransactions,
+                signatures: result.signatures, client_final_state: { phase: result.record.phase, payout_verified: result.record.payoutVerified ?? null, note: null } };
+        });
+        stopAfter('gasless-close');
+
+        await scenario('gasless bundler outages (SDK): bundler down at the send, then self-bundling from the funded wallet; a dropped operation re-signed with higher fees; forgotten receipts found by the EntryPoint logs', async () => {
+            const sdk = await gaslessClient();
+            const S = await transitOf(account.gaslessSdk, gaslessPayee);
+            // (a) The bundler answers the pre-flight but not the send: the
+            // proof is made and the operation journaled, then bundler_unavailable.
+            const first = await gaslessDeposit(sdk);
+            bundler.hold(['eth_sendUserOperation']);
+            let refusal;
+            try {
+                refusal = await sdkRefusal(sdk('withdraw', { mode: 'mutual', destination: gaslessPayee, fees: 'payout' }));
+            } finally {
+                bundler.release();
+            }
+            assert.equal(refusal.code, 'bundler_unavailable', json(refusal));
+            assert.deepEqual(refusal.data?.fallbacks, ['self_bundle', 'direct_call']);
+            const held = await sdk('snapshot');
+            assert.equal(held.prepared_gasless?.transit?.account?.toLowerCase(), S, 'the plan stays bound to S');
+            // Self-bundling: the connected (funded) account sends handleOps
+            // itself; the paymaster pays and refunds it as the beneficiary.
+            bundler.hold(['eth_sendUserOperation']);
+            const walletBefore = await balance(account.gaslessSdk);
+            const floatBefore = await floatWei();
+            let selfBundled;
+            try {
+                selfBundled = await sdk('withdraw', { mode: 'mutual', destination: gaslessPayee, fees: 'payout', selfBundle: true });
+            } finally {
+                bundler.release();
+            }
+            assert.equal(selfBundled.result?.status, 'closed', json(selfBundled.result));
+            const handleOpsTx = selfBundled.sent.slice(first.sent).find(item => item.to?.toLowerCase() === entryPointAddress);
+            assert.ok(handleOpsTx, 'the wallet sent handleOps itself');
+            assert.equal(selfBundled.sent.length, first.sent + 1, 'one transaction: the bundle');
+            const selfReceipt = await waitReceipt(handleOpsTx.hash);
+            const selfOutcome = sponsoredOutcome(selfReceipt, S);
+            assert.ok(selfOutcome.op?.args.success);
+            assert.equal(selfOutcome.deployed, null, 'S existed: no initCode');
+            const fee = BigInt(selfReceipt.gasUsed) * BigInt(selfReceipt.effectiveGasPrice);
+            const walletAfter = await balance(account.gaslessSdk);
+            assert.equal(walletAfter - walletBefore, selfOutcome.op.args.actualGasCost - fee, 'the beneficiary got the operation\'s gas cost back');
+            assert.ok(await floatWei() >= floatBefore);
+            const selfMargin = chargeWithinMargin(selfOutcome);
+            gas.record('gasless_self_bundle', selfReceipt, { client: 'sdk', note_id: first.noteId, refund_wei: selfOutcome.op.args.actualGasCost.toString(), ...selfMargin });
+            await sdkClosedRecord(sdk, first.noteId);
+            // (b) The mempool drops the operation and then refuses its
+            // identical bytes as underpriced: the SDK signs it again with both
+            // fee fields raised by 12.5% and journals both hashes.
+            const second = await gaslessDeposit(sdk);
+            bundler.drop();
+            const dropped = await sdkSponsoredClose(sdk, second, gaslessPayee, { operation: 'gasless_close_repeat' });
+            assert.equal(dropped.outcome.deployed, null, 'a repeat close from an existing S has no initCode');
+            const lost = bundler.sends.find(item => item.outcome === 'accepted_then_dropped');
+            assert.ok(lost, json(bundler.sends));
+            assert.ok(bundler.sends.some(item => item.hash === lost.hash && item.outcome === 'refused' && /underpriced/.test(item.error?.message)),
+                'the identical re-send was refused for its fee');
+            const hashes = (dropped.record.userOpHashes || []).map(hash => hash.toLowerCase());
+            assert.ok(hashes.includes(lost.hash) && hashes.includes(dropped.closed.result.userOpHash) && hashes.length >= 2,
+                `both hashes are journaled: ${json(dropped.record.userOpHashes)}`);
+            const lostOp = bundler.ops.get(lost.hash).json;
+            const bumpedOp = bundler.ops.get(dropped.closed.result.userOpHash).json;
+            assert.ok(BigInt(bumpedOp.maxFeePerGas) * 1000n >= BigInt(lostOp.maxFeePerGas) * 1125n
+                && BigInt(bumpedOp.maxPriorityFeePerGas) * 1000n >= BigInt(lostOp.maxPriorityFeePerGas) * 1125n, 'both fees raised by 12.5%');
+            // (c) The bundler forgets every receipt: the inclusion is found
+            // through the EntryPoint's UserOperationEvent logs.
+            const third = await gaslessDeposit(sdk);
+            bundler.forgetReceipts();
+            const receiptQueries = bundler.requests.filter(item => item.method === 'eth_getUserOperationReceipt').length;
+            let forgotten;
+            try {
+                forgotten = await sdkSponsoredClose(sdk, third, gaslessPayee, { operation: 'gasless_close_repeat' });
+            } finally {
+                bundler.release();
+            }
+            assert.ok(bundler.requests.filter(item => item.method === 'eth_getUserOperationReceipt').length > receiptQueries,
+                'the SDK asked the bundler, which answered null');
+            return { transit_account: S,
+                bundler_down: { refusal: refusal.code, fallbacks: refusal.data.fallbacks, self_bundle: handleOpsTx.hash,
+                    beneficiary_refund_wei: selfOutcome.op.args.actualGasCost.toString(), wallet_fee_wei: fee.toString() },
+                dropped: { lost_hash: lost.hash, bumped_hash: dropped.closed.result.userOpHash, journaled: hashes,
+                    max_fee_per_gas: [lostOp.maxFeePerGas, bumpedOp.maxFeePerGas], bundle: dropped.receipt.transactionHash },
+                forgotten_receipts: { bundle: forgotten.receipt.transactionHash, found_by: 'EntryPoint UserOperationEvent logs' } };
+        });
+        stopAfter('gasless-bundler');
+
+        // A griefer's self-funded ERC-4337 account (it pays its own gas), deployed and funded.
+        async function selfFundedAccount() {
+            const deployData = `${selfFundedArtifact.bytecode.object}${coder.encode(['address'], [entryPointAddress]).slice(2)}`;
+            const receipt = await sendTx({ from: account.griefer, to: null, data: deployData });
+            assert.equal(receipt.status, '0x1');
+            const address = receipt.contractAddress.toLowerCase();
+            await sendTx({ from: account.griefer, to: address, data: '0x', value: 50_000_000_000_000_000n });
+            return address;
+        }
+        // Starts a sponsored close through the SDK with the bundler holding
+        // accepted operations, and returns it once its operation sits in the mempool.
+        async function deferredSponsoredClose(sdk, payee) {
+            bundler.defer();
+            let ended = null;
+            const closing = sdk('withdraw', { mode: 'mutual', destination: payee, fees: 'payout' })
+                .then(value => ({ value }), error => ({ error }));
+            void closing.then(outcome => { ended = outcome; });
+            const end = Date.now() + 300_000;
+            let pendingOp;
+            while (!(pendingOp = bundler.pending()[0])) {
+                check();
+                if (ended || Date.now() > end) {
+                    bundler.release();
+                    throw new Error(`the sponsored close never reached the mempool: ${ended?.error?.message ?? json(ended?.value?.result ?? 'timeout')}`);
+                }
+                await delay(500);
+            }
+            bundler.defer(false);
+            return { closing, pendingOp };
+        }
+
+        await scenario('griefing bundle: a self-funded account replays the close in the operation before the sponsored one; the sponsored close reverts (success false), the float pays at most maxCost at the capped tip, S is stranded, and collectTransitBalance pays the payee', async () => {
+            const sdk = await gaslessClient();
+            const note = await gaslessDeposit(sdk);
+            const payee = freshAddress();
+            const S = await transitOf(account.gaslessSdk, payee);
+            const { closing, pendingOp } = await deferredSponsoredClose(sdk, payee);
+            const vaultCall = vaultCallOf(pendingOp.json.callData);
+            assert.ok(vaultCall?.startsWith(vault.getFunction('mutualClose').selector), 'the operation carries the public close calldata');
+            const replayer = await selfFundedAccount();
+            const replayOp = { sender: replayer, nonce: hex(await contractRead(entryPoint, entryPointAddress, 'getNonce', [replayer, 0])),
+                callData: selfFunded.encodeFunctionData('execute', [vaultAddress, vaultCall]), callGasLimit: hex(900_000),
+                verificationGasLimit: hex(100_000), preVerificationGas: hex(50_000), maxFeePerGas: pendingOp.json.maxFeePerGas,
+                maxPriorityFeePerGas: pendingOp.json.maxPriorityFeePerGas, signature: `0x${'00'.repeat(65)}` };
+            const floatBefore = await floatWei();
+            const lostBefore = await pmRead('lostWei');
+            const attemptsKey = await pmRead('keyFor', [1, BigInt(vault.decodeFunctionData('mutualClose', vaultCall)[0].withdrawalNullifier), 0, S]);
+            const { receipt } = await bundler.bundle([replayOp, pendingOp.hash]);
+            assert.equal(receipt.status, '0x1', 'both operations passed validation; the bundle lands');
+            gas.record('gasless_griefing_bundle', receipt, { note_id: note.noteId, ops: 2 });
+            const replayEvent = sponsoredOutcome(receipt, replayer).op;
+            assert.ok(replayEvent?.args.success, 'the replay closed the note');
+            assert.equal(eventOf(receipt, 'MutualClose').args.destination.toLowerCase(), S, 'the payout went to S all the same');
+            const outcome = sponsoredOutcome(receipt, S);
+            assert.equal(outcome.op?.args.success, false, 'the sponsored close reverted in execution');
+            assert.ok(outcome.revert, 'UserOperationRevertReason carries the vault\'s refusal');
+            const accountError = transitAbi.parseError(outcome.revert.args.revertReason);
+            assert.equal(accountError?.name, 'VaultCallFailed', `S's call failed: ${outcome.revert.args.revertReason}`);
+            assert.equal(vault.parseError(accountError.args[0])?.name, 'NoteNotActive', `the vault refused the closed note: ${accountError.args[0]}`);
+            assert.ok(outcome.failed, 'SponsorshipFailed');
+            assert.ok(outcome.stranded, 'Stranded(S)');
+            assert.equal(outcome.postOpFailure, null);
+            const cost = outcome.op.args.actualGasCost;
+            // SponsorshipFailed carries the cost postOp was told, before the
+            // EntryPoint added postOp's own gas and the unused-gas penalty.
+            assert.ok(outcome.failed.args.actualGasCost <= cost, 'SponsorshipFailed reports the cost before postOp');
+            assert.ok(cost <= maxCostOf(pendingOp.json), `the float paid ${cost} ≤ maxCost ${maxCostOf(pendingOp.json)}`);
+            const ceiling = await pmRead('priorityFeeCeiling');
+            assert.ok(BigInt(pendingOp.json.maxPriorityFeePerGas) <= ceiling, 'the tip is within the paymaster\'s ceiling');
+            assert.equal(floatBefore - await floatWei(), cost, 'the float paid exactly the operation\'s gas');
+            assert.ok(await pmRead('lostWei') - lostBefore >= cost, 'lostWei records it');
+            assert.equal(await pmRead('stranded', [S]), true);
+            assert.equal(Number(await pmRead('attempts', [attemptsKey])), 1, 'one attempt counted');
+            const closed = await closing;
+            assert.ok(closed.value, `the SDK settled the reverted operation: ${closed.error?.message}`);
+            assert.equal(closed.value.result.status, 'closed', json(closed.value.result));
+            assert.equal(closed.value.result.fundsWaitingInTransit, true);
+            const payoutWei = BigInt(closed.value.result.transitBalanceWei);
+            assert.equal(await balance(S), payoutWei);
+            // The sponsored forward of the stranded payout.
+            const before = await balances(payee, account.gaslessSdk);
+            const collected = await sdk('collect', { recordId: closed.value.result.recordId });
+            assert.equal(collected.result?.status, 'collected', json(collected.result));
+            const forwardReceipt = await rpc('eth_getTransactionReceipt', [collected.result.transactionHash]);
+            const forward = sponsoredOutcome(forwardReceipt, S);
+            assert.ok(forward.op?.args.success);
+            assert.equal(Number(forward.settled.args.kind), 4);
+            assert.equal(forward.settled.args.received, payoutWei);
+            const margin = chargeWithinMargin(forward);
+            const after = await balances(payee, account.gaslessSdk);
+            assert.equal(after[payee] - before[payee], payoutWei - forward.settled.args.charged, 'the payee gets the stranded payout less the forward\'s charge');
+            assert.equal(after[account.gaslessSdk], before[account.gaslessSdk]);
+            assert.equal(await balance(S), 0n);
+            assert.equal(await pmRead('stranded', [S]), false, 'the forward consumed the evidence');
+            gas.record('gasless_forward', forwardReceipt, { client: 'sdk', note_id: note.noteId, ...margin });
+            return { note_id: note.noteId, transit_account: S, replayer, bundle: receipt.transactionHash, sponsored_success: false,
+                float_paid_wei: cost.toString(), max_cost_wei: maxCostOf(pendingOp.json).toString(), tip: pendingOp.json.maxPriorityFeePerGas,
+                priority_fee_ceiling: ceiling.toString(), revert_reason: outcome.revert.args.revertReason,
+                revert_decoded: `VaultCallFailed(${vault.parseError(accountError.args[0]).name})`, stranded: true,
+                forward: collected.result.transactionHash, forward_paid_out_wei: forward.settled.args.paidOut.toString(), ...margin };
+        });
+        stopAfter('gasless-griefing');
+
+        await scenario('replay before inclusion: a third party lands the public close calldata directly while the sponsored operation waits; the bundle fails validation (the bundler pays, the float and the attempts do not move) and the payout waiting in S is swept to the payee', async () => {
+            const sdk = await gaslessClient();
+            const note = await gaslessDeposit(sdk);
+            const payee = freshAddress();
+            const S = await transitOf(account.gaslessSdk, payee);
+            const { closing, pendingOp } = await deferredSponsoredClose(sdk, payee);
+            bundler.defer();
+            const vaultCall = vaultCallOf(pendingOp.json.callData);
+            const replay = await sendTx({ from: account.thirdParty, to: vaultAddress, data: vaultCall });
+            assert.equal(replay.status, '0x1', 'anyone can land the public calldata');
+            assert.equal(eventOf(replay, 'MutualClose').args.destination.toLowerCase(), S);
+            const payoutWei = eventOf(replay, 'MutualClose').args.finalBalance * GWEI;
+            const attemptsKey = await pmRead('keyFor', [1, BigInt(vault.decodeFunctionData('mutualClose', vaultCall)[0].withdrawalNullifier), 0, S]);
+            assert.equal(Number(await pmRead('attempts', [attemptsKey])), 0, 'no attempt before the bundle');
+            const floatBefore = await floatWei();
+            const bundlerBefore = await balance(account.bundler);
+            const flushed = await bundler.flush();
+            bundler.release();
+            assert.equal(flushed.receipt.status, '0x0', 'on-chain validation refused the operation: the whole bundle reverted');
+            assert.deepEqual(flushed.bundle.hashes, [pendingOp.hash], 'the bundle carried the sponsored operation alone');
+            // Why the bundle reverted: the same handleOps replayed with
+            // eth_call on the state its block left (a reverted bundle changes
+            // nothing) answers the EntryPoint's FailedOpWithRevert.
+            const bundleTx = await rpc('eth_getTransactionByHash', [flushed.receipt.transactionHash]);
+            let failedOp = null;
+            try {
+                await rpc('eth_call', [{ from: bundleTx.from, to: bundleTx.to, data: bundleTx.input, gas: bundleTx.gas }, flushed.receipt.blockNumber]);
+            } catch (error) {
+                assert.ok(error instanceof RpcCallError && error.data, `no revert data: ${error.message}`);
+                failedOp = decodeFailedOp(error.data);
+            }
+            assert.ok(failedOp, 'handleOps reverts with FailedOp');
+            assert.equal(failedOp.opIndex, 0);
+            assert.equal(failedOp.aa, 'AA33', `the paymaster's validation refused the operation: ${json(failedOp)}`);
+            assert.equal(failedOp.inner?.slice(0, 10), paymaster.getError('NoteNotActive').selector, `NoteNotActive: ${json(failedOp)}`);
+            const bundlerFee = BigInt(flushed.receipt.gasUsed) * BigInt(flushed.receipt.effectiveGasPrice);
+            assert.equal(bundlerBefore - await balance(account.bundler), bundlerFee, 'the bundler paid for the failed bundle');
+            assert.equal(await floatWei(), floatBefore, 'the float paid nothing');
+            assert.equal(Number(await pmRead('attempts', [attemptsKey])), 0, 'the attempts did not move');
+            assert.equal(await pmRead('stranded', [S]), false, 'nothing recorded: no sponsored execution happened');
+            assert.equal(await balance(S), payoutWei, 'the payout sits in S');
+            const failure = await closing;
+            const refusal = failure.error?.sdk ?? null;
+            assert.equal(refusal?.code, 'note_not_active', `the SDK refuses: the note was closed by someone else: ${json(refusal ?? failure.value?.result)}`);
+            // The SDK's own record of the note closed by someone else, with the payout waiting in S.
+            const waiting = await waitFor('the SDK records the payout waiting in S', async () => {
+                const state = await sdk('sync');
+                const record = sdkRecord(state, note.noteId);
+                return record && record.transit && { state, record };
+            }, 120_000, 2_000).catch(error => { throw new Error(`${error.message}; the withdraw ended ${json(failure.error?.sdk ?? failure.value?.result)}`); });
+            const collect = await sdkRefusal(sdk('collect', { recordId: waiting.record.recordId }));
+            assert.equal(collect.code, 'transit_not_stranded', json(collect));
+            const before = await balances(payee, account.gaslessSdk);
+            const sentBefore = (await sdk('snapshot')).sent.length;
+            const swept = await sdk('sweep', { recordId: waiting.record.recordId });
+            assert.equal(swept.result?.status, 'swept', json(swept.result));
+            assert.equal(swept.sent.length - sentBefore, 2, 'two wallet transactions: createAccount, sweep');
+            assert.deepEqual(swept.sent.slice(sentBefore).map(item => item.hash.toLowerCase()),
+                [swept.result.createTransactionHash.toLowerCase(), swept.result.transactionHash.toLowerCase()], 'createAccount, then sweep');
+            const createReceipt = await waitReceipt(swept.result.createTransactionHash);
+            const sweepReceipt = await waitReceipt(swept.result.transactionHash);
+            const collected = sponsoredOutcome(sweepReceipt, S).collected;
+            assert.ok(collected, 'Collected(S)');
+            assert.equal(collected.args.received, payoutWei);
+            assert.equal(collected.args.paidOut, payoutWei);
+            const after = await balances(payee);
+            assert.equal(after[payee] - before[payee], payoutWei, 'the payee received the whole payout');
+            assert.equal(await balance(S), 0n);
+            gas.record('gasless_create_account', createReceipt, { client: 'sdk', note_id: note.noteId });
+            gas.record('gasless_sweep', sweepReceipt, { client: 'sdk', note_id: note.noteId });
+            return { note_id: note.noteId, transit_account: S, replay: replay.transactionHash, failed_bundle: flushed.receipt.transactionHash,
+                bundle_failure: { aa: failedOp.aa, reason: failedOp.reason, inner: failedOp.inner }, attempts: 0,
+                bundler_paid_wei: bundlerFee.toString(), float_paid_wei: '0', sdk_withdraw: { code: refusal.code, user_op_sent: refusal.user_op_sent },
+                wallet_transactions: 2, collect_refusal: collect.code, sweep: swept.result.transactionHash,
+                create_account: swept.result.createTransactionHash, paid_out_wei: payoutWei.toString() };
+        });
+        stopAfter('gasless-replay');
+
+        await scenario('post-prepare fallback: the bundler stops after the proof; the wallet pays the direct vault call to S (the plan stays bound to S), then sweepTransit creates S and forwards the payout (two transactions)', async () => {
+            const sdk = await gaslessClient();
+            const note = await gaslessDeposit(sdk);
+            const payee = freshAddress();
+            const S = await transitOf(account.gaslessSdk, payee);
+            bundler.hold(['eth_sendUserOperation']);
+            let refusal;
+            try {
+                refusal = await sdkRefusal(sdk('withdraw', { mode: 'mutual', destination: payee, fees: 'payout' }));
+            } finally {
+                bundler.release();
+            }
+            assert.equal(refusal.code, 'bundler_unavailable', json(refusal));
+            const held = await sdk('snapshot');
+            assert.equal(held.prepared?.destination?.toLowerCase(), S, 'the proof is bound to S');
+            // fees: 'wallet' on the prepared plan: the ordinary vault transaction, destination S.
+            const direct = await sdk('withdraw', { mode: 'mutual', destination: payee, fees: 'wallet' });
+            const closeTx = direct.sent.slice(note.sent).find(item => item.data === vault.getFunction('mutualClose').selector);
+            assert.ok(closeTx, json(direct.statuses));
+            const closeReceipt = await waitReceipt(closeTx.hash);
+            const closeEvent = eventOf(closeReceipt, 'MutualClose');
+            assert.equal(closeEvent.args.destination.toLowerCase(), S);
+            const payoutWei = closeEvent.args.finalBalance * GWEI;
+            assert.equal(await balance(S), payoutWei);
+            assert.equal(await rpc('eth_getCode', [S, 'latest']), '0x');
+            const record = await waitFor('the SDK records the payout waiting in S', async () => {
+                const state = await sdk('sync');
+                const found = sdkRecord(state, note.noteId);
+                return found?.transit && found;
+            }, 90_000, 2_000);
+            const before = await balances(payee);
+            const swept = await sdk('sweep', { recordId: record.recordId });
+            assert.equal(swept.result?.status, 'swept', json(swept.result));
+            assert.ok(swept.result.createTransactionHash, 'S had no code: createAccount first');
+            const createReceipt = await waitReceipt(swept.result.createTransactionHash);
+            const sweepReceipt = await waitReceipt(swept.result.transactionHash);
+            const collected = sponsoredOutcome(sweepReceipt, S).collected;
+            assert.ok(collected, 'Collected(S)');
+            assert.equal(collected.args.paidOut, payoutWei);
+            assert.equal((await balances(payee))[payee] - before[payee], payoutWei);
+            assert.equal(swept.sent.length - direct.sent.length, 2, 'two wallet transactions: createAccount, sweep');
+            gas.record('gasless_create_account', createReceipt, { client: 'sdk', note_id: note.noteId });
+            gas.record('gasless_sweep', sweepReceipt, { client: 'sdk', note_id: note.noteId });
+            return { note_id: note.noteId, transit_account: S, refusal: refusal.code, direct_close: closeTx.hash,
+                create_account: swept.result.createTransactionHash, sweep: swept.result.transactionHash, paid_out_wei: payoutWei.toString() };
+        });
+        stopAfter('gasless-fallback');
+
+        // ---------------------------------------------------------------- gasless escapes
+        // The harness as zkapi-clientd (design §3.3): an ephemeral owner key
+        // per withdrawal, the operation's gas fields from the profile's
+        // pinned policy, the fees within the paymaster's ceilings, an
+        // EIP-191 signature over the operation hash, the bundler's JSON-RPC.
+        async function clientdOperation({ owner, payee, kind, vaultCall, nonceKey }) {
+            const S = await transitOf(owner.address, payee);
+            const withInitCode = await rpc('eth_getCode', [S, 'latest']) === '0x';
+            const nonce = await contractRead(entryPoint, entryPointAddress, 'getNonce', [S, nonceKey]);
+            const base = BigInt((await rpc('eth_getBlockByNumber', ['latest', false])).baseFeePerGas);
+            const min = (a, b) => (a < b ? a : b);
+            const tip = min(BigInt(await rpc('eth_maxPriorityFeePerGas')), await pmRead('priorityFeeCeiling'));
+            const maxFee = min(2n * base + tip, await pmRead('maxFeeCeiling'));
+            const flatFee = (await pmRead('policy')).flatFeeWei;
+            const op = { sender: S, nonce: hex(nonce),
+                ...(withInitCode ? { factory: factoryAddress, factoryData: accountFactory.encodeFunctionData('createAccount', [owner.address, payee]) } : {}),
+                callData: transitAbi.encodeFunctionData('withdraw', [vaultCall]), callGasLimit: hex(gasPolicy.call_default[kind - 1]),
+                verificationGasLimit: hex(withInitCode ? gasPolicy.verification_default_init : gasPolicy.verification_default),
+                preVerificationGas: '0x0', maxFeePerGas: hex(maxFee), maxPriorityFeePerGas: hex(tip), paymaster: paymasterAddress,
+                paymasterVerificationGasLimit: hex(gasPolicy.pm_verification_default), paymasterPostOpGasLimit: hex(gasPolicy.postop_default),
+                paymasterData: `0x${BigInt(flatFee).toString(16).padStart(24, '0')}`, signature: `0x${'00'.repeat(65)}` };
+            const bytes = (encodeHandleOps([packUserOperation(op)], account.bundler).length - 2) / 2;
+            op.preVerificationGas = hex(Math.min(Math.max(21_000 + 16 * bytes + 10_000, gasPolicy.pvg_floor), gasPolicy.pvg_cap));
+            const hash = userOperationHash(packUserOperation(op), entryPointAddress, CHAIN_ID);
+            op.signature = (await owner.signMessage(getBytes(hash))).toLowerCase();
+            return { op, hash, S, withInitCode, maxCost: maxCostOf(op) };
+        }
+        async function clientdSend({ op, hash }) {
+            const answered = await rpcAt(bundler.url, 'eth_sendUserOperation', [op, entryPointAddress]);
+            assert.equal(answered, hash, 'the bundler returns the locally computed hash');
+            const included = await waitFor(`the bundler's receipt of ${hash}`, () => rpcAt(bundler.url, 'eth_getUserOperationReceipt', [hash]), 60_000, 300);
+            assert.equal(included.userOpHash, hash);
+            return rpc('eth_getTransactionReceipt', [included.receipt.transactionHash]);
+        }
+        const gaslessEscapes = [];
+
+        await scenario('gasless escape as zkapi-clientd (ephemeral owner key): the companion proves an early escape to S, the sponsored initiation records S\'s debt, the challenger raises the concession', async () => {
+            await startServer(null, { keySource: 'oa_org' });
+            const companion = await startCompanion('gasless');
+            const noteId = await companionDeposit(companion, GASLESS_ESCAPE_UNITS);
+            await companionRequest(companion);
+            const owner = Wallet.createRandom();
+            const payee = freshAddress();
+            const S = await transitOf(owner.address, payee);
+            gate.mode = 'down';
+            let prepared;
+            try {
+                const decision = await companion.call('POST', '/oa/v1/withdraw/escape/prepare', { destination: S, early_exit: 'concede_nothing' });
+                assert.equal(decision.status, 200, json(decision.value));
+                prepared = decision.value.status === 'prepared' ? decision.value : (await companion.call('POST', '/oa/v1/withdraw/escape/prepare',
+                    { destination: S, conceded: String(decision.value.conceded ?? '0'), early_exit: 'concede_nothing' })).value;
+                assert.equal(prepared.status, 'prepared', json(prepared));
+                assert.equal(String(prepared.conceded), '0');
+            } finally {
+                gate.mode = 'pass';
+            }
+            const escapeCall = vault.parseTransaction({ data: prepared.calldata });
+            assert.equal(escapeCall.name, 'initiateEscapeWithdrawal');
+            assert.equal(escapeCall.args.inputs.destination.toLowerCase(), S, 'the proof names the transit account');
+            const nullifier = BigInt(escapeCall.args.inputs.withdrawalNullifier);
+            const floatBefore = await floatWei();
+            const built = await clientdOperation({ owner, payee, kind: 2, vaultCall: prepared.calldata, nonceKey: nullifier & ((1n << 192n) - 1n) });
+            assert.ok(built.withInitCode);
+            const receipt = await clientdSend(built);
+            const outcome = sponsoredOutcome(receipt, S);
+            assert.ok(outcome.op?.args.success, json(outcome.paymasterEvents));
+            assert.ok(outcome.deployed, 'S created by the escape operation');
+            const initiated = eventOf(receipt, 'EscapeWithdrawalInitiated');
+            assert.equal(Number(initiated.args.noteId), noteId);
+            const owed = outcome.owed.args.owedWei;
+            assert.equal(await pmRead('owed', [S]), owed, 'the initiation is S\'s debt');
+            assert.equal(outcome.settled.args.charged, owed);
+            assert.equal(outcome.settled.args.received, 0n, 'nothing is paid at initiation');
+            assert.equal(await pmRead('escapeSponsored', [noteId]), true);
+            assert.equal(await pmRead('escapeNotePlusOne', [S]), BigInt(noteId) + 1n);
+            const margin = chargeWithinMargin(outcome); // the recorded debt is the measured charge
+            assert.equal(await floatWei() - floatBefore, 0n - outcome.op.args.actualGasCost, 'the float advanced the initiation');
+            gas.record('gasless_escape', receipt, { client: 'clientd', note_id: noteId, user_op_hash: built.hash, owed_wei: owed.toString(), ...margin });
+            const submitted = await companion.call('POST', '/oa/v1/withdraw/escape/submit', { transaction_hash: receipt.transactionHash });
+            assert.equal(submitted.status, 200, json(submitted.value));
+            const raised = await waitEvent('EscapeConcessionRaised', noteId, Number(BigInt(receipt.blockNumber)), (TIMING.leaseTtl + 120) * 1000);
+            gas.record('raise', raised.receipt, { note_id: noteId });
+            assert.equal(raised.event.args.conceded, BigInt(INFERENCE_CHARGE));
+            await startServer();
+            gaslessEscapes.push({ name: 'clientd-gasless', client: 'clientd', companion, owner, payee, S, noteId, owed,
+                finalBalance: GASLESS_ESCAPE_UNITS - INFERENCE_CHARGE });
+            return { note_id: noteId, owner: owner.address.toLowerCase(), payee, transit_account: S, user_op_hash: built.hash,
+                bundle: receipt.transactionHash, owed_wei: owed.toString(), actual_gas_cost_wei: outcome.op.args.actualGasCost.toString(),
+                raise: raised.event.transactionHash, raised_to: INFERENCE_CHARGE };
+        });
+        stopAfter('gasless-escape');
+
+        let gaslessPauseNote = null;
+        await scenario('gasless escape through the SDK: a sponsored initiation (escapes enabled for the drill) records the debt; a second balance is deposited beside it', async () => {
+            const sdk = await gaslessClient();
+            const note = await gaslessDeposit(sdk, '0.05');
+            const payee = freshAddress();
+            const S = await transitOf(account.gaslessSdk, payee);
+            const escaped = await sdk('withdraw', { mode: 'escape', destination: payee, fees: 'payout' });
+            assert.equal(escaped.result?.status, 'pending_withdrawal', json(escaped.result));
+            assert.equal(escaped.sent.length, note.sent, 'no wallet transaction');
+            const receipt = await rpc('eth_getTransactionReceipt', [escaped.result.transactionHash]);
+            const outcome = sponsoredOutcome(receipt, S);
+            assert.ok(outcome.op?.args.success);
+            const owed = outcome.owed.args.owedWei;
+            assert.equal(escaped.result.initiationDebtWei, owed.toString(), 'the SDK records the debt');
+            assert.equal(await pmRead('owed', [S]), owed);
+            assert.equal(outcome.settled.args.charged, owed, 'the debt is the initiation\'s measured charge');
+            const margin = chargeWithinMargin(outcome);
+            gas.record('gasless_escape', receipt, { client: 'sdk', note_id: note.noteId, user_op_hash: outcome.op.args.userOpHash.toLowerCase(), owed_wei: owed.toString(), ...margin });
+            gaslessEscapes.push({ name: 'sdk-gasless', client: 'sdk', sdk, payee, S, noteId: note.noteId, owed,
+                finalBalance: Number((await vaultRead('pendingWithdrawals', [note.noteId]))[3]), recordId: escaped.result.recordId });
+            // A second balance beside the pending escape: the pause drill's.
+            gaslessPauseNote = await gaslessDeposit(sdk);
+            return { note_id: note.noteId, transit_account: S, payee, escape: escaped.result.transactionHash, owed_wei: owed.toString(),
+                decision: escaped.result.decision ?? null, second_note: gaslessPauseNote.noteId };
+        });
+        stopAfter('gasless-sdk-escape');
 
         // Prepared now, abandoned, replayed after its valid_until.
         const replay = { client: await wallet('replay') };
@@ -2038,10 +2712,126 @@ async function main() {
         });
         stopAfter('pause');
 
+        await scenario('gasless under the pause: sponsored closes refused before any proof (exits_paused); the sponsored finalization (zkapi-clientd) and the forward of a third party\'s finalization (SDK) land while paused, each settling S\'s debt', async () => {
+            assert.equal(await vaultRead('paused'), true);
+            // (a) A sponsored close is refused in the pre-flight, before the
+            // proof binds S, with the time exits reopen.
+            const availability = await gaslessSdk('availability', { mode: 'mutual', destination: gaslessPayee });
+            assert.equal(availability.result.available, false);
+            assert.equal(availability.result.reason, 'exits_paused', json(availability.result));
+            const reopenAt = Number(await vaultRead('pausedAt')) + TIMING.maxPauseDuration;
+            const beforeRefusal = await gaslessSdk('snapshot');
+            const refusal = await sdkRefusal(gaslessSdk('withdraw', { mode: 'mutual', destination: gaslessPayee, fees: 'payout' }));
+            assert.equal(refusal.code, 'exits_paused', json(refusal));
+            assert.equal(Number(refusal.data?.reopenAt), reopenAt, 'the refusal names when exits reopen');
+            const afterRefusal = await gaslessSdk('snapshot');
+            assert.equal(afterRefusal.prepared, null, 'nothing was proved');
+            assert.equal(afterRefusal.signatures.length, beforeRefusal.signatures.length, 'nothing was signed');
+            // Both sponsored escapes are past their deadline.
+            const deadlines = await Promise.all(gaslessEscapes.map(async entry => Number((await vaultRead('pendingWithdrawals', [entry.noteId]))[5])));
+            const now = await chainNow();
+            if (Math.max(...deadlines) >= now) await skipChain(Math.max(...deadlines) - now + 5, 'the gasless escapes\' challenge period, while paused');
+            const results = {};
+            // (b) zkapi-clientd's sponsored FINALIZE: not gated by the pause.
+            const clientd = gaslessEscapes.find(entry => entry.client === 'clientd');
+            const pending = await vaultRead('pendingWithdrawals', [clientd.noteId]);
+            assert.equal(Number(pending[3]), clientd.finalBalance, 'the raised balance B − c_final');
+            const finalize = await clientdOperation({ owner: clientd.owner, payee: clientd.payee, kind: 3,
+                vaultCall: vault.encodeFunctionData('finalizeEscapeWithdrawal', [clientd.noteId]), nonceKey: BigInt(pending[2]) & ((1n << 192n) - 1n) });
+            assert.equal(finalize.withInitCode, false);
+            const before = await balances(clientd.payee, treasury);
+            const receipt = await clientdSend(finalize);
+            const outcome = sponsoredOutcome(receipt, clientd.S);
+            assert.ok(outcome.op?.args.success, json(outcome.paymasterEvents));
+            const finalized = eventOf(receipt, 'EscapeWithdrawalFinalized');
+            assert.equal(finalized.args.finalBalance, BigInt(clientd.finalBalance));
+            const settled = outcome.settled.args;
+            assert.equal(Number(settled.kind), 3);
+            assert.equal(settled.received, BigInt(clientd.finalBalance) * GWEI);
+            assert.equal(settled.owedPaid, clientd.owed, 'the initiation\'s debt is settled first');
+            assert.equal(outcome.shortfall, null, 'the raise preceded validation: no shortfall');
+            const shortfallWei = await pmRead('shortfallWei');
+            assert.equal(shortfallWei, 0n, 'no shortfall was ever written off');
+            const paid = BigInt(clientd.finalBalance) * GWEI - clientd.owed - settled.charged;
+            assert.equal(settled.paidOut, paid);
+            const after = await balances(clientd.payee, treasury);
+            assert.equal(after[clientd.payee] - before[clientd.payee], paid, 'the payee receives B − c_final − owed − charge');
+            assert.equal(after[treasury] - before[treasury], BigInt(GASLESS_ESCAPE_UNITS - clientd.finalBalance) * GWEI);
+            assert.equal(await pmRead('owed', [clientd.S]), 0n);
+            assert.equal(await pmRead('escapeNotePlusOne', [clientd.S]), 0n);
+            assert.equal(await balance(clientd.S), 0n);
+            const margin = chargeWithinMargin(outcome);
+            gas.record('gasless_finalize', receipt, { client: 'clientd', note_id: clientd.noteId, ...margin });
+            const completed = await waitFor('the companion records the finalized escape', async () => {
+                const answer = await clientd.companion.call('POST', '/oa/v1/withdraw/escape/finalize', { transaction_hash: receipt.transactionHash });
+                return answer.status === 200 && answer.value.status === 'complete' && answer.value;
+            }, 60_000, 1_000);
+            assert.equal(completed.payout, String(clientd.finalBalance));
+            assert.equal(completed.conceded_final, String(INFERENCE_CHARGE));
+            const companionWallet = await clientd.companion.call('GET', '/status');
+            assert.equal(companionWallet.value.has_note, false);
+            await stop(clientd.companion.child);
+            results.clientd = { note_id: clientd.noteId, finalize: receipt.transactionHash, owed_paid_wei: settled.owedPaid.toString(),
+                charged_wei: settled.charged.toString(), paid_out_wei: paid.toString(), ...margin,
+                shortfall_wei: shortfallWei.toString(), shortfall_note: 'the Shortfall settlement is covered by the Forge suite (PostOp.t.sol) only: the drill\'s raise cannot bring B − c_final below owed + charge',
+                companion: { status: completed.status, payout: completed.payout, conceded_final: completed.conceded_final } };
+            // (c) A third party finalizes the SDK's sponsored escape: the
+            // payout lands in S, and the SDK's finalizeEscape goes straight
+            // to the sponsored FORWARD, which settles the debt.
+            const sdkEscape = gaslessEscapes.find(entry => entry.client === 'sdk');
+            const third = await vaultSend(account.thirdParty, 'finalizeEscapeWithdrawal', [sdkEscape.noteId], { operation: 'finalize' });
+            assert.equal(eventOf(third, 'EscapeWithdrawalFinalized').args.destination.toLowerCase(), sdkEscape.S);
+            const inTransit = await balance(sdkEscape.S);
+            assert.equal(inTransit, BigInt(sdkEscape.finalBalance) * GWEI);
+            const lead = await chainNow() - wallNow();
+            await gaslessSdk('clock', { offsetSeconds: Math.max(0, lead + 60) });
+            const payeeBefore = await balance(sdkEscape.payee);
+            const ownerBefore = await balance(account.gaslessSdk);
+            const sentBefore = (await gaslessSdk('snapshot')).sent.length;
+            const sendsBefore = bundler.sends.length;
+            const forwarded = await gaslessSdk('finalize', { recordId: sdkEscape.recordId });
+            assert.equal(forwarded.result?.status, 'collected', json(forwarded.result));
+            // Straight to FORWARD: no sponsored FINALIZE attempted, no wallet transaction.
+            const sendsOfS = bundler.sends.slice(sendsBefore).filter(item => item.sender === sdkEscape.S);
+            assert.ok(sendsOfS.length >= 1 && sendsOfS.every(item => item.kind === 4), `only FORWARD operations from S: ${json(sendsOfS)}`);
+            assert.ok(!bundler.sends.some(item => item.sender === sdkEscape.S && item.kind === 3), 'S never sent a sponsored FINALIZE');
+            assert.equal(forwarded.sent.length, sentBefore, 'the wallet sent no transaction');
+            assert.equal(await balance(account.gaslessSdk), ownerBefore, 'the connected account paid nothing');
+            const forwardReceipt = await rpc('eth_getTransactionReceipt', [forwarded.result.transactionHash]);
+            const forward = sponsoredOutcome(forwardReceipt, sdkEscape.S);
+            assert.ok(forward.op?.args.success);
+            assert.equal(Number(forward.settled.args.kind), 4);
+            assert.equal(forward.settled.args.owedPaid, sdkEscape.owed, 'the forward collects S\'s debt');
+            const forwardPaid = inTransit - sdkEscape.owed - forward.settled.args.charged;
+            assert.equal(forward.settled.args.paidOut, forwardPaid);
+            assert.equal(await balance(sdkEscape.payee) - payeeBefore, forwardPaid);
+            assert.equal(await pmRead('owed', [sdkEscape.S]), 0n);
+            assert.equal(await balance(sdkEscape.S), 0n);
+            const forwardMargin = chargeWithinMargin(forward);
+            gas.record('gasless_forward', forwardReceipt, { client: 'sdk', note_id: sdkEscape.noteId, after: 'third-party finalization', ...forwardMargin });
+            await gaslessSdk('clock', { offsetSeconds: 0 });
+            results.sdk = { note_id: sdkEscape.noteId, third_party_finalize: third.transactionHash, forward: forwarded.result.transactionHash,
+                bundler_sends: sendsOfS.map(item => ({ kind: item.kind, outcome: item.outcome })), wallet_transactions: 0,
+                owed_paid_wei: forward.settled.args.owedPaid.toString(), paid_out_wei: forwardPaid.toString(), ...forwardMargin };
+            assert.equal(await vaultRead('paused'), true, 'all of it while paused');
+            return { refusal_before_proof: refusal.code, reopen_at: reopenAt, ...results };
+        });
+        stopAfter('gasless-pause');
+
         await scenario('pause past maxPauseDuration: exits reopen while paused; re-pause cooldown; abandoned proof replay after valid_until', async () => {
             const pausedAt = Number(await vaultRead('pausedAt'));
             await skipChain(pausedAt + TIMING.maxPauseDuration - await chainNow() + 1, 'past maxPauseDuration');
             assert.equal(await vaultRead('paused'), true);
+            // The paymaster refuses every sponsored close and escape while the
+            // vault is paused, also past maxPauseDuration (it cannot read the
+            // clock in validation): the SDK still answers exits_paused, with a
+            // reopenAt already past. Exits go through the wallet path here.
+            const pausedAvailability = await gaslessSdk('availability', { mode: 'mutual', destination: gaslessPayee });
+            assert.equal(pausedAvailability.result.available, false);
+            assert.equal(pausedAvailability.result.reason, 'exits_paused', json(pausedAvailability.result));
+            const staleReopenAt = Number(pausedAvailability.result.data?.reopenAt);
+            assert.equal(staleReopenAt, pausedAt + TIMING.maxPauseDuration);
+            assert.ok(staleReopenAt < await chainNow(), 'the reopenAt the SDK names has already passed');
             // The abandoned proof is past its valid_until: nobody can land it.
             assert.equal(await revertName(replay.abandoned.plan.calldata), 'ProofExpired');
             const replayed = await sendTx({ from: account.thirdParty, to: vaultAddress, data: replay.abandoned.plan.calldata, gasLimit: 1_000_000 });
@@ -2055,10 +2845,26 @@ async function main() {
             const unpaused = await vaultSend(owner, 'unpause', [], { operation: 'unpause' });
             assert.equal(unpaused.status, '0x1');
             assert.equal(await revertName(vault.encodeFunctionData('pause', []), owner), 'PauseCooldown');
-            return { paused_at: pausedAt, escape_while_paused: escape.receipt.transactionHash, abandoned_proof: 'ProofExpired',
+            return { paused_at: pausedAt, gasless_while_paused: { reason: pausedAvailability.result.reason, reopen_at: staleReopenAt,
+                wallet_path: 'the escape below lands from the wallet' },
+                escape_while_paused: escape.receipt.transactionHash, abandoned_proof: 'ProofExpired',
                 repause: 'PauseCooldown' };
         });
         stopAfter('pause-max');
+
+        await scenario('gasless close after the pause: sponsored closes resume once the vault is unpaused', async () => {
+            assert.equal(await vaultRead('paused'), false);
+            const snapshot = await gaslessSdk('snapshot');
+            assert.equal(Number(snapshot.note?.note_id), gaslessPauseNote.noteId, 'the second balance is still held');
+            const note = { noteId: gaslessPauseNote.noteId, units: Number(snapshot.note.current_balance), deposit: gaslessPauseNote.deposit,
+                sent: snapshot.sent.length,
+                signatures: snapshot.signatures.length };
+            const result = await sdkSponsoredClose(gaslessSdk, note, gaslessPayee, { operation: 'gasless_close_repeat' });
+            await gaslessSdk.close();
+            return { note_id: note.noteId, bundle: result.receipt.transactionHash, charged_wei: result.settled.charged.toString(),
+                paid_out_wei: result.settled.paidOut.toString(), ...result.margin };
+        });
+        stopAfter('gasless-reopen');
 
         // ================================================================ adversarial operators (drill build)
         // A signed successor at a non-derived anchor (S4) or above the bound
@@ -2605,9 +3411,31 @@ async function main() {
             oa_org_keys: mock.events.filter(event => event.source === 'oa_org' && event.type === 'issued').length };
         evidence.challenger_sends = challengeSends.map(send => ({ call: send.call, note_id: send.note_id, hash: send.hash ?? null,
             error: send.error ?? null, ...send.fees }));
+        // Every operation the operator's bundler was sent, and every bundle it sent.
+        evidence.bundler = bundler.summary();
+        evidence.paymaster = { float_wei: (await floatWei()).toString(), lost_wei: (await pmRead('lostWei')).toString(),
+            shortfall_wei: (await pmRead('shortfallWei')).toString(), total_credits_wei: (await pmRead('totalCredits')).toString(),
+            balance_wei: (await balance(paymasterAddress)).toString() };
+        assert.equal(BigInt(evidence.paymaster.balance_wei), BigInt(evidence.paymaster.total_credits_wei),
+            'the paymaster holds exactly the credits it owes');
+        // The operator's own report (docs/deployment.md, gasless runtime):
+        // after the drill no debt, stranded balance or EntryPoint alarm is open.
+        const statusRun = await runToExit(process.execPath, [path.join(ROOT, 'scripts/paymaster-status.mjs'), '--deployment',
+            path.join(runDir, 'deployment.json'), '--rpc', rpcUrl], 'paymaster-status.log');
+        assert.equal(statusRun.code, 0, `paymaster-status failed: ${statusRun.output.slice(-2000)}`);
+        const paymasterStatus = JSON.parse(statusRun.output.slice(statusRun.output.indexOf('{')));
+        await save('paymaster-status.json', paymasterStatus);
+        assert.equal(paymasterStatus.open_owed_total_wei, '0', json(paymasterStatus.open_owed));
+        assert.deepEqual(paymasterStatus.stranded_open, [], 'every stranded transit account was forwarded or swept');
+        assert.deepEqual(paymasterStatus.entry_point_alarms, { post_op_revert_reason: 0, user_operation_prefund_too_low: 0 });
+        assert.equal(paymasterStatus.unaccounted_balance_wei, '0');
+        assert.ok(paymasterStatus.user_operations.failed >= 1 && paymasterStatus.user_operations.succeeded >= 1, json(paymasterStatus.user_operations));
+        evidence.paymaster.status_report = { user_operations: paymasterStatus.user_operations, events: paymasterStatus.events.counts,
+            deposit_covers_operations: paymasterStatus.deposit_covers_operations };
         const hashes = {};
         for (const file of [fileURLToPath(import.meta.url), path.join(ROOT, 'crates/zkapi-serverd/examples/v2_acceptance_wallet.rs'),
-            path.join(ROOT, 'scripts/acceptance/sdk-agent.mjs'),
+            path.join(ROOT, 'scripts/acceptance/sdk-agent.mjs'), path.join(ROOT, 'scripts/acceptance/mini-bundler.mjs'),
+            ...['entrypoint-v0.7.0.runtime.hex', 'sender-creator-v0.7.0.runtime.hex'].map(file => path.join(ROOT, 'protocol/contracts/test/fixtures', file)),
             ...['zkapi', 'zkapi-indexerd', 'zkapi-challenged', 'zkapi-walletd', 'examples/v2_acceptance_wallet'].map(file => path.join(opts.binDir, file)),
             ...['request.pk', 'request.vk', 'withdrawal.pk', 'withdrawal.vk'].map(file => path.join(SETUP_DIR, file)),
             path.join(ROOT, 'sdk/wasm/zkapi_browser_bg.wasm')]) {
@@ -2640,6 +3468,9 @@ async function main() {
                 clients: { wallet_core: 'examples/v2_acceptance_wallet (zkapi-browser natively; the harness applies the exit rules for it)',
                     sdk: 'sdk/ (zkapiClient + browserWalletRuntime) with sdk/wasm in Node: its own exit decisions, escapes, mutual closes, finalizations and credit claim',
                     companion: 'zkapi-walletd routes the Go clientd calls, escape and mutual close (the harness signs and sends its transactions), every connection through its authenticated proxy' },
+                gasless: 'the canonical EntryPoint v0.7.0 and SenderCreator runtimes etched at their addresses (codehash-pinned), the paymaster and its factory from the same Deploy.s.sol broadcast; sponsored closes, escapes, finalizations, forwards and sweeps through the SDK (fees: payout) and the harness as zkapi-clientd (ephemeral owner key)',
+                bundler: 'in-process mini bundler (handleOps from an Anvil account); no real bundler tracer',
+                erc7562_audit: 'not run here: the Forge suite traces validation (protocol/contracts/test/gasless/Validation.t.sol test_opcodeAudit_*, RealAdapter.t.sol with the real adapter); a real bundler tracer run is a release gate (docs/migration-concession-vault.md)',
                 provider: 'loopback mock management and inference HTTP service',
                 oracle: 'loopback mock ETH/USD feed; every other read is the actual chain',
                 external_provider_verified: false, live_network_verified: false, go_clientd_verified: false },

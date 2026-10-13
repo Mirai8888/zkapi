@@ -19,6 +19,15 @@
 //   every recovery answer reads as still reserved;
 // - `drop_deposit_path`: the saved deposit-time path is lost, so an exit
 //   takes its path from the indexer or the vault's logs.
+//
+// Gasless withdrawals (ERC-4337, `fees: 'payout'`): `withdraw` and `finalize`
+// pass `fees` and the other sponsored options through; `collect`
+// (collectTransitBalance), `sweep` (sweepTransit), `claim_credit`
+// (claimGaslessCredit), `quote` (gaslessWithdrawalQuote), `availability`
+// (gaslessAvailability), `set_bundler` (setBundlerUrl) and `gasless_timing`
+// (shortens the submission loop's waits, as the SDK's own tests do). The
+// wallet answers `personal_sign` with the Anvil account (recorded in
+// `signatures`), so a sponsored operation is signed and never sent by it.
 import path from 'node:path';
 import readline from 'node:readline';
 import { readFile } from 'node:fs/promises';
@@ -100,6 +109,8 @@ let walletRpcUrl;
 let account;
 let rpcId = 0;
 const sent = [];
+// Every personal_sign the wallet answered (a sponsored operation's hash).
+const signatures = [];
 // `wallet_reject`: selectors whose calls the wallet refuses to send.
 const rejectSelectors = new Set();
 const rejected = [];
@@ -131,6 +142,11 @@ const provider = {
                 sent.push({ hash, to: tx.to, data: tx.data?.slice(0, 10), value: tx.value ?? '0x0' });
                 return hash;
             }
+            case 'personal_sign': {
+                const signature = await walletRpc('personal_sign', params);
+                signatures.push({ message: params[0], account: params[1], signature });
+                return signature;
+            }
             default: return walletRpc(method, params);
         }
     },
@@ -138,7 +154,8 @@ const provider = {
 };
 
 const pick = error => ({ message: error?.shortMessage || error?.message || String(error), code: error?.code ?? null,
-    data: error?.data ?? null, status: error?.status ?? null });
+    data: summarize(error?.data ?? null), status: error?.status ?? null, user_op_sent: error?.userOpSent === true,
+    statuses: error?.statuses ?? null, amounts: error?.amounts ?? null });
 
 async function handle(command) {
     switch (command.command) {
@@ -189,9 +206,20 @@ async function handle(command) {
         }
         case 'withdraw': {
             const statuses = [];
-            const result = await client.withdraw(command.mode, message => statuses.push(message),
-                { destination: command.destination, concede: command.concede ?? 'zero' });
-            return { result: summarize(result), statuses, ...state() };
+            const amounts = [];
+            const options = { destination: command.destination, concede: command.concede ?? 'zero' };
+            for (const key of ['fees', 'feeCapWei', 'bundlerUrl', 'allowExpensiveGas', 'selfBundle']) {
+                if (command[key] !== undefined) options[key] = command[key];
+            }
+            try {
+                const result = await client.withdraw(command.mode, (message, detail) => {
+                    statuses.push(message);
+                    if (detail?.amounts) amounts.push(summarize(detail.amounts));
+                }, options);
+                return { result: summarize(result), statuses, amounts, ...state() };
+            } catch (error) {
+                throw Object.assign(error, { statuses, amounts });
+            }
         }
         case 'sync': {
             const statuses = [];
@@ -201,9 +229,39 @@ async function handle(command) {
         }
         case 'finalize': {
             const statuses = [];
-            const result = await client.finalizeEscape(command.recordId ?? null, message => statuses.push(message));
+            const options = {};
+            for (const key of ['fees', 'feeCapWei', 'bundlerUrl', 'allowExpensiveGas', 'selfBundle']) {
+                if (command[key] !== undefined) options[key] = command[key];
+            }
+            const result = await client.finalizeEscape(command.recordId ?? null, message => statuses.push(message), options);
             return { result: summarize(result), statuses, ...state() };
         }
+        case 'collect': {
+            const statuses = [];
+            const result = await client.collectTransitBalance(command.recordId, message => statuses.push(message));
+            return { result: summarize(result), statuses, ...state() };
+        }
+        case 'sweep': {
+            const statuses = [];
+            const result = await client.sweepTransit(command.recordId, message => statuses.push(message));
+            return { result: summarize(result), statuses, ...state() };
+        }
+        case 'claim_credit': {
+            const statuses = [];
+            const result = await client.claimGaslessCredit(command.payee, message => statuses.push(message));
+            return { result: summarize(result), statuses, ...state() };
+        }
+        case 'quote':
+            return { result: summarize(await client.gaslessWithdrawalQuote(command.mode ?? 'mutual', { destination: command.destination ?? null,
+                feeCapWei: command.feeCapWei ?? null, allowExpensiveGas: command.allowExpensiveGas ?? false })), ...state() };
+        case 'availability':
+            return { result: summarize(await client.gaslessAvailability({ mode: command.mode ?? 'mutual', destination: command.destination ?? null })),
+                ...state() };
+        case 'set_bundler':
+            return { bundler_url: client.setBundlerUrl(command.url ?? null), effective: client.getBundlerUrl() };
+        case 'gasless_timing':
+            client.gaslessTimingOverrides = { ...(command.timing || {}) };
+            return { timing: client.gaslessTiming };
         case 'claim': {
             const statuses = [];
             const result = await client.claimEscapePayout(command.recordId, message => statuses.push(message));
@@ -242,6 +300,7 @@ async function handle(command) {
 
 // What the harness asserts on; never the note secret or blindings.
 function summarize(value) {
+    if (typeof value === 'bigint') return value.toString();
     if (value == null || typeof value !== 'object') return value ?? null;
     const { secret, secret_s: secretS, balance_blinding: blinding, ...rest } = value;
     return JSON.parse(JSON.stringify(rest, (_, v) => typeof v === 'bigint' ? v.toString() : v));
@@ -274,7 +333,13 @@ function state() {
         exit: summarize(exit),
         last_error: snapshot.lastError ? pick(snapshot.lastError) : null,
         sent,
+        signatures,
         rejected,
+        // The prepared plan's gasless journal and the sponsored-path status.
+        prepared_gasless: plan && plan.feePayer === 'payout' ? summarize({ payout: plan.payout, transit: plan.transit, destination: plan.destination,
+            userOpHash: plan.userOpHash ?? null, userOpHashes: plan.userOpHashes ?? null, userOpPhase: plan.userOpPhase ?? null,
+            transactionHash: plan.transactionHash ?? null }) : null,
+        gasless: summarize(snapshot.gasless ?? snapshot.config?.gasless ?? null),
         held_readings: heldReadings,
         deposit_path_saved: Boolean(durable.state?.deposit_path),
         worker_operations: [...new Set(workerOperations)],

@@ -9,6 +9,8 @@ import {
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
+import { SELECTORS, TOPICS, bundleGas, checkUserOperation, decodeFailedOp, encodeGetUserOpHash, encodeHandleOps, estimateFromPolicy,
+    failedOpRpcError, packUserOperation, sponsoredKind, userOperationHash, userOperationReceipt, vaultCallOf } from './acceptance/mini-bundler.mjs';
 
 test('provider mock accounts only accepted calls against the issued child key', async () => {
     const mock = mockProvider('test-management');
@@ -491,4 +493,164 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     assert.notEqual(refusedFraction.status, 0);
     assert.match(refusedFraction.stderr, /deployment field requestChargeCap: 50000.5 is not an exact integer/);
     fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------- the mini bundler (scripts/acceptance/mini-bundler.mjs)
+
+const transitVectors = async () => JSON.parse(await (await import('node:fs/promises')).readFile(
+    new URL('../protocol/contracts/test/fixtures/transit-vectors.json', import.meta.url), 'utf8'));
+const hexQ = value => `0x${BigInt(value).toString(16)}`;
+// The golden close of transit-vectors.json (Golden.t.sol, hashed by the etched
+// EntryPoint) as the unpacked v0.7 JSON a client sends eth_sendUserOperation.
+function vectorOperation(vectors) {
+    const close = vectors.close;
+    const init = close.init_code.slice(2);
+    return {
+        sender: close.sender, nonce: hexQ(close.nonce), factory: `0x${init.slice(0, 40)}`, factoryData: `0x${init.slice(40)}`,
+        callData: close.call_data, callGasLimit: hexQ(close.call_gas_limit), verificationGasLimit: hexQ(close.verification_gas_limit),
+        preVerificationGas: hexQ(close.pre_verification_gas), maxFeePerGas: hexQ(close.max_fee_per_gas),
+        maxPriorityFeePerGas: hexQ(close.max_priority_fee_per_gas), paymaster: vectors.paymaster,
+        paymasterVerificationGasLimit: hexQ(close.paymaster_verification_gas_limit), paymasterPostOpGasLimit: hexQ(close.paymaster_post_op_gas_limit),
+        paymasterData: `0x${BigInt(close.fee_cap_wei).toString(16).padStart(24, '0')}`, signature: close.signature,
+    };
+}
+
+test('mini bundler: v0.7 packing and the user operation hash match the golden vectors and the SDK\'s independent encoder', async () => {
+    const vectors = await transitVectors();
+    const op = checkUserOperation(vectorOperation(vectors));
+    const packed = packUserOperation(op);
+    assert.equal(packed.initCode, vectors.close.init_code.toLowerCase());
+    assert.equal(packed.callData, vectors.close.call_data.toLowerCase());
+    assert.equal(packed.accountGasLimits, vectors.close.account_gas_limits);
+    assert.equal(packed.gasFees, vectors.close.gas_fees);
+    assert.equal(packed.paymasterAndData, vectors.close.paymaster_and_data.toLowerCase());
+    assert.equal(packed.nonce, BigInt(vectors.close.nonce));
+    assert.equal(packed.nonce >> 64n, BigInt(vectors.close.nonce_key), 'the nonce key is the nullifier');
+    assert.equal(userOperationHash(packed, vectors.entry_point, vectors.chain_id), vectors.close.user_op_hash);
+    // Another chain or EntryPoint is another hash.
+    assert.notEqual(userOperationHash(packed, vectors.entry_point, 11155111), vectors.close.user_op_hash);
+    // handleOps and getUserOpHash calldata agree byte for byte with the SDK's encoder.
+    const sdk = await import('../sdk/services/zkapiGasless.mjs');
+    const sdkOp = sdk.userOperationFromJson(op);
+    const beneficiary = '0x00000000000000000000000000000000000000b1';
+    assert.equal(SELECTORS.handleOps, '0x765e827f');
+    assert.equal(encodeHandleOps([packed], beneficiary), sdk.encodeHandleOps([sdkOp], beneficiary));
+    assert.equal(encodeHandleOps([packed, packed], beneficiary), sdk.encodeHandleOps([sdkOp, sdkOp], beneficiary));
+    assert.equal(encodeGetUserOpHash(packed), sdk.encodeGetUserOpHash(sdkOp));
+    assert.equal(sdk.userOpHash(sdkOp, vectors.entry_point, vectors.chain_id), vectors.close.user_op_hash);
+    // The vault call inside withdraw(bytes), and the operation's kind.
+    assert.equal(vaultCallOf(op.callData), vectors.close.vault_calldata.toLowerCase());
+    assert.equal(sponsoredKind(op.callData), 1);
+    // A paymaster-less operation (a self-funded account's) packs empty paymasterAndData and initCode.
+    const plain = { ...op, factory: undefined, factoryData: undefined, paymaster: undefined, paymasterData: undefined,
+        paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined };
+    assert.equal(packUserOperation(plain).paymasterAndData, '0x');
+    assert.equal(packUserOperation(plain).initCode, '0x');
+    assert.equal(bundleGas([op]), 687_500n + 180_000n + 50_000n + 450_000n + 270_000n + 300_000n);
+    assert.equal(bundleGas([op, plain]), bundleGas([op]) + 687_500n + 180_000n + 50_000n);
+});
+
+test('mini bundler: refuses malformed operations by field', () => {
+    const base = { sender: `0x${'11'.repeat(20)}`, nonce: '0x1', callData: '0x', callGasLimit: '0x1', verificationGasLimit: '0x1',
+        preVerificationGas: '0x1', maxFeePerGas: '0x1', maxPriorityFeePerGas: '0x1', signature: `0x${'00'.repeat(65)}` };
+    assert.doesNotThrow(() => checkUserOperation(base));
+    for (const [patch, message] of [
+        [{ sender: '0x1234' }, /sender/],
+        [{ nonce: '0x01' }, /nonce is not a canonical/],
+        [{ callGasLimit: 7 }, /callGasLimit/],
+        [{ maxFeePerGas: `0x1${'0'.repeat(32)}` }, /maxFeePerGas does not fit in 128 bits/],
+        [{ callData: '0xabc' }, /callData/],
+        [{ signature: `0x${'00'.repeat(64)}` }, /signature is not 65 bytes/],
+        [{ factoryData: '0x12' }, /factoryData without a factory/],
+        [{ factory: `0x${'22'.repeat(20)}`, factoryData: 'zz' }, /factoryData/],
+        [{ paymaster: `0x${'33'.repeat(20)}` }, /paymasterVerificationGasLimit/],
+    ]) assert.throws(() => checkUserOperation({ ...base, ...patch }), message, JSON.stringify(patch));
+});
+
+test('mini bundler: a dry run\'s FailedOp becomes an ERC-7769 error the SDK decodes the same way', async () => {
+    const word = value => BigInt(value).toString(16).padStart(64, '0');
+    const text = value => {
+        const hex = Buffer.from(value, 'utf8').toString('hex');
+        return `${word(hex.length / 2)}${hex.padEnd(Math.ceil(hex.length / 64) * 64 || 64, '0')}`;
+    };
+    // FailedOpWithRevert(0, "AA33 reverted", NoteNotActive()) and FailedOp(1, "AA25 invalid account nonce").
+    const noteNotActive = keccak256(new TextEncoder().encode('NoteNotActive()')).slice(0, 10);
+    const inner = `${word(4)}${noteNotActive.slice(2).padEnd(64, '0')}`;
+    const reason = text('AA33 reverted');
+    const withRevert = `${SELECTORS.failedOpWithRevert}${word(0)}${word(0x60)}${word(0x60 + reason.length / 2)}${reason}${inner}`;
+    assert.equal(SELECTORS.failedOpWithRevert, '0x65c8fd4d');
+    assert.deepEqual(decodeFailedOp(withRevert), { opIndex: 0, reason: 'AA33 reverted', aa: 'AA33', inner: noteNotActive });
+    const paymasterRefusal = failedOpRpcError(withRevert);
+    assert.equal(paymasterRefusal.code, -32501, 'a paymaster refusal');
+    assert.equal(paymasterRefusal.data, withRevert);
+    const nonce = `${SELECTORS.failedOp}${word(1)}${word(0x40)}${text('AA25 invalid account nonce')}`;
+    assert.equal(SELECTORS.failedOp, '0x220266b6');
+    assert.deepEqual(decodeFailedOp(nonce), { opIndex: 1, reason: 'AA25 invalid account nonce', aa: 'AA25', inner: null });
+    assert.equal(failedOpRpcError(nonce).code, -32500);
+    const window = `${SELECTORS.failedOp}${word(0)}${word(0x40)}${text('AA32 paymaster expired or not due')}`;
+    assert.equal(failedOpRpcError(window).code, -32503, 'outside the time range');
+    assert.equal(decodeFailedOp('0x08c379a0'), null);
+    assert.equal(failedOpRpcError('0x').code, -32500);
+    // The SDK reads the same revert data out of the bundler's error.
+    const { decodeEntryPointRevert } = await import('../sdk/services/zkapiContractError.mjs');
+    const decoded = decodeEntryPointRevert({ code: paymasterRefusal.code, message: paymasterRefusal.message, data: paymasterRefusal.data });
+    assert.equal(decoded.aa, 'AA33');
+    assert.equal(decoded.inner, noteNotActive);
+});
+
+test('mini bundler: eth_getUserOperationReceipt shapes a bundle receipt per operation', () => {
+    const entryPoint = CANONICAL_ENTRY_POINT;
+    const word = value => BigInt(value).toString(16).padStart(64, '0');
+    const topicOf = address => `0x${word(address)}`;
+    const [hashA, hashB] = [`0x${'aa'.repeat(32)}`, `0x${'bb'.repeat(32)}`];
+    const [senderA, senderB, paymasterAddress] = [`0x${'0a'.repeat(20)}`, `0x${'0b'.repeat(20)}`, `0x${'0c'.repeat(20)}`];
+    const event = (hash, sender, paymaster, nonce, success, cost, used) => ({ address: entryPoint, topics: [TOPICS.userOperationEvent, hash,
+        topicOf(sender), topicOf(paymaster)], data: `0x${word(nonce)}${word(success ? 1 : 0)}${word(cost)}${word(used)}` });
+    const revertBytes = '0xc3076dea';
+    const logs = [
+        { address: entryPoint, topics: [TOPICS.beforeExecution], data: '0x' },
+        { address: `0x${'dd'.repeat(20)}`, topics: [`0x${'01'.repeat(32)}`], data: '0x' },
+        event(hashA, senderA, '0x0000000000000000000000000000000000000000', 5, true, 1000, 100),
+        { address: entryPoint, topics: [TOPICS.userOperationRevertReason, hashB, topicOf(senderB)],
+            data: `0x${word(7)}${word(0x40)}${word(4)}${revertBytes.slice(2).padEnd(64, '0')}` },
+        { address: paymasterAddress, topics: [`0x${'02'.repeat(32)}`], data: '0x' },
+        event(hashB, senderB, paymasterAddress, 7, false, 2000, 200),
+    ];
+    const receipt = { transactionHash: `0x${'ee'.repeat(32)}`, status: '0x1', logs };
+    const a = userOperationReceipt(receipt, { hash: hashA, entryPoint });
+    assert.equal(a.success, true);
+    assert.equal(a.sender, senderA);
+    assert.equal(a.nonce, '0x5');
+    assert.equal(a.actualGasCost, '0x3e8');
+    assert.equal(a.reason, null);
+    assert.deepEqual(a.logs, logs.slice(1, 2), 'only the logs of A\'s execution');
+    const b = userOperationReceipt(receipt, { hash: hashB, entryPoint });
+    assert.equal(b.success, false);
+    assert.equal(b.paymaster, paymasterAddress);
+    assert.equal(b.actualGasUsed, '0xc8');
+    assert.equal(b.reason, revertBytes);
+    assert.deepEqual(b.logs, logs.slice(3, 5));
+    assert.equal(b.receipt, receipt);
+    assert.equal(userOperationReceipt(receipt, { hash: `0x${'cc'.repeat(32)}`, entryPoint }), null);
+    assert.equal(userOperationReceipt(receipt, { hash: hashA, entryPoint: paymasterAddress }), null, 'only the EntryPoint\'s events count');
+});
+
+test('mini bundler: estimates answer the profile\'s pinned defaults by kind', async () => {
+    const policy = { pvg_floor: 40_000, verification_default: 70_000, verification_default_init: 180_000, call_default: [687_500, 762_500, 295_000, 97_500],
+        pm_verification_default: 450_000, postop_default: 270_000 };
+    const vectors = await transitVectors();
+    const op = vectorOperation(vectors);
+    assert.deepEqual(estimateFromPolicy(op, policy), { preVerificationGas: op.preVerificationGas, verificationGasLimit: hexQ(180_000),
+        callGasLimit: hexQ(687_500), paymasterVerificationGasLimit: hexQ(450_000), paymasterPostOpGasLimit: hexQ(270_000) });
+    const word = value => BigInt(value).toString(16).padStart(64, '0');
+    const withdraw = call => `${SELECTORS.withdraw}${word(0x20)}${word((call.length - 2) / 2)}${call.slice(2).padEnd(Math.ceil((call.length - 2) / 64) * 64, '0')}`;
+    const forward = { ...op, factory: undefined, callData: withdraw('0x') };
+    assert.equal(sponsoredKind(forward.callData), 4);
+    assert.equal(estimateFromPolicy(forward, policy).callGasLimit, hexQ(97_500));
+    assert.equal(estimateFromPolicy(forward, policy).verificationGasLimit, hexQ(70_000));
+    const finalize = withdraw(`0xff8f5585${word(9)}`);
+    assert.equal(sponsoredKind(finalize), 3);
+    assert.equal(vaultCallOf(finalize), `0xff8f5585${word(9)}`);
+    assert.equal(sponsoredKind(withdraw(`0xa38d62aa${'00'.repeat(832)}`)), 2);
+    assert.equal(vaultCallOf('0x12345678'), null);
 });

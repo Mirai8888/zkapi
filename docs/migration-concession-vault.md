@@ -492,8 +492,10 @@ The drill vault tests the adversarial cases with short timings. It uses the
 1. Deploy with the drill parameters (table below), `SETUP_MANIFEST` pointing
    at `protocol/setup/v2-concession-dev/manifest.json` and `ALLOW_DEV_SETUP=1`
    (recorded as `allowDevSetup: true`; a profile built from it is a drill
-   profile only). Finalize the manifest as in
-   [B2, step 3](#b2-production-sepolia).
+   profile only). Deploy the gasless-withdrawal paymaster with it as in
+   [B2, step 2](#b2-production-sepolia), with `PAYMASTER_ESCAPES=1`: the
+   drill sponsors escape initiations, which no published profile does.
+   Finalize the manifest as in [B2, step 3](#b2-production-sepolia).
 2. Build drill binaries that load the `dev` keys, the server with the
    adversary modes, into their own target directory, as
    `scripts/run-v2-acceptance.sh` does, so that they never replace a release
@@ -556,7 +558,12 @@ The drill vault tests the adversarial cases with short timings. It uses the
    state as well as balances: the honest flow; a withholding server
    (`--adversary withhold`) and the concession at `T`; `hang`, with the
    escape landing before `must_initiate_by`; `born-spent`, `reuse-anchor`,
-   `random-anchor` and `overcharge`; `lie-expired`; a forced early exit with
+   `random-anchor` and `overcharge`; `lie-expired`; gasless withdrawals
+   (`fees: 'payout'`) through the operator's bundler: a close to a payout
+   address with no ETH, a sponsored escape, its raise and its sponsored
+   finalization, and a forced `success == false` (the two-operation bundle
+   of [gasless release gate 3](#gasless-release-gates), sent from a funded
+   account) collected by a sponsored forward; a forced early exit with
    `c = 0`, a raise to the charge, and the client state `closed`; an
    under-concession, its raise, a finalization to a destination that refuses
    ETH and the credit's claim; a stale escape defeated, `SupersededState`,
@@ -593,6 +600,48 @@ start when the settlement check fails and `zkapi-challenged` when either
 fails; the vault's constructor requires `maxPauseDuration` of at least twice
 the challenge period.
 
+#### Gasless release gates
+
+Gasless withdrawals have release gates. Pass them on the drill vault before
+B2, step 5 generates any profile with `--bundler-url` (a published
+`gasless.bundler_url`), and again before mainnet (Phase C, step 1). Until
+they pass, generate the profiles without `--bundler-url` (`bundler_url` is
+then `null`, and no client sponsors anything by default), and regenerate and
+republish them once the gates pass.
+
+1. **Validation gas.** The Forge suite's `RealAdapter.t.sol`
+   (`test_realValidationGasFitsUnderTheCap`, run by CI's `forge test`)
+   measures the paymaster's validation with the real Groth16 adapter, for
+   the close and the escape shapes, cold and warm. It requires each cold
+   measurement under `PM_VERIFICATION_CAP − 20,000`, each warm one below its
+   cold one, and a cold/warm gap under 70,000 gas (about 15%: the cold
+   storage and account accesses of the checks). The gap changes no outcome,
+   because a bundler's simulations and the inclusion all run cold. The
+   committed measurements are in `protocol/contracts/snapshots/gasless-gas.json`.
+2. **A real bundler's tracer.** Run a v0.7 bundler with full ERC-7562
+   validation (the reference bundler's `debug_bundler_*` mode or Rundler in
+   debug mode) against the Anvil harness with the etched EntryPoint, send it
+   the acceptance's sponsored close, escape, finalization and forward, and
+   record zero rule violations with the bundler's version. The acceptance's
+   mini bundler does not trace, and the Forge opcode audit
+   (`test_opcodeAudit_*`) is not a bundler's.
+3. **A public bundler on Sepolia.** On the drill vault, with a public v0.7
+   bundler, `eth_sendUserOperation` is accepted and included and `Settled`
+   is observed. Then force a `success == false` that the operator controls:
+   build a sponsored close as the acceptance harness does (scenario 27),
+   and send `handleOps([replay, sponsored])` from a funded account, where
+   the replay is a self-funded operation that lands the close's public
+   calldata on the vault first. The sponsored operation executes with
+   `success == false` and `Stranded(S)`; recover it with a sponsored
+   FORWARD sent through the public bundler, and observe its `Settled`. Do
+   not force the failure by landing a replay ahead of an operation the
+   public bundler holds: the bundler's second validation then fails
+   (`NoteNotActive`, `AA33`), nothing executes, and GREP-040 lets that
+   bundler ban the paymaster for the rest of the drill and for this gate's
+   re-runs during the B4 soak.
+4. **The canonical EntryPoint.** Before each broadcast, the `cast keccak`
+   check of both runtimes in [B2, step 2](#b2-production-sepolia) matches.
+
 ### B2. Production Sepolia
 
 The new deployment is a separate stack: new public manifest, hostname,
@@ -613,6 +662,26 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    the vault with 11 constructor arguments, checks the adapter's
    `CIRCUIT_ID_HASH()` and verifying-key hashes against the setup manifest,
    and writes only the provisional manifest `$OUTPUT_PATH.pending`.
+
+   In the same broadcast it deploys the gasless-withdrawal paymaster
+   (`GASLESS=1`, the default; see
+   [the contract notes](deployment.md#gasless-withdrawals)). Set
+   `PAYMASTER_OWNER` (the multisig; when it is not the deployer it must call
+   `acceptOwnership()` on the paymaster), `PAYMASTER_STAKE_WEI` and
+   `FACTORY_STAKE_WEI` (0.1 ETH on Sepolia, 1 ETH on mainnet),
+   `PAYMASTER_DEPOSIT_WEI` (1 ETH on Sepolia, 2 ETH on mainnet),
+   `PAYMASTER_MAX_FEE_CEILING_WEI` (200 gwei on Sepolia) and leave
+   `PAYMASTER_ESCAPES` at 0. Etch nothing on a public chain: the canonical
+   EntryPoint v0.7.0 and its SenderCreator are deployed there. Check their
+   code before the broadcast, as the script and the paymaster's constructor
+   will:
+
+   ```sh
+   cast keccak "$(cast code 0x0000000071727De22E5E9d8BAf0edAc6f37da032 --rpc-url "$RPC_URL")"
+   # 0x8db5ff695839d655407cc8490bb7a5d82337a86a6b39c3f0258aa6c3b582fc58
+   cast keccak "$(cast code 0xEFC2c1444eBCC4Db75e7613d20C6a62fF67A167C --rpc-url "$RPC_URL")"
+   # 0x283c9d14378f5f4c4e24045b87d621d48443fa5b4af7dd7180a599b3756a7689
+   ```
 3. **Finalize the manifest** once the vault's creation is final:
 
    ```sh
@@ -623,7 +692,9 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    It reads the creation receipts from forge's broadcast log
    (`demo/contracts/broadcast/Deploy.s.sol/<chainId>/run-latest.json`, or
    `--broadcast-log`), checks every creation, the three runtime codehashes,
-   the owner and the treasury on chain, and only then writes `$OUTPUT_PATH`
+   the owner and the treasury on chain (with the paymaster: the eight
+   codehashes, its deposit, both stakes, its policy, ceilings, gas policy and
+   owner), and only then writes `$OUTPUT_PATH`
    with `deploymentStatus: "deployed"`, `deployBlock` (the vault's creation
    block) and `deployTransactions`. Keep the broadcast log until then: there
    is no fallback without it. Re-audit later with
@@ -652,7 +723,11 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    (keccak256 of `zkapi-v2-concession-v1`), and the VK hashes of
    `protocol/setup/v2-concession/manifest.json`. Compare the four key getters
    with the printed keys as numbers, and the codehashes with the published
-   expected values.
+   expected values. Then read the paymaster's state:
+   `node scripts/paymaster-status.mjs --deployment "$OUTPUT_PATH" --rpc "$RPC_URL"`
+   must show the deposit and both stakes, the policy with `escapes_enabled`
+   false, the ceilings, `owner` the multisig (or `pending_owner` until it
+   accepts) and nothing lost or owed.
 5. **Profiles.** Every consumer takes its pins and `deploy_block` from the
    finalized manifest only, never from `.pending` or `deployBlockLowerBound`.
    Generate them with `scripts/deployment-profile.mjs`, which refuses a
@@ -664,7 +739,7 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    ```sh
    PROFILE_ARGS=(--finalized "$OUTPUT_PATH" --deployment-id zkapi-native-eth-sepolia-concession-v1
      --protocol-server-url https://API_HOST --indexer-url https://API_HOST
-     --verifier-url https://OA_VERIFIER_HOST)
+     --verifier-url https://OA_VERIFIER_HOST --bundler-url https://BUNDLER_HOST)
    node scripts/deployment-profile.mjs "${PROFILE_ARGS[@]}" --rpc-url "$PINNED_RPC_URL" \
      --price-feed 0x694AA1769357215DE4FAC081bf1f309aDC325306 --settlement-window-seconds 14705 \
      --out deployment.json
@@ -687,6 +762,14 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
      `note-bound`, and the script refuses them). Both browser builds keep
      their wallets in one store keyed by it.
    - On mainnet, add the canary with `--canary '{"per_note_max_wei": ..., "aggregate_max_wei": ..., "until": ...}'`.
+   - Every format carries the `gasless` object (the EntryPoint, paymaster,
+     factory and account pins, the gas policy, `bundler_url`); serverd, the
+     indexer and the challenger ignore it.
+
+   Pass `--bundler-url` only once the
+   [gasless release gates](#gasless-release-gates) have passed. Without it
+   the profiles carry `gasless` with `bundler_url: null`; regenerate them
+   with it, and republish, after the gates.
 
    Review the three diffs. Write a profile by hand only with the script's
    rules: decimal coordinates written as `0x` hex (`cast to-hex`), a new
@@ -702,7 +785,10 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    `⌈m/2⌉` defeats per note (a user holding `m` archived states can force that
    many), at most 64 concurrent escapes and a 20% margin, plus leaf
    retirements: at 100 gwei, about 0.06 ETH per defeat and 0.72 ETH per
-   retirement.
+   retirement. Run the operator's ERC-4337 bundler at `BUNDLER_HOST` with the
+   paymaster and the factory whitelisted, as
+   [Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)
+   describes.
 7. **Start in this order:** the indexer from `DEPLOY_BLOCK`, `zkapi db init`
    (the `db-init` service), the challenger, the API server, then the
    gateway that publishes it (`up` never starts the services that depend on
@@ -734,6 +820,9 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
    Then a funded lifecycle on Sepolia: deposit, a paid request, a mutual
    close (which sends a kind-2 ownership proof), an escape with `c = 0` from a
    fresh state, and an escape from a served state that the challenger raises.
+   Then a gasless close (`fees: 'payout'`) to a payout address with no ETH
+   through the operator's bundler: the paymaster's `Settled` pays it the
+   payout less the charge, and the float does not shrink.
 
 ### B3. Publish clients for Sepolia
 
@@ -750,14 +839,24 @@ share one, see [Two stacks on one VM](#two-stacks-on-one-vm).
 
 Run production Sepolia for at least 14 days with weekly drills on the drill
 vault. Watch every alert of the Docker guide's Monitoring section, the raise
-and defeat counters, and the settlement dashboard's `exit_deferred` and
-`exited_unsigned` counts.
+and defeat counters, the settlement dashboard's `exit_deferred` and
+`exited_unsigned` counts, and the paymaster's alerts
+([Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals)).
+
+The [gasless release gates](#gasless-release-gates) passed before B2
+generated a profile with a `bundler_url`. Re-run gate 3 on the drill vault
+during the soak, and all four again before mainnet.
 
 ## Phase C: mainnet
 
 1. **Deploy** with the mainnet parameters, as in B2, steps 1 to 4
-   (`CHAIN_ID=1`; `Deploy.s.sol` refuses a `dev` setup there). Finalize with
-   `--confirmations 64` and publish the manifest and the expected codehashes.
+   (`CHAIN_ID=1`; `Deploy.s.sol` refuses a `dev` setup there). Re-check both
+   canonical EntryPoint codehashes on mainnet with `cast code | cast keccak`
+   before the broadcast (B2, step 2; [gasless release gate](#gasless-release-gates) 4),
+   and pass gates 1 to 3 again for the mainnet build before its profiles
+   carry `--bundler-url`.
+   Finalize with `--confirmations 64` and publish the manifest and the
+   expected codehashes.
 2. **Start the daemons** in the order of B2, step 7.
 3. **Smoke tests with small notes:** deposit, request, settle, mutual close;
    an escape with `c = 0` from a fresh state, then finalize; a served
@@ -1016,6 +1115,12 @@ every note's claim time, and after any unpause `claimExpired` waits at least
 challenger must still act in each window, which it can while paused. Alert on
 `Paused` and `Unpaused`.
 
+The gasless paymaster refuses sponsored closes and escape initiations for as
+long as the vault is paused (`ExitsPaused(reopenAt)`), even after
+`maxPauseDuration`: its validation cannot read the clock. Clients refuse them
+before proving (`exits_paused`). Users who exit while paused use the wallet
+path. Sponsored finalizations and forwards stay open.
+
 ### Treasury change
 
 ```sh
@@ -1156,6 +1261,105 @@ and reads `pendingWithdrawals` and `pendingConcessions` from the vault, and a
 defeat or a raise needs no indexer. A diverged indexer still blocks deposits,
 leaf retirements, the server's admission (`root_unavailable`) and clients
 without a saved deposit-time path or an exit RPC for a log rebuild.
+
+### Gasless withdrawals
+
+The paymaster's runtime (bundler, float, fee ceilings, metrics, alerts) is in
+[Operating gasless withdrawals](deployment.md#operating-gasless-withdrawals).
+The owner (the multisig) holds these levers:
+
+- **Stop sponsoring:** `setPolicy` with `sponsorshipPaused: true` (the
+  current values otherwise unchanged). New operations fail validation within
+  a block, and are never charged. Users keep the wallet path.
+- **Release a key:** `release([key])` after an operation was included and
+  reverted, for a user who must retry the same state sponsored. The key is
+  `keyFor(kind, nullifier, noteId, sender)`. An operation the bundler held, or
+  one that failed on-chain validation, never consumed an attempt.
+- **A balance stranded without evidence** (a close replayed on the vault
+  before any sponsored operation): `allowForward(S)` lets the user's
+  sponsored forward collect it. Otherwise anyone can `S.sweep()` it from a
+  funded account.
+- **A defeated escape's debt:** `writeOffDebt(S)` once the note has closed
+  elsewhere. It changes accounting only.
+- **Fees and limits:** `setFeeCeilings` (owner or `feeKeeper`) moves the fee
+  ceilings anywhere up to the immutable hard caps (500 gwei and 20 gwei), and
+  `setCallCap` (owner) moves each kind's call cap between its floor and its
+  hard cap. Lowering them narrows what is sponsored; raising them widens the
+  float's exposure (a higher `priorityFeeCeiling` raises a griefing
+  bundler's gain linearly). The `feeKeeper` can therefore raise the ceilings
+  to the hard caps: protect it like a key that sets risk policy.
+  `deposit()` (anyone) and `withdrawTo` move the float.
+
+**Retire** a paymaster in this order:
+
+1. `setPolicy` with `escapesEnabled: false` (the published default), so no
+   new escape debt is recorded, and keep the profiles' `gasless` pins
+   published. Both clients refuse every gasless action once a profile has
+   no pins: the sponsored FINALIZE and FORWARD, and even the wallet-paid
+   `sweepTransit`. The pins must therefore outlive the records that need
+   them. New closes stay sponsored meanwhile; each settles inside its own
+   operation and adds no debt.
+2. Keep sponsoring until `paymaster-status.mjs` shows `open_owed` and
+   `stranded_open` empty. Each pending sponsored escape finalizes once its
+   challenge period ends, sponsored by its client, or by anyone with
+   `finalizeEscapeWithdrawal` from a funded account followed by the
+   permissionless `S.sweep()`, which pays the payee and settles `S`'s debt
+   (`S` exists: the initiation created it). Collect or sweep each stranded
+   balance the same way, and `writeOffDebt` a defeated escape's debt.
+3. Publish profiles whose `gasless` is `null`, so no new proof binds a
+   transit account of this paymaster.
+4. Stop sponsoring.
+5. `unlockStake` the paymaster and the factory, wait the unstake delay, then
+   `withdrawStake` and `withdrawTo` the float.
+
+Sponsorship stops every kind at once, FINALIZE and FORWARD included
+(`SponsorshipPaused` is validation's first check), and after step 3 the
+clients refuse to finalize, collect or sweep anything of this paymaster. A
+balance that appears later (an operation in flight at step 3, or an escape
+left pending) is recovered by hand from any funded account: after the
+challenge period, `cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)'
+<noteId>`, then `cast send "$S" 'sweep()'` (for a stranded balance, only the
+sweep; an `S` with no code needs `cast send "$FACTORY"
+'createAccount(address,address)' <owner> <payee>` first, with the values
+its client holds). `sweep()` pays the payee, settling `S`'s debt on the
+way; see [Retirement](deployment.md#operating-gasless-withdrawals).
+Neither `sweep()` nor `claimCredit` needs the float or a stake, and
+`createAccount` needs no stake: the contracts stay deployed (immutable
+code), and "retiring" the factory means only withdrawing its stake. A new paymaster means new transit-account
+addresses for new proofs.
+
+**Escape exposure.** Sponsored escape initiations stay disabled in every
+published profile. Each defeated sponsored escape costs the float the
+initiation (about 1.25M gas) on top of the operator's challenge (about 435k
+gas), against the attacker's deposit gas (about 0.3M, recovered later):
+about 5:1 against the operator. Enable them only on the Sepolia drill, and
+decide for mainnet from the `EscapeInitiationOwed` and `owedPaid` data.
+Without them, escapes are sponsored at finalization only.
+
+**Uneconomic floor per network.** Clients refuse a sponsored withdrawal whose
+`maxCost + flatFee` exceeds 25% of the payout (`gasless_uneconomic`, unless
+the host passes `allowExpensiveGas`). `maxCost` is about 1.7M gas of limits
+times `maxFeePerGas`. The SDK takes `maxFeePerGas = 2 × base fee + tip` and
+refuses (`gas_above_paymaster_ceiling`) when that exceeds `maxFeeCeiling`;
+zkapi-clientd takes `min(2 × base fee + tip, maxFeeCeiling)` and refuses
+only when `base fee + tip` exceeds it. The SDK therefore stops sponsoring
+at about half the base fee zkapi-clientd does, and the ceiling is sized
+for the SDK ([Fee ceilings](deployment.md#operating-gasless-withdrawals)).
+The smallest payout sponsored by default is about
+`4 × 1.7M × maxFeePerGas`:
+
+| `maxFeePerGas` | Smallest payout | `maxSponsoredCost` needed |
+| --- | --- | --- |
+| 5 gwei | about 0.034 ETH | the default 0.05 ETH |
+| 28 gwei | about 0.19 ETH | the default 0.05 ETH |
+| 62 gwei (a 30 gwei base fee) | about 0.42 ETH | at least about 0.11 ETH |
+
+The policy's `maxSponsoredCost` refuses anything above it first
+(`max_cost_above_policy`): at the default 0.05 ETH, nothing is sponsored
+above about 28 gwei, whatever the payout. The 62 gwei row applies only with
+a raised policy, and the hard cap of 0.25 ETH stops sponsorship above about
+139 gwei. Publish the floor with the network's typical fees and the live
+policy. Smaller balances keep the wallet path.
 
 ### Fee spikes
 

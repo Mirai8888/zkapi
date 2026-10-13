@@ -8,7 +8,26 @@ act on.
 
 ## [Unreleased]
 
-Nothing yet.
+Folded into 0.2.0's notes at release.
+
+### Added
+
+- **Gasless withdrawals (ERC-4337, EntryPoint v0.7.0).** `fees: 'payout'` in
+  the SDK (`client.withdraw`, `finalizeEscape`) and `--fees payout` in
+  zkapi-clientd pay the network fee from the payout through an
+  operator-funded paymaster; the payout address needs no ETH. New contracts
+  `ZkApiWithdrawalPaymaster`, `ZkApiWithdrawalAccountFactory` and
+  `ZkApiWithdrawalAccount`, deployed with the vault by `Deploy.s.sol`; new
+  deploy variables `GASLESS` and `PAYMASTER_*`; a new profile object
+  `gasless` (with the operator's `bundler_url`); `scripts/paymaster-status.mjs`
+  for the operator. The wallet-pays path is unchanged and remains the
+  default. The local acceptance runs the gasless scenarios through a mini
+  bundler ([v2 acceptance](docs/v2-acceptance.md), rows 24 to 31).
+
+### Breaking
+
+- None: the change is additive. Profiles without `gasless` (or with
+  `gasless: null`) keep working with the wallet-pays path.
 
 ## [0.2.0] - not yet released
 

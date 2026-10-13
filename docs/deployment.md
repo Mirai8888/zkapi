@@ -133,7 +133,7 @@ with `forge script`. The script links the library itself; no
 | `PAYMASTER_OWNER` | Owner of the paymaster (policy, fee ceilings, call caps, key release, stake and deposit withdrawals); default `OWNER`. When it is not the deployer, the script deploys the paymaster with the deployer as owner (only the owner may set the first stake), stakes and funds it, and nominates `PAYMASTER_OWNER`, which must call `acceptOwnership()` on the paymaster; the manifest records this as `paymasterOwnershipTransferPending` |
 | `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` | EntryPoint stakes of the paymaster and the factory (positive, at most 2^112 - 1). Local chains default to 0.1 ether each; required off local chains. Plan 1 ether each on Mainnet and 0.1 ether on Sepolia |
 | `PAYMASTER_UNSTAKE_DELAY_SECONDS` | Unstake delay of both stakes; default 86,400 |
-| `PAYMASTER_DEPOSIT_WEI` | Initial EntryPoint deposit of the paymaster, the float that pays sponsored gas (positive). Local default 1 ether; required off local chains. Plan 0.5 ETH on Sepolia and 2 ETH on Mainnet |
+| `PAYMASTER_DEPOSIT_WEI` | Initial EntryPoint deposit of the paymaster, the float that pays sponsored gas (positive). Local default 1 ether; required off local chains. Plan 1 ETH on Sepolia and 2 ETH on Mainnet |
 | `PAYMASTER_MAX_SPONSORED_COST_WEI` | Most one sponsored operation may cost the float; default 0.05 ether, at most 0.25 ether |
 | `PAYMASTER_FLAT_FEE_WEI` | Flat fee kept per sponsored operation; default 0, at most 0.001 ether |
 | `PAYMASTER_MIN_ESCAPE_NET_WEI` | Least net payout a sponsored escape must leave; default 0.01 ether, at most 2^64 - 1 |
@@ -316,8 +316,8 @@ bytes), `accountCreationCodeKeccak256`, `paymasterOwner`,
 flatFeeWei, minEscapeNetWei, escapesEnabled }`, `paymasterFeeCeilings {
 maxFeeWei, priorityFeeWei }` and `paymasterGasPolicy`, the paymaster's
 `gasPolicy()` with its field names (`callFloor[4]`, `callCap[4]` (the hard
-caps; the live `callCap(kind)` starts there and the owner may only lower
-it), `postOpFloor`, `postOpCap`, `verificationFloor`,
+caps; the live `callCap(kind)` starts there, and the owner may move it
+anywhere between the kind's floor and this hard cap), `postOpFloor`, `postOpCap`, `verificationFloor`,
 `verificationFloorInit`, `verificationCap`, `pvgFloor`, `pvgCap`,
 `pmVerificationFloor`, `pmVerificationCap`, `postOpBaseGas`,
 `postOpEscapeGas`, `postOpFinalizeExtraGas`, `postOpEscapeForwardGas`,
@@ -361,7 +361,9 @@ defaults clients sign: `call_default[4]`, `postop_default`,
 A deployment made with `GASLESS=0` gives `gasless: null`, as the
 `not_deployed` placeholders have. `node scripts/paymaster-status.mjs
 --deployment "$OUTPUT_PATH" --rpc "$RPC_URL"` prints the float, stakes,
-policy, loss metrics and open debts of a finalized deployment as JSON.
+policy, loss metrics and open debts of a finalized deployment as JSON; see
+[Operating gasless withdrawals](#operating-gasless-withdrawals) for the
+float, the bundler, the fee ceilings, alerts and incident levers.
 
 ## Runtime
 
@@ -409,9 +411,14 @@ Sepolia's chain ID, the only chain besides mainnet the signer sidecar signs
 for. It then:
 
 1. generates random seeds and derives the keys with `zkapi signing-keys`;
-2. deploys with `Deploy.s.sol` (`ALLOW_DEV_SETUP=1`, as for the drill vault);
+2. etches the canonical EntryPoint v0.7.0 and SenderCreator runtimes with
+   `anvil_setCode` (keccak-checked), then deploys with `Deploy.s.sol`
+   (`ALLOW_DEV_SETUP=1`, as for the drill vault, and the explicit
+   `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI` an
+   Anvil with a public chain ID needs, with `PAYMASTER_ESCAPES=1`);
 3. finalizes the manifest with `expected-codehashes.mjs --finalize`, and builds
-   the `trusted_deployment` profile from it;
+   the `trusted_deployment` profile from it, whose `gasless.bundler_url` is the
+   harness's mini bundler;
 4. starts the daemons in order: the indexer
    (`--from-block deployBlock --max-head-age-secs 0`), `zkapi db init`, the
    signer sidecar, `zkapi-challenged` (`--deployment`,
@@ -427,3 +434,210 @@ its trusted config against the finalized deployment manifest, on-chain state,
 the published expected code hashes and the selected proof hashes before
 enabling funding. Until a revision-3 vault exists on a network, its packaged
 profile is a `not_deployed` placeholder that the SDK build refuses.
+
+### Operating gasless withdrawals
+
+A deployment with the paymaster (`GASLESS=1`, [above](#gasless-withdrawals))
+adds a float to keep funded, a bundler to run, fee ceilings to keep current
+and a few incident levers. The vault does not depend on any of them: a dead,
+paused or underfunded paymaster only removes the option to pay the fee from
+the payout. Wallet-paid exits and `S.sweep()` need no paymaster policy.
+
+**Bundler.** Run an ERC-4337 v0.7 bundler (the eth-infinitism reference
+bundler, Rundler or Alto) against the operator's RPC. Whitelist the paymaster
+and the factory (both are staked) so the bundler exempts them from
+reputation. Set `beneficiary` to a fee account, and fund the bundler's EOA
+with ETH. Publish its URL in every profile with `scripts/deployment-profile.mjs
+--bundler-url` (`gasless.bundler_url`). Users may set their own bundler:
+`client.setBundlerUrl` in the SDK, `--bundler-url` or `zkapi.bundler_url` in
+zkapi-clientd.
+
+Public bundlers are best effort. A close's calldata is public once it is in
+a mempool. If someone replays it on the vault first, the paymaster fails the
+bundler's second validation, and ERC-7562 GREP-040 lets that bundler ban the
+paymaster at once. Only the operator's whitelisting bundler is reliable, so it
+is the supported default.
+
+The paymaster also holds a per-key in-flight lock (`SponsorshipInFlight` in
+`ZkApiWithdrawalPaymaster.sol`). It refuses, in validation, a second
+sponsorship of the same key in one bundle, because the EntryPoint validates a
+whole bundle before it executes any of it. A compliant bundler never bundles
+two operations of one sender, so the lock fires only against a non-compliant
+or malicious bundler. When it fires, the whole bundle fails on-chain
+validation: the bundler pays, nothing is counted, and GREP-040 lets that
+bundler ban the paymaster. Clients replace a pending operation only at the
+same nonce (a fee bump), and never build a new operation for a key while an
+older one may still be in a mempool. Configure the operator's bundler so
+that, while an operation is pending for a (sender, nonce key), it rejects
+another operation with a different nonce sequence for that key, and still
+accepts a same-nonce replacement whose fees clear its replacement rule (the
+SDK's 12.5% bump of both fee fields).
+
+**Float.** Bundlers reserve each pending operation's `maxCost` against the
+paymaster's deposit (ERC-7562 EREP-010), so keep `entryPoint.balanceOf(P)` at
+`N × maxSponsoredCost` plus a loss buffer for `N` concurrent operations.
+With the default `maxSponsoredCost` of 0.05 ETH, start Sepolia at 1 ETH
+(about 20 concurrent operations) and mainnet at 2 ETH (about 40). Alert
+below `10 × maxSponsoredCost` (`deposit_covers_operations` under 10 in
+`paymaster-status.mjs`). Start well above that threshold: the release
+gates' and drills' forced failures cost the float, and a float started at
+the threshold alerts on the first of them. Anyone can top it up with
+`P.deposit{value}()`.
+
+The float replenishes itself on success: each settled operation re-deposits
+its measured charge, which covers the EntryPoint's cost within
+`MARGIN_GAS`. It shrinks only by failed sponsorships (`SponsorshipFailed`,
+`lostWei`), shortfalls (`Shortfall`, `shortfallWei`) and open escape debt
+(`owed`).
+
+`maxSponsoredCost` also bounds the fees the paymaster sponsors. A close or
+escape that creates `S` signs about 1.7 million gas of limits, and its
+`maxCost` is those limits times `maxFeePerGas`. The two clients choose it
+differently. The SDK takes `2 × base fee + tip` and refuses
+(`gas_above_paymaster_ceiling`, before any proof) as soon as that exceeds
+`maxFeeCeiling`. zkapi-clientd takes `min(2 × base fee + tip,
+maxFeeCeiling)` and refuses only when `base fee + tip` exceeds the ceiling.
+At the default 0.05 ETH, operations
+are refused above a `maxFeePerGas` of about 28 gwei (`max_cost_above_policy`,
+before any proof). Raise the policy toward `1.8M × maxFeeCeiling` to sponsor
+up to the ceiling, and fund the float to match, within the immutable hard
+cap of 0.25 ETH per operation (`setPolicy` reverts `PolicyOutOfBounds`
+above it, and `Deploy.s.sol` refuses a larger
+`PAYMASTER_MAX_SPONSORED_COST_WEI`). That cap stops sponsorship above a
+`maxFeePerGas` of about 139 gwei (0.25 ETH / 1.8M gas) whatever the
+ceiling: a ceiling above that, such as Sepolia's 200 gwei, matters only for
+operations with smaller limits.
+
+**Stakes.** Never `unlockStake` the paymaster while it sponsors. The
+factory's stake only lifts the public mempool's per-factory limits for
+operations that create `S`; withdraw it only with the paymaster's. The
+factory's code stays deployed (it is immutable): every `S` address depends
+on it, and its `createAccount` keeps working for sweeps without any stake.
+
+**Fee ceilings.** Validation cannot read the base fee, so the ceilings
+(`setFeeCeilings`, by the owner or `feeKeeper`, at most 500 and 20 gwei) are
+static policy. Size `maxFeeCeiling` for the SDK's rule, the stricter one:
+the SDK sponsors only while `2 × base fee + tip ≤ maxFeeCeiling`, so a
+ceiling of `c` covers base fees up to about `(c − tip) / 2` for SDK users
+and up to `c − tip` for zkapi-clientd. To keep SDK users sponsored up to
+about 3 × the trailing 24-hour p90 base fee, set `maxFeeCeiling` to about
+6 × that p90 plus `priorityFeeCeiling`, and raise `maxSponsoredCost` to
+match (it refuses first; see above). zkapi-clientd then sponsors through
+spikes up to about 6 × p90, and the float is exposed through them. A
+ceiling of 3 × p90 halves that but refuses SDK users above about 1.5 ×
+p90. Set
+`priorityFeeCeiling` to 2–3 gwei on mainnet, at most about 0.7 × a typical
+base fee: that keeps a griefing bundler's gain from tips on reverted
+operations below its cost. An optional `feeKeeper` key may re-set both daily
+from the exit RPC's `eth_feeHistory`; a lost keeper only freezes them, within
+the hard caps. Ceilings that are too low refuse sponsorship during fee spikes
+(`gas_above_paymaster_ceiling`), and users keep the wallet path. Ceilings that
+are too high raise that griefing exposure linearly.
+
+**Escapes.** `escapesEnabled` is false in every published profile
+(`PAYMASTER_ESCAPES=0`). Enabling it means the float pays each sponsored
+initiation (about 1.25M gas) on top of the existing challenge (about 435k
+gas) when the escape is defeated, against the attacker's deposit gas (about
+0.3M, recovered later): about 5:1 against the operator. Enable it on the
+Sepolia drill, and decide for mainnet from the `EscapeInitiationOwed` and
+`owedPaid` data. Keep `minEscapeNetWei` at least 10 × a typical initiation
+plus finalization cost. While it is disabled, escapes are sponsored only at
+finalization: the user starts the escape through the wallet path with
+destination `S`, or through a funded helper.
+
+**Metrics.** `node scripts/paymaster-status.mjs --deployment "$OUTPUT_PATH"
+--rpc "$RPC_URL"` prints one JSON report:
+
+- the float (`deposit_wei`, `deposit_covers_operations`) and both stakes;
+- the live policy, fee ceilings, call caps, keeper and owner;
+- `lost_wei`, `shortfall_wei`, `total_credits_wei` and
+  `unaccounted_balance_wei`;
+- the open escape debt per transit account (`open_owed`, from the events and
+  checked against `owed(S)`);
+- `stranded_open`: transit accounts stranded or allowed without a later
+  forward or sweep, with their balances;
+- the operations the paymaster paid for (`user_operations`);
+- the EntryPoint's alarms for its senders (`entry_point_alarms`).
+
+Alert on:
+
+- any `entry_point_alarms` (`PostOpRevertReason`,
+  `UserOperationPrefundTooLow`): the float paid and recorded nothing, which
+  must never happen;
+- a nonzero `unaccounted_balance_wei`;
+- `deposit_covers_operations` under 10;
+- growth of `lost_wei`, `shortfall_wei` or the open debt;
+- `stranded_open` entries older than a day;
+- the bundler's health (`eth_supportedEntryPoints` must list the
+  EntryPoint) and, on the operator's bundler, the paymaster's reputation.
+
+**Incident levers** (owner only, unless noted):
+
+- `setPolicy` with `sponsorshipPaused: true` stops new sponsorship within a
+  block. Operations not yet included then fail validation: an operation is
+  never charged, and the bundler pays for any bundle it already sent.
+- `release(keys)` resets a key's attempts. Use it only after an operation was
+  included and reverted: an operation the bundler held, or one that failed
+  on-chain validation, never consumes an attempt.
+- `allowForward(S)` lets a sponsored FORWARD collect a balance that reached
+  `S` without paymaster evidence (a close replayed before any sponsored
+  operation). Anyone can otherwise `sweep()` it from a funded account.
+- `writeOffDebt(S)` clears a defeated escape's debt once its note has closed
+  elsewhere. It changes accounting only.
+- `setFeeCeilings` (owner or `feeKeeper`) moves the ceilings anywhere up to
+  the immutable hard caps (500 gwei and 20 gwei), and `setCallCap` moves
+  each kind's call cap between its floor and its hard cap. Lowering them
+  narrows what the paymaster accepts; raising them widens the float's
+  exposure (a higher `priorityFeeCeiling` raises the griefing exposure of
+  the fee-ceilings paragraph). A `feeKeeper` can raise the ceilings to the
+  hard caps, so protect it like a key that sets risk policy, not as a
+  low-value hot key. `withdrawTo` moves float.
+
+No lever can move a payout, a credit (`credits[payee]`, which anyone delivers
+with `claimCredit(payee)`) or a transit account.
+
+**Retirement.** In this order:
+
+1. `setPolicy` with `escapesEnabled: false` (the published default), so
+   no new escape debt is recorded. Keep the profiles' `gasless` pins
+   published: both clients refuse every gasless action, the sponsored
+   FINALIZE and FORWARD and even the wallet-paid `sweepTransit`, once a
+   profile has no pins, so the pins must outlive the records that need
+   them. New closes stay sponsored meanwhile; each one settles inside its
+   own operation and adds no debt.
+2. Keep sponsoring until `paymaster-status.mjs` shows `open_owed` and
+   `stranded_open` empty. Each pending sponsored escape finalizes after its
+   challenge period, sponsored by its client, or by anyone with
+   `finalizeEscapeWithdrawal` from a funded account followed by the
+   permissionless `S.sweep()`, which pays the payee and settles the debt.
+   Collect or sweep each stranded balance the same way, and `writeOffDebt`
+   a defeated escape's debt (it never settles by itself).
+3. Publish profiles whose `gasless` is `null`, so no new proof binds a
+   transit account of this paymaster.
+4. Pause sponsorship.
+5. `unlockStake` the paymaster and the factory, wait the unstake delay,
+   `withdrawStake`, and `withdrawTo` the float.
+
+Pausing sponsorship refuses every kind, FINALIZE and FORWARD included
+(`SponsorshipPaused` is validation's first check), and after step 3 the
+clients refuse to finalize, collect or sweep anything of this paymaster. A
+balance that appears later (an operation already in flight at step 3, or an
+escape left pending) is recovered by hand from any funded account. For a
+pending escape, after its challenge period:
+
+```sh
+cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)' "$NOTE_ID" --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"
+cast send "$S" 'sweep()' --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"
+```
+
+For a stranded balance, only the `sweep()`. Every `S` that
+`paymaster-status.mjs` lists was created by a sponsored operation and has
+code; a balance that reached an `S` with no code needs
+`cast send "$FACTORY" 'createAccount(address,address)' "$OWNER" "$PAYEE"`
+first, with the owner and payee its client holds. `sweep()` pays the payee
+and settles `S`'s debt on the way.
+
+The contracts stay deployed (immutable code): `collect` (the path of
+every `sweep()`), `claimCredit` and the factory's `createAccount` work
+without a deposit or a stake. A new paymaster means new transit-account
+addresses for new proofs.

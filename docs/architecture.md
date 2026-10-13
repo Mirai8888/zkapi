@@ -6,6 +6,8 @@ Host app -> browser SDK -> zkAPI server (proof-backed lease authorization)
                    |-> inference provider (prompts/responses)
                    |-> Ethereum native ETH vault
                    |-> indexer (current Merkle root and paths)
+                   |-> ERC-4337 bundler -> EntryPoint v0.7.0 -> transit account -> vault (withdrawals that pay their gas from the payout;
+                                                                        the withdrawal paymaster sponsors and settles)
 
 Challenger -> server request evidence + vault (+ indexer for retirements) -> restricted EIP-1559 signer -> vault
 ```
@@ -47,6 +49,15 @@ exits for at most `maxPauseDuration` and schedule time-locked treasury
 changes; a pause cannot move funds or expire notes. See
 [owner and operator powers](../docs-site/content/docs/protocol.mdx#owner-and-operator-powers)
 and the [concession-vault migration](migration-concession-vault.md).
+
+A withdrawal can pay its network fee from the payout instead of a funded
+account: its proof names a transit account derived from the owner and the
+payout address, and a user operation from that account, sent through the
+operator's ERC-4337 bundler, makes the vault call. The withdrawal paymaster
+re-runs the vault's checks in validation, sponsors the gas from its EntryPoint
+deposit, and in postOp keeps a measured charge and pushes the rest to the
+payout address; the vault itself is unchanged
+([operating it](deployment.md#operating-gasless-withdrawals)).
 
 Only the v2 Groth16/Baby-JubJub proof path and native ETH payment path are active.
 The operator CLI supplies server/indexer/setup/signing-key commands; the host

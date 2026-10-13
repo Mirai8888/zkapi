@@ -25,7 +25,10 @@ until 1.0.0, any interface may change in any release. See the
 ## Local OpenAI-compatible API
 
 Use [zkapi-clientd](zkapi-clientd/README.md) to configure an ETH wallet and serve
-inference to Open WebUI or another local OpenAI-compatible client.
+inference to Open WebUI or another local OpenAI-compatible client. Its
+withdrawals can pay their network fee from the payout (`withdraw --fees
+payout`, through an ERC-4337 paymaster), so the payout address needs no ETH;
+the vault is unchanged.
 
 ## Build and test
 
@@ -50,7 +53,9 @@ No submodule initialization, Cairo compiler or STARK prover is needed. See
 proof generation, lease recovery, settlement and withdrawals. Mainnet and Sepolia
 have independent deployment pins, signing keys and wallet state. Applications
 configure the SDK before initializing a wallet; see [SDK integration](sdk/README.md)
-and [native billing](docs/native-eth-billing.md).
+and [native billing](docs/native-eth-billing.md). A withdrawal can pay its
+network fee from the payout (`fees: 'payout'`, through an ERC-4337 paymaster),
+so the payout address needs no ETH; the vault is unchanged.
 
 The packaged WASM and proving keys support the current circuit
 `zkapi-v2-concession-v1` (vault revision 3), with the development setup until
@@ -69,8 +74,9 @@ Run `npm run test:e2e:v2` to build and test circuit `zkapi-v2-concession-v1`
 end to end on a fresh local chain. It covers the honest flow and the Sepolia
 drill scenarios that run locally, and writes a gas report. The drill scenarios
 include withholding, bad successor anchors, a lying expiry check, forced and
-conceding escapes with raises and defeats, the bounded pause, and a missed
-defeat with leaf retirement.
+conceding escapes with raises and defeats, the bounded pause, a missed
+defeat with leaf retirement, and gasless withdrawals through a local
+bundler.
 
 The contracts, proofs, server, indexer, challenger, signer sidecar, browser SDK
 and clientd companion are real. The provider, OA org and price feed are

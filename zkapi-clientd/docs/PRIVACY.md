@@ -137,6 +137,11 @@ RPC would. An exit RPC on another chain is never trusted.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
+With `--fees payout` no local signing address pays for the withdrawal and no
+withdrawal fee QR is needed; a fresh owner key per withdrawal signs the
+operation and the payout address appears on chain only as the transit
+account's payee. The bundler (the deployment's, or your own `--bundler-url`)
+sees the operation and your client IP before inclusion, as an RPC does.
 
 Waiting for ETH and refreshing quotes do not authorize transactions. For a
 guided deposit, Enter approves the fixed principal with fees that adjust

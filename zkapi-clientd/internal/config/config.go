@@ -67,6 +67,13 @@ type ZKAPI struct {
 	// deployment checks also run through it, the companion reads expiry,
 	// roots and logs through it, and exit transactions are sent through it.
 	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
+	// WithdrawalFees is how a withdrawal pays its network fee by default:
+	// "wallet" (the local signing address; the default) or "payout" (a
+	// sponsored operation paid from the payout, --fees payout).
+	WithdrawalFees string `json:"withdrawal_fees,omitempty"`
+	// BundlerURL is the owner's ERC-4337 bundler for gasless withdrawals
+	// (--bundler-url); empty uses the deployment's published bundler.
+	BundlerURL string `json:"bundler_url,omitempty"`
 }
 
 type Config struct {
@@ -198,6 +205,12 @@ func Validate(c Config) error {
 	}
 	if c.ZKAPI.ExitRPCURL != "" && !validExitRPC(c.ZKAPI.ExitRPCURL) {
 		return errors.New("ZKAPI exit_rpc_url must be an HTTPS URL, or plain HTTP to a node on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.BundlerURL != "" && !validExitRPC(c.ZKAPI.BundlerURL) {
+		return errors.New("ZKAPI bundler_url must be an HTTPS URL, or plain HTTP to a bundler on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.WithdrawalFees != "" && c.ZKAPI.WithdrawalFees != "wallet" && c.ZKAPI.WithdrawalFees != "payout" {
+		return errors.New("ZKAPI withdrawal_fees must be wallet or payout")
 	}
 	return nil
 }

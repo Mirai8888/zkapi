@@ -100,6 +100,9 @@ type addressFixture struct {
 	hideReceipts int
 	// logs are the vault logs eth_getLogs serves, filtered by topics.
 	logs []map[string]any
+	// gasless, when enabled (enableGasless), serves the gasless contracts
+	// and the bundler of a sponsored withdrawal.
+	gasless *gaslessFixture
 }
 
 // addressTestFirstNote is the first fixture deposit's note: the indexer
@@ -211,6 +214,18 @@ func newAddressFixture(t *testing.T, native ...bool) *addressFixture {
 			f.rpcCalls = append(f.rpcCalls, request.Method)
 		}
 		var result any
+		// The gasless fixture (gasless_fixture_test.go) answers the gasless
+		// contracts' reads and the dry run of a sponsored operation.
+		if f.gasless != nil {
+			if result, refused, handled := f.gasless.answer(t, request.Method, request.Params); handled {
+				if refused != nil {
+					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": refused})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+				}
+				return
+			}
+		}
 		// The deployment checks before a deposit read the fixture vault's
 		// code and getters.
 		if answer, ok := deploymentCheckAnswer("mainnet", request.Method, request.Params); ok {

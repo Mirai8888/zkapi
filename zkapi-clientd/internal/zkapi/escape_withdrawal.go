@@ -103,14 +103,14 @@ func parseUnits(value string) (uint64, error) {
 func escapeCalldata(plan escapePlan, config fundingConfig, saved *addressWithdrawalRecord, now time.Time) (string, *addressWithdrawalRecord, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("escape proof does not match the confirmed note, destination, balance, concession or deployment")
-	if plan.Status != "prepared" || p.Kind != 0 || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.Destination) || plan.Proof.Backend != "groth16_bn254" {
+	if plan.Status != "prepared" || p.Kind != 0 || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || plan.Proof.Backend != "groth16_bn254" {
 		return "", nil, invalid
 	}
 	stateBalance, err := parseUnits(plan.StateBalance)
 	if err != nil || stateBalance != saved.StateBalance || p.Conceded != saved.Conceded || p.FinalBalance+p.Conceded != stateBalance || p.FinalBalance > stateBalance {
 		return "", nil, invalid
 	}
-	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.Destination)
+	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
 	if err != nil {
 		return "", nil, invalid
 	}
@@ -147,7 +147,7 @@ func validateSignedEscape(data []byte, config fundingConfig, saved *addressWithd
 	for i := range words {
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.Destination), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: strings.Repeat("0", 64), 13: addressABIWord(saved.NextNullifier), 14: fmt.Sprintf("%064x", saved.Conceded), 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
@@ -212,9 +212,15 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		return update(), errors.New("the saved withdrawal does not match the active note; preserve recovery files")
 	}
 	w := record.Withdrawal
+	options := withdrawalOptions(ctx)
 	if w != nil && w.Phase == "complete" {
 		if !strings.EqualFold(w.Destination, destination) {
 			return update(), errors.New("the completed withdrawal went to its saved destination")
+		}
+		// A finalized escape whose payout sits in the transit account (a
+		// third party finalized it): the sponsored forward is quoted now.
+		if w.Transit != nil && w.FundsWaitingInTransit && quoteMode(ctx) != nil {
+			return h.transitAction(ctx, config, record, addressWithdrawalOptions{Collect: true, BundlerURL: options.BundlerURL, FeeCapGwei: options.FeeCapGwei, AllowExpensiveGas: options.AllowExpensiveGas}, update)
 		}
 		return update(), nil
 	}
@@ -232,11 +238,28 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		if record.Pending != nil && (record.Pending.Kind != "deposit" || record.Phase != "active") {
 			return update(), errors.New("finish the saved deposit before withdrawing")
 		}
+		w = &addressWithdrawalRecord{NoteID: noteID, Destination: destination, Mode: "escape", Phase: "escape_decision"}
+		if options.Fees == "payout" {
+			// Design 3.3: the gasless pre-flight runs before the companion
+			// reserves the exit for the transit account.
+			payeeHasCode, err := h.gaslessPrepareCheck(ctx, config, options, gaslessKindEscape, wallet.Note.Balance, destination)
+			if err != nil {
+				return update(), err
+			}
+			profile, _, err := h.gaslessProfile()
+			if err != nil {
+				return update(), err
+			}
+			transit, err := h.newTransit(ctx, config, profile, destination)
+			if err != nil {
+				return update(), err
+			}
+			w.FeePayer, w.ProofDestination, w.Transit, w.PayeeHasCode = "payout", transit.Account, transit, payeeHasCode
+		}
 		if record.Pending != nil {
 			record.History = append(record.History, *record.Pending)
 			record.Pending = nil
 		}
-		w = &addressWithdrawalRecord{NoteID: noteID, Destination: destination, Mode: "escape", Phase: "escape_decision"}
 		record.Withdrawal, record.Phase = w, "withdrawal_pending"
 		if err := h.saveAddress(record); err != nil {
 			return update(), err
@@ -266,7 +289,11 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		if !strings.EqualFold(w.Destination, destination) {
 			return update(), errors.New("a withdrawal destination is already saved; escape to that same destination")
 		}
-		*w = addressWithdrawalRecord{NoteID: w.NoteID, Destination: w.Destination, Mode: "escape", Phase: "escape_decision"}
+		if w.UserOp != nil && w.Phase != "op_reverted" && w.Phase != "gasless_refused" {
+			return update(), errors.New("a sponsored close operation is in flight; finish it with zkapi-clientd withdraw --to " + w.Destination)
+		}
+		// The reservation (and so a transit account the proof binds) stays.
+		*w = addressWithdrawalRecord{NoteID: w.NoteID, Destination: w.Destination, Mode: "escape", Phase: "escape_decision", FeePayer: w.FeePayer, ProofDestination: w.ProofDestination, Transit: w.Transit, StartBlock: w.StartBlock}
 		if err := h.saveAddress(record); err != nil {
 			return update(), err
 		}
@@ -275,25 +302,142 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 			return update(), errors.New("an escape destination is already saved; resume with that same destination")
 		}
 	}
+	// The fee mode of a saved gasless escape: --fees wallet falls back to
+	// wallet-paid transactions bound to the transit account while no
+	// operation is in flight.
+	if w.Transit != nil && options.Fees == "wallet" && w.FeePayer == "payout" {
+		switch w.Phase {
+		case "escape_decision", "escape_wait", "quoted", "reverted", "escape_expired", "gasless_refused", "op_reverted", "escape_initiated", "defeated":
+			// A dropped operation the bundler included after all is
+			// followed, never replaced by a wallet-paid transaction nor
+			// forgotten.
+			if late, err := h.lateGaslessOperation(ctx, config, record); err != nil {
+				return update(), err
+			} else if late && w.InitiateHash != "" {
+				return h.resumeGaslessFinalize(ctx, config, record, update)
+			} else if late {
+				return h.resumeGaslessEscapeInitiation(ctx, config, record, update)
+			}
+			w.FeePayer, w.UserOp, w.GaslessRefusal = "wallet", nil, ""
+			// The bundle transaction of a reverted operation is not the
+			// escape's: the record shows the initiation on chain, or none.
+			w.TransactionHash = w.InitiateHash
+			if w.Phase == "gasless_refused" || w.Phase == "op_reverted" {
+				w.Phase = "escape_decision"
+				if w.InitiateHash != "" {
+					w.Phase = "escape_initiated"
+				}
+			}
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+		default:
+			return update(), errors.New("a sponsored operation is in flight; resume it before changing how the fee is paid")
+		}
+	}
+	// The reverse: --fees payout on an escape the owner pays from the wallet
+	// (an initiation the paymaster does not sponsor, say, bound to the
+	// transit account). While no transaction is pending the sponsored path
+	// takes over the next step after its pre-flight: the finalization of an
+	// escape on chain, else the initiation.
+	if w.Transit != nil && options.Fees == "payout" && w.FeePayer == "wallet" {
+		if record.Pending != nil {
+			return update(), errors.New("a wallet-paid escape transaction is pending; follow it before changing how the fee is paid")
+		}
+		switch w.Phase {
+		case "escape_decision", "escape_wait", "quoted", "waiting_funds", "reverted", "escape_expired", "escape_initiated", "defeated":
+			kind := gaslessKindEscape
+			if w.InitiateHash != "" {
+				kind = gaslessKindFinalize
+			}
+			if _, _, err := h.gaslessPreflight(ctx, config, options, kind); err != nil {
+				return update(), err
+			}
+			w.FeePayer = "payout"
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+		default:
+			return update(), errors.New("the wallet-paid escape step is under way; follow it with --fees wallet")
+		}
+	}
+	if w.Transit == nil && options.Fees == "payout" {
+		return update(), errors.New("this escape is reserved for the payout address with a wallet-paid fee; finish it with --fees wallet (a gasless escape needs a fresh reservation)")
+	}
 	if record.Pending != nil && escapeKinds[record.Pending.Kind] {
 		return h.followEscapeTransaction(ctx, config, record, update)
 	}
+	if record.Pending != nil && transitKinds[record.Pending.Kind] {
+		if err := h.followTransitTransaction(ctx, config, record); err != nil {
+			return update(), err
+		}
+		return update(), nil
+	}
 	if record.Pending != nil {
 		return update(), errors.New("unexpected pending payment during an escape; preserve recovery files")
+	}
+	// An operation in flight is followed whatever pays the fee now (a
+	// forward after the wallet fallback included).
+	if w.UserOp != nil {
+		switch w.Phase {
+		case "op_built", "op_submitted", "escape_pending":
+			if mode := quoteMode(ctx); mode != nil && mode.Capture != nil {
+				return update(), errors.New("recover the sponsored operation before requesting a new quote")
+			}
+			return h.resumeGaslessEscapeInitiation(ctx, config, record, update)
+		case "finalize_op_built", "finalize_op_submitted", "finalize_pending":
+			if mode := quoteMode(ctx); mode != nil && mode.Capture != nil {
+				return update(), errors.New("recover the sponsored operation before requesting a new quote")
+			}
+			return h.resumeGaslessFinalize(ctx, config, record, update)
+		case "forward_op_built", "forward_op_submitted":
+			return h.resumeForward(ctx, config, record, update)
+		}
 	}
 	switch w.Phase {
 	case "escape_initiated", "defeated":
 		// A defeat is never final on one reading: it is asked again on
 		// every run, through the exit RPC once one is configured.
 		return h.finalizeEscape(ctx, config, record, update)
+	case "op_reverted", "gasless_refused":
+		if w.Phase == "gasless_refused" {
+			// A dropped operation the bundler included after all is
+			// followed.
+			if late, err := h.lateUserOperation(ctx, config, record); err != nil {
+				return update(), err
+			} else if late && w.InitiateHash != "" {
+				return h.resumeGaslessFinalize(ctx, config, record, update)
+			} else if late {
+				return h.resumeGaslessEscapeInitiation(ctx, config, record, update)
+			}
+		}
+		if w.InitiateHash != "" {
+			// The finalization's operation failed or was refused: the escape
+			// is still on chain and is looked at again.
+			w.UserOp, w.Phase, w.GaslessRefusal, w.TransactionHash = nil, "escape_initiated", "", w.InitiateHash
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+			return h.finalizeEscape(ctx, config, record, update)
+		}
+		// The initiation's operation failed or was refused: the decision is
+		// reviewed and proved again (like a reverted initiation).
+		w.UserOp, w.GaslessRefusal, w.TransactionHash = nil, "", ""
+		w.Phase = "reverted"
+		w.Binding = ""
+		if err := h.saveAddress(record); err != nil {
+			return update(), err
+		}
 	}
-	// No escape transaction is live: decide, or prove and sign.
-	body := map[string]any{"destination": destination}
+	// No escape transaction is live: decide, or prove and sign. The companion
+	// reserves the exit for the proof's destination (the transit account of
+	// a gasless escape).
+	body := map[string]any{"destination": w.proofDestination()}
 	if earlyExit != "" {
 		body["early_exit"] = earlyExit
 	}
 	if conceded != nil {
-		if w.Phase != "escape_decision" && w.Phase != "quoted" && w.Phase != "waiting_funds" && w.Phase != "reverted" && w.Phase != "escape_expired" {
+		if w.Phase != "escape_decision" && w.Phase != "quoted" && w.Phase != "waiting_funds" && w.Phase != "reverted" && w.Phase != "escape_expired" && w.Phase != "gasless_refused" {
 			return update(), errors.New("review the escape decision before confirming a concession")
 		}
 		if *conceded != w.Conceded || w.StateBalance == 0 {
@@ -364,6 +508,19 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 	if err := h.saveAddress(record); err != nil {
 		return update(), err
 	}
+	if w.FeePayer == "payout" {
+		vaultCall, _ := hex.DecodeString(data[2:])
+		if err := h.submitUserOperation(ctx, config, record, gaslessKindEscape, vaultCall); err != nil {
+			if GaslessRefusalCode(err) != "" {
+				w.Phase, w.GaslessRefusal = "gasless_refused", err.Error()
+				if saveErr := h.saveAddress(record); saveErr != nil {
+					return update(), saveErr
+				}
+			}
+			return update(), err
+		}
+		return update(), nil
+	}
 	if err := h.signAddressTransaction(ctx, config, record, "escape", config.Contract, data); err != nil {
 		if errors.Is(err, errAddressNeedsETH) {
 			w.Phase = "waiting_funds"
@@ -380,6 +537,57 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		h.reportEscapeSubmission(ctx, record.Pending.Hash)
 	}
 	return update(), nil
+}
+
+// resumeGaslessEscapeInitiation follows the sponsored initiation: once its
+// bundle transaction is final and successful the escape is on chain, the
+// companion is told the transaction and the initiation's charge is recorded
+// as the transit account's debt.
+func (h *FundingHandler) resumeGaslessEscapeInitiation(ctx context.Context, config fundingConfig, record *addressFundingRecord, update func() AddressWithdrawalStatus) (AddressWithdrawalStatus, error) {
+	w := record.Withdrawal
+	outcome, err := h.followUserOperation(ctx, config, record)
+	if err != nil {
+		return update(), err
+	}
+	if outcome.Hash != "" {
+		h.reportEscapeSubmission(ctx, outcome.Hash)
+	}
+	if !outcome.Included || !outcome.Success {
+		return update(), nil
+	}
+	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	if err != nil {
+		return update(), err
+	}
+	if settlement := parsePaymasterSettlement(outcome.Receipt, env.paymaster, env.account, env.payee); settlement.Found {
+		w.InitiationDebtWei = settlement.Charged.String()
+	}
+	w.Phase, w.InitiateHash, w.TransactionHash = "escape_initiated", strings.ToLower(outcome.Hash), strings.ToLower(outcome.Hash)
+	if err := h.saveAddress(record); err != nil {
+		return update(), err
+	}
+	return h.finalizeEscape(ctx, config, record, update)
+}
+
+// resumeGaslessFinalize follows the sponsored finalization; one that
+// reverted (someone else may have finalized first) is looked at again.
+func (h *FundingHandler) resumeGaslessFinalize(ctx context.Context, config fundingConfig, record *addressFundingRecord, update func() AddressWithdrawalStatus) (AddressWithdrawalStatus, error) {
+	w := record.Withdrawal
+	outcome, err := h.followUserOperation(ctx, config, record)
+	if err != nil {
+		return update(), err
+	}
+	if !outcome.Included {
+		return update(), nil
+	}
+	if !outcome.Success {
+		w.UserOp, w.Phase, w.GaslessRefusal, w.TransactionHash = nil, "escape_initiated", "", w.InitiateHash
+		if err := h.saveAddress(record); err != nil {
+			return update(), err
+		}
+		return h.finalizeEscape(ctx, config, record, update)
+	}
+	return h.completeEscape(ctx, config, record, outcome.Hash, outcome.Receipt, update)
 }
 
 // CancelAddressEscape cancels an escape that released no exit proof (design
@@ -636,6 +844,19 @@ func (h *FundingHandler) finalizeEscape(ctx context.Context, config fundingConfi
 			// Finalization is signed under an approved fee quote.
 			return update(), nil
 		}
+		if w.FeePayer == "payout" {
+			vaultCall, _ := hex.DecodeString(finalizeEscapeCalldata(w.NoteID)[2:])
+			if err := h.submitUserOperation(ctx, config, record, gaslessKindFinalize, vaultCall); err != nil {
+				if GaslessRefusalCode(err) != "" {
+					w.Phase, w.GaslessRefusal = "gasless_refused", err.Error()
+					if saveErr := h.saveAddress(record); saveErr != nil {
+						return update(), saveErr
+					}
+				}
+				return update(), err
+			}
+			return update(), nil
+		}
 		if err := h.signAddressTransaction(ctx, config, record, "escape_finalize", config.Contract, finalizeEscapeCalldata(w.NoteID)); err != nil {
 			if errors.Is(err, errAddressNeedsETH) {
 				next := update()
@@ -654,7 +875,17 @@ func (h *FundingHandler) finalizeEscape(ctx context.Context, config fundingConfi
 		if err != nil || !final {
 			return update(), err
 		}
-		return h.completeEscape(ctx, config, record, hash, receipt, update)
+		status, err := h.completeEscape(ctx, config, record, hash, receipt, update)
+		if err == nil && w.Transit != nil && w.FundsWaitingInTransit && quoteMode(ctx) != nil {
+			// Design 3.3: finalized by someone else, the payout sits in the
+			// transit account; the sponsored forward is quoted right away.
+			// The forward is quoted under the command's own choices: like
+			// every operation it is refused as gasless_uneconomic unless
+			// --allow-expensive-gas was passed (--sweep is the way out).
+			options := withdrawalOptions(ctx)
+			return h.transitAction(ctx, config, record, addressWithdrawalOptions{Collect: true, BundlerURL: options.BundlerURL, FeeCapGwei: options.FeeCapGwei, AllowExpensiveGas: options.AllowExpensiveGas}, update)
+		}
+		return status, err
 	case "defeated":
 		w.Phase = "defeated"
 		if err := h.saveAddress(record); err != nil {
@@ -738,6 +969,15 @@ func (h *FundingHandler) completeEscape(ctx context.Context, config fundingConfi
 	w.FinalizeHash, w.Payout, w.Amount, w.PayoutCredited, w.ConcessionExceededBound = strings.ToLower(hash), paid, paid, credited, matched.ExceededBound
 	w.CompletedOnPinnedRPC = config.ExitRPC == ""
 	w.SettlementHash = strings.ToLower(hash)
+	if w.Transit != nil {
+		// The vault paid the transit account: a sponsored finalization's
+		// Settled figures say what reached Y; without them the payout waits
+		// in the transit account.
+		recordSettlement(w, parsePaymasterSettlement(receipt, common.HexToAddress(w.Transit.Paymaster), common.HexToAddress(w.Transit.Account), common.HexToAddress(w.Destination)))
+		if w.PayoutCredited && !w.PaymasterCredited {
+			w.FundsWaitingInTransit = false
+		}
+	}
 	if err := h.archiveWithdrawnDepositForEscape(config, record, hash); err != nil {
 		return update(), err
 	}
@@ -764,7 +1004,7 @@ func escapeReceiptPayout(receipt *addressReceipt, config fundingConfig, w *addre
 		if log.Removed || !strings.EqualFold(log.Address, config.Contract) {
 			continue
 		}
-		if len(log.Topics) == 3 && strings.EqualFold(log.Topics[0], escapePayoutDeferredEventTopic) && strings.EqualFold(log.Topics[1], noteTopic) && strings.EqualFold(log.Topics[2], "0x"+addressABIWord(w.Destination)) {
+		if len(log.Topics) == 3 && strings.EqualFold(log.Topics[0], escapePayoutDeferredEventTopic) && strings.EqualFold(log.Topics[1], noteTopic) && strings.EqualFold(log.Topics[2], "0x"+addressABIWord(w.proofDestination())) {
 			credited = true
 			continue
 		}
@@ -772,7 +1012,7 @@ func escapeReceiptPayout(receipt *addressReceipt, config fundingConfig, w *addre
 			continue
 		}
 		data := strings.TrimPrefix(log.Data, "0x")
-		if !strings.EqualFold(data[:64], addressABIWord(w.Nullifier)) || !strings.EqualFold(data[128:], addressABIWord(w.Destination)) {
+		if !strings.EqualFold(data[:64], addressABIWord(w.Nullifier)) || !strings.EqualFold(data[128:], addressABIWord(w.proofDestination())) {
 			continue
 		}
 		if paid != nil {
@@ -912,6 +1152,7 @@ func escapeStatus(status AddressWithdrawalStatus, record *addressFundingRecord, 
 		}
 	}
 	setEscapePayoutCredit(&status, w, config)
+	setGaslessStatus(&status, w)
 	setWithdrawalMessage(&status)
 	if w.Mode == "escape" && config.ExitRPC == "" && status.Phase != "complete" {
 		status.Message += " " + noExitRPCWarning

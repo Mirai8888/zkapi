@@ -27,6 +27,9 @@ type FundingHandler struct {
 	// priorAdvice, guarded by mu, spares repeated quotes a download of an
 	// indexer tree that was already searched; see advisePriorDeposits.
 	priorAdvice *priorDepositAdvice
+	// gaslessChecked, guarded by mu, records the RPCs through which the
+	// gasless deployment checks passed in this process (ensureGaslessChecked).
+	gaslessChecked map[string]bool
 }
 
 type fundingConfig struct {

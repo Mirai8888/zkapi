@@ -426,6 +426,158 @@ For a delegated or contract recipient, choose an exact ETH amount and leave
 room for the displayed maximum fee. The exact-amount path still simulates the
 transfer and requires destination, amount and fee approval.
 
+### Paying the fee from the payout (gasless withdrawals)
+
+On a deployment that publishes a gasless withdrawal paymaster (the profile's
+`gasless` object: an ERC-4337 EntryPoint v0.7.0, the `ZkApiWithdrawalPaymaster`
+and its account factory), the withdrawal's network fee can be paid from the
+payout instead of by the local signing address, so the destination needs no
+ETH and no fee QR appears:
+
+```sh
+zkapi-clientd withdraw --to 0xDESTINATION --fees payout                       # quote a sponsored close
+zkapi-clientd withdraw --approve QUOTE_ID                                     # sign and send the operation
+zkapi-clientd withdraw --resume                                               # follow a sent operation
+zkapi-clientd withdraw --to 0xDESTINATION --fees payout --fee-cap-gwei 2000000 \
+    --bundler-url https://bundler.example/rpc --allow-expensive-gas          # bounds and your own bundler
+zkapi-clientd withdraw --to 0xDESTINATION --collect                           # forward a payout waiting in the transit account (sponsored)
+zkapi-clientd withdraw --to 0xDESTINATION --sweep                             # ... or sweep it, paid by the local signing address
+zkapi-clientd withdraw --to 0xDESTINATION --claim-credit                      # deliver a payout the paymaster credited
+zkapi-clientd config --withdrawal-fees payout --bundler-url https://bundler.example/rpc   # defaults
+```
+
+The guided **withdraw** menu offers "Pay the network fee from the payout (no
+ETH needed)" whenever the pre-flight says the paymaster can sponsor the exit,
+before any fee QR; a saved sponsored withdrawal that stopped as
+`gasless_refused` while the sponsored path is unavailable falls back to the
+wallet-paid fee without asking (its quote is still reviewed). `--fees` resolves from the flag, then
+`zkapi.withdrawal_fees` (`wallet` by default); `--bundler-url` from the flag,
+then `zkapi.bundler_url`, then the deployment's published bundler. The bundler
+URL follows the exit RPC's rules (HTTPS, or plain HTTP to this machine). It
+is resolved once, when the quote is made (the quote shows it), and
+`--approve` sends the operation to that bundler; an approval that would
+resolve another one is refused before it is contacted. `--fees wallet` named
+on the command line (or chosen in the guided menu) is sent to the daemon even
+when it is the default, so it switches a saved sponsored withdrawal to the
+wallet-paid path; a rerun without `--fees` keeps a saved withdrawal's mode
+(the configured `zkapi.withdrawal_fees` is sent only for a new withdrawal).
+`--fee-cap-gwei` bounds what the payout may lose: the sponsored fee's maximum
+plus, for a destination with code, the paymaster's credit surcharge of a
+failed push.
+
+How it works. Before anything is reserved, the client checks the gasless
+contracts against this release's pins (the runtime code of the EntryPoint,
+its SenderCreator, the paymaster and the factory, the paymaster's vault,
+factory, unit and gas policy, and the factory's address derivation) through
+the pinned RPC and your exit RPC when one is set, asks the bundler for its
+chain and EntryPoints, reads the paymaster's live policy and deposit and the
+vault's pause, and checks the fee against the private balance. A mismatch or
+a refusal (`gasless_unavailable`, `bundler_unavailable`, `sponsorship_paused`,
+`exits_paused`, `payout_below_gas`, `gasless_uneconomic` — the fee would take
+more than the deployment's uneconomic fraction, 25%, of the payout, unless
+`--allow-expensive-gas` — `gas_above_paymaster_ceiling`, `paymaster_underfunded`,
+`gasless_attempts_exhausted`) disables only `--fees payout`; deposits and
+wallet-paid exits are unaffected. A payout address the transit account's
+factory never accepts as a payee (the vault, the EntryPoint, the withdrawal
+paymaster or the withdrawal account factory of the deployment) is refused with
+`invalid_payee` before anything is reserved: a transit account bound to it
+could never be created, so neither a sponsored operation nor `--sweep` could
+deliver the payout.
+
+A fresh owner key is generated for every withdrawal and saved, hex-encoded, in
+the mode-0600 payment journal (`transit.owner_key`); the funding key never owns
+a transit account. The transit account `S` is `CREATE2(factory, 0,
+creationCode ‖ abi.encode(entryPoint, vault, paymaster, owner, destination))`,
+cross-checked with the factory's `getAddress`; the companion prepares the
+proof with `S` as its destination (`proof_destination` in the journal, while
+`destination` stays the payout address), so nothing after proving can change
+where the money goes. The quote shows the payout, the most the fee can take
+(the operation's maximum cost at the signed limits plus the paymaster's flat
+fee), what `S` still owes from an earlier sponsored escape, what the
+destination receives at least, and the most the fee may take should the
+operation have to be re-signed (`fee_bump_cap_wei`: your `--fee-cap-gwei`
+when the quote was made with one, else that same maximum); `--approve` binds
+those exact gas fields and fees and the choices the quote was made with
+(the cap and `--allow-expensive-gas`). The operation's `preVerificationGas`
+is the rule the browser SDK shares, `clamp(max(A, ceil(1.1 × B), C),
+pvg_floor, pvg_cap)` on the operation as built: A is ERC-7562's LIM-070
+minimum at its worst (the calldata cost of `handleOps` with a 65-byte
+signature and both fee fields at `2^128 − 1`, plus 50,000) with a 2,000
+margin, B the reference bundler's minimum (21,000 + 18,300 + 4 per word +
+4 / 16 per zero / non-zero byte of the encoded operation) and C 21,000 + 16
+per byte of `handleOps` calldata + 10,000; a higher `preVerificationGas` from
+the bundler's `eth_estimateUserOperationGas` within the paymaster's cap is
+what that bundler requires and is adopted in the quote, and so in the signed
+operation. The operation (`S.withdraw(mutualClose(...))`, packed per EntryPoint
+v0.7.0, hashed locally and cross-checked with `getUserOpHash`, signed EIP-191
+with the owner key, dry-run through `eth_call handleOps`) is journaled before
+it is sent (`user_op` with its hash, nonce, bundler and every hash of a
+re-signed copy), then sent with `eth_sendUserOperation`.
+
+Phases: `quoted` → `op_built` (journaled, being sent) → `op_submitted` (at the
+bundler) → `withdrawal_pending` (the bundle transaction is known) →
+`confirming` → `complete`. Recovery follows `--resume` or the same `--to`: a
+crash in `op_built` re-sends the identical bytes; the bundle transaction is
+found by the operation's `UserOperationEvent` in the chain's logs (the
+bundler's receipt is only a hint and must carry that event), read through
+your exit RPC when one is set, and needs Ethereum finality; after five
+minutes without inclusion the bundler is asked again, an operation it forgot
+is re-sent, one it refuses because the transit account was created meanwhile
+(`AA10`) is rebuilt without `initCode`, and one it refuses as underpriced is
+re-signed with both fees raised an eighth (dry-run before it is journaled), within the paymaster's ceilings and within what the
+approval allows: your `--fee-cap-gwei` when the quote was made with one
+(without one an approved operation is never re-signed above its approved
+maximum), the payout's floor, the uneconomic fraction, and the paymaster's
+policy and deposit. A raise beyond them is not signed: the record stops as
+`gasless_refused` (reason `fee_bump_needs_quote`), and rerunning `--to`
+quotes again at the current fees, after looking once more for an inclusion
+of any journaled copy of the dropped operation, which is adopted (so does
+`--fees wallet`, which then refuses the wallet quote and names the resume). The operation is abandoned
+60 seconds before the proof's `valid_until` (phase `gasless_refused`, reason
+`op_expired`; rerun `--to` to prove again). An operation found on chain is
+never taken for a dropped one later: an escape whose sponsored initiation was
+included and whose finalization is then refused stops as `gasless_refused`,
+and `--fees wallet` signs the wallet-paid finalization. `op_reverted` is an operation
+included but reverted (its reason is shown): rerun `--to` to prove again, or,
+when another transaction closed the note first (`NoteNotActive`), the payout
+sits in `S`: `--collect` adopts that close, confirms it with the companion and
+forwards the balance with a sponsored FORWARD operation (phases
+`forward_op_built`, `forward_op_submitted`); `--sweep` does it with a
+wallet-paid `S.sweep()` (creating `S` first when it has no code).
+A sponsored forward that is refused (by the bundler at sending, or when a
+re-signed copy is not allowed) or reverts leaves the record `complete` with
+the payout waiting in `S` and the reason shown (a plain rerun of `--to` changes
+nothing); `--collect` tries again without confirming the close with the
+companion a second time, after looking for an inclusion of the refused
+forward, which is followed instead (the quote is then refused with the resume
+command), and `--sweep` delivers it wallet-paid (`--sweep` and
+`--claim-credit` need no bundler). `gasless_refused` names why the
+sponsored path stopped before the note closed; rerun `--to` to try again, or
+`--fees wallet`, which reuses the plan bound to `S` (the companion's
+reservation pins it), pays the fee from the local signing address, and leaves
+the payout in `S` for `--sweep` or `--collect` (the forward of `S`'s balance
+stays sponsored whatever paid the close); while that wallet-paid close is
+not signed yet, `--fees payout` takes it back to the sponsored path. A
+payout the paymaster could not push to the
+destination (it rejected the ETH or needed more than 100,000 gas) is credited
+there; `--claim-credit` delivers it with a wallet-paid `claimCredit`. A new
+deposit is refused while a payout waits in `S` or the paymaster.
+
+Amounts: before signing only "the destination receives at least" is promised.
+The quote's expected charge is an estimate (the paymaster's charge formula at
+the gas an operation of this shape uses and today's base fee plus tip), shown
+beside the signed maximum. When the destination has code the push may fail
+and the paymaster then credits the payout less a surcharge of up to
+`credit_gas` × max fee per gas taken beyond the maximum: the quote says so
+(`payee_has_code`, `credit_surcharge_wei`), its floor already deducts it, and
+the status shows the advisory from the reservation on;
+after settlement the status shows the paymaster's `Settled` figures
+(`charged_wei`, `owed_paid_wei`, `received_wei`), or `received_wei` 0 with
+`paymaster_credited`. The operation is sent to the bundler, which learns it and
+your client IP before inclusion (the operator's bundler, unless you set your
+own); the chain shows the bundler's transaction, the transit account and the
+destination, never the funding address.
+
 ### Escape withdrawals
 
 An escape exits without the operator: the vault pays after its challenge
@@ -441,6 +593,36 @@ zkapi-clientd withdraw --escape --to 0xDESTINATION                    # later: q
 zkapi-clientd withdraw --claim --to 0xDESTINATION                     # deliver a credited payout
 zkapi-clientd withdraw --escape --cancel                              # drop an unsigned escape
 ```
+
+With `--fees payout` the escape is gasless too: the decision reserves the
+exit for the transit account, the initiation quote includes the
+finalization reserve (the escape must leave enough for a sponsored
+finalization at the same fee, the paymaster's minimum net and both flat
+fees; the paymaster must have escapes enabled), nothing is paid at
+initiation and the initiation's charge becomes the transit account's debt
+(`initiation_debt_wei`, `EscapeInitiationOwed`), the finalization is quoted
+after the challenge deadline with that debt deducted (`owed_wei`), and a
+sponsored finalization settles it. The initiation quote promises no floor
+for the payout: it shows the initiation's maximum charge and expected charge,
+the paymaster's reserve, the finalization's expected charge at today's fee
+(`finalize_estimate_wei`) and what the destination would receive after both
+expected charges and the debt (`estimated_received_wei`), as estimates, since the
+finalization is quoted at its own fees after the challenge period (what the
+destination receives at least is stated by that quote). When the paymaster
+has escapes disabled (`escapes_disabled`), initiate with `--fees wallet`;
+once the escape is on chain, `withdraw --escape --to --fees payout` takes
+the sponsored path back for its finalization from the transit account (the
+sponsored path takes over a wallet-paid escape whenever none of its
+transactions is pending). Phases: `op_built`/`op_submitted` →
+`escape_pending` → `escape_initiated` → `finalize_op_built` /
+`finalize_op_submitted` → `finalize_pending` → `complete`. When someone else
+finalized the escape (the vault paid the transit account), the same
+`withdraw --escape --to` completes the record from that finalization and
+quotes the sponsored forward right away (`withdraw --approve` sends it; the
+debt is deducted from the forward); like every sponsored operation it is
+refused as `gasless_uneconomic` when its fee may exceed the uneconomic
+fraction of the balance in `S`, unless the command passes
+`--allow-expensive-gas`; `--sweep` is the wallet-paid alternative.
 
 `--escape --cancel` drops an escape whose proof was never released (only its
 decision was shown, or it waits for a request to settle); chats resume. Once

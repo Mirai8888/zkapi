@@ -19,11 +19,14 @@ type fundingWizardUI struct {
 	confirmations             []bool
 	asks, confirms, continues int
 	beforeContinue            func()
+	// questions records what was asked, in order.
+	questions []string
 }
 
 func (u *fundingWizardUI) Printf(format string, args ...any) { fmt.Fprintf(&u.Buffer, format, args...) }
-func (u *fundingWizardUI) Ask(context.Context, string, string) (string, error) {
+func (u *fundingWizardUI) Ask(_ context.Context, question, _ string) (string, error) {
 	u.asks++
+	u.questions = append(u.questions, question)
 	if len(u.answers) == 0 {
 		return "", errors.New("unexpected input request")
 	}

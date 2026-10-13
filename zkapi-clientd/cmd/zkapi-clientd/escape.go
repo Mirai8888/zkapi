@@ -26,6 +26,7 @@ type escapeOptions struct {
 	conceded    *uint64
 	earlyExit   string
 	claim       bool
+	gasless     gaslessOptions
 }
 
 func parseEarlyExit(value string) (string, error) {
@@ -61,6 +62,7 @@ func runEscape(ctx context.Context, c config.Config, o escapeOptions, out io.Wri
 		return errors.New("there is no private balance to withdraw")
 	}
 	body := map[string]any{"destination": o.destination, "note_id": state.NoteID}
+	o.gasless.apply(body, savedWithdrawal(state))
 	if o.earlyExit != "" {
 		body["early_exit"] = o.earlyExit
 	}
@@ -81,6 +83,15 @@ func runEscape(ctx context.Context, c config.Config, o escapeOptions, out io.Wri
 	printEscapeStatus(out, state)
 	if state.Phase == "escape_initiated" && state.ChallengeDeadline != 0 && time.Now().Unix() > int64(state.ChallengeDeadline) {
 		quote, err := requestPaymentQuote(ctx, c, http.MethodPost, "/admin/escape/quote", "escape_finalize", body)
+		if err != nil {
+			return err
+		}
+		printPaymentQuote(out, quote, "zkapi-clientd withdraw")
+	}
+	if state.Phase == "complete" && state.FundsWaitingInTransit {
+		// Finalized by someone else: the sponsored forward of the payout
+		// waiting in the transit account is quoted now.
+		quote, err := requestPaymentQuote(ctx, c, http.MethodPost, "/admin/escape/quote", "withdrawal", body)
 		if err != nil {
 			return err
 		}
@@ -158,7 +169,7 @@ func approveEscapeQuote(ctx context.Context, c config.Config, id string, out io.
 		return true, nil
 	}
 	previous := state.Phase
-	for state.Phase == "escape_pending" || state.Phase == "finalize_pending" {
+	for state.Phase == "escape_pending" || state.Phase == "finalize_pending" || zkapi.GaslessPendingPhase(state.Phase) {
 		if err := waitFundingPoll(ctx); err != nil {
 			return true, errWithdrawalWaitStopped
 		}

@@ -50,6 +50,54 @@ type AddressPaymentQuote struct {
 	// Warnings are advisory findings the owner sees before approving, such
 	// as an escape whose simulation failed (design §6.4 E4 step 5).
 	Warnings []string `json:"warnings,omitempty"`
+	// A payout quote (FeePolicy "payout", design 3.3): the network fee is
+	// paid from the payout by a sponsored user operation. FeeCapWei is the
+	// most the payout can lose to this operation (its maximum cost plus the
+	// paymaster's flat fee), MinimumReceivedWei what the payout address
+	// receives at least (absent for an escape initiation, whose
+	// finalization is a later operation at its own fees: FinalizeEstimateWei
+	// is that finalization at the client's limits and today's fee, and
+	// EstimatedReceivedWei the payout after both, estimates only), OwedWei
+	// what the transit account owes from an earlier sponsored escape,
+	// FinalizeReserveWei the reserve the paymaster requires an escape
+	// initiation to leave. FeeBumpCapWei is the most the fee may take after
+	// the operation is re-signed with higher fees because the bundler
+	// dropped it (the --fee-cap-gwei the quote was made with, FeeCapGwei,
+	// else FeeCapWei: without a cap it is never re-signed above the
+	// approved maximum); AllowExpensiveGas records that flag. UserOpGas and
+	// the fee fields are the operation's; all of them are bound at approval.
+	UserOpKind           string           `json:"user_op_kind,omitempty"`
+	UserOpNonce          string           `json:"user_op_nonce,omitempty"`
+	TransitAccount       string           `json:"transit_account,omitempty"`
+	BundlerURL           string           `json:"bundler_url,omitempty"`
+	FeeCapWei            string           `json:"fee_cap_wei,omitempty"`
+	FlatFeeWei           string           `json:"flat_fee_wei,omitempty"`
+	PayoutWei            string           `json:"payout_wei,omitempty"`
+	MinimumReceivedWei   string           `json:"minimum_received_wei,omitempty"`
+	OwedWei              string           `json:"owed_wei,omitempty"`
+	FinalizeReserveWei   string           `json:"finalize_reserve_wei,omitempty"`
+	FinalizeEstimateWei  string           `json:"finalize_estimate_wei,omitempty"`
+	EstimatedReceivedWei string           `json:"estimated_received_wei,omitempty"`
+	FeeBumpCapWei        string           `json:"fee_bump_cap_wei,omitempty"`
+	FeeCapGwei           uint64           `json:"fee_cap_gwei,omitempty"`
+	AllowExpensiveGas    bool             `json:"allow_expensive_gas,omitempty"`
+	UserOpGas            *GaslessQuoteGas `json:"user_op_gas,omitempty"`
+	// PayeeHasCode: the payout address is a contract (design 3.1's
+	// advisory is in Warnings). The paymaster pushes it the payout with
+	// 100,000 gas and credits it when the push fails, charging
+	// CreditSurchargeWei beyond the cap; MinimumReceivedWei already
+	// deducts it, so it is the floor whether the push succeeds or not.
+	PayeeHasCode       bool   `json:"payee_has_code,omitempty"`
+	CreditSurchargeWei string `json:"credit_surcharge_wei,omitempty"`
+}
+
+// quoteID is a fresh 32-byte approval ID.
+func quoteID() (string, error) {
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(nonceBytes), nil
 }
 
 type addressQuoteContextKey struct{}
@@ -114,6 +162,9 @@ func (h *FundingHandler) quoteAddressDepositLocked(ctx context.Context, amount, 
 	}
 	if record.Phase == "active" || record.Phase == "legacy_recovery" || (record.Withdrawal != nil && record.Withdrawal.Phase != "complete") {
 		return quote, errors.New("recover the saved transaction or close the private note before quoting a deposit")
+	}
+	if record.Withdrawal.waitingPayout() {
+		return quote, errWithdrawalPayoutWaiting
 	}
 	retryHash := ""
 	if record.Pending != nil {
@@ -228,14 +279,29 @@ func (h *FundingHandler) ApproveAddressWithdrawal(ctx context.Context, id string
 		h.mu.Unlock()
 		return AddressWithdrawalStatus{}, err
 	}
-	quote, err := checkedAddressQuote(record, id, "withdrawal")
+	kind := "withdrawal"
+	if record.Quote != nil && transitKinds[record.Quote.Kind] {
+		kind = record.Quote.Kind
+	}
+	quote, err := checkedAddressQuote(record, id, kind)
 	h.mu.Unlock()
 	if err != nil {
 		return AddressWithdrawalStatus{}, err
 	}
 	// WithdrawAddress takes the same lock again and the signer rechecks this
 	// exact saved ID/binding before any signing; a competing quote fails closed.
-	return h.WithdrawAddress(context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote}), quote.Destination, quote.NoteID, quote.RetryHash)
+	ctx = context.WithValue(ctx, addressQuoteContextKey{}, &addressQuoteMode{Approval: quote})
+	options := withdrawalOptions(ctx)
+	switch kind {
+	case "transit_create", "transit_sweep":
+		options.Sweep = true
+	case "gasless_claim":
+		options.ClaimCredit = true
+	}
+	if quote.FeePolicy == "payout" && quote.UserOpKind == "forward" {
+		options.Collect = true
+	}
+	return h.WithdrawAddress(WithWithdrawalOptions(ctx, options), quote.Destination, quote.NoteID, quote.RetryHash)
 }
 func checkedAddressQuote(record *addressFundingRecord, id, kind string) (*AddressPaymentQuote, error) {
 	q := record.Quote
@@ -278,8 +344,8 @@ func positiveDifference(left, right *big.Int) *big.Int {
 	return n
 }
 func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to string, value, balance, estimate *big.Int, gas, nonce uint64, fees addressFees, retryHash string, warnings ...string) (AddressPaymentQuote, error) {
-	nonceBytes := make([]byte, 32)
-	if _, err := rand.Read(nonceBytes); err != nil {
+	id, err := quoteID()
+	if err != nil {
 		return AddressPaymentQuote{}, err
 	}
 	gasInt := new(big.Int).SetUint64(gas)
@@ -290,12 +356,12 @@ func (h *FundingHandler) savePaymentQuote(record *addressFundingRecord, kind, to
 	if recommended.BitLen() > 256 {
 		return AddressPaymentQuote{}, errAddressFeeData
 	}
-	q := AddressPaymentQuote{ID: hex.EncodeToString(nonceBytes), Kind: kind, Address: record.Address, ChainID: record.ChainID, Contract: record.Contract, DeploymentID: record.DeploymentID, Amount: record.Amount, PrincipalWei: value.String(), BalanceWei: balance.String(), ExpectedFeeWei: new(big.Int).Mul(estimate, fees.Expected).String(), RequiredFeeWei: required.String(), FeeReserveWei: reserve.String(), FeeBufferWei: new(big.Int).Sub(reserve, required).String(), RequiredTotalWei: total.String(), RecommendedTotalWei: recommended.String(), ShortfallWei: positiveDifference(total, balance).String(), RecommendedTopUpWei: positiveDifference(recommended, balance).String(), EstimatedGas: estimate.Uint64(), GasLimit: gas, MaxFeePerGas: fees.Max.String(), MaxPriorityFeePerGas: fees.Tip.String(), FeePolicy: "low", ExpiresAt: time.Now().Add(30 * time.Second).UnixMilli(), Commitment: record.Commitment, Nonce: nonce, RetryHash: retryHash}
+	q := AddressPaymentQuote{ID: id, Kind: kind, Address: record.Address, ChainID: record.ChainID, Contract: record.Contract, DeploymentID: record.DeploymentID, Amount: record.Amount, PrincipalWei: value.String(), BalanceWei: balance.String(), ExpectedFeeWei: new(big.Int).Mul(estimate, fees.Expected).String(), RequiredFeeWei: required.String(), FeeReserveWei: reserve.String(), FeeBufferWei: new(big.Int).Sub(reserve, required).String(), RequiredTotalWei: total.String(), RecommendedTotalWei: recommended.String(), ShortfallWei: positiveDifference(total, balance).String(), RecommendedTopUpWei: positiveDifference(recommended, balance).String(), EstimatedGas: estimate.Uint64(), GasLimit: gas, MaxFeePerGas: fees.Max.String(), MaxPriorityFeePerGas: fees.Tip.String(), FeePolicy: "low", ExpiresAt: time.Now().Add(30 * time.Second).UnixMilli(), Commitment: record.Commitment, Nonce: nonce, RetryHash: retryHash}
 	if kind == "deposit" {
 		q.InputMicroUSD = record.DepositMicroUSD
 	}
 	q.Warnings = warnings
-	if (kind == "withdrawal" || escapeKinds[kind]) && record.Withdrawal != nil {
+	if (kind == "withdrawal" || escapeKinds[kind] || transitKinds[kind]) && record.Withdrawal != nil {
 		q.NoteID = record.Withdrawal.NoteID
 		q.Amount = record.Withdrawal.Amount
 		q.Destination = record.Withdrawal.Destination
@@ -328,6 +394,15 @@ func validatePaymentApproval(record *addressFundingRecord, q *AddressPaymentQuot
 	}
 	if escapeKinds[kind] && (record.Withdrawal == nil || record.Withdrawal.Mode != "escape" || q.NoteID != record.Withdrawal.NoteID || q.Amount != record.Withdrawal.Amount || q.Binding != record.Withdrawal.Binding || !strings.EqualFold(q.Destination, record.Withdrawal.Destination) || !strings.EqualFold(to, record.Contract)) {
 		return errAddressQuoteChanged
+	}
+	if transitKinds[kind] {
+		w := record.Withdrawal
+		if w == nil || w.Transit == nil || q.NoteID != w.NoteID || !strings.EqualFold(q.Destination, w.Destination) {
+			return errAddressQuoteChanged
+		}
+		if expected, _ := transitTransactionData(kind, w); !strings.EqualFold(to, expected) {
+			return errAddressQuoteChanged
+		}
 	}
 	return nil
 }

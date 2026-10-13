@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/zkapi"
 )
 
 type configureAction func(context.Context, string, config.Config, string, setupPrompter, io.Writer) error
@@ -18,6 +19,7 @@ type configureAction func(context.Context, string, config.Config, string, setupP
 type configureOptions struct {
 	network, listen, relay, binary, proofs    string
 	exitRPC                                   string
+	bundlerURL, withdrawalFees                string
 	usd                                       string
 	keyReuseWindowSeconds                     int
 	status, apiKey, edit, menu, requireAPIKey bool
@@ -34,6 +36,8 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.StringVar(&o.binary, "zkapi-binary", "", "path to the installed zkAPI companion")
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
 	f.StringVar(&o.exitRPC, "exit-rpc-url", "", "your own Ethereum RPC for exits: deployment checks also use it and exit transactions are sent through it (HTTPS, or http:// to this machine; 'none' clears it)")
+	f.StringVar(&o.bundlerURL, "bundler-url", "", "your own ERC-4337 bundler for gasless withdrawals (--fees payout): HTTPS, or http:// to this machine; 'none' clears it and the deployment's published bundler is used")
+	f.StringVar(&o.withdrawalFees, "withdrawal-fees", "", "how withdrawals pay the network fee by default: wallet (the local signing address) or payout (a sponsored operation paid from the payout, no ETH needed)")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
 	f.BoolVar(&o.status, "status", false, "show saved configuration status without setup")
 	f.BoolVar(&o.apiKey, "api-key", false, "print the local inference API key explicitly")
@@ -72,6 +76,14 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	}
 	if o.fields["key-reuse-window-seconds"] && (o.keyReuseWindowSeconds < 0 || o.keyReuseWindowSeconds > config.MaxKeyReuseWindowSeconds) {
 		return o, errors.New("key-reuse-window-seconds must be between 0 and 300")
+	}
+	if o.fields["withdrawal-fees"] && o.withdrawalFees != "wallet" && o.withdrawalFees != "payout" {
+		return o, errors.New("withdrawal-fees must be wallet or payout")
+	}
+	if o.fields["bundler-url"] && o.bundlerURL != "none" {
+		if err := zkapi.ValidateBundlerURL(o.bundlerURL); err != nil {
+			return o, err
+		}
 	}
 	if o.usd != "" {
 		if _, err := parseFundingAmountForAsset(o.usd, 6, "USD"); err != nil {
@@ -264,6 +276,18 @@ func applyConfigureOptions(c config.Config, o configureOptions) config.Config {
 			c.ZKAPI.ExitRPCURL = ""
 		}
 	}
+	if o.fields["bundler-url"] {
+		c.ZKAPI.BundlerURL = o.bundlerURL
+		if o.bundlerURL == "none" {
+			c.ZKAPI.BundlerURL = ""
+		}
+	}
+	if o.fields["withdrawal-fees"] {
+		c.ZKAPI.WithdrawalFees = o.withdrawalFees
+		if o.withdrawalFees == "wallet" {
+			c.ZKAPI.WithdrawalFees = ""
+		}
+	}
 	return c
 }
 
@@ -277,6 +301,12 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	ui.Printf("Configuration: saved.\nzkAPI network: %s\nTransport: %s\n", c.ZKAPI.Network, transport)
 	if c.ZKAPI.ExitRPCURL != "" {
 		ui.Printf("Exit RPC: %s (deployment checks and exit transactions)\n", c.ZKAPI.ExitRPCURL)
+	}
+	if c.ZKAPI.BundlerURL != "" {
+		ui.Printf("Bundler: %s (gasless withdrawals)\n", c.ZKAPI.BundlerURL)
+	}
+	if c.ZKAPI.WithdrawalFees == "payout" {
+		ui.Printf("Withdrawal fees: paid from the payout by default (--fees payout)\n")
 	}
 	showClientConnection(c, ui)
 	if c.KeyReuseWindowSeconds == 0 {

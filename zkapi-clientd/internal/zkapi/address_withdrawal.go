@@ -63,6 +63,29 @@ type AddressWithdrawalStatus struct {
 	ChallengeDeadline       uint64 `json:"challenge_deadline,omitempty"`
 	ValidUntil              uint64 `json:"valid_until,omitempty"`
 	ConcessionExceededBound bool   `json:"concession_exceeded_bound,omitempty"`
+	// A gasless withdrawal (design 3.3): the fee is paid from the payout by a
+	// sponsored user operation from the transit account. UserOpHash is the
+	// operation in flight; TransactionHash its bundle transaction once
+	// known. The wei figures are the paymaster's Settled figures; a
+	// PaymasterCredited payout waits in the paymaster for
+	// withdraw --claim-credit; FundsWaitingInTransit marks a payout that
+	// reached the transit account and waits for --collect or --sweep.
+	FeePayer              string `json:"fee_payer,omitempty"`
+	TransitAccount        string `json:"transit_account,omitempty"`
+	UserOpHash            string `json:"user_op_hash,omitempty"`
+	ChargedWei            string `json:"charged_wei,omitempty"`
+	OwedPaidWei           string `json:"owed_paid_wei,omitempty"`
+	ReceivedWei           string `json:"received_wei,omitempty"`
+	InitiationDebtWei     string `json:"initiation_debt_wei,omitempty"`
+	FundsWaitingInTransit bool   `json:"funds_waiting_in_transit,omitempty"`
+	PaymasterCredited     bool   `json:"paymaster_credited,omitempty"`
+	PaymasterAddress      string `json:"paymaster_address,omitempty"`
+	GaslessRefusal        string `json:"gasless_refusal,omitempty"`
+	// PayeeHasCode: the payout address is a contract, and GaslessAdvisory
+	// design 3.1's advisory about it (shown before proving: the push may
+	// fail and the payout be credited).
+	PayeeHasCode    bool   `json:"payee_has_code,omitempty"`
+	GaslessAdvisory string `json:"gasless_advisory,omitempty"`
 }
 
 type addressWithdrawalRecord struct {
@@ -105,6 +128,79 @@ type addressWithdrawalRecord struct {
 	// finalization and payout, so the owner is told to check the payout
 	// through an independent source.
 	CompletedOnPinnedRPC bool `json:"completed_on_pinned_rpc,omitempty"`
+	// A gasless withdrawal (design 3.3). The proof binds the transit account
+	// S (ProofDestination), the vault log's destination word, while
+	// Destination stays the payout address Y for display and the command
+	// line. FeePayer is "payout" while the sponsored path carries the exit
+	// and "wallet" once the owner fell back to a wallet-paid call to S.
+	ProofDestination string          `json:"proof_destination,omitempty"`
+	FeePayer         string          `json:"fee_payer,omitempty"`
+	Transit          *addressTransit `json:"transit,omitempty"`
+	UserOp           *addressUserOp  `json:"user_op,omitempty"`
+	// The paymaster's Settled figures (wei) and an escape initiation's debt.
+	ChargedWei        string `json:"charged_wei,omitempty"`
+	OwedPaidWei       string `json:"owed_paid_wei,omitempty"`
+	ReceivedWei       string `json:"received_wei,omitempty"`
+	InitiationDebtWei string `json:"initiation_debt_wei,omitempty"`
+	// FundsWaitingInTransit marks a payout that sits in S (a replayed close,
+	// a third-party finalization, a wallet-paid call to S) until a sponsored
+	// FORWARD (--collect, CollectHashes) or a wallet-paid sweep (SweepHash).
+	FundsWaitingInTransit bool     `json:"funds_waiting_in_transit,omitempty"`
+	SweepHash             string   `json:"sweep_hash,omitempty"`
+	CollectHashes         []string `json:"collect_hashes,omitempty"`
+	// PaymasterCredited marks a PayoutCredited payout the paymaster holds
+	// (its push to Y failed), delivered by withdraw --claim-credit.
+	PaymasterCredited bool `json:"paymaster_credited,omitempty"`
+	// GaslessRefusal is why the gasless path stopped (phase gasless_refused).
+	GaslessRefusal string `json:"gasless_refusal,omitempty"`
+	// PayeeHasCode records that the payout address had code when the
+	// withdrawal was prepared (design 3.1's advisory).
+	PayeeHasCode bool `json:"payee_has_code,omitempty"`
+}
+
+// proofDestination is the address the proof and the vault's logs name: the
+// transit account of a gasless withdrawal, else the payout address.
+func (w *addressWithdrawalRecord) proofDestination() string {
+	if w.ProofDestination != "" {
+		return w.ProofDestination
+	}
+	return w.Destination
+}
+
+// transitClaimCalldata is paymaster.claimCredit(Y).
+func (w *addressWithdrawalRecord) transitClaimCalldata() string {
+	return "0x" + selectorClaimCredit + addressABIWord(strings.ToLower(w.Destination))
+}
+
+// setGaslessStatus copies a gasless withdrawal's public progress into the
+// status.
+func setGaslessStatus(status *AddressWithdrawalStatus, w *addressWithdrawalRecord) {
+	if w == nil || w.Transit == nil {
+		return
+	}
+	status.FeePayer, status.TransitAccount = w.FeePayer, w.Transit.Account
+	if w.FeePayer == "" {
+		status.FeePayer = "wallet"
+	}
+	if w.PayeeHasCode {
+		status.PayeeHasCode, status.GaslessAdvisory = true, gaslessPayeeAdvisory
+	}
+	if w.UserOp != nil {
+		status.UserOpHash = w.UserOp.shownHash()
+		// While an operation is in flight the transaction shown is its
+		// own bundle transaction (none until it is found), not the exit's.
+		if status.TransactionHash == "" || GaslessPendingPhase(w.Phase) {
+			status.TransactionHash = w.UserOp.TransactionHash
+		}
+	}
+	status.ChargedWei, status.OwedPaidWei, status.ReceivedWei, status.InitiationDebtWei = w.ChargedWei, w.OwedPaidWei, w.ReceivedWei, w.InitiationDebtWei
+	status.FundsWaitingInTransit, status.GaslessRefusal = w.FundsWaitingInTransit, w.GaslessRefusal
+	if w.Phase == "op_reverted" && w.UserOp != nil && status.GaslessRefusal == "" {
+		status.GaslessRefusal = w.UserOp.Revert
+	}
+	if w.PaymasterCredited {
+		status.PaymasterCredited, status.PaymasterAddress = true, w.Transit.Paymaster
+	}
 }
 
 type withdrawalWallet struct {
@@ -214,7 +310,7 @@ type EscapePayoutCredit struct {
 // credited escape payout stays in CreditedPayouts: the vault holds it for
 // the destination until claimEscapePayout(destination) delivers it.
 func retireWithdrawal(record *addressFundingRecord) {
-	if w := record.Withdrawal; w != nil && w.Phase == "complete" && w.PayoutCredited {
+	if w := record.Withdrawal; w != nil && w.Phase == "complete" && w.PayoutCredited && !w.PaymasterCredited {
 		listed := false
 		for _, credit := range record.CreditedPayouts {
 			listed = listed || strings.EqualFold(credit.SettlementHash, w.SettlementHash)
@@ -409,6 +505,7 @@ func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (
 			status.TransactionHash = withdrawal.SettlementHash
 		}
 		setEscapePayoutCredit(&status, withdrawal, config)
+		setGaslessStatus(&status, withdrawal)
 		if *wallet.HasNote && wallet.Note.NoteID != withdrawal.NoteID {
 			status.Phase = "recovery_required"
 		}
@@ -430,6 +527,9 @@ func (h *FundingHandler) withdrawalSnapshotFor(ctx context.Context, exit bool) (
 }
 
 func setEscapeMessage(status *AddressWithdrawalStatus) {
+	if setGaslessMessage(status) {
+		return
+	}
 	if status.Phase == "complete" && status.PayoutCredited {
 		status.Message = fmt.Sprintf("The escape finalized and closed the note, but the vault could not deliver the payout to %[1]s and holds it as an escape payout credit. Once %[1]s accepts a plain ETH transfer, deliver it with zkapi-clientd withdraw --claim --to %[1]s (claimEscapePayout, selector 0x%[2]s, on the vault %[3]s; data %[4]s).", status.Destination, claimEscapePayoutSelector, status.VaultAddress, status.ClaimCalldata)
 		return
@@ -478,6 +578,11 @@ func setEscapePayoutCredit(status *AddressWithdrawalStatus, w *addressWithdrawal
 		return
 	}
 	status.PayoutCredited = true
+	if w.PaymasterCredited && w.Transit != nil {
+		status.PaymasterCredited, status.PaymasterAddress = true, w.Transit.Paymaster
+		status.ClaimCalldata = w.transitClaimCalldata()
+		return
+	}
 	status.VaultAddress = common.HexToAddress(config.Contract).Hex()
 	status.ClaimCalldata = "0x" + claimEscapePayoutSelector + addressABIWord(strings.ToLower(w.Destination))
 }
@@ -485,6 +590,9 @@ func setEscapePayoutCredit(status *AddressWithdrawalStatus, w *addressWithdrawal
 func setWithdrawalMessage(status *AddressWithdrawalStatus) {
 	if status.Mode == "escape" {
 		setEscapeMessage(status)
+		return
+	}
+	if setGaslessMessage(status) {
 		return
 	}
 	if status.Phase == "complete" && status.PayoutCredited {
@@ -513,6 +621,60 @@ func setWithdrawalMessage(status *AddressWithdrawalStatus) {
 	default:
 		status.Message = "Withdrawal recovery is required. Preserve the local payment and private-note files."
 	}
+}
+
+// setGaslessMessage writes the status message of a gasless withdrawal's
+// phases (for a mutual close and an escape alike) and of a complete one
+// whose payout waits in the transit account or in the paymaster; false when
+// the phase is not a gasless one.
+func setGaslessMessage(status *AddressWithdrawalStatus) bool {
+	if status.TransitAccount == "" {
+		return false
+	}
+	escape := status.Mode == "escape"
+	command := "zkapi-clientd withdraw --to " + status.Destination
+	if escape {
+		command = "zkapi-clientd withdraw --escape --to " + status.Destination
+	}
+	switch status.Phase {
+	case "op_built", "finalize_op_built", "forward_op_built":
+		status.Message = fmt.Sprintf("The sponsored operation (%s) is signed and saved and is being sent to the bundler; the network fee is paid from the payout, not by the local signing address. Resume with %s.", status.UserOpHash, command)
+	case "op_submitted", "finalize_op_submitted", "forward_op_submitted":
+		status.Message = fmt.Sprintf("The sponsored operation (%s) was sent to the bundler and awaits inclusion and Ethereum finality; new inference is paused. Resume with %s.", status.UserOpHash, command)
+		if status.TransactionHash != "" {
+			status.Message = fmt.Sprintf("The sponsored operation (%s) is in transaction %s and awaits Ethereum finality. Resume with %s.", status.UserOpHash, status.TransactionHash, command)
+		}
+	case "op_reverted":
+		status.Message = fmt.Sprintf("The sponsored operation (%s) was included in %s but reverted (%s). If another transaction closed the note first, the payout sits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address). Otherwise rerun %s to prove again.", status.UserOpHash, status.TransactionHash, status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination, command)
+	case "gasless_refused":
+		status.Message = fmt.Sprintf("The gasless path stopped: %s. Rerun %s to try again, or add --fees wallet to pay the fee from the local signing address; the payout then reaches the transit account %s and zkapi-clientd withdraw --sweep --to %s delivers it.", status.GaslessRefusal, command, status.TransitAccount, status.Destination)
+		if status.FundsWaitingInTransit {
+			status.Message = fmt.Sprintf("The gasless path stopped: %s. The payout waits in the transit account %s: deliver it with zkapi-clientd withdraw --collect --to %s (sponsored) or --sweep --to %s (paid by the local signing address).", status.GaslessRefusal, status.TransitAccount, status.Destination, status.Destination)
+		}
+	case "complete":
+		switch {
+		case status.PaymasterCredited:
+			status.Message = fmt.Sprintf("The sponsored withdrawal closed the note, but the payout could not be pushed to %[1]s (it rejected the ETH or needed more than 100,000 gas), so the paymaster %[2]s holds it as a credit; nothing has arrived at %[1]s yet. Once %[1]s accepts a plain ETH transfer, anyone can deliver it with zkapi-clientd withdraw --claim-credit --to %[1]s (claimCredit(%[1]s) on the paymaster; data %[3]s).", status.Destination, status.PaymasterAddress, status.ClaimCalldata)
+		case status.FundsWaitingInTransit:
+			status.Message = fmt.Sprintf("The private note is closed, and the payout waits in the transit account %s. Deliver it to %s with zkapi-clientd withdraw --collect --to %s (a sponsored operation; the fee is taken from the payout) or zkapi-clientd withdraw --sweep --to %s (paid by the local signing address).", status.TransitAccount, status.Destination, status.Destination, status.Destination)
+			if status.GaslessRefusal != "" {
+				status.Message = fmt.Sprintf("The sponsored forward stopped: %s. ", status.GaslessRefusal) + status.Message
+			}
+		case status.ReceivedWei != "":
+			status.Message = fmt.Sprintf("The private note is closed; %s received %s wei after a sponsored network fee of %s wei (and %s wei of earlier debt).", status.Destination, status.ReceivedWei, status.ChargedWei, status.OwedPaidWei)
+			if escape {
+				status.Message = fmt.Sprintf("The escape finalized and closed the note; %s received %s wei after a sponsored network fee of %s wei (and %s wei of earlier debt).", status.Destination, status.ReceivedWei, status.ChargedWei, status.OwedPaidWei)
+			}
+			if status.ConcessionExceededBound {
+				status.Message += " concession_exceeded_bound: the payout is below the state balance less the state's bound."
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string, noteID uint64, retryHashes ...string) (AddressWithdrawalStatus, error) {
@@ -546,6 +708,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		return status, errors.New("the selected private note has changed; run a new withdrawal command to authorize the current balance")
 	}
 	update := func() AddressWithdrawalStatus {
+		if w := record.Withdrawal; w != nil && w.Mode == "escape" {
+			return escapeStatus(status, record, config)
+		}
 		if w := record.Withdrawal; w != nil {
 			status.NoteID, status.Amount, status.Destination = w.NoteID, w.Amount, w.Destination
 			status.Phase, status.TransactionHash = w.Phase, w.TransactionHash
@@ -558,6 +723,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			}
 		}
 		setEscapePayoutCredit(&status, record.Withdrawal, config)
+		setGaslessStatus(&status, record.Withdrawal)
 		if record.Withdrawal != nil && record.Pending == nil {
 			for _, entry := range record.History {
 				if strings.EqualFold(entry.Hash, record.Withdrawal.TransactionHash) {
@@ -571,15 +737,18 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	if status.Phase == "recovery_required" {
 		return status, errors.New("the saved withdrawal does not match the active note; preserve recovery files")
 	}
+	options := withdrawalOptions(ctx)
+	transitAction := options.Collect || options.Sweep || options.ClaimCredit
 	capabilityChecked := false
 	if record.Withdrawal != nil {
 		if !strings.EqualFold(record.Withdrawal.Destination, destination) {
 			return status, errors.New("a withdrawal destination is already saved; resume with that same destination")
 		}
-		if record.Withdrawal.Phase == "complete" {
+		if record.Withdrawal.Phase == "complete" && !transitAction && (record.Pending == nil || !transitKinds[record.Pending.Kind]) {
 			return status, nil
 		}
-		if record.Withdrawal.Mode == "escape" {
+		forwardInFlight := record.Withdrawal.UserOp != nil && record.Withdrawal.UserOp.Kind == "forward" && (record.Withdrawal.Phase == "forward_op_built" || record.Withdrawal.Phase == "forward_op_submitted")
+		if record.Withdrawal.Mode == "escape" && !transitAction && !forwardInFlight && (record.Pending == nil || !transitKinds[record.Pending.Kind]) {
 			return status, errors.New("an escape of this note is under way; follow it with zkapi-clientd withdraw --escape --to " + record.Withdrawal.Destination)
 		}
 	} else {
@@ -595,10 +764,33 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		if record.Pending != nil && (record.Pending.Kind != "deposit" || record.Phase != "active") {
 			return status, errors.New("finish the saved deposit before withdrawing")
 		}
+		if transitAction {
+			return status, errors.New("there is no saved gasless withdrawal with a transit account to collect, sweep or claim from")
+		}
 		if err := h.requireClearanceOwnershipCapability(ctx); err != nil {
 			return status, err
 		}
 		capabilityChecked = true
+		// Design 3.3: with --fees payout the proof will bind a transit
+		// account, so the gasless pre-flight (the pins, the bundler, the
+		// paymaster's policy and the fee against the current balance) runs
+		// before anything is reserved; a refusal leaves nothing saved.
+		var transit *addressTransit
+		proofDestination := ""
+		payeeHasCode := false
+		if options.Fees == "payout" {
+			if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindClose, wallet.Note.Balance, destination); err != nil {
+				return status, err
+			}
+			profile, _, err := h.gaslessProfile()
+			if err != nil {
+				return status, err
+			}
+			if transit, err = h.newTransit(ctx, config, profile, destination); err != nil {
+				return status, err
+			}
+			proofDestination = transit.Account
+		}
 		// One atomic save transfers the finalized deposit into nonce history
 		// and records intent, before asking the companion to reserve clearance.
 		if record.Pending != nil {
@@ -606,12 +798,111 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			record.Pending = nil
 		}
 		record.Withdrawal = &addressWithdrawalRecord{NoteID: wallet.Note.NoteID, Destination: destination, Phase: "quoted"}
+		if transit != nil {
+			record.Withdrawal.FeePayer, record.Withdrawal.ProofDestination, record.Withdrawal.Transit = "payout", proofDestination, transit
+			record.Withdrawal.PayeeHasCode = payeeHasCode
+			record.Withdrawal.StartBlock = h.latestBlock(ctx, config.exitConfig())
+		}
 		record.Phase = "withdrawal_pending"
 		if err := h.saveAddress(record); err != nil {
 			return update(), err
 		}
 	}
 	w := record.Withdrawal
+	// The fee mode of a saved gasless withdrawal: --fees wallet falls back to
+	// a wallet-paid call bound to the transit account (then --sweep delivers
+	// the payout) while no operation is in flight; --fees payout cannot be
+	// added to a reservation made for the payout address.
+	if w.Transit != nil && options.Fees == "wallet" && w.FeePayer == "payout" {
+		switch w.Phase {
+		case "quoted", "waiting_settlement", "gasless_refused", "op_reverted":
+			// A dropped operation the bundler included after all closed the
+			// note: it is followed, never replaced by a wallet-paid close
+			// (which would revert and pay gas) nor forgotten.
+			if late, err := h.lateGaslessOperation(ctx, config, record); err != nil {
+				return update(), err
+			} else if late {
+				return h.resumeGaslessClose(ctx, config, record, update)
+			}
+			// The bundle transaction of a reverted operation is not this
+			// wallet-paid close's: the record starts clean, as a retry does.
+			w.FeePayer, w.UserOp, w.GaslessRefusal, w.TransactionHash = "wallet", nil, "", ""
+			w.Phase = "quoted"
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+		default:
+			return update(), errors.New("a sponsored operation is in flight; resume it before changing how the fee is paid")
+		}
+	}
+	// The reverse: --fees payout on a close the owner fell back to paying
+	// from the wallet, while nothing is signed. The sponsored path takes the
+	// close over again after its pre-flight.
+	if w.Transit != nil && options.Fees == "payout" && w.FeePayer == "wallet" && w.Phase != "complete" && !transitAction {
+		if record.Pending != nil {
+			return update(), errors.New("a wallet-paid transaction is pending; follow it before changing how the fee is paid")
+		}
+		switch w.Phase {
+		case "quoted", "waiting_funds", "waiting_settlement":
+			if _, _, err := h.gaslessPreflight(ctx, config, options, gaslessKindClose); err != nil {
+				return update(), err
+			}
+			w.FeePayer, w.Phase = "payout", "quoted"
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+		default:
+			return update(), errors.New("the wallet-paid close is under way; follow it with --fees wallet")
+		}
+	}
+	if w.Transit == nil && options.Fees == "payout" && w.Phase != "complete" {
+		return update(), errors.New("this withdrawal is reserved for the payout address with a wallet-paid fee; finish it with --fees wallet (a gasless withdrawal needs a fresh reservation)")
+	}
+	if transitAction {
+		return h.transitAction(ctx, config, record, options, update)
+	}
+	if record.Pending != nil && transitKinds[record.Pending.Kind] {
+		if err := h.followTransitTransaction(ctx, config, record); err != nil {
+			return update(), err
+		}
+		return update(), nil
+	}
+	if w.Phase == "complete" {
+		return update(), nil
+	}
+	// An operation in flight is followed whatever pays the fee now: a
+	// forward of the transit account's balance is sponsored after a
+	// wallet-paid close bound to it as well.
+	if w.UserOp != nil {
+		switch w.Phase {
+		case "op_built", "op_submitted", "withdrawal_pending", "confirming":
+			if mode := quoteMode(ctx); mode != nil && mode.Capture != nil {
+				return update(), errors.New("recover the sponsored operation before requesting a new quote")
+			}
+			return h.resumeGaslessClose(ctx, config, record, update)
+		case "forward_op_built", "forward_op_submitted":
+			return h.resumeForward(ctx, config, record, update)
+		case "op_reverted":
+			// Like a reverted transaction, a reverted operation is proved
+			// again only when the command names its hash.
+			if retryHash == "" || (!strings.EqualFold(retryHash, w.UserOp.Hash) && !strings.EqualFold(retryHash, w.UserOp.IncludedHash)) {
+				return update(), nil
+			}
+			retryHash = ""
+			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
+		case "gasless_refused":
+			// A dropped operation the bundler included after all is
+			// followed; otherwise the close is proved again.
+			if late, err := h.lateUserOperation(ctx, config, record); err != nil {
+				return update(), err
+			} else if late {
+				return h.resumeGaslessClose(ctx, config, record, update)
+			}
+			w.UserOp, w.Phase, w.TransactionHash, w.GaslessRefusal = nil, "quoted", "", ""
+		}
+	} else if w.Transit != nil && w.Phase == "gasless_refused" {
+		w.Phase, w.GaslessRefusal = "quoted", ""
+	}
 	// Payout evidence comes from the pinned RPC. The vault and indexer must
 	// also show the note closed before the companion deletes its state; while
 	// they do not, a saved withdrawal keeps polling and an explicit alternate
@@ -737,7 +1028,7 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 			return update(), err
 		}
 	}
-	prepare := map[string]any{"destination": destination}
+	prepare := map[string]any{"destination": w.proofDestination()}
 	if mode := quoteMode(ctx); mode != nil && mode.AcceptUnsettledRequestRisk {
 		if err := h.requireUnsettledRequestOverride(ctx); err != nil {
 			return update(), err
@@ -786,6 +1077,22 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 	}
 	if err := h.saveAddress(record); err != nil {
 		return update(), err
+	}
+	if w.FeePayer == "payout" {
+		// Design 3.3: the sponsored operation replaces the wallet-paid
+		// transaction; a refusal of the gasless path is journaled with its
+		// reason, and the wallet path stays available.
+		vaultCall, _ := hex.DecodeString(data[2:])
+		if err := h.submitUserOperation(ctx, config, record, gaslessKindClose, vaultCall); err != nil {
+			if code := GaslessRefusalCode(err); code != "" {
+				w.Phase, w.GaslessRefusal = "gasless_refused", err.Error()
+				if saveErr := h.saveAddress(record); saveErr != nil {
+					return update(), saveErr
+				}
+			}
+			return update(), err
+		}
+		return update(), nil
 	}
 	if mode := quoteMode(ctx); mode != nil && mode.Capture != nil && retrying != nil {
 		// Keep the finalized failed transaction in the durable journal while
@@ -851,6 +1158,9 @@ func (h *FundingHandler) completeAddressWithdrawal(ctx context.Context, config f
 		return errors.New("invalid withdrawal confirmation; preserve the saved transaction")
 	}
 	w.PayoutCredited = localReverted && (w.PayoutCredited || confirmed.EscapePayoutCredited)
+	// A payout to the transit account (a wallet-paid call bound to S after a
+	// gasless prepare) waits there for --collect or --sweep.
+	w.FundsWaitingInTransit = w.ProofDestination != "" && !w.PayoutCredited
 	if err := h.archiveWithdrawnDeposit(config, record); err != nil {
 		return err
 	}
@@ -864,7 +1174,7 @@ func (h *FundingHandler) completeAddressWithdrawal(ctx context.Context, config f
 
 func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithdrawalRecord) bool {
 	amount, ok := new(big.Int).SetString(status.FinalBalance, 10)
-	return ok && amount.IsUint64() && amount.Uint64() == record.Amount && status.NoteID == record.NoteID && strings.EqualFold(status.Destination, record.Destination) && isField(status.Nullifier) && strings.EqualFold(addressABIWord(status.Nullifier), addressABIWord(record.Nullifier))
+	return ok && amount.IsUint64() && amount.Uint64() == record.Amount && status.NoteID == record.NoteID && strings.EqualFold(status.Destination, record.proofDestination()) && isField(status.Nullifier) && strings.EqualFold(addressABIWord(status.Nullifier), addressABIWord(record.Nullifier))
 }
 
 // withdrawalCalldata builds mutualClose calldata from the companion's plan
@@ -873,10 +1183,10 @@ func withdrawalStatusMatches(status withdrawalBridgeStatus, record *addressWithd
 func withdrawalCalldata(plan withdrawalPlan, config fundingConfig, saved *addressWithdrawalRecord, previousBalance uint64, now time.Time) (string, string, error) {
 	p := plan.PublicInputs
 	invalid := errors.New("withdrawal proof does not match the authorized note, destination, balance, or deployment")
-	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.Destination) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
+	if plan.Mode != "mutual" || p.Kind != 1 || p.Conceded != 0 || !isField(p.NextNullifier) || addressABIWord(p.NextNullifier) != strings.Repeat("0", 64) || p.ProtocolVersion != 2 || p.ChainID != config.ChainID || !isField(p.Contract) || !strings.EqualFold(addressABIWord(p.Contract), addressABIWord(config.Contract)) || p.NoteID != saved.NoteID || p.NoteID > 0xffffffff || len(p.Destination) != 20 || !strings.EqualFold(common.BytesToAddress(p.Destination).Hex(), saved.proofDestination()) || p.FinalBalance > previousBalance || plan.Proof.Backend != "groth16_bn254" {
 		return "", "", invalid
 	}
-	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.Destination)
+	words, proof, err := withdrawalWords(p, plan.Proof.Proof, saved.proofDestination())
 	if err != nil {
 		return "", "", invalid
 	}
@@ -952,7 +1262,7 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 			// Whatever amount it names, a deferral for this note and
 			// destination means the destination was not paid. Only an
 			// escape, and so only a relayed payout, can be credited.
-			if len(log.Topics) == 3 && strings.EqualFold(log.Topics[0], escapePayoutDeferredEventTopic) && strings.EqualFold(log.Topics[1], noteTopic) && strings.EqualFold(log.Topics[2], "0x"+addressABIWord(saved.Destination)) {
+			if len(log.Topics) == 3 && strings.EqualFold(log.Topics[0], escapePayoutDeferredEventTopic) && strings.EqualFold(log.Topics[1], noteTopic) && strings.EqualFold(log.Topics[2], "0x"+addressABIWord(saved.proofDestination())) {
 				credited = relayed
 				continue
 			}
@@ -962,7 +1272,7 @@ func validateWithdrawalReceipt(receipt *addressReceipt, config fundingConfig, sa
 				continue
 			}
 			data := strings.TrimPrefix(log.Data, "0x")
-			if !strings.EqualFold(data[:64], addressABIWord(saved.Nullifier)) || !strings.EqualFold(data[128:], addressABIWord(saved.Destination)) {
+			if !strings.EqualFold(data[:64], addressABIWord(saved.Nullifier)) || !strings.EqualFold(data[128:], addressABIWord(saved.proofDestination())) {
 				continue
 			}
 			amount, ok := new(big.Int).SetString(data[64:128], 16)
@@ -1051,7 +1361,7 @@ func validateSignedWithdrawal(data []byte, config fundingConfig, saved *addressW
 		words[i] = hex.EncodeToString(data[4+i*32 : 4+(i+1)*32])
 	}
 	zero := strings.Repeat("0", 64)
-	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.Destination), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
+	expected := map[int]string{0: fmt.Sprintf("%064x", 2), 1: fmt.Sprintf("%064x", config.ChainID), 2: addressABIWord(config.Contract), 8: fmt.Sprintf("%064x", saved.NoteID), 9: fmt.Sprintf("%064x", saved.Amount), 10: addressABIWord(saved.proofDestination()), 11: addressABIWord(saved.Nullifier), 12: fmt.Sprintf("%064x", 1), 13: zero, 14: zero, 16: fmt.Sprintf("%064x", 17*32), 17: fmt.Sprintf("%064x", 256)}
 	for index, value := range expected {
 		if !strings.EqualFold(words[index], value) {
 			return invalid
@@ -1123,7 +1433,21 @@ func (h *FundingHandler) checkWithdrawalFunding(config fundingConfig) error {
 	if record.Withdrawal != nil && record.Withdrawal.Phase != "complete" {
 		return errors.New("finish the saved withdrawal before funding a new private balance")
 	}
+	if record.Withdrawal != nil && record.Withdrawal.waitingPayout() {
+		return errWithdrawalPayoutWaiting
+	}
 	return nil
+}
+
+// errWithdrawalPayoutWaiting refuses a new deposit while a gasless
+// withdrawal's payout waits in the transit account or the paymaster: a new
+// deposit retires the record, with the transit account and its key.
+var errWithdrawalPayoutWaiting = errors.New("deliver the completed withdrawal's payout first (zkapi-clientd withdraw --collect, --sweep or --claim-credit with its destination) before funding a new private balance")
+
+// waitingPayout reports a complete gasless withdrawal whose payout has not
+// reached the payout address yet.
+func (w *addressWithdrawalRecord) waitingPayout() bool {
+	return w != nil && w.Phase == "complete" && w.Transit != nil && (w.FundsWaitingInTransit || w.PaymasterCredited)
 }
 
 // Called only by deposit confirmation after the exact new note's receipt and

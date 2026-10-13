@@ -41,6 +41,9 @@ type Config struct {
 	// ExitRPCURL is the user's own Ethereum RPC (--exit-rpc-url): deployment
 	// checks also run through it, and exit transactions are sent through it.
 	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
+	// BundlerURL is the user's ERC-4337 bundler for gasless withdrawals
+	// (--bundler-url / zkapi.bundler_url); empty uses the profile's.
+	BundlerURL string `json:"bundler_url,omitempty"`
 }
 
 type Client struct {

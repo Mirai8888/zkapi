@@ -162,7 +162,7 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, ExitRPCURL: c.ZKAPI.ExitRPCURL}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
 }
 
 type zkInference struct{ *zkapi.Client }

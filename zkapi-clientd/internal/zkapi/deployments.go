@@ -106,6 +106,9 @@ type deploymentIdentity struct {
 	StateSigningKey  *curvePoint        `json:"state_signing_key"`
 	ClearanceSigning *curvePoint        `json:"clearance_signing_key"`
 	Evidence         deploymentEvidence `json:"deployment_evidence"`
+	// Gasless is the deployment's gasless withdrawal paymaster (design 4.3);
+	// nil (absent or null) hides --fees payout and changes nothing else.
+	Gasless *gaslessProfile `json:"gasless"`
 	deploymentCapabilities
 	Proof   proofSetupIdentity `json:"proof_setup"`
 	Privacy struct {
@@ -125,6 +128,12 @@ type deploymentEvidence struct {
 	VaultCode    string `json:"vault_runtime_keccak256"`
 	AdapterCode  string `json:"adapter_runtime_keccak256"`
 	PoseidonCode string `json:"poseidon_runtime_keccak256"`
+	// The gasless contracts' pins (design 4.3), checked before a gasless
+	// withdrawal only; absent for a deployment without the paymaster.
+	EntryPointCode    string `json:"entry_point_runtime_keccak256,omitempty"`
+	SenderCreatorCode string `json:"sender_creator_runtime_keccak256,omitempty"`
+	PaymasterCode     string `json:"paymaster_runtime_keccak256,omitempty"`
+	FactoryCode       string `json:"factory_runtime_keccak256,omitempty"`
 }
 
 // deployed reports whether this is a deployed vault rather than a placeholder.

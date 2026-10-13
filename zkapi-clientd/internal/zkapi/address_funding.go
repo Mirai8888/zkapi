@@ -123,14 +123,15 @@ func (h *FundingHandler) addressSnapshotFor(ctx context.Context, exit bool) (fun
 	return config, record, status, nil
 }
 
-// escapeSaved reports whether the saved withdrawal is an escape. It reads
-// the payment record only when one exists, and creates nothing.
+// escapeSaved reports whether the saved withdrawal is an escape, or a
+// gasless withdrawal (whose reads prefer the exit RPC too, design 3.1). It
+// reads the payment record only when one exists, and creates nothing.
 func (h *FundingHandler) escapeSaved(config fundingConfig) bool {
 	if _, err := os.Lstat(h.addressStatePath()); err != nil {
 		return false
 	}
 	record, err := h.loadAddress(config)
-	return err == nil && record.Withdrawal != nil && record.Withdrawal.Mode == "escape"
+	return err == nil && record.Withdrawal != nil && (record.Withdrawal.Mode == "escape" || record.Withdrawal.Transit != nil)
 }
 
 func (h *FundingHandler) addressHasNote(ctx context.Context) (bool, error) {
@@ -262,6 +263,9 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 	}
 	if record.Withdrawal != nil && record.Withdrawal.Phase != "complete" {
 		return update(), errors.New("a withdrawal is saved; finish it with the same destination before funding again")
+	}
+	if record.Withdrawal.waitingPayout() {
+		return update(), errWithdrawalPayoutWaiting
 	}
 	if record.Phase == "active" {
 		hasNote, err := h.addressHasNote(ctx)
@@ -661,59 +665,80 @@ var errExitRPCUnavailable = errors.New("the exit RPC (--exit-rpc-url) did not an
 // that did not answer (exitConfig).
 var exitRPCRetryDelays = []time.Duration{time.Second, 3 * time.Second}
 
+var errAddressRPCResponse = errors.New("invalid payment RPC response; retry the saved funding attempt")
+
 func (h *FundingHandler) addressRPC(ctx context.Context, config fundingConfig, method string, params []any, result any) error {
+	raw, refused, err := h.addressRPCRaw(ctx, config, method, params)
+	if err != nil {
+		return err
+	}
+	// An RPC's refusal (a JSON-RPC error) is never reflected to callers: it
+	// may carry request bodies or signed bytes. The gasless dry run reads
+	// it through addressRPCRaw.
+	if refused != nil || len(raw) == 0 || json.Unmarshal(raw, result) != nil {
+		return errAddressRPCResponse
+	}
+	return nil
+}
+
+// addressRPCRaw is addressRPC with the answer unparsed: the result, or the
+// JSON-RPC error the node answered (which is final, never retried).
+func (h *FundingHandler) addressRPCRaw(ctx context.Context, config fundingConfig, method string, params []any) (json.RawMessage, *rpcError, error) {
 	if !config.exitOnly {
-		return h.addressRPCAt(ctx, config.RPC, method, params, result)
+		return h.addressRPCAt(ctx, config.RPC, method, params)
 	}
 	// An escape through the owner's exit RPC: a call it did not answer is
 	// retried there, never asked of the pinned RPC (exitConfig). An answer
 	// it refused (a JSON-RPC error) is final, as for any RPC.
 	for attempt := 0; ; attempt++ {
-		err := h.addressRPCAt(ctx, config.RPC, method, params, result)
+		raw, refused, err := h.addressRPCAt(ctx, config.RPC, method, params)
 		if !errors.Is(err, errAddressRPCUnavailable) {
-			return err
+			return raw, refused, err
 		}
 		if attempt == len(exitRPCRetryDelays) {
-			return errExitRPCUnavailable
+			return nil, nil, errExitRPCUnavailable
 		}
 		select {
 		case <-ctx.Done():
-			return errExitRPCUnavailable
+			return nil, nil, errExitRPCUnavailable
 		case <-time.After(exitRPCRetryDelays[attempt]):
 		}
 	}
 }
 
-func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, params []any, result any) error {
+func (h *FundingHandler) addressRPCAt(ctx context.Context, url, method string, params []any) (json.RawMessage, *rpcError, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return errors.New("invalid payment RPC request")
+		return nil, nil, errors.New("invalid payment RPC request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// This uses the configured direct/Wisp client. Never use http.DefaultClient
 	// and never reflect RPC errors, request bodies, or signed bytes to callers.
 	response, err := h.client.inference.Do(req)
 	if err != nil {
-		return errAddressRPCUnavailable
+		return nil, nil, errAddressRPCUnavailable
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil || len(raw) > 1<<20 || response.StatusCode != http.StatusOK {
-		return errAddressRPCUnavailable
+		return nil, nil, errAddressRPCUnavailable
 	}
 	var envelope struct {
 		Version string          `json:"jsonrpc"`
 		ID      int             `json:"id"`
 		Result  json.RawMessage `json:"result"`
-		Error   json.RawMessage `json:"error"`
+		Error   *rpcError       `json:"error"`
 	}
-	if json.Unmarshal(raw, &envelope) != nil || envelope.Version != "2.0" || envelope.ID != 1 || len(envelope.Error) != 0 || len(envelope.Result) == 0 || json.Unmarshal(envelope.Result, result) != nil {
-		return errors.New("invalid payment RPC response; retry the saved funding attempt")
+	if json.Unmarshal(raw, &envelope) != nil || envelope.Version != "2.0" || envelope.ID != 1 {
+		return nil, nil, errAddressRPCResponse
 	}
-	return nil
+	if envelope.Error != nil {
+		return nil, envelope.Error, nil
+	}
+	return envelope.Result, nil, nil
 }
 
 func (h *FundingHandler) addressQuantity(ctx context.Context, config fundingConfig, method string, params []any) (*big.Int, error) {
@@ -1016,6 +1041,14 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 		record.Return.Phase = "return_pending"
 		record.Return.TransactionHash = signed.Hash().Hex()
 	}
+	if transitKinds[kind] {
+		// The note is closed already; the transaction only moves the
+		// payout out of the transit account or the paymaster.
+		if record.Withdrawal == nil || record.Withdrawal.Transit == nil {
+			return errors.New("transit intent is missing; no transaction was sent")
+		}
+		record.Phase = "ready"
+	}
 	// From this point every retry uses these exact bytes, even if a broadcast
 	// fails or the daemon crashes before the RPC responds.
 	if err := h.saveAddress(record); err != nil {
@@ -1027,7 +1060,7 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 
 func (h *FundingHandler) broadcastAddress(ctx context.Context, config fundingConfig, tx *addressTransaction) {
 	// Design §6.7: exits are sent through the owner's exit RPC when set.
-	if escapeKinds[tx.Kind] {
+	if escapeKinds[tx.Kind] || transitKinds[tx.Kind] {
 		config = config.exitConfig()
 	}
 	if h.assertAddressChain(ctx, config) != nil {

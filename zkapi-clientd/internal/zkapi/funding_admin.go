@@ -31,6 +31,15 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		result, err = h.AddressWithdrawal(ctx)
 	case r.Method == http.MethodGet && r.URL.Path == "/admin/escape":
 		result, err = h.AddressWithdrawal(ctx)
+	case r.URL.Path == "/admin/withdrawal/gasless":
+		// Design 3.1: the gasless pre-flight, with the request's bundler.
+		var body withdrawalRequestOptions
+		if r.Method == http.MethodPost {
+			err = decode(&body)
+		}
+		if err == nil {
+			result, err = h.GaslessAvailability(WithWithdrawalOptions(ctx, body.options()))
+		}
 	case r.Method == http.MethodPost && (r.URL.Path == "/admin/escape" || r.URL.Path == "/admin/escape/quote"):
 		// Design §6.4 E4: conceded is the amount the owner confirmed after
 		// reviewing the decision; without it only the decision is returned.
@@ -39,8 +48,10 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 			NoteID      *uint64 `json:"note_id"`
 			Conceded    *uint64 `json:"conceded,omitempty"`
 			EarlyExit   string  `json:"early_exit,omitempty"`
+			withdrawalRequestOptions
 		}
 		if err = decode(&body); err == nil {
+			ctx = WithWithdrawalOptions(ctx, body.options())
 			if body.NoteID == nil {
 				err = errors.New("an escape requires the selected private note ID")
 			} else if r.URL.Path == "/admin/escape/quote" {
@@ -123,8 +134,10 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 			RetryTransactionHash        string  `json:"retry_transaction_hash,omitempty"`
 			ConfirmationTransactionHash string  `json:"confirmation_transaction_hash,omitempty"`
 			AcceptUnsettledRequestRisk  bool    `json:"accept_unsettled_request_risk,omitempty"`
+			withdrawalRequestOptions
 		}
 		if err = decode(&body); err == nil {
+			ctx = WithWithdrawalOptions(ctx, body.options())
 			if body.NoteID == nil {
 				err = errors.New("withdrawal requires the selected private note ID")
 			} else if r.URL.Path == "/admin/withdrawal/quote" {
@@ -197,8 +210,29 @@ func (h *FundingHandler) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) 
 		if errors.As(err, &companion) && (companion.Code == "unsettled_request_state" || companion.Code == "unsettled_clearance_reserved" || companion.Code == "receipt_journal_missing" || companion.Code == "ownership_proof_sent" || companion.Code == "escape_required" || companion.Code == "device_not_newest" || companion.Code == "conceded_mismatch") {
 			failure["code"] = companion.Code
 		}
+		// A gasless refusal names its reason so a guided flow can offer the
+		// wallet-paid path.
+		if code := GaslessRefusalCode(err); code != "" {
+			failure["code"] = code
+		}
 		_ = json.NewEncoder(w).Encode(failure)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// withdrawalRequestOptions are the gasless choices a withdrawal or escape
+// request carries (design 3.3).
+type withdrawalRequestOptions struct {
+	Fees              string `json:"fees,omitempty"`
+	FeeCapGwei        uint64 `json:"fee_cap_gwei,omitempty"`
+	BundlerURL        string `json:"bundler_url,omitempty"`
+	AllowExpensiveGas bool   `json:"allow_expensive_gas,omitempty"`
+	Collect           bool   `json:"collect,omitempty"`
+	Sweep             bool   `json:"sweep,omitempty"`
+	ClaimCredit       bool   `json:"claim_credit,omitempty"`
+}
+
+func (o withdrawalRequestOptions) options() addressWithdrawalOptions {
+	return addressWithdrawalOptions{Fees: o.Fees, FeeCapGwei: o.FeeCapGwei, BundlerURL: o.BundlerURL, AllowExpensiveGas: o.AllowExpensiveGas, Collect: o.Collect, Sweep: o.Sweep, ClaimCredit: o.ClaimCredit}
 }

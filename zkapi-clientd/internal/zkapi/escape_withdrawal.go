@@ -350,6 +350,9 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 			if w.InitiateHash != "" {
 				kind = gaslessKindFinalize
 			}
+			if _, _, err := h.recordProfile(w); err != nil {
+				return update(), err
+			}
 			if _, _, err := h.gaslessPreflight(ctx, config, options, kind); err != nil {
 				return update(), err
 			}
@@ -555,7 +558,7 @@ func (h *FundingHandler) resumeGaslessEscapeInitiation(ctx context.Context, conf
 	if !outcome.Included || !outcome.Success {
 		return update(), nil
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	env, err := h.followEnvironment(ctx, config, record)
 	if err != nil {
 		return update(), err
 	}

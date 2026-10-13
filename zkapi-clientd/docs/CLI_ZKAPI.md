@@ -563,6 +563,34 @@ destination (it rejected the ETH or needed more than 100,000 gas) is credited
 there; `--claim-credit` delivers it with a wallet-paid `claimCredit`. A new
 deposit is refused while a payout waits in `S` or the paymaster.
 
+`--sweep` and `--claim-credit` on a saved gasless withdrawal use the
+contracts journaled with it (`S`, the factory, the paymaster, the
+EntryPoint, the owner and the destination), never the release's current
+profile, so they keep working after a release publishes `gasless: null`
+(the paymaster's retirement) or pins another paymaster; before anything is
+signed the journaled factory's `getAddress(owner, destination)` must name
+the journaled `S` through the read RPC. `--escape --fees wallet` finalizes
+a pending escape with a plain `finalizeEscapeWithdrawal` on the vault, which
+needs no gasless contract at all (only a record stopped as
+`gasless_refused` first looks for a late inclusion of its operation, through
+the journaled contracts and the same `getAddress` check). A sponsored
+operation for such a record (`--collect`, a sponsored finalization, or
+`--fees payout` on it) needs the current pins to name the record's paymaster
+and factory, and is refused otherwise with `gasless_record_not_pinned`,
+which names those wallet-paid alternatives, led by the wallet-paid close or
+escape initiation (`withdraw --to Y --fees wallet`, `withdraw --escape --to
+Y --fees wallet`) while the record's exit is not on chain yet. A new
+sponsored withdrawal under a profile with `gasless: null` is refused with
+`gasless_unavailable` instead. An operation already sent when
+the pins went away is still followed by the resume (`withdraw --to`, or
+`withdraw --escape --to`, without `--fees`), through the journaled
+contracts and without re-sending it: included, the record settles from its
+inclusion; not included five minutes after it was sent, it is released
+(`gasless_refused`, or a complete record with the payout waiting in `S` for
+a forward) with `gasless_record_not_pinned` and the wallet-paid step to
+take next. The wallet-paid path waits until then (`a sponsored operation is
+in flight`).
+
 Amounts: before signing only "the destination receives at least" is promised.
 The quote's expected charge is an estimate (the paymaster's charge formula at
 the gas an operation of this shape uses and today's base fee plus tip), shown

@@ -197,6 +197,11 @@ type gaslessEnvironment struct {
 	bundlerErr                                                   error
 	entryPoint, paymaster, factory, vault, account, owner, payee common.Address
 	key                                                          *ecdsa.PrivateKey
+	// journaled marks an environment of the contracts journaled with the
+	// record that the current profile does not pin (followEnvironment): an
+	// operation already sent is looked for on chain and settled from its
+	// inclusion, but nothing is sent, re-sent or re-signed through it.
+	journaled bool
 }
 
 func (h *FundingHandler) gaslessProfile() (gaslessProfile, deploymentIdentity, error) {
@@ -295,30 +300,229 @@ func (h *FundingHandler) newTransit(ctx context.Context, config fundingConfig, p
 	return &addressTransit{Factory: common.HexToAddress(profile.Factory).Hex(), Paymaster: common.HexToAddress(profile.Paymaster).Hex(), EntryPoint: common.HexToAddress(profile.EntryPoint).Hex(), Account: account.Hex(), Owner: owner.Hex(), OwnerKey: hex.EncodeToString(crypto.FromECDSA(key)), CreationCodeKeccak: profile.AccountCreationCodeHash}, nil
 }
 
-// gaslessEnvironment loads the saved transit account of record against the
-// pinned profile.
+// GaslessRecordNotPinned is the refusal of a sponsored operation (a
+// FORWARD, a FINALIZE, a new, re-sent or re-signed operation of a sponsored
+// close or escape) for an existing gasless record whose paymaster and
+// factory the current profile does not pin: the profile publishes no
+// gasless contracts any more (gasless: null, the paymaster's retirement) or
+// pins others. The record's wallet-paid recovery (--sweep, --claim-credit,
+// --escape --fees wallet) uses the contracts journaled with it and keeps
+// working, and an operation already sent is still followed on chain and
+// released if it was not included (followEnvironment, followUserOperation);
+// the code is also the reason journaled with such a release.
+const GaslessRecordNotPinned = "gasless_record_not_pinned"
+
+// sameGaslessContracts reports whether the transit account t was made under
+// the profile's contracts.
+func sameGaslessContracts(t *addressTransit, profile gaslessProfile) bool {
+	return strings.EqualFold(t.Factory, profile.Factory) && strings.EqualFold(t.Paymaster, profile.Paymaster) && strings.EqualFold(t.EntryPoint, profile.EntryPoint) && strings.EqualFold(t.CreationCodeKeccak, profile.AccountCreationCodeHash)
+}
+
+// recordProfile is the current gasless profile when it pins the contracts
+// the record's transit account was made under, which a sponsored operation
+// for that record needs; otherwise the gasless_record_not_pinned refusal,
+// which names the wallet-paid alternatives.
+func (h *FundingHandler) recordProfile(w *addressWithdrawalRecord) (gaslessProfile, deploymentIdentity, error) {
+	deployment, _, err := deployedDeployment(h.client.config.Network)
+	if err != nil {
+		return gaslessProfile{}, deployment, err
+	}
+	t := w.Transit
+	alternatives := walletRecoveryAlternatives(w)
+	if w.UserOp != nil && GaslessPendingPhase(w.Phase) {
+		// The wallet-paid actions wait for the operation in flight: the
+		// resume follows it through the journaled contracts and releases it
+		// if it was not included.
+		command := "zkapi-clientd withdraw --to " + w.Destination
+		if w.Mode == "escape" {
+			command = "zkapi-clientd withdraw --escape --to " + w.Destination
+		}
+		alternatives = "the operation already sent is followed on chain by resuming with " + command + " (without --fees): if it was not included it is released, and then " + alternatives
+	}
+	if deployment.Gasless == nil {
+		return gaslessProfile{}, deployment, refuse(GaslessRecordNotPinned, "this withdrawal's transit account %s was made under paymaster %s and factory %s, and this release's deployment profile publishes no gasless paymaster any more, so nothing of it is sponsored; %s", t.Account, t.Paymaster, t.Factory, alternatives)
+	}
+	profile, err := deployment.Gasless.validate()
+	if err != nil {
+		return profile, deployment, err
+	}
+	if !sameGaslessContracts(t, profile) {
+		return gaslessProfile{}, deployment, refuse(GaslessRecordNotPinned, "this withdrawal's transit account %s was made under paymaster %s and factory %s, but this release's deployment profile pins paymaster %s and factory %s, so nothing of it is sponsored; %s", t.Account, t.Paymaster, t.Factory, profile.Paymaster, profile.Factory, alternatives)
+	}
+	return profile, deployment, nil
+}
+
+// walletRecoveryAlternatives names the wallet-paid recovery of a gasless
+// record, which uses the contracts journaled with it. While the record's
+// exit is not on chain yet, the wallet-paid close or escape initiation
+// (--fees wallet) comes first: it is the only way forward for an open note.
+func walletRecoveryAlternatives(w *addressWithdrawalRecord) string {
+	recovery := "deliver a payout waiting in the transit account with zkapi-clientd withdraw --sweep --to " + w.Destination + " and a credited payout with --claim-credit (both paid by the local signing address), and finalize a pending escape with zkapi-clientd withdraw --escape --to " + w.Destination + " --fees wallet"
+	if !gaslessExitNotOnChain(w) {
+		return recovery
+	}
+	if w.Mode == "escape" {
+		return "initiate the escape from the local signing address with zkapi-clientd withdraw --escape --to " + w.Destination + " --fees wallet (the payout then reaches the transit account); later, " + recovery
+	}
+	return "close the note from the local signing address with zkapi-clientd withdraw --to " + w.Destination + " --fees wallet (the payout then reaches the transit account); later, " + recovery
+}
+
+// gaslessExitNotOnChain reports whether a gasless record's exit (its close,
+// or its escape's initiation) is not known on chain yet, so the note is
+// still open as far as the record knows.
+func gaslessExitNotOnChain(w *addressWithdrawalRecord) bool {
+	if w.FundsWaitingInTransit || w.PaymasterCredited || w.PayoutCredited || w.SettlementHash != "" {
+		return false
+	}
+	if w.Mode == "escape" {
+		return w.InitiateHash == "" && w.Phase != "complete" && w.Phase != "defeated"
+	}
+	switch w.Phase {
+	case "complete", "confirming", "forward_op_built", "forward_op_submitted":
+		return false
+	case "op_reverted":
+		// The bundle transaction of a reverted close is not the note's exit.
+		return true
+	}
+	return w.TransactionHash == ""
+}
+
+// releasedOperationReason is the refusal journaled when followUserOperation
+// releases an operation the current profile no longer sponsors.
+func releasedOperationReason(w *addressWithdrawalRecord) string {
+	next := "close the note again with zkapi-clientd withdraw --to " + w.Destination + " --fees wallet"
+	switch {
+	case w.UserOp != nil && gaslessKindOf(w.UserOp.Kind) == gaslessKindForward:
+		next = "deliver the payout waiting in the transit account with zkapi-clientd withdraw --sweep --to " + w.Destination
+	case w.Mode == "escape" && w.InitiateHash != "":
+		next = "finalize the escape with zkapi-clientd withdraw --escape --to " + w.Destination + " --fees wallet"
+	case w.Mode == "escape":
+		next = "initiate the escape again with zkapi-clientd withdraw --escape --to " + w.Destination + " --fees wallet"
+	}
+	return "this release's deployment profile no longer pins the paymaster and factory this withdrawal's transit account was made under, so the sponsored operation it sent, not included by now, was released without being re-sent; " + next + " (a late inclusion of the released operation is looked for first and otherwise fails harmlessly)"
+}
+
+// transitOwnerKey is the record's transit owner key, checked against its
+// journaled owner and the proof's destination.
+func transitOwnerKey(w *addressWithdrawalRecord) (*ecdsa.PrivateKey, error) {
+	key, err := crypto.HexToECDSA(w.Transit.OwnerKey)
+	if err != nil || !strings.EqualFold(crypto.PubkeyToAddress(key.PublicKey).Hex(), w.Transit.Owner) {
+		return nil, errors.New("the saved transit owner key is invalid; preserve the recovery file")
+	}
+	if !strings.EqualFold(w.ProofDestination, w.Transit.Account) {
+		return nil, errors.New("the saved transit account is not the one derived from its owner and payout address; preserve the recovery file")
+	}
+	return key, nil
+}
+
+// journaledEnvironment is the environment of a wallet-paid action on an
+// existing gasless record (--sweep, --claim-credit, and the look for a late
+// inclusion before --fees wallet finalizes or closes): the contracts
+// journaled with the record (transit account, factory, paymaster,
+// EntryPoint, owner, payout address), never the current profile's, so these
+// keep working once the profile retires its gasless pins or names another
+// paymaster. The journaled factory's getAddress(owner, payee) must name the
+// journaled account through the read RPC; while the profile still pins the
+// same contracts, the account is also derived locally as for a sponsored
+// operation. No bundler is resolved: none of these contacts one.
+func (h *FundingHandler) journaledEnvironment(ctx context.Context, config fundingConfig, record *addressFundingRecord) (*gaslessEnvironment, error) {
+	w := record.Withdrawal
+	if w == nil || w.Transit == nil {
+		return nil, errors.New("the saved withdrawal has no transit account")
+	}
+	t := w.Transit
+	for _, address := range []string{t.Factory, t.Paymaster, t.EntryPoint, t.Account, t.Owner, w.Destination} {
+		if !isHex(address, 20) || common.HexToAddress(address) == (common.Address{}) {
+			return nil, errors.New("the saved transit account names an invalid contract or account address; preserve the recovery file")
+		}
+	}
+	key, err := transitOwnerKey(w)
+	if err != nil {
+		return nil, err
+	}
+	deployment, _, err := deployedDeployment(h.client.config.Network)
+	if err != nil {
+		return nil, err
+	}
+	env := &gaslessEnvironment{
+		deployment: deployment, config: config.exitConfig(),
+		entryPoint: common.HexToAddress(t.EntryPoint), paymaster: common.HexToAddress(t.Paymaster), factory: common.HexToAddress(t.Factory),
+		vault: common.HexToAddress(config.Contract), account: common.HexToAddress(t.Account), owner: common.HexToAddress(t.Owner), payee: common.HexToAddress(w.Destination), key: key,
+	}
+	if deployment.Gasless != nil {
+		if profile, err := deployment.Gasless.validate(); err == nil && sameGaslessContracts(t, profile) {
+			creation, _ := hex.DecodeString(strings.TrimPrefix(profile.AccountCreationCode, "0x"))
+			if transitAccountAddress(env.factory, creation, env.entryPoint, env.vault, env.paymaster, env.owner, env.payee) != env.account {
+				return nil, errors.New("the saved transit account is not the one derived from its owner and payout address; preserve the recovery file")
+			}
+			env.profile = profile
+		}
+	}
+	var derived string
+	if err := h.addressRPC(ctx, env.config, "eth_call", []any{map[string]string{"to": env.factory.Hex(), "data": "0x" + selectorFactoryGetAddress + addressABIWord(strings.ToLower(env.owner.Hex())) + addressABIWord(strings.ToLower(env.payee.Hex()))}, "latest"}, &derived); err != nil {
+		return nil, err
+	}
+	if !isHex(derived, 32) || !strings.EqualFold(derived[2:], addressABIWord(strings.ToLower(env.account.Hex()))) {
+		return nil, errors.New("the saved transit account's factory derives another account for its owner and payout address; nothing was signed, preserve the recovery file")
+	}
+	return env, nil
+}
+
+// followEnvironment is the environment that follows an operation the
+// record already sent, and reads the settlement of its inclusion: the
+// sponsored one (gaslessEnvironment) while the current profile pins the
+// record's contracts; otherwise (gasless: null, or pins naming another
+// paymaster) the journaled one, marked journaled, with the bundler the
+// operation was sent to (else the request's or the configuration's) for
+// read-only lookups. Following needs no sponsorship from the current
+// profile: an operation already sent either lands or is released
+// (followUserOperation), so a record in flight when the profile retired
+// its pins is never left without a path forward.
+func (h *FundingHandler) followEnvironment(ctx context.Context, config fundingConfig, record *addressFundingRecord) (*gaslessEnvironment, error) {
+	options := withdrawalOptions(ctx)
+	env, err := h.gaslessEnvironment(ctx, config, record, options)
+	if GaslessRefusalCode(err) != GaslessRecordNotPinned {
+		return env, err
+	}
+	if env, err = h.journaledEnvironment(ctx, config, record); err != nil {
+		return nil, err
+	}
+	env.journaled = true
+	candidates := []string{options.BundlerURL, h.client.config.BundlerURL}
+	if u := record.Withdrawal.UserOp; u != nil && options.BundlerURL == "" {
+		candidates = append([]string{u.BundlerURL}, candidates...)
+	}
+	for _, candidate := range candidates {
+		if candidate != "" && ValidateBundlerURL(candidate) == nil {
+			env.bundler = candidate
+			break
+		}
+	}
+	return env, nil
+}
+
+// gaslessEnvironment loads the saved transit account of record for a
+// sponsored operation: the current profile must pin the contracts it was
+// made under (recordProfile).
 func (h *FundingHandler) gaslessEnvironment(ctx context.Context, config fundingConfig, record *addressFundingRecord, options addressWithdrawalOptions) (*gaslessEnvironment, error) {
 	w := record.Withdrawal
 	if w == nil || w.Transit == nil {
 		return nil, errors.New("the saved withdrawal has no transit account")
 	}
-	profile, deployment, err := h.gaslessProfile()
+	profile, deployment, err := h.recordProfile(w)
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(w.Transit.Factory, profile.Factory) || !strings.EqualFold(w.Transit.Paymaster, profile.Paymaster) || !strings.EqualFold(w.Transit.EntryPoint, profile.EntryPoint) || !strings.EqualFold(w.Transit.CreationCodeKeccak, profile.AccountCreationCodeHash) {
-		return nil, fmt.Errorf("%w: the saved transit account was derived from other gasless contracts than this release pins", errGaslessUnavailable)
-	}
-	key, err := crypto.HexToECDSA(w.Transit.OwnerKey)
-	if err != nil || !strings.EqualFold(crypto.PubkeyToAddress(key.PublicKey).Hex(), w.Transit.Owner) {
-		return nil, errors.New("the saved transit owner key is invalid; preserve the recovery file")
+	key, err := transitOwnerKey(w)
+	if err != nil {
+		return nil, err
 	}
 	// The saved account must be the CREATE2 of the saved owner and the payout
 	// address under the pinned contracts: a lying RPC or an edited journal
 	// cannot substitute the account the proof binds.
 	creation, _ := hex.DecodeString(strings.TrimPrefix(profile.AccountCreationCode, "0x"))
 	derived := transitAccountAddress(common.HexToAddress(profile.Factory), creation, common.HexToAddress(profile.EntryPoint), common.HexToAddress(config.Contract), common.HexToAddress(profile.Paymaster), common.HexToAddress(w.Transit.Owner), common.HexToAddress(w.Destination))
-	if !strings.EqualFold(derived.Hex(), w.Transit.Account) || !strings.EqualFold(w.ProofDestination, w.Transit.Account) {
+	if !strings.EqualFold(derived.Hex(), w.Transit.Account) {
 		return nil, errors.New("the saved transit account is not the one derived from its owner and payout address; preserve the recovery file")
 	}
 	// The bundler is resolved here but required only where it is used
@@ -504,10 +708,8 @@ func (h *FundingHandler) checkBundler(ctx context.Context, env *gaslessEnvironme
 
 // ----------------------------------------------------------------- fees and gas
 
-// gaslessFees picks the operation's fees: the chain's median tip capped by
-// the paymaster's priority ceiling, and twice the base fee plus the tip,
-// capped by the fee ceiling while the base fee plus the tip still fits
-// under it.
+// gaslessFees picks the operation's fees from the latest base fee and the
+// chain's median tip by selectGaslessFees.
 func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironment, live gaslessLive) (maxFee, priority *big.Int, err error) {
 	var block struct {
 		Number string `json:"number"`
@@ -529,17 +731,30 @@ func (h *FundingHandler) gaslessFees(ctx context.Context, env *gaslessEnvironmen
 	if err != nil {
 		return nil, nil, err
 	}
-	if tip.Cmp(live.PriorityFeeCeiling) > 0 {
-		tip = new(big.Int).Set(live.PriorityFeeCeiling)
+	return selectGaslessFees(base, tip, live.MaxFeeCeiling, live.PriorityFeeCeiling)
+}
+
+// selectGaslessFees is the fee rule both clients share (the SDK's
+// selectFees; testdata/gasless-fee-parity.json is the table both assert):
+// maxPriorityFeePerGas = min(tip, priority ceiling) and maxFeePerGas =
+// min(2 × base + priority, max-fee ceiling), refused
+// (gas_above_paymaster_ceiling) only when base + priority is above the
+// max-fee ceiling. An operation at maxFeePerGas = ceiling still lands while
+// base + priority fits under it; a base fee that rises past it is handled by
+// the fee bump (within the ceilings) and the stop before validUntil.
+func selectGaslessFees(base, tip, maxFeeCeiling, priorityFeeCeiling *big.Int) (maxFee, priority *big.Int, err error) {
+	priority = new(big.Int).Set(tip)
+	if priority.Cmp(priorityFeeCeiling) > 0 {
+		priority.Set(priorityFeeCeiling)
 	}
-	maxFee = new(big.Int).Add(new(big.Int).Mul(base, big.NewInt(2)), tip)
-	if maxFee.Cmp(live.MaxFeeCeiling) > 0 {
-		if new(big.Int).Add(base, tip).Cmp(live.MaxFeeCeiling) > 0 {
-			return nil, nil, refuse("gas_above_paymaster_ceiling", "the network fee (base %s wei plus tip %s wei per gas) is above the paymaster's ceiling of %s wei; sponsorship is refused during this fee spike, use --fees wallet or retry later", base, tip, live.MaxFeeCeiling)
-		}
-		maxFee = new(big.Int).Set(live.MaxFeeCeiling)
+	if new(big.Int).Add(base, priority).Cmp(maxFeeCeiling) > 0 {
+		return nil, nil, refuse("gas_above_paymaster_ceiling", "the network fee (base %s wei plus tip %s wei per gas) is above the paymaster's ceiling of %s wei; sponsorship is refused during this fee spike, use --fees wallet or retry later", base, priority, maxFeeCeiling)
 	}
-	return maxFee, tip, nil
+	maxFee = new(big.Int).Add(new(big.Int).Mul(base, big.NewInt(2)), priority)
+	if maxFee.Cmp(maxFeeCeiling) > 0 {
+		maxFee.Set(maxFeeCeiling)
+	}
+	return maxFee, priority, nil
 }
 
 // gaslessGasFields are the five limits and the fees an operation is built
@@ -1573,12 +1788,14 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 	if u == nil {
 		return nil, errors.New("no user operation is saved")
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	env, err := h.followEnvironment(ctx, config, record)
 	if err != nil {
 		return nil, err
 	}
-	if err := env.needBundler(); err != nil {
-		return nil, err
+	if !env.journaled {
+		if err := env.needBundler(); err != nil {
+			return nil, err
+		}
 	}
 	var encoded gaslessUserOpJSON
 	if json.Unmarshal(u.JSON, &encoded) != nil {
@@ -1606,7 +1823,7 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 			return nil, err
 		}
 	}
-	if tx == "" && u.SubmittedAt != 0 {
+	if tx == "" && u.SubmittedAt != 0 && env.bundler != "" {
 		// The bundler's receipt names a transaction; only the chain decides.
 		for _, hash := range hashes {
 			result, refused, err := h.bundlerCall(ctx, env.bundler, "eth_getUserOperationReceipt", []any{hash})
@@ -1682,6 +1899,24 @@ func (h *FundingHandler) followUserOperation(ctx context.Context, config funding
 	now := time.Now().Unix()
 	if u.ValidUntil != 0 && now >= int64(u.ValidUntil)-int64(gaslessExpiryMargin/time.Second) {
 		stopUserOperation(w, "op_expired: the proof's lifetime ran out before the operation was included; rerun --to to prove again (a late inclusion fails harmlessly)")
+		return &gaslessOutcome{}, h.saveAddress(record)
+	}
+	if env.journaled {
+		// The current profile no longer sponsors this record: the operation
+		// is not re-sent nor re-signed. It is given the time a bundler
+		// takes to include it, then released, so the wallet-paid recovery
+		// can proceed; a later inclusion is still looked for before a
+		// wallet-paid step (lateUserOperation) and otherwise fails
+		// harmlessly (the note's nullifier, or the escape's finalization,
+		// is spent once).
+		last := u.SubmittedAt
+		if u.BuiltAt > last {
+			last = u.BuiltAt
+		}
+		if now-last < int64(gaslessResendAfter/time.Second) {
+			return &gaslessOutcome{}, nil
+		}
+		stopUserOperation(w, GaslessRecordNotPinned+": "+releasedOperationReason(w))
 		return &gaslessOutcome{}, h.saveAddress(record)
 	}
 	if u.SubmittedAt == 0 {
@@ -1847,7 +2082,9 @@ func (h *FundingHandler) lateUserOperation(ctx context.Context, config fundingCo
 		// and its inclusion is not a step to take again.
 		return false, nil
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	// A look on chain only: the journaled contracts, so the wallet-paid
+	// fallback it guards works without the current profile's pins.
+	env, err := h.journaledEnvironment(ctx, config, record)
 	if err != nil {
 		return false, err
 	}
@@ -2185,7 +2422,7 @@ func (h *FundingHandler) resumeGaslessClose(ctx context.Context, config fundingC
 	if !outcome.Included || !outcome.Success {
 		return update(), nil
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	env, err := h.followEnvironment(ctx, config, record)
 	if err != nil {
 		return update(), err
 	}
@@ -2229,7 +2466,7 @@ func (h *FundingHandler) resumeForward(ctx context.Context, config fundingConfig
 		}
 		return update(), nil
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, withdrawalOptions(ctx))
+	env, err := h.followEnvironment(ctx, config, record)
 	if err != nil {
 		return update(), err
 	}
@@ -2354,7 +2591,17 @@ func (h *FundingHandler) transitAction(ctx context.Context, config fundingConfig
 	if quoteMode(ctx) == nil {
 		return update(), errors.New("review and approve a current payment quote before signing")
 	}
-	env, err := h.gaslessEnvironment(ctx, config, record, options)
+	// The wallet-paid sweep and credit claim use the contracts journaled
+	// with the record and work whatever the current profile pins; the
+	// sponsored FORWARD needs the current pins to name the record's
+	// paymaster and factory (gasless_record_not_pinned otherwise).
+	var env *gaslessEnvironment
+	var err error
+	if options.ClaimCredit || options.Sweep {
+		env, err = h.journaledEnvironment(ctx, config, record)
+	} else {
+		env, err = h.gaslessEnvironment(ctx, config, record, options)
+	}
 	if err != nil {
 		return update(), err
 	}

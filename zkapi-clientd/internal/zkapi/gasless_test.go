@@ -1548,3 +1548,67 @@ func TestGaslessJournalTamperingIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestGaslessFeeParity asserts the fee rule on the table the SDK's selectFees
+// asserts too (testdata/gasless-fee-parity.json): the same inputs give the
+// same fee fields or the same refusal in both clients.
+func TestGaslessFeeParity(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "gasless-fee-parity.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var table struct {
+		MaxFeeCeiling      string `json:"maxFeeCeiling"`
+		PriorityFeeCeiling string `json:"priorityFeeCeiling"`
+		Cases              []struct {
+			Name                 string `json:"name"`
+			Base                 string `json:"base"`
+			Tip                  string `json:"tip"`
+			MaxFeeCeiling        string `json:"maxFeeCeiling"`
+			PriorityFeeCeiling   string `json:"priorityFeeCeiling"`
+			MaxFeePerGas         string `json:"maxFeePerGas"`
+			MaxPriorityFeePerGas string `json:"maxPriorityFeePerGas"`
+			Refused              string `json:"refused"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &table); err != nil {
+		t.Fatal(err)
+	}
+	wei := func(value, fallback string) *big.Int {
+		if value == "" {
+			value = fallback
+		}
+		n, ok := new(big.Int).SetString(value, 10)
+		if !ok {
+			t.Fatalf("not a decimal wei amount: %q", value)
+		}
+		return n
+	}
+	if len(table.Cases) < 10 {
+		t.Fatalf("the parity table has %d cases", len(table.Cases))
+	}
+	for _, c := range table.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			maxCeiling := wei(c.MaxFeeCeiling, table.MaxFeeCeiling)
+			priorityCeiling := wei(c.PriorityFeeCeiling, table.PriorityFeeCeiling)
+			base, tip := wei(c.Base, ""), wei(c.Tip, "")
+			maxFee, priority, err := selectGaslessFees(base, tip, maxCeiling, priorityCeiling)
+			if c.Refused != "" {
+				if GaslessRefusalCode(err) != c.Refused || maxFee != nil || priority != nil {
+					t.Fatalf("got %v %v %v, want refusal %s", maxFee, priority, err, c.Refused)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if maxFee.Cmp(wei(c.MaxFeePerGas, "")) != 0 || priority.Cmp(wei(c.MaxPriorityFeePerGas, "")) != 0 {
+				t.Fatalf("got maxFee %s priority %s, want %s %s", maxFee, priority, c.MaxFeePerGas, c.MaxPriorityFeePerGas)
+			}
+			// The inputs are not aliased into the result.
+			if maxFee == maxCeiling || priority == tip || priority == priorityCeiling {
+				t.Fatal("the result aliases an input")
+			}
+		})
+	}
+}

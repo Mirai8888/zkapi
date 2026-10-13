@@ -105,6 +105,7 @@ export const GASLESS_MESSAGES = Object.freeze({
     entry_point_hash_mismatch: 'The EntryPoint computes a different operation hash than this app. Nothing was signed; update this app.',
     signature_rejected: 'The EntryPoint rejected the signature: the connected account is not the owner of this withdrawal’s transit account.',
     gasless_plan_mismatch: 'This withdrawal was prepared to pay the fee from a wallet. Finish it that way, or cancel it first.',
+    gasless_record_not_pinned: 'This app no longer sponsors the paymaster this withdrawal used. Recover it from a funded wallet: if the note has not left the vault yet, withdraw again with the fee paid from the wallet; otherwise sweep a payout waiting in its transit account, claim a credited payout, or finalize a pending escape with the fee paid from the wallet.',
     gasless_op_expired: 'The withdrawal proof is about to expire before the operation was included. It is prepared again.',
     escape_not_due: 'The chain has not reached the end of this escape’s safety window yet. Finalize it once the latest block is past the deadline.',
     gasless_op_reverted: 'The sponsored operation was included but its vault call reverted. The withdrawal can be retried.',
@@ -506,10 +507,16 @@ export function maxCostWei(gas, maxFeePerGas) {
 }
 
 /**
- * The fee fields: maxPriorityFeePerGas = min(suggested tip, the paymaster's
+ * The fee fields, by the rule clientd shares (its selectGaslessFees; both
+ * assert zkapi-clientd/internal/zkapi/testdata/gasless-fee-parity.json):
+ * maxPriorityFeePerGas = min(suggested tip, the paymaster's priority
  * ceiling); maxFeePerGas = min(2 × baseFee + priority, the max-fee ceiling),
- * refused (`gas_above_paymaster_ceiling`) when 2 × baseFee + priority is
- * above that ceiling: the paymaster would not sponsor the op during the spike.
+ * refused (`gas_above_paymaster_ceiling`) only when baseFee + priority is
+ * above the max-fee ceiling: the op could not land at any fee the paymaster
+ * sponsors during that spike. An op at maxFeePerGas = ceiling still lands
+ * while baseFee + priority fits under it; a base fee that rises past it is
+ * handled by the fee bump (within the ceilings) and the stop before
+ * validUntil.
  */
 export function selectFees({ baseFeePerGas, priorityFeePerGas = null, maxFeeCeiling, priorityFeeCeiling }) {
     const base = toBigInt(baseFeePerGas, 'baseFeePerGas');
@@ -518,10 +525,16 @@ export function selectFees({ baseFeePerGas, priorityFeePerGas = null, maxFeeCeil
     const suggested = priorityFeePerGas == null ? 1_000_000_000n : toBigInt(priorityFeePerGas, 'priorityFeePerGas');
     const maxPriorityFeePerGas = suggested < priorityCeiling ? suggested : priorityCeiling;
     const wanted = 2n * base + maxPriorityFeePerGas;
-    if (wanted > maxCeiling) {
-        throw gaslessError('gas_above_paymaster_ceiling', { baseFeePerGas: base, wantedMaxFeePerGas: wanted, maxFeeCeiling: maxCeiling });
+    if (base + maxPriorityFeePerGas > maxCeiling) {
+        // neededMaxFeePerGas (base + tip) is what the refusal compares;
+        // wantedMaxFeePerGas (2 × base + tip) keeps its earlier meaning for
+        // hosts that display it.
+        throw gaslessError('gas_above_paymaster_ceiling', {
+            baseFeePerGas: base, maxPriorityFeePerGas, neededMaxFeePerGas: base + maxPriorityFeePerGas, wantedMaxFeePerGas: wanted,
+            maxFeeCeiling: maxCeiling
+        });
     }
-    return { maxFeePerGas: wanted, maxPriorityFeePerGas };
+    return { maxFeePerGas: wanted < maxCeiling ? wanted : maxCeiling, maxPriorityFeePerGas };
 }
 
 /** The smallest raise a bundler's replacement rule accepts: both fee fields at least 10% higher. */

@@ -2799,6 +2799,90 @@ class ZkapiClient extends EventTarget {
         return pins;
     }
 
+    /**
+     * The pins a sponsored operation for an existing gasless record needs
+     * (a FORWARD, a FINALIZE, a new, re-sent or re-signed operation of a
+     * sponsored close or escape; an operation already sent is still looked
+     * for on chain and released, see releaseUnpinnedFinalization and
+     * recoverGaslessSubmission):
+     * the current profile's, naming the paymaster and factory the record's
+     * transit account was made under. A profile that publishes no gasless
+     * contracts any more (`gasless: null`, the paymaster's retirement) or
+     * pins others is refused with `gasless_record_not_pinned`, which names
+     * the wallet-paid recovery that keeps working from the journaled
+     * addresses: sweepTransit, claimGaslessCredit and finalizeEscape with
+     * fees: 'wallet', led by withdraw(mode, onStatus, { fees: 'wallet' })
+     * while a prepared plan's exit is not on chain yet.
+     */
+    requireRecordPins(record) {
+        const transit = record?.transit || {};
+        // A prepared plan (no withdrawal record yet) whose close or escape
+        // initiation is not on chain: the note is still open, so the
+        // wallet-paid exit is the way forward, named first.
+        const exitPending = Boolean(record) && !record.recordId && !record.transactionHash;
+        const refusal = (reason, pins = null) => gaslessError('gasless_record_not_pinned', {
+            reason,
+            transitAccount: transit.account ? String(transit.account).toLowerCase() : null,
+            paymaster: transit.paymaster ? String(transit.paymaster).toLowerCase() : null,
+            factory: transit.factory ? String(transit.factory).toLowerCase() : null,
+            pinnedPaymaster: pins ? pins.paymaster.toLowerCase() : null,
+            pinnedFactory: pins ? pins.factory.toLowerCase() : null,
+            alternatives: [...(exitPending ? [`withdraw('${record.mode === 'escape' ? 'escape' : 'mutual'}', onStatus, { fees: 'wallet' })`] : []),
+                'sweepTransit', 'claimGaslessCredit', "finalizeEscape({ fees: 'wallet' })"]
+        });
+        let pins;
+        try {
+            pins = this.requireGaslessPins();
+        } catch (error) {
+            if (error?.data?.reason === 'not_pinned') throw refusal('not_pinned');
+            throw error;
+        }
+        if ((transit.paymaster && !sameAddress(transit.paymaster, pins.paymaster))
+            || (transit.factory && !sameAddress(transit.factory, pins.factory))) {
+            throw refusal('pins_mismatch', pins);
+        }
+        return pins;
+    }
+
+    /**
+     * The contracts a wallet-paid action on an existing gasless record uses
+     * (sweepTransit; claimGaslessCredit reads the paymaster the same way):
+     * the transit account, factory, paymaster, EntryPoint, owner and payee
+     * journaled with the record, never the current profile's, so recovery
+     * keeps working after the profile retires its pins or names another
+     * paymaster. The journaled factory's getAddress(owner, payee) must name
+     * the journaled account through the read RPC; while the profile still
+     * pins the same contracts their deployment is verified too.
+     */
+    async journaledTransit(record, reader) {
+        const transit = record?.transit || {};
+        const address = value => /^0x[0-9a-fA-F]{40}$/.test(String(value || '')) ? String(value).toLowerCase() : null;
+        const journaled = {
+            account: address(transit.account), factory: address(transit.factory), paymaster: address(transit.paymaster),
+            entryPoint: address(transit.entryPoint), owner: address(transit.owner), payee: address(transit.payee || record?.payout)
+        };
+        if (Object.values(journaled).some(value => !value)) {
+            throw new Error('The journaled transit account of this withdrawal is incomplete; nothing was signed.');
+        }
+        let pins = null;
+        try {
+            pins = this.requireGaslessPins();
+        } catch {
+            pins = null;
+        }
+        if (pins && sameAddress(pins.paymaster, journaled.paymaster) && sameAddress(pins.factory, journaled.factory)
+            && sameAddress(pins.entryPoint, journaled.entryPoint)) {
+            await this.assertGaslessDeployment(pins, reader);
+        }
+        const derived = decodeAddressWord(await this.gaslessCall(reader, journaled.factory, encodeGetAddress(journaled.owner, journaled.payee)));
+        if (derived.toLowerCase() !== journaled.account) {
+            throw gaslessError('gasless_unavailable', {
+                reason: 'gasless_deployment_mismatch', field: 'factory.getAddress', expected: journaled.account, actual: derived.toLowerCase()
+            }, 'The journaled factory derives another transit account for this withdrawal’s owner and payout address. Nothing was signed.');
+        }
+        return journaled;
+    }
+
     async gaslessCall(reader, to, data) {
         return reader({ method: 'eth_call', params: [{ to, data }, 'latest'] });
     }
@@ -2850,9 +2934,10 @@ class ZkapiClient extends EventTarget {
      * transport on the provider, `provider.zkapiBundler`, else the URL given,
      * the user's, or the profile's).
      */
-    async gaslessContext({ from, payout, owner = from, expectedAccount = null, bundlerUrl = null, kind = KIND.close }) {
+    async gaslessContext({ from, payout, owner = from, expectedAccount = null, bundlerUrl = null, kind = KIND.close, record = null }) {
         if (!this.config?.funding?.contract_address) throw new Error('Initialize the wallet before a sponsored withdrawal.');
-        const pins = this.requireGaslessPins();
+        // An existing record is sponsored only by the paymaster it was made under.
+        const pins = record?.transit ? this.requireRecordPins(record) : this.requireGaslessPins();
         const reader = this.gaslessReader();
         await this.assertGaslessDeployment(pins, reader);
         const transit = await this.transitIdentity(pins, reader, { owner, payout, expected: expectedAccount });
@@ -3005,8 +3090,9 @@ class ZkapiClient extends EventTarget {
     /**
      * The fee fields of §3.1: a tip within the paymaster's ceiling (the
      * bundler's own suggestion when it offers one, since a bundler refuses an
-     * operation below its minimum tip; else the chain's), 2 × baseFee + tip
-     * within the max-fee ceiling.
+     * operation below its minimum tip; else the chain's) and min(2 × baseFee
+     * + tip, the max-fee ceiling), refused only when baseFee + tip is above
+     * that ceiling (selectFees, the rule clientd shares).
      */
     async selectGaslessFees(context, state) {
         const block = await context.reader({ method: 'eth_getBlockByNumber', params: ['latest', false] });
@@ -3821,7 +3907,7 @@ class ZkapiClient extends EventTarget {
         onStatus('Checking the sponsored withdrawal path…');
         const context = await this.gaslessContext({
             from, payout, owner, expectedAccount: durablePrepared?.transit?.account || null,
-            bundlerUrl: bundlerUrl || durablePrepared?.bundlerUrl || null, kind
+            bundlerUrl: bundlerUrl || durablePrepared?.bundlerUrl || null, kind, record: durablePrepared || null
         });
         const S = context.transit.account;
         if (!durablePrepared) {
@@ -4134,7 +4220,7 @@ class ZkapiClient extends EventTarget {
         const transit = withdrawal.transit;
         const context = await this.gaslessContext({
             from, payout: withdrawal.payout, owner: transit.owner, expectedAccount: transit.account,
-            bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.finalize
+            bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.finalize, record: withdrawal
         });
         const noteId = Number(withdrawal.noteId);
         const vault = this.config.funding.contract_address;
@@ -4219,7 +4305,7 @@ class ZkapiClient extends EventTarget {
         if (!settlement) throw new Error('The bundle transaction carries no settlement of this finalization.');
         if (!settlement.success) {
             await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { transactionHash: settlement.transactionHash }).catch(() => null);
-            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { finalizeUserOp: null, finalizeUserOpPhase: null }).catch(() => null);
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { finalizeUserOp: null, finalizeUserOpPhase: 'reverted' }).catch(() => null);
             const after = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
             if (after.status === 'closed') {
                 onStatus('A third party finalized this escape first. Collecting the payout from the transit account…');
@@ -4291,7 +4377,7 @@ class ZkapiClient extends EventTarget {
         if (!context) {
             context = await this.gaslessContext({
                 from, payout: withdrawal.payout, owner: transit.owner, expectedAccount: transit.account,
-                bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.forward
+                bundlerUrl: bundlerUrl || withdrawal.bundlerUrl || null, kind: KIND.forward, record: withdrawal
             });
         }
         context.kind = KIND.forward;
@@ -4409,10 +4495,10 @@ class ZkapiClient extends EventTarget {
         const record = await browserWalletRuntime.currentWithdrawal(recordId);
         if (!record) throw new Error('The withdrawal record was not found.');
         if (!isGaslessWithdrawal(record)) throw gaslessError('gasless_plan_mismatch', null, 'This withdrawal has no transit account to sweep.');
-        const transit = record.transit;
-        const pins = this.requireGaslessPins();
+        // The journaled contracts, not the current profile's: a sweep keeps
+        // working after the profile retires its gasless pins.
         const reader = this.gaslessReader();
-        await this.assertGaslessDeployment(pins, reader);
+        const transit = await this.journaledTransit(record, reader);
         const S = transit.account;
         onStatus('Connecting to MetaMask to sweep the transit account…');
         const from = await this.connectWallet();
@@ -4428,7 +4514,7 @@ class ZkapiClient extends EventTarget {
             onStatus('Confirm the transit account creation in MetaMask. Your account pays only gas.');
             const created = await this.sendContractTransaction(
                 from,
-                pins.factory,
+                transit.factory,
                 encodeCreateAccount(transit.owner, transit.payee),
                 async hash => {
                     createTransactionHash = hash;
@@ -4460,9 +4546,9 @@ class ZkapiClient extends EventTarget {
             null,
             { kind: 'transit-sweep', submission: { recordId, noteId: Number(record.noteId), destination: S } }
         );
-        const collected = parseCollected(receipt, pins.paymaster, S);
+        const collected = parseCollected(receipt, transit.paymaster, S);
         if (!collected) throw new Error('The sweep transaction succeeded, but the paymaster recorded no collection for this transit account.');
-        const credited = parsePayoutCredited(receipt, pins.paymaster, transit.payee);
+        const credited = parsePayoutCredited(receipt, transit.paymaster, transit.payee);
         const amounts = {
             receivedWei: collected.received, chargedWei: 0n, owedPaidWei: collected.owedPaid, paidOutWei: collected.paidOut,
             paymasterCredited: Boolean(credited), paymasterCreditedWei: credited?.amount ?? null
@@ -4488,17 +4574,43 @@ class ZkapiClient extends EventTarget {
      * `claimGaslessCredit(payee, onStatus)`: the wallet-paid
      * `P.claimCredit(payee)` for a payout the paymaster credited because its
      * push to the payee failed. Anyone may call it; only the payee is paid.
+     * P is the paymaster journaled with this browser's sponsored records of
+     * that payee (so a claim keeps working after the profile retires its
+     * gasless pins or names another paymaster), else the pinned one; the
+     * first of them that holds a credit for the payee is claimed.
      */
     async claimGaslessCredit(payee, onStatus = () => {}) {
         const destination = normalizeWithdrawalDestination(payee, this.config?.funding);
         if (!destination) throw new TypeError('Choose the payout address whose credit to claim.');
-        const pins = this.requireGaslessPins();
+        let pins = null;
+        try {
+            pins = this.requireGaslessPins();
+        } catch (error) {
+            if (error?.data?.reason !== 'not_pinned') throw error;
+        }
+        const records = (await browserWalletRuntime.currentWithdrawals()).filter(record => isGaslessWithdrawal(record)
+            && String(record.payout || '').toLowerCase() === destination
+            && /^0x[0-9a-fA-F]{40}$/.test(String(record.transit?.paymaster || '')));
+        // Credited records first, then any other record of the payee, then the pins.
+        const journaled = [...records.filter(record => record.paymasterCredited === true), ...records]
+            .map(record => record.transit.paymaster.toLowerCase());
+        const paymasters = [...new Set([...journaled, ...(pins ? [pins.paymaster.toLowerCase()] : [])])];
+        if (!paymasters.length) throw gaslessError('gasless_unavailable', { reason: 'not_pinned' });
         const reader = this.gaslessReader();
-        await this.assertGaslessDeployment(pins, reader);
+        if (pins && paymasters.includes(pins.paymaster.toLowerCase())) await this.assertGaslessDeployment(pins, reader);
         onStatus('Checking the payout the paymaster holds for this address…');
-        const credit = decodeWord(await this.gaslessCall(reader, pins.paymaster, encodeCredits(destination)), 'credits');
+        let paymaster = null;
+        let credit = 0n;
+        for (const candidate of paymasters) {
+            const held = decodeWord(await this.gaslessCall(reader, candidate, encodeCredits(destination)), 'credits');
+            if (held > 0n) {
+                paymaster = candidate;
+                credit = held;
+                break;
+            }
+        }
         if (credit === 0n) {
-            await this.markGaslessCreditsDelivered(destination, null);
+            for (const candidate of paymasters) await this.markGaslessCreditsDelivered(destination, null, candidate);
             return { status: 'nothing_to_claim', payee: destination, amount: '0' };
         }
         onStatus('Connecting to MetaMask to deliver the credited payout…');
@@ -4507,7 +4619,7 @@ class ZkapiClient extends EventTarget {
         let transactionHash = null;
         const receipt = await this.sendContractTransaction(
             from,
-            pins.paymaster,
+            paymaster,
             encodeClaimCredit(destination),
             async hash => {
                 transactionHash = hash;
@@ -4517,17 +4629,20 @@ class ZkapiClient extends EventTarget {
             null,
             { kind: 'gasless-credit-claim', submission: { destination } }
         );
-        const claimed = parseCreditClaimed(receipt, pins.paymaster, destination);
+        const claimed = parseCreditClaimed(receipt, paymaster, destination);
         if (!claimed) throw new Error('The claim transaction succeeded, but it did not pay this address.');
-        await this.markGaslessCreditsDelivered(destination, transactionHash || receipt?.transactionHash || null);
+        await this.markGaslessCreditsDelivered(destination, transactionHash || receipt?.transactionHash || null, paymaster);
         await this.refresh();
         onStatus(`Credited payout delivered: ${formatUnits(claimed.amount / NATIVE_WEI_PER_UNIT, 9)} ETH.`);
-        return { status: 'claimed', payee: destination, amount: claimed.amount.toString(), transactionHash: transactionHash || receipt?.transactionHash || null };
+        return { status: 'claimed', payee: destination, amount: claimed.amount.toString(), transactionHash: transactionHash || receipt?.transactionHash || null,
+            paymaster };
     }
 
-    async markGaslessCreditsDelivered(payee, transactionHash) {
+    /** Mark the credited records of `payee` under `paymaster` (any paymaster when null) delivered. */
+    async markGaslessCreditsDelivered(payee, transactionHash, paymaster = null) {
         for (const record of await browserWalletRuntime.currentWithdrawals()) {
-            if (record.paymasterCredited === true && String(record.payout || '').toLowerCase() === payee) {
+            if (record.paymasterCredited === true && String(record.payout || '').toLowerCase() === payee
+                && (!paymaster || !record.transit?.paymaster || sameAddress(record.transit.paymaster, paymaster))) {
                 await browserWalletRuntime.updateWithdrawal(record.recordId, {
                     paymasterCredited: false, payoutVerified: true, creditClaimTransactionHash: transactionHash
                 }).catch(() => null);
@@ -4684,10 +4799,23 @@ class ZkapiClient extends EventTarget {
                 Number(prepared.userOpFollowedAt || 0))
         }, timing.resendAfterMs)) return null;
         const kind = prepared.mode === 'mutual' ? KIND.close : KIND.escape;
-        const context = await this.gaslessContext({
-            from: prepared.transit.owner, payout: prepared.payout, owner: prepared.transit.owner, expectedAccount: prepared.transit.account,
-            bundlerUrl: prepared.bundlerUrl || null, kind
-        });
+        let context;
+        let unpinned = false;
+        try {
+            context = await this.gaslessContext({
+                from: prepared.transit.owner, payout: prepared.payout, owner: prepared.transit.owner, expectedAccount: prepared.transit.account,
+                bundlerUrl: prepared.bundlerUrl || null, kind, record: prepared
+            });
+        } catch (error) {
+            // The current profile no longer sponsors this plan's paymaster:
+            // its inclusion is still looked for through the journaled
+            // EntryPoint (read-only, no bundler), but nothing is re-sent;
+            // an operation not included is released below.
+            if (error?.code !== 'gasless_record_not_pinned') throw error;
+            context = this.recordReaderContext(prepared);
+            if (!context) throw error;
+            unpinned = true;
+        }
         // From the earliest block any of the plan's operations was tracked from.
         const fromBlock = earliestBlock(prepared.submittedAtBlock, prepared.staleSubmittedAtBlock);
         let found = await this.findUserOperationInclusion(context, hashes, fromBlock);
@@ -4716,6 +4844,25 @@ class ZkapiClient extends EventTarget {
                     if (!this.gaslessAlreadyKnown(error)) onStatus(`The bundler did not take the sponsored operation again (${error?.shortMessage || error?.message}).`);
                 }
             }
+        }
+        if (!found && unpinned) {
+            // Not re-sent under a profile that no longer pins its paymaster:
+            // once a bundler would have included it (the re-send window from
+            // its last activity), or its proof is about to expire, it is
+            // released with the plan's claim, so the wallet-paid close or
+            // escape (fees: 'wallet') can proceed. Its hashes stay in
+            // staleUserOpHashes: a late inclusion is still settled.
+            const lastActiveAt = Math.max(Number(prepared.submissionStartedAt || 0), Number(prepared.userOpBuiltAt || 0),
+                Number(prepared.userOpSubmittedAt || 0), Number(prepared.userOpFollowedAt || 0));
+            const expiring = Number(prepared.public_inputs?.valid_until || 0) - timing.stopBeforeValidUntilSeconds <= Date.now() / 1_000;
+            if (expiring || Date.now() - lastActiveAt >= timing.resendAfterMs) {
+                await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission);
+                if (submission?.operationId && submission.submissionId) {
+                    await browserWalletRuntime.markPreparedWithdrawalRetryable(null, submission);
+                }
+                onStatus('The sponsored operation sent earlier was not included and is no longer sponsored; it was released. Pay the fee from a wallet to finish this withdrawal.');
+            }
+            return null;
         }
         if (!found) return null;
         await browserWalletRuntime.rememberPreparedWithdrawalTransaction(found.transactionHash, submission, null);
@@ -4758,8 +4905,25 @@ class ZkapiClient extends EventTarget {
 
     /** Whether a record's finalization or forward operation was journaled but its bundle transaction is not known yet. */
     recordUserOpUnresolved(record, prefix) {
-        return this.recordUserOpHashes(record, prefix).length > 0 && !record[`${prefix}TransactionHash`]
+        // 'reverted': its inclusion was found and released (nothing to record again).
+        return this.recordUserOpHashes(record, prefix).length > 0 && record[`${prefix}UserOpPhase`] !== 'reverted'
+            && !record[`${prefix}TransactionHash`]
             && !(record[`${prefix}TransactionHashes`] || []).length;
+    }
+
+    /**
+     * The EntryPoint and paymaster a gasless record's operations ran under:
+     * those journaled with its transit account, else (a record without them)
+     * the current pins; null when neither names them.
+     */
+    recordGaslessContracts(record) {
+        const transit = record?.transit || {};
+        const valid = value => /^0x[0-9a-fA-F]{40}$/.test(String(value || ''));
+        if (valid(transit.entryPoint) && valid(transit.paymaster)) {
+            return { entryPoint: transit.entryPoint.toLowerCase(), paymaster: transit.paymaster.toLowerCase() };
+        }
+        const pins = browserWalletRuntime.gaslessPins();
+        return pins ? { entryPoint: pins.entryPoint, paymaster: pins.paymaster } : null;
     }
 
     /**
@@ -4769,8 +4933,9 @@ class ZkapiClient extends EventTarget {
      * null when the receipt carries no operation of S.
      */
     async gaslessRecordSettlement(record, transactionHash, { reader = null, hash = null, receipt = null } = {}) {
-        const pins = browserWalletRuntime.gaslessPins();
-        if (!pins || !isGaslessWithdrawal(record)) return null;
+        if (!isGaslessWithdrawal(record)) return null;
+        const contracts = this.recordGaslessContracts(record);
+        if (!contracts) return null;
         let bundle = receipt;
         if (!bundle) {
             try {
@@ -4781,7 +4946,7 @@ class ZkapiClient extends EventTarget {
         }
         if (!bundle || BigInt(bundle.status || '0x0') !== 1n) return null;
         const settlement = settlementOf(bundle, {
-            entryPoint: pins.entryPoint, paymaster: pins.paymaster, hash, sender: record.transit.account, payee: record.payout
+            entryPoint: contracts.entryPoint, paymaster: contracts.paymaster, hash, sender: record.transit.account, payee: record.payout
         });
         if (!settlement) return null;
         const settled = settlement.settled;
@@ -4799,6 +4964,51 @@ class ZkapiClient extends EventTarget {
     }
 
     /**
+     * The read-only context of a gasless record's own operations: its
+     * journaled EntryPoint and paymaster (recordGaslessContracts), its
+     * transit account, and the gasless reader; no pins are required and no
+     * bundler is resolved. null when the record names no contracts.
+     */
+    recordReaderContext(record, reader = this.gaslessReader()) {
+        const contracts = this.recordGaslessContracts(record);
+        const account = String(record?.transit?.account || '');
+        if (!contracts || !/^0x[0-9a-fA-F]{40}$/.test(account)) return null;
+        return { pins: contracts, reader, transit: { account: account.toLowerCase() }, bundler: null };
+    }
+
+    /**
+     * Record the inclusion `found` of a record's own finalization or forward
+     * operation (prefix 'finalize' / 'forward'): its bundle transaction under
+     * the record's finalization claim (or the forward's hashes) and, when the
+     * bundle carries it, the paymaster's settlement.
+     */
+    async rememberRecordUserOpInclusion(record, prefix, found, reader) {
+        const settlement = await this.gaslessRecordSettlement(record, found.transactionHash, { reader, hash: found.userOpHash });
+        const settled = settlement ? {
+            ...journalValue(settlement.amounts),
+            [`${prefix}UserOpHash`]: settlement.userOpHash,
+            [`${prefix}UserOpPhase`]: settlement.success ? 'settled' : 'reverted',
+            ...(settlement.success ? { payoutVerified: settlement.payoutVerified } : {})
+        } : {};
+        if (prefix === 'finalize') {
+            const claim = record.finalizeSubmissionId ? {
+                recordId: record.recordId, submissionId: record.finalizeSubmissionId, operationId: record.finalizeOperationId,
+                generation: record.finalizeGeneration, deploymentId: record.deploymentId, chainId: record.chainId,
+                contractAddress: record.contractAddress, noteId: record.noteId, destination: record.destination
+            } : await browserWalletRuntime.claimWithdrawalFinalization(record.recordId);
+            await browserWalletRuntime.rememberWithdrawalFinalization(record.recordId, found.transactionHash, claim, null);
+            if (Object.keys(settled).length) await browserWalletRuntime.updateWithdrawal(record.recordId, settled);
+        } else {
+            await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                forwardTransactionHash: found.transactionHash,
+                forwardTransactionHashes: [...new Set([...(record.forwardTransactionHashes || []), found.transactionHash])],
+                ...settled,
+                ...(settlement?.success ? { fundsWaitingInTransit: false, transitBalanceWei: '0' } : {})
+            });
+        }
+    }
+
+    /**
      * Background pass: the bundle transactions of journaled finalization and
      * forward operations, from the EntryPoint's logs (by every hash the
      * record names, whether or not the op body is still journaled), then the
@@ -4808,41 +5018,22 @@ class ZkapiClient extends EventTarget {
         const records = (await browserWalletRuntime.currentWithdrawals()).filter(record => isGaslessWithdrawal(record)
             && (this.recordUserOpUnresolved(record, 'finalize') || this.recordUserOpUnresolved(record, 'forward')));
         if (!records.length || this.finalizePromise) return;
-        let context = null;
+        // A look on chain only: the record's journaled EntryPoint and
+        // paymaster through the read RPC, never the current pins nor a
+        // bundler, so a late inclusion is still recorded after the profile
+        // retires its gasless pins or names another paymaster (as clientd's
+        // lateUserOperation does).
+        const reader = this.gaslessReader();
         for (const record of records) {
             try {
-                context ||= await this.gaslessContext({
-                    from: record.transit.owner, payout: record.payout, owner: record.transit.owner, expectedAccount: record.transit.account,
-                    bundlerUrl: record.bundlerUrl || null, kind: KIND.finalize
-                });
+                const context = this.recordReaderContext(record, reader);
+                if (!context) continue;
                 for (const prefix of ['finalize', 'forward']) {
                     if (!this.recordUserOpUnresolved(record, prefix)) continue;
                     const fromBlock = record[`${prefix}UserOpBlock`] ?? record.startBlockNumber ?? null;
                     const found = await this.findUserOperationInclusion(context, this.recordUserOpHashes(record, prefix), fromBlock);
                     if (!found) continue;
-                    const settlement = await this.gaslessRecordSettlement(record, found.transactionHash, { reader: context.reader, hash: found.userOpHash });
-                    const settled = settlement ? {
-                        ...journalValue(settlement.amounts),
-                        [`${prefix}UserOpHash`]: settlement.userOpHash,
-                        [`${prefix}UserOpPhase`]: settlement.success ? 'settled' : 'reverted',
-                        ...(settlement.success ? { payoutVerified: settlement.payoutVerified } : {})
-                    } : {};
-                    if (prefix === 'finalize') {
-                        const claim = record.finalizeSubmissionId ? {
-                            recordId: record.recordId, submissionId: record.finalizeSubmissionId, operationId: record.finalizeOperationId,
-                            generation: record.finalizeGeneration, deploymentId: record.deploymentId, chainId: record.chainId,
-                            contractAddress: record.contractAddress, noteId: record.noteId, destination: record.destination
-                        } : await browserWalletRuntime.claimWithdrawalFinalization(record.recordId);
-                        await browserWalletRuntime.rememberWithdrawalFinalization(record.recordId, found.transactionHash, claim, null);
-                        if (Object.keys(settled).length) await browserWalletRuntime.updateWithdrawal(record.recordId, settled);
-                    } else {
-                        await browserWalletRuntime.updateWithdrawal(record.recordId, {
-                            forwardTransactionHash: found.transactionHash,
-                            forwardTransactionHashes: [...new Set([...(record.forwardTransactionHashes || []), found.transactionHash])],
-                            ...settled,
-                            ...(settlement?.success ? { fundsWaitingInTransit: false, transitBalanceWei: '0' } : {})
-                        });
-                    }
+                    await this.rememberRecordUserOpInclusion(record, prefix, found, reader);
                 }
             } catch (error) {
                 console.warn(`Unable to recover the sponsored operations of ${record.recordId}.`, error);
@@ -5810,15 +6001,15 @@ class ZkapiClient extends EventTarget {
                     transitBalanceWei = null;
                 }
                 let settlement = null;
-                const pins = browserWalletRuntime.gaslessPins();
+                const contracts = this.recordGaslessContracts(durable);
                 // The settlement of S's operation in the bundle: by the
                 // journaled hash, or (an operation released before its late
                 // inclusion was found) by S as the sender.
-                if (transactionHash && pins) {
+                if (transactionHash && contracts) {
                     try {
                         const bundle = await chainRead({ method: 'eth_getTransactionReceipt', params: [transactionHash] });
                         settlement = bundle && BigInt(bundle.status || '0x0') === 1n ? settlementOf(bundle, {
-                            entryPoint: pins.entryPoint, paymaster: pins.paymaster, hash: durable.userOpHash || null,
+                            entryPoint: contracts.entryPoint, paymaster: contracts.paymaster, hash: durable.userOpHash || null,
                             sender: durable.transit.account, payee: durable.payout
                         }) : null;
                     } catch {
@@ -7539,6 +7730,96 @@ class ZkapiClient extends EventTarget {
         }
     }
 
+    /**
+     * The sponsored finalization a gasless record journaled (its claim,
+     * `finalizeUserOp`, its hashes) when the current profile no longer pins
+     * the record's paymaster and factory (`gasless: null`, or other pins):
+     * it is never re-sent, so the wallet-paid finalization must not wait on
+     * its claim forever. It is looked for on chain through the journaled
+     * EntryPoint (the read RPC only). Included and settled, its bundle
+     * transaction and settlement are recorded and `{ result }` reports it
+     * (nothing is signed). Included but reverted (its vault call failed),
+     * it is released (claim and op body cleared, phase 'reverted', hashes
+     * kept) and the vault is read again: closed by a third party, the record
+     * is synced and `{ result }` reports the payout waiting in S for
+     * sweepTransit; still pending, `{ record }` goes on to the wallet. Not included, it is given the re-send window from its last
+     * activity (refused with `user_op_pending` meanwhile, or while a client
+     * still follows it), then released: the claim and the op body are
+     * cleared, its hashes stay journaled for the background pass's
+     * late-inclusion look, and `{ record }` is what the wallet path claims.
+     * A record whose pins still match, or with no journaled operation, is
+     * returned as is.
+     */
+    async releaseUnpinnedFinalization(withdrawal, onStatus = () => {}) {
+        const hashes = this.recordUserOpHashes(withdrawal, 'finalize');
+        if (!withdrawal?.finalizeSubmissionId || !(withdrawal.finalizeUserOp || withdrawal.finalizeUserOpHash) || !hashes.length
+            || withdrawal.finalizeTransactionHash || (withdrawal.finalizeTransactionHashes || []).length) return { record: withdrawal };
+        try {
+            this.requireRecordPins(withdrawal);
+            return { record: withdrawal };
+        } catch (error) {
+            if (error?.code !== 'gasless_record_not_pinned') throw error;
+        }
+        const reader = this.gaslessReader();
+        const context = this.recordReaderContext(withdrawal, reader);
+        if (!context) return { record: withdrawal };
+        onStatus('Looking on chain for the sponsored finalization sent earlier…');
+        const found = await this.recordUserOpInclusion(context, withdrawal, 'finalize');
+        const submission = {
+            recordId: withdrawal.recordId, submissionId: withdrawal.finalizeSubmissionId, operationId: withdrawal.finalizeOperationId,
+            generation: Number(withdrawal.finalizeGeneration || 0), deploymentId: withdrawal.deploymentId, chainId: Number(withdrawal.chainId),
+            contractAddress: withdrawal.contractAddress, noteId: Number(withdrawal.noteId), destination: withdrawal.destination
+        };
+        // Included but reverted (its vault call failed, e.g. exits paused):
+        // released as performGaslessFinalization releases it, never recorded
+        // as this record's finalization, so the wallet path is not blocked.
+        const settlement = found ? await this.gaslessRecordSettlement(withdrawal, found.transactionHash, { reader, hash: found.userOpHash }) : null;
+        if (found && (settlement ? !settlement.success : found.success === false)) {
+            await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission });
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                finalizeUserOp: null, finalizeUserOpPhase: 'reverted', finalizeUserOpSubmittedAt: null, finalizeUserOpFollowedAt: null,
+                finalizeUserOpRevertedTransactionHash: found.transactionHash
+            });
+            const released = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal;
+            const after = await this.readBrowserWithdrawalStatus(Number(withdrawal.noteId), null, { request: reader });
+            if (after.status === 'closed') {
+                // A third party finalized the escape first: the vault paid S,
+                // where the payout waits for sweepTransit (wallet-paid).
+                onStatus(`The sponsored finalization sent earlier reverted in ${this.compact(found.transactionHash)}; a third party finalized this escape first.`);
+                await this.syncEscapeWithdrawals(onStatus, withdrawal.recordId);
+                const closed = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || released;
+                return { result: { status: 'closed', recordId: withdrawal.recordId, finalizedByThirdParty: true,
+                    fundsWaitingInTransit: closed.fundsWaitingInTransit === true, transitAccount: context.transit.account } };
+            }
+            onStatus(`The sponsored finalization sent earlier reverted in ${this.compact(found.transactionHash)}; it was released.`);
+            return { record: released };
+        }
+        if (found) {
+            await this.rememberRecordUserOpInclusion(withdrawal, 'finalize', found, reader);
+            await this.refresh({ quiet: true });
+            onStatus(`The sponsored finalization sent earlier was included in ${this.compact(found.transactionHash)}. Nothing was signed; its settlement is checked in the background.`);
+            return { result: { status: 'finalizing', recordId: withdrawal.recordId, sponsored: true, transactionHash: found.transactionHash,
+                userOpHash: found.userOpHash } };
+        }
+        const resendAfterMs = this.gaslessTiming.resendAfterMs;
+        const lastActiveAt = Math.max(Number(withdrawal.finalizeSubmissionStartedAt || 0), Number(withdrawal.finalizeUserOpBuiltAt || 0),
+            Number(withdrawal.finalizeUserOpSubmittedAt || 0), Number(withdrawal.finalizeUserOpFollowedAt || 0));
+        const followed = browserWalletRuntime.gaslessClaimLive({
+            submissionId: withdrawal.finalizeSubmissionId, owner: withdrawal.finalizeSubmissionOwner, lastActiveAt
+        }, resendAfterMs);
+        if (followed || Date.now() - lastActiveAt < resendAfterMs) {
+            throw gaslessError('user_op_pending', {
+                userOpHash: withdrawal.finalizeUserOpHash || hashes.at(-1), retryAfterMs: Math.max(0, lastActiveAt + resendAfterMs - Date.now())
+            }, 'The sponsored finalization sent earlier may still be included. This app no longer sponsors its paymaster, so it is not sent again; finalize from the wallet once it has had time to land.');
+        }
+        await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission });
+        await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+            finalizeUserOp: null, finalizeUserOpPhase: 'released', finalizeUserOpSubmittedAt: null, finalizeUserOpFollowedAt: null
+        });
+        onStatus('The sponsored finalization sent earlier was not included and is no longer sponsored; it was released. A late inclusion is still recorded.');
+        return { record: await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal };
+    }
+
     async performFinalizeEscape(recordIdOrStatus = null, maybeStatus = () => {}, options = {}) {
         const hasRecordId = typeof recordIdOrStatus === 'string';
         const onStatus = typeof recordIdOrStatus === 'function' ? recordIdOrStatus : maybeStatus;
@@ -7570,6 +7851,14 @@ class ZkapiClient extends EventTarget {
         if (!['wallet', 'payout'].includes(fees)) throw new TypeError('Choose wallet or payout for the finalization fees.');
         if (fees === 'payout') return this.performGaslessFinalization(withdrawal, onStatus, options);
         const sponsoredRecord = isGaslessWithdrawal(withdrawal);
+        if (sponsoredRecord) {
+            // A sponsored finalization this record sent before the profile
+            // stopped pinning its paymaster is followed on chain, then
+            // released, before the wallet pays (it never blocks the wallet).
+            const unpinned = await this.releaseUnpinnedFinalization(withdrawal, onStatus);
+            if (unpinned.result) return unpinned.result;
+            withdrawal = unpinned.record;
+        }
 
         onStatus('Connecting to MetaMask for finalization…');
         const from = await this.connectWallet();

@@ -6,6 +6,7 @@
 // the receipt parsers, the availability verdicts and the 25% rule.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import {
     VECTORS, assertUserOperationShape, attemptsKeyOf, create2TransitAccount, decodeGetUserOpHash, decodeHandleOps, failedOpData,
     gaslessProfileFromVectors, hashPacked, logs, revertError, userOperationHashFromJson
@@ -342,8 +343,13 @@ test('fees sit within the paymaster’s ceilings, a spike is refused, and a bump
     assert.deepEqual(selectFees({ baseFeePerGas: 10_000_000_000n, priorityFeePerGas: 9_000_000_000n, ...ceilings }),
         { maxFeePerGas: 25_000_000_000n, maxPriorityFeePerGas: 5_000_000_000n }, 'the tip is capped by its ceiling');
     assert.equal(selectFees({ baseFeePerGas: 1n, ...ceilings }).maxPriorityFeePerGas, 1_000_000_000n, 'no suggestion: 1 gwei');
-    assert.throws(() => selectFees({ baseFeePerGas: 60_000_000_000n, priorityFeePerGas: 1n, ...ceilings }),
-        error => error.code === 'gas_above_paymaster_ceiling' && error.data.wantedMaxFeePerGas === 120_000_000_001n);
+    assert.deepEqual(selectFees({ baseFeePerGas: 60_000_000_000n, priorityFeePerGas: 1n, ...ceilings }),
+        { maxFeePerGas: 100_000_000_000n, maxPriorityFeePerGas: 1n }, '2 × base + tip above the ceiling: capped, not refused');
+    assert.throws(() => selectFees({ baseFeePerGas: 100_000_000_000n, priorityFeePerGas: 1n, ...ceilings }),
+        error => error.code === 'gas_above_paymaster_ceiling' && error.data.neededMaxFeePerGas === 100_000_000_001n
+            && error.data.maxFeeCeiling === 100_000_000_000n && error.data.baseFeePerGas === 100_000_000_000n
+            && error.data.maxPriorityFeePerGas === 1n && error.data.wantedMaxFeePerGas === 200_000_000_001n,
+        'the refusal data: base + tip compared, and wantedMaxFeePerGas (2 × base + tip) kept for hosts that read it');
     assert.deepEqual(bumpFees({ maxFeePerGas: 20_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n }, ceilings),
         { maxFeePerGas: 22_500_000_000n, maxPriorityFeePerGas: 1_125_000_000n });
     assert.deepEqual(bumpFees({ maxFeePerGas: 90_000_000_000n, maxPriorityFeePerGas: 4_400_000_000n }, ceilings),
@@ -356,6 +362,50 @@ test('fees sit within the paymaster’s ceilings, a spike is refused, and a bump
         'maxFeePerGas at the ceiling: a priority-only bump is no replacement');
     assert.equal(bumpFees({ maxFeePerGas: 20_000_000_000n, maxPriorityFeePerGas: 5_000_000_000n }, ceilings), null,
         'maxPriorityFeePerGas at the ceiling: no replacement either');
+});
+
+test('selectFees: both thresholds, below, at and above (2 × base + tip caps, base + tip refuses)', () => {
+    const gwei = 1_000_000_000n;
+    const ceilings = { maxFeeCeiling: 100n * gwei, priorityFeeCeiling: 5n * gwei };
+    const fees = (base, tip) => selectFees({ baseFeePerGas: base, priorityFeePerGas: tip, ...ceilings });
+    const refused = (base, tip) => assert.throws(() => fees(base, tip), error => error.code === 'gas_above_paymaster_ceiling'
+        && error.data.neededMaxFeePerGas === base + (tip < ceilings.priorityFeeCeiling ? tip : ceilings.priorityFeeCeiling));
+    const tip = gwei;
+    // 2 × base + tip against the ceiling: below is taken as is, at is the
+    // ceiling, above is capped at the ceiling (the op still lands).
+    assert.deepEqual(fees(49_500_000_000n, tip - 1n), { maxFeePerGas: 100n * gwei - 1n, maxPriorityFeePerGas: tip - 1n });
+    assert.deepEqual(fees(49_500_000_000n, tip), { maxFeePerGas: 100n * gwei, maxPriorityFeePerGas: tip });
+    assert.deepEqual(fees(49_500_000_000n, tip + 1n), { maxFeePerGas: 100n * gwei, maxPriorityFeePerGas: tip + 1n });
+    // base + tip against the ceiling: below and at are sponsored at the
+    // ceiling, one wei above is refused.
+    assert.deepEqual(fees(99n * gwei - 1n, tip), { maxFeePerGas: 100n * gwei, maxPriorityFeePerGas: tip });
+    assert.deepEqual(fees(99n * gwei, tip), { maxFeePerGas: 100n * gwei, maxPriorityFeePerGas: tip });
+    refused(99n * gwei + 1n, tip);
+    // The capped tip is the one that counts.
+    assert.deepEqual(fees(95n * gwei, 9n * gwei), { maxFeePerGas: 100n * gwei, maxPriorityFeePerGas: 5n * gwei });
+    refused(95n * gwei + 1n, 9n * gwei);
+    // A fee pair at the ceiling has nothing left to bump: the stop before
+    // valid_until takes over (the bump never leaves the ceilings).
+    assert.equal(bumpFees(fees(60n * gwei, tip), ceilings), null);
+});
+
+test('selectFees asserts the fee parity table clientd asserts (same inputs, same fees or the same refusal)', () => {
+    const table = JSON.parse(readFileSync(new URL('../../zkapi-clientd/internal/zkapi/testdata/gasless-fee-parity.json', import.meta.url), 'utf8'));
+    assert.ok(table.cases.length >= 10);
+    for (const c of table.cases) {
+        const input = {
+            baseFeePerGas: BigInt(c.base), priorityFeePerGas: BigInt(c.tip),
+            maxFeeCeiling: BigInt(c.maxFeeCeiling ?? table.maxFeeCeiling),
+            priorityFeeCeiling: BigInt(c.priorityFeeCeiling ?? table.priorityFeeCeiling)
+        };
+        if (c.refused) {
+            assert.throws(() => selectFees(input), error => error.code === c.refused, c.name);
+        } else {
+            assert.deepEqual(selectFees(input), {
+                maxFeePerGas: BigInt(c.maxFeePerGas), maxPriorityFeePerGas: BigInt(c.maxPriorityFeePerGas)
+            }, c.name);
+        }
+    }
 });
 
 test('the amounts of each kind, payout_below_gas and the 25% rule with allowExpensiveGas', () => {
@@ -586,4 +636,15 @@ test('the bundler client speaks JSON-RPC over fetch without credentials, refines
         .sendUserOperation({}, V.entry_point), error => error.code === 'sender_already_constructed' && error.silent === true);
     assert.equal(decodePolicy(`0x${[1n, 2n, 3n, 1n, 0n].map(v => v.toString(16).padStart(64, '0')).join('')}`).escapesEnabled, true);
     assert.equal(decodeQuote(`0x${[1n, 2n, 3n, 4n, 1n, 0n].map(v => v.toString(16).padStart(64, '0')).join('')}`).attemptsLeft, true);
+});
+
+test('every sponsored-withdrawal error code the SDK throws is listed in the README error table', () => {
+    const source = ['../services/zkapiClient.js', '../services/zkapiGasless.mjs']
+        .map(path => readFileSync(new URL(path, import.meta.url), 'utf8')).join('\n');
+    const thrown = new Set([...source.matchAll(/gaslessError\('([a-z0-9_]+)'/g)].map(match => match[1]));
+    assert.ok(thrown.has('user_op_pending') && thrown.has('gasless_record_not_pinned'));
+    const table = readFileSync(new URL('../README.md', import.meta.url), 'utf8').split('\n')
+        .filter(line => line.startsWith('| Sponsored withdrawals')).join('\n');
+    assert.ok(table, 'the README has the sponsored-withdrawal rows');
+    assert.deepEqual([...thrown].filter(code => !table.includes(`\`${code}\``)), []);
 });

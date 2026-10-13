@@ -844,6 +844,9 @@ func (h *FundingHandler) WithdrawAddress(ctx context.Context, destination string
 		}
 		switch w.Phase {
 		case "quoted", "waiting_funds", "waiting_settlement":
+			if _, _, err := h.recordProfile(w); err != nil {
+				return update(), err
+			}
 			if _, _, err := h.gaslessPreflight(ctx, config, options, gaslessKindClose); err != nil {
 				return update(), err
 			}

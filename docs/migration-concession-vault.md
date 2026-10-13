@@ -1294,11 +1294,13 @@ The owner (the multisig) holds these levers:
 
 1. `setPolicy` with `escapesEnabled: false` (the published default), so no
    new escape debt is recorded, and keep the profiles' `gasless` pins
-   published. Both clients refuse every gasless action once a profile has
-   no pins: the sponsored FINALIZE and FORWARD, and even the wallet-paid
-   `sweepTransit`. The pins must therefore outlive the records that need
-   them. New closes stay sponsored meanwhile; each settles inside its own
-   operation and adds no debt.
+   published for now: a sponsored operation for an existing record (the
+   FORWARD of a collect, a sponsored FINALIZE, a new, re-sent or re-signed
+   operation of a sponsored close or escape) needs the current pins to name
+   the record's paymaster and factory, so sponsored recovery ends with the
+   pins. New closes stay
+   sponsored meanwhile; each settles inside its own operation and adds no
+   debt.
 2. Keep sponsoring until `paymaster-status.mjs` shows `open_owed` and
    `stranded_open` empty. Each pending sponsored escape finalizes once its
    challenge period ends, sponsored by its client, or by anyone with
@@ -1306,18 +1308,43 @@ The owner (the multisig) holds these levers:
    permissionless `S.sweep()`, which pays the payee and settles `S`'s debt
    (`S` exists: the initiation created it). Collect or sweep each stranded
    balance the same way, and `writeOffDebt` a defeated escape's debt.
+   Draining while sponsorship is still possible lets users recover without
+   ETH.
 3. Publish profiles whose `gasless` is `null`, so no new proof binds a
    transit account of this paymaster.
 4. Stop sponsoring.
 5. `unlockStake` the paymaster and the factory, wait the unstake delay, then
    `withdrawStake` and `withdrawTo` the float.
 
+After step 3 both clients refuse a new sponsored withdrawal with
+`gasless_unavailable` (the SDK's `reason: 'not_pinned'`), and a sponsored
+operation for an existing record of this paymaster with
+`gasless_record_not_pinned` (also returned when a profile pins another
+paymaster than the record's; it names the wallet-paid close or escape
+initiation first while the record's exit is not on chain yet), while the
+wallet-paid recovery of an existing record keeps working from the
+addresses journaled with it, never the profile's: the SDK's
+`sweepTransit`, `claimGaslessCredit` and `finalizeEscape(…, { fees:
+'wallet' })`, and zkapi-clientd's `withdraw --sweep`, `--claim-credit` and
+`--escape --fees wallet` (a sweep, and zkapi-clientd's credit claim, first
+checks that the journaled factory's `getAddress(owner, payee)` is the journaled `S`; the
+wallet-paid finalization is a plain vault call). They need an account with
+ETH for gas. An operation sent before step 3 and not yet included is not
+sent again: the clients follow it through the journaled EntryPoint on the
+read RPC (zkapi-clientd also asks the bundler it sent it to for a receipt,
+read-only), settle the record if it lands, release it if it landed
+reverted, and otherwise release it after the five-minute
+re-send window so the wallet-paid action takes over (zkapi-clientd's resume
+without `--fees` releases it and names the next command; the SDK releases a
+close or escape initiation in its background sync and a finalization in
+`finalizeEscape(…, { fees: 'wallet' })`; a forward in flight never blocks
+the SDK's sweep). See [Retirement](deployment.md#operating-gasless-withdrawals).
+
 Sponsorship stops every kind at once, FINALIZE and FORWARD included
-(`SponsorshipPaused` is validation's first check), and after step 3 the
-clients refuse to finalize, collect or sweep anything of this paymaster. A
-balance that appears later (an operation in flight at step 3, or an escape
-left pending) is recovered by hand from any funded account: after the
-challenge period, `cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)'
+(`SponsorshipPaused` is validation's first check). A balance that appears
+later (an operation in flight at step 3 that landed or was released, or an
+escape left pending) is recovered by its user's client with those
+wallet-paid actions, or by hand from any funded account: after the challenge period, `cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)'
 <noteId>`, then `cast send "$S" 'sweep()'` (for a stranded balance, only the
 sweep; an `S` with no code needs `cast send "$FACTORY"
 'createAccount(address,address)' <owner> <payee>` first, with the values
@@ -1339,14 +1366,13 @@ Without them, escapes are sponsored at finalization only.
 **Uneconomic floor per network.** Clients refuse a sponsored withdrawal whose
 `maxCost + flatFee` exceeds 25% of the payout (`gasless_uneconomic`, unless
 the host passes `allowExpensiveGas`). `maxCost` is about 1.7M gas of limits
-times `maxFeePerGas`. The SDK takes `maxFeePerGas = 2 × base fee + tip` and
-refuses (`gas_above_paymaster_ceiling`) when that exceeds `maxFeeCeiling`;
-zkapi-clientd takes `min(2 × base fee + tip, maxFeeCeiling)` and refuses
-only when `base fee + tip` exceeds it. The SDK therefore stops sponsoring
-at about half the base fee zkapi-clientd does, and the ceiling is sized
-for the SDK ([Fee ceilings](deployment.md#operating-gasless-withdrawals)).
+times `maxFeePerGas`. Both clients take `maxFeePerGas = min(2 × base fee +
+tip, maxFeeCeiling)` and refuse (`gas_above_paymaster_ceiling`) only when
+`base fee + tip` exceeds `maxFeeCeiling`, so a ceiling of `c` sponsors base
+fees up to `c − tip`, and from a base fee of `(c − tip) / 2` on every
+operation is priced at `c` ([Fee ceilings](deployment.md#operating-gasless-withdrawals)).
 The smallest payout sponsored by default is about
-`4 × 1.7M × maxFeePerGas`:
+`4 × 1.7M × maxFeePerGas`, at most `4 × 1.7M × maxFeeCeiling`:
 
 | `maxFeePerGas` | Smallest payout | `maxSponsoredCost` needed |
 | --- | --- | --- |

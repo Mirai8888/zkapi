@@ -2434,7 +2434,14 @@ class BrowserWalletRuntime extends EventTarget {
         await this.init();
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
-            if (this.runtime.state) throw new Error('This browser already has an active private note.');
+            if (this.runtime.state) {
+                // The SDK's background reconcile may have confirmed this very
+                // deposit from the vault while the foreground waited for its
+                // receipt. That is the same confirmation, not a second note.
+                const confirmed = this.confirmedDepositFor(args);
+                if (!confirmed) throw new Error('This browser already has an active private note.');
+                return this.completeConfirmedDeposit(confirmed, args);
+            }
             const pending = this.runtime.pendingDeposit;
             if (!pending || pending.secret !== args.secret
                 || (args.operationId && pending.operationId !== args.operationId)
@@ -2489,6 +2496,69 @@ class BrowserWalletRuntime extends EventTarget {
                 transactionHash: args.transactionHash || null
             };
         });
+    }
+
+    /**
+     * The confirmed deposit record of the active note when that note is the
+     * one `args` confirms: the same note id, deposit amount and secret (the
+     * secret fixes the registration commitment), and a confirmed record for
+     * this deployment that carries `args.operationId`. Anything else is null.
+     */
+    confirmedDepositFor(args) {
+        const state = this.runtime.state;
+        if (!state || typeof args?.operationId !== 'string' || !args.operationId) return null;
+        const secret = state.secret_s;
+        if (Number(state.note_id) !== Number(args.note_id)
+            || Number(state.deposit_amount) !== Number(args.amount)
+            || secret == null || args.secret == null
+            || !(secret === args.secret || sameFelt(secret, args.secret))) return null;
+        const record = (this.deposits || []).find(deposit => deposit.type === 'deposit'
+            && deposit.status === 'confirmed'
+            && deposit.deploymentId === this.manifest.deployment_id
+            && Number(deposit.noteId) === Number(args.note_id));
+        return record?.operationId === args.operationId ? record : null;
+    }
+
+    /**
+     * Finish a confirmation whose note another path (the background vault
+     * recovery) already committed: fill in the receipt-only fields that path
+     * could not know (the transaction hash and fee on the deposit record, and
+     * the note's deposit path of Amendment A1 from the receipt's
+     * NoteDeposited root and `args.zero_path`, the plan's siblings, since the
+     * pending deposit that held them is gone), then return what a fresh
+     * confirmation returns, so both orders of the race end in the same
+     * durable state. Called under the wallet lock.
+     */
+    async completeConfirmedDeposit(record, args) {
+        const metadata = args.receiptMetadata || {};
+        const transactionHash = args.transactionHash || metadata.transactionHash || null;
+        const missingHash = !record.transactionHash && /^0x[0-9a-fA-F]{64}$/.test(transactionHash || '');
+        const missingFee = record.feeWei == null && metadata.feeWei != null
+            && (!record.transactionHash || !transactionHash
+                || record.transactionHash === String(transactionHash).toLowerCase());
+        const state = this.runtime.state;
+        const depositPath = !state.deposit_path && args.deposit_root != null
+            ? await this.verifiedDepositPath(state, args.deposit_root, args.zero_path)
+            : null;
+        if (missingHash || missingFee || depositPath) {
+            await this.commit({ ...this.runtime, ...(depositPath ? { state: { ...state, deposit_path: depositPath } } : {}) },
+                missingHash || missingFee ? {
+                    depositConfirmation: {
+                        operationId: record.operationId,
+                        createdAt: record.createdAt,
+                        confirmedAt: record.confirmedAt,
+                        transactionHash,
+                        ...metadata
+                    }
+                } : undefined);
+        }
+        return {
+            status: 'confirmed',
+            operationId: record.operationId,
+            noteId: Number(args.note_id),
+            amount: Number(args.amount),
+            transactionHash: transactionHash || record.transactionHash || null
+        };
     }
 
     /** The deposit-time Merkle path, when it leads from the note's leaf to `root`. */

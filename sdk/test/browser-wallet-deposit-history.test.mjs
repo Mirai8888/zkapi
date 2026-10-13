@@ -873,3 +873,160 @@ test('legacy or token wallet state cannot be relabeled as a native ETH wallet', 
         assert.equal(runtime.runtime, null);
     }
 });
+
+// Phase D item 1: the background reconcile (15 s interval, window focus when
+// the MetaMask popup closes) can confirm the pending deposit from the vault
+// while the foreground waits for its receipt. Both orders are the same single
+// confirmation; only a different note refuses.
+const RECEIPT_METADATA = {
+    transactionHash: HASH, fundingAddress: `0x${'34'.repeat(20)}`,
+    feeWei: String(21_000n * 1_000_000_000n), gasUsed: '21000', effectiveGasPrice: '1000000000',
+    receiptBlockNumber: 42, receiptBlockHash: BLOCK_HASH
+};
+
+// The plan's siblings and the root the receipt's NoteDeposited sets (77):
+// the deposit path of Amendment A1 that both orders must save.
+const RACE_ZERO_PATH = Array(32).fill('0x2');
+const RACE_DEPOSIT_PATH = { active_root: `0x${(77).toString(16).padStart(64, '0')}`, siblings: RACE_ZERO_PATH };
+const racePlan = () => plan({ zero_path: RACE_ZERO_PATH });
+
+function raceRuntime() {
+    const runtime = makeRuntime();
+    // The real wasm state names the note secret `secret_s`.
+    runtime.worker = { call: async (method, payload) => {
+        if (method === 'notePathMatches') {
+            return payload.state.note_id === 7 && JSON.stringify(payload.path) === JSON.stringify(RACE_DEPOSIT_PATH);
+        }
+        assert.equal(method, 'confirmDeposit');
+        return { ...state(payload.args.note_id, payload.args.amount), secret_s: payload.args.secret };
+    } };
+    return runtime;
+}
+
+function raceClient(t, runtime) {
+    const client = confirmationClient(t, runtime);
+    t.mock.method(singleton, 'walletStatus', async () => ({ has_note: Boolean(runtime.runtime.state) }));
+    t.mock.method(singleton, 'pendingDeposit', runtime.pendingDeposit.bind(runtime));
+    t.mock.method(singleton, 'treePath', async () => ({}));
+    t.mock.method(singleton, 'refreshExitCost', async () => null);
+    t.mock.method(client, 'readBrowserNote', async () => ({
+        status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999
+    }));
+    return client;
+}
+
+function gate() {
+    let open;
+    const opened = new Promise(resolve => { open = resolve; });
+    return { opened, open };
+}
+
+test('a background vault recovery that confirms first leaves the foreground receipt confirmation successful and fills in its receipt', async t => {
+    // The vault recovery cannot know the mined hash: the saved one was replaced.
+    seedRuntime({ pendingDeposit: racePlan() });
+    const runtime = raceRuntime();
+    const client = raceClient(t, runtime);
+    const receiptRead = gate();
+    const metadataHeld = gate();
+    t.mock.method(client, 'readDepositReceiptMetadata', async (_plan, receipt) => {
+        if (receipt.transactionHash !== HASH) return null;
+        receiptRead.open();
+        await metadataHeld.opened;
+        return { ...RECEIPT_METADATA };
+    });
+    const { vault, receipt } = depositReceipt();
+    const statuses = [];
+    // Foreground: the receipt arrived; its metadata read is held open.
+    const foreground = client.confirmBrowserDepositReceipt(racePlan(), receipt, vault, message => statuses.push(message));
+    await receiptRead.opened;
+    // Background: the reconcile confirms the same note from the vault.
+    const recovered = await client.recoverBrowserDeposit(() => {});
+    assert.equal(recovered.status, 'confirmed');
+    const recoveredRow = runtime.snapshot().deposits.find(row => row.noteId === 7);
+    assert.equal(recoveredRow.transactionHash, null, 'the vault recovery could not know the mined hash');
+    assert.equal(recoveredRow.feeWei, undefined);
+    assert.equal((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.state.deposit_path, undefined,
+        'without the receipt the vault recovery has no deposit root, and its commit drops the pending zero path');
+    const confirmedAt = recoveredRow.confirmedAt;
+    metadataHeld.open();
+    const result = await foreground;
+    assert.equal(result.status, 'confirmed');
+    assert.equal(result.balanceRefreshPending, false);
+    assert.equal(result.noteId, 7);
+    assert.equal(result.amount, 2_000_000);
+    assert.equal(result.transactionHash, HASH);
+    assert.equal(statuses.at(-1), 'Private balance is ready.');
+    assert.equal(client.lastError, null);
+    assert.equal(client.config.pending_deposit, null);
+    assert.equal(client.wallet.has_note, true);
+    // One confirmed row, now carrying the receipt the foreground saw.
+    const persisted = await readBrowserWalletSnapshot(DEPLOYMENT);
+    assert.equal(persisted.runtime.pendingDeposit, null);
+    assert.equal(persisted.runtime.state.note_id, 7);
+    // The deposit path from the receipt's root and the plan's siblings, as
+    // when the foreground confirms first.
+    assert.deepEqual(persisted.runtime.state.deposit_path, RACE_DEPOSIT_PATH);
+    assert.equal(persisted.deposits.length, 1);
+    const row = persisted.deposits[0];
+    assert.equal(row.status, 'confirmed');
+    assert.equal(row.operationId, 'deposit-operation');
+    assert.equal(row.transactionHash, HASH);
+    assert.equal(row.feeWei, RECEIPT_METADATA.feeWei);
+    assert.equal(row.receiptBlockHash, BLOCK_HASH);
+    assert.equal(row.createdAt, 1000);
+    assert.equal(row.confirmedAt, confirmedAt, 'the first confirmation time is kept');
+    assert.deepEqual(client.deposits, persisted.deposits);
+    assertSanitized(persisted.deposits);
+});
+
+test('a background recovery after the foreground confirmed is a no-op, also when it read the plan before the commit', async t => {
+    seedRuntime({ pendingDeposit: racePlan() });
+    const runtime = raceRuntime();
+    const client = raceClient(t, runtime);
+    t.mock.method(client, 'readDepositReceiptMetadata', async (_plan, receipt) =>
+        receipt.transactionHash === HASH ? { ...RECEIPT_METADATA } : null);
+    // The background read the pending plan and is checking the vault.
+    const noteRead = gate();
+    const noteHeld = gate();
+    client.readBrowserNote.mock.mockImplementation(async () => {
+        noteRead.open();
+        await noteHeld.opened;
+        return { status: 1, amount: 2_000_000n, commitment: '0x123', expiryTs: 9999 };
+    });
+    const background = client.recoverBrowserDeposit(() => {});
+    await noteRead.opened;
+    const { vault, receipt } = depositReceipt();
+    const result = await client.confirmBrowserDepositReceipt(racePlan(), receipt, vault, () => {});
+    assert.equal(result.status, 'confirmed');
+    assert.deepEqual((await readBrowserWalletSnapshot(DEPLOYMENT)).runtime.state.deposit_path, RACE_DEPOSIT_PATH);
+    const confirmed = (await readBrowserWalletSnapshot(DEPLOYMENT)).deposits;
+    assert.equal(confirmed[0].transactionHash, HASH);
+    noteHeld.open();
+    assert.equal((await background).status, 'confirmed');
+    // Sequential order: nothing pending, nothing read, nothing written.
+    client.readBrowserNote.mock.mockImplementation(async () => { throw new Error('no vault read expected'); });
+    assert.equal(await client.recoverBrowserDeposit(() => {}), null);
+    const after = await readBrowserWalletSnapshot(DEPLOYMENT);
+    assert.deepEqual(after.deposits, confirmed);
+    assert.equal(after.runtime.state.note_id, 7);
+    assert.deepEqual(after.runtime.state.deposit_path, RACE_DEPOSIT_PATH);
+    assert.equal(after.runtime.pendingDeposit, null);
+});
+
+test('a confirmation naming a different note than the active one still refuses', async () => {
+    seedRuntime({ pendingDeposit: plan() });
+    const runtime = raceRuntime();
+    await runtime.confirmDeposit(confirmArgs());
+    const before = await readBrowserWalletSnapshot(DEPLOYMENT);
+    for (const [label, args] of [
+        ['another note id', confirmArgs({ note_id: 8 })],
+        ['another amount', confirmArgs({ amount: 3_000_000 })],
+        ['another secret', confirmArgs({ secret: 'another-secret' })],
+        ['another operation', confirmArgs({ operationId: 'other-operation' })],
+        ['no operation', confirmArgs({ operationId: undefined })]
+    ]) {
+        await assert.rejects(runtime.confirmDeposit({ ...args, transactionHash: HASH }),
+            /already has an active private note/, label);
+    }
+    assert.deepEqual(await readBrowserWalletSnapshot(DEPLOYMENT), before);
+});

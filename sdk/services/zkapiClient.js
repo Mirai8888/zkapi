@@ -1669,8 +1669,11 @@ class ZkapiClient extends EventTarget {
             receiptMetadata,
             expiry_ts: Number(deposited.expiryTs),
             // The root this deposit set: with its path, the note's exit path
-            // for life (Amendment A1).
-            deposit_root: `0x${deposited.newRoot.toString(16)}`
+            // for life (Amendment A1). The plan's siblings come along for a
+            // note the background recovery committed first, whose pending
+            // deposit (and its zero_path) is gone by then.
+            deposit_root: `0x${deposited.newRoot.toString(16)}`,
+            zero_path: Array.isArray(plan.zero_path) ? plan.zero_path : null
         });
         const balanceRefreshPending = await this.refreshConfirmedBrowserDeposit();
         onStatus(balanceRefreshPending

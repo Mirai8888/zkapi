@@ -159,9 +159,10 @@ node scripts/expected-codehashes.mjs --deployment .demo/deployment.json.pending 
 
 The script runs locally before it sends anything, so `$OUTPUT_PATH.pending`
 describes the simulated deployment: `deploymentStatus` `"pending"` (or
-`"simulated"` without `--broadcast`), the linked addresses, the three runtime
-code hashes and `deployBlockLowerBound`, the chain head the simulation ran on,
-which is not the vault's creation block. The deployment is final only after
+`"simulated"` without `--broadcast`), the linked addresses, the runtime code
+hashes (the vault's three, and with the paymaster five more) and
+`deployBlockLowerBound`, the chain head the simulation ran on, which is not
+the vault's creation block. The deployment is final only after
 `expected-codehashes.mjs --finalize`, run from the repository root after
 `--broadcast`: it reads the creation receipts from forge's broadcast log
 (`demo/contracts/broadcast/Deploy.s.sol/<chain>/run-latest.json`, or

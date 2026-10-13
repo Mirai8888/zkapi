@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { parseDeployment } from './expected-codehashes.mjs';
 import { trustedDeployment } from './v2-acceptance.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -158,9 +159,18 @@ function options(args) {
     return parsed;
 }
 
+// A profile field carried as a JSON number must be a safe integer: a BigInt reaching the
+// serializer is a manifest number above 2^53 - 1 in a field the profile does not take as text.
+function refuseWide(key, value) {
+    assert.ok(typeof value !== 'bigint', `${key}: ${value} is above 2^53 - 1 and the profile carries it as a number; write it as a decimal string in the manifest`);
+    return value;
+}
+
 function main(args) {
     const opts = options(args);
-    const finalized = JSON.parse(fs.readFileSync(opts.finalized, 'utf8'));
+    // The manifest is read as expected-codehashes.mjs reads it: a bare number above 2^53 - 1
+    // becomes a BigInt (a wei amount then prints exactly), never a rounded double.
+    const finalized = parseDeployment(fs.readFileSync(opts.finalized, 'utf8'));
     const base = opts.base ? JSON.parse(fs.readFileSync(opts.base, 'utf8')) : null;
     const baseProfile = opts.format === 'sdk' ? base.trusted_deployment : base;
     const setupDir = path.resolve(ROOT, opts.setupDir ?? SETUP_DIRS[finalized.setupId] ?? '');
@@ -180,7 +190,7 @@ function main(args) {
     if (opts.format === 'trusted') output = { trusted_deployment: profile };
     else if (opts.format === 'sdk') output = { ...base, trusted_deployment: profile };
     else output = clientdProfile(base, profile, finalized, keyHashes);
-    const text = `${JSON.stringify(output, null, 2)}\n`;
+    const text = `${JSON.stringify(output, refuseWide, 2)}\n`;
     if (opts.out) fs.writeFileSync(opts.out, text);
     else process.stdout.write(text);
 }

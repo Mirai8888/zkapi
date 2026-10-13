@@ -473,5 +473,22 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     const sdkOut = run('--format', 'sdk', '--base', path.join(root, 'sdk/assets/config/sepolia.json'));
     assert.equal(sdkOut.status, 0, sdkOut.stderr);
     assert.deepEqual(JSON.parse(sdkOut.stdout).trusted_deployment.gasless, gasless);
+    // The manifest is read as expected-codehashes.mjs reads it: a wei amount written as a bare
+    // number above 2^53 - 1 reaches the profile exactly, a wide number in a field the profile
+    // carries as a number is refused by name, and a fraction is refused outright.
+    const wide = JSON.stringify(finalized).replace('"maxSponsoredCostWei":"50000000000000000"', '"maxSponsoredCostWei":50000000000000001');
+    assert.ok(wide.includes(':50000000000000001'), 'the manifest text carries the bare number');
+    fs.writeFileSync(file, wide);
+    const exact = run('--format', 'clientd', '--base', path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'));
+    assert.equal(exact.status, 0, exact.stderr);
+    assert.equal(JSON.parse(exact.stdout).gasless.policy.max_sponsored_cost_wei, '50000000000000001');
+    fs.writeFileSync(file, JSON.stringify(finalized).replace('"requestChargeCap":50000', '"requestChargeCap":9007199254740993'));
+    const refusedWide = run('--format', 'clientd', '--base', path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'));
+    assert.notEqual(refusedWide.status, 0);
+    assert.match(refusedWide.stderr, /request_charge_cap: 9007199254740993 is above 2\^53 - 1 .* decimal string/);
+    fs.writeFileSync(file, JSON.stringify(finalized).replace('"requestChargeCap":50000', '"requestChargeCap":50000.5'));
+    const refusedFraction = run('--format', 'clientd', '--base', path.join(root, 'zkapi-clientd/internal/zkapi/deployments/sepolia.json'));
+    assert.notEqual(refusedFraction.status, 0);
+    assert.match(refusedFraction.stderr, /deployment field requestChargeCap: 50000.5 is not an exact integer/);
     fs.rmSync(dir, { recursive: true, force: true });
 });

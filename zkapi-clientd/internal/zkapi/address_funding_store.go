@@ -193,10 +193,10 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 		if entry.Kind == "deposit" || entry.Kind == "withdrawal" || escapeKinds[entry.Kind] {
 			expected = config.Contract
 		}
-		if transitKinds[entry.Kind] {
-			// A transit transaction of the gasless path calls the factory,
-			// the transit account or the paymaster of the saved withdrawal
-			// with exactly its intent.
+		if transitKinds[entry.Kind] && record.Pending != nil && strings.EqualFold(record.Pending.Hash, entry.Hash) {
+			// A pending transit transaction of the gasless path calls the
+			// factory, the transit account or the paymaster of the saved
+			// withdrawal with exactly its intent.
 			w := record.Withdrawal
 			if w == nil || w.Transit == nil {
 				return nil, errors.New("transit transaction recovery data is missing its withdrawal; preserve the file")
@@ -206,6 +206,15 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			if !strings.EqualFold("0x"+hex.EncodeToString(tx.Data()), data) || tx.Value().Sign() != 0 {
 				return nil, errors.New("transit transaction recovery call is invalid; preserve the file")
 			}
+		} else if transitKinds[entry.Kind] {
+			// A finished one stays in the history after its withdrawal was
+			// retired for the next note (whose transit account, if any, is
+			// another): it was checked against its withdrawal when signed,
+			// and carries no value.
+			if tx.Value().Sign() != 0 {
+				return nil, errors.New("transit transaction recovery call is invalid; preserve the file")
+			}
+			expected = tx.To().Hex()
 		}
 		if !strings.EqualFold(tx.To().Hex(), expected) {
 			return nil, errors.New("payment transaction recovery destination is invalid; preserve the file")

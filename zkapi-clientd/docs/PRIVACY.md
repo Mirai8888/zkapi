@@ -131,9 +131,15 @@ client sends chain reads and transactions only to the RPC packaged with the
 release, and to your own exit RPC when you configure one
 (`config --exit-rpc-url`), and refuses a wallet companion that reports another
 RPC, indexer or protocol server. Deployment checks then also run through the
-exit RPC, and an escape reads and sends only through it, so that RPC's
-provider sees the note's exit and your interest in the vault, as any wallet's
-RPC would. An exit RPC on another chain is never trusted.
+exit RPC, and an escape reads and sends its transactions only through it, so
+that RPC's provider sees the note's exit and your interest in the vault, as
+any wallet's RPC would. A gasless escape (`--escape --fees payout`, its
+initiation or its sponsored finalization) is the exception: its operation is
+sent to the bundler, the deployment's (run by the operator) unless you set
+your own `--bundler-url`, never through the exit RPC, so that bundler learns
+of the escape before inclusion and can delay or drop it. For an escape that
+must not depend on the operator, use `--fees wallet` or your own bundler. An
+exit RPC on another chain is never trusted.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.

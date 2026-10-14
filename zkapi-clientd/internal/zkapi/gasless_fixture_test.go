@@ -33,7 +33,9 @@ type gaslessFixture struct {
 	profile gaslessProfile
 	// The gasless contracts of the test profile.
 	entryPoint, senderCreator, paymaster, factory, vault common.Address
-	codes                                                map[string]string
+	// implementation is what the factory's implementation() names.
+	implementation common.Address
+	codes          map[string]string
 	// The paymaster's live state.
 	flatFee, minEscapeNet, maxSponsoredCost, maxFeeCeiling, priorityCeiling, deposit *big.Int
 	escapesEnabled, sponsorshipPaused, vaultPaused                                   bool
@@ -84,6 +86,7 @@ type fixturePending struct {
 
 const gaslessFixturePaymasterCode = "0x600460045b"
 const gaslessFixtureFactoryCode = "0x600560055b"
+const gaslessFixtureImplementationCode = "0x600660065b"
 
 // enableGasless attaches the gasless fixture and points the handler's
 // bundler at it.
@@ -107,7 +110,7 @@ func (f *addressFixture) enableGasless(t *testing.T) *gaslessFixture {
 	}
 	g := &gaslessFixture{
 		f: f, vectors: vectors, profile: profile,
-		entryPoint: common.HexToAddress(profile.EntryPoint), senderCreator: common.HexToAddress(profile.SenderCreator), paymaster: common.HexToAddress(profile.Paymaster), factory: common.HexToAddress(profile.Factory), vault: common.HexToAddress(deployment.Contract),
+		entryPoint: common.HexToAddress(profile.EntryPoint), senderCreator: common.HexToAddress(profile.SenderCreator), paymaster: common.HexToAddress(profile.Paymaster), factory: common.HexToAddress(profile.Factory), vault: common.HexToAddress(deployment.Contract), implementation: common.HexToAddress(profile.Implementation),
 		flatFee: vectorUint(t, vectors.Policy.FlatFeeWei), minEscapeNet: vectorUint(t, vectors.Policy.MinEscapeNetWei), maxSponsoredCost: vectorUint(t, vectors.Policy.MaxSponsoredCost), maxFeeCeiling: vectorUint(t, vectors.Policy.MaxFeeCeiling), priorityCeiling: vectorUint(t, vectors.Policy.PriorityFeeCeiling),
 		deposit: new(big.Int).Mul(big.NewInt(10), big.NewInt(1_000_000_000_000_000_000)), escapesEnabled: true,
 		attempts: map[string]uint64{}, owed: map[string]*big.Int{}, credits: map[string]*big.Int{}, balances: map[string]*big.Int{}, stranded: map[string]bool{}, escapeNote: map[string]uint64{}, escapeSponsored: map[uint32]bool{}, sequences: map[string]uint64{}, pending: map[uint32]fixturePending{},
@@ -116,6 +119,7 @@ func (f *addressFixture) enableGasless(t *testing.T) *gaslessFixture {
 	g.codes = map[string]string{
 		strings.ToLower(profile.EntryPoint): readRuntime("entrypoint-v0.7.0.runtime.hex"), strings.ToLower(profile.SenderCreator): readRuntime("sender-creator-v0.7.0.runtime.hex"),
 		strings.ToLower(profile.Paymaster): gaslessFixturePaymasterCode, strings.ToLower(profile.Factory): gaslessFixtureFactoryCode,
+		strings.ToLower(profile.Implementation): gaslessFixtureImplementationCode,
 	}
 	if crypto.Keccak256Hash(common.FromHex(g.codes[strings.ToLower(profile.EntryPoint)])).Hex() != gaslessEntryPointCodehash {
 		t.Fatal("the EntryPoint runtime fixture does not hash to the canonical codehash")
@@ -313,6 +317,8 @@ func (g *gaslessFixture) view(t *testing.T, to, data string) (any, map[string]an
 		switch selector {
 		case selectorFactoryPaymaster:
 			return "0x" + addressWord(g.paymaster), nil, true
+		case selectorFactoryImplementation:
+			return "0x" + addressWord(g.implementation), nil, true
 		case selectorAccountCreationCodeHash:
 			return strings.ToLower(g.profile.AccountCreationCodeHash), nil, true
 		case selectorFactoryGetAddress:

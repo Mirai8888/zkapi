@@ -178,6 +178,50 @@ func TestGaslessWalletFallbackFollowsALateOperation(t *testing.T) {
 	}
 }
 
+// A sponsored close stopped as gasless_refused (fee_bump_needs_quote) that
+// the bundler included after all is not turned into an escape: withdraw
+// --escape looks for the dropped operation first. A quote request is
+// refused with the resume command (the close is then in flight, which the
+// escape refuses as well, until withdraw --to completes it); a plain run
+// follows the close to its completion. Either way the companion is told the
+// bundle transaction and no escape is prepared.
+func TestGaslessEscapeOverARefusedCloseFollowsALateOperation(t *testing.T) {
+	for _, quoted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "resume", true: "quoted"}[quoted], func(t *testing.T) {
+			f, g := newGaslessEscapeFixture(t)
+			first := f.sponsoredClose(t)
+			f.editJournal(t, func(record *addressFundingRecord) { record.Withdrawal.UserOp.SubmittedAt -= 400 })
+			g.known[first], g.refuseResend = false, true
+			status, err := f.h.WithdrawAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID)
+			if err != nil || status.Phase != "gasless_refused" || !strings.Contains(status.GaslessRefusal, "fee_bump_needs_quote") {
+				t.Fatalf("no stop: %+v %v", status, err)
+			}
+			g.refuseResend = false
+			g.mineUserOp(t, first, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: big.NewInt(5), PaidOut: new(big.Int).Sub(gaslessPayoutWei, big.NewInt(5))})
+			if quoted {
+				if quote, err := f.h.QuoteAddressEscape(context.Background(), withdrawalTestDestination, f.noteID, nil, ""); err == nil || !strings.Contains(err.Error(), "included after all") || !strings.Contains(err.Error(), "withdraw --to") {
+					t.Fatalf("an escape quote over a late close: %+v %v", quote, err)
+				}
+				if w := f.journal(t).Withdrawal; w.Mode != "" || w.UserOp == nil || w.UserOp.Hash != first || w.Phase != "op_submitted" {
+					t.Fatalf("the escape discarded the close operation: %+v", w)
+				}
+				if _, err := f.h.EscapeAddress(context.Background(), withdrawalTestDestination, f.noteID, nil, ""); err == nil || !strings.Contains(err.Error(), "withdraw --to") {
+					t.Fatalf("an escape over the close in flight: %v", err)
+				}
+				status, err = f.h.WithdrawAddress(context.Background(), withdrawalTestDestination, f.noteID)
+			} else {
+				status, err = f.h.EscapeAddress(context.Background(), withdrawalTestDestination, f.noteID, nil, "")
+			}
+			if err != nil || status.Phase != "complete" || status.Mode != "" || status.UserOpHash != first || f.confirmCalls != 1 || len(f.escape.prepares) != 0 {
+				t.Fatalf("the late close was not followed: %+v %v", status, err)
+			}
+			if w := f.journal(t).Withdrawal; w.Mode != "" || w.UserOp == nil || w.UserOp.Hash != first {
+				t.Fatalf("record: %+v", w)
+			}
+		})
+	}
+}
+
 // Without a quote request the --fees wallet fallback follows the late
 // operation at once.
 func TestGaslessWalletFallbackResumeFollowsALateOperation(t *testing.T) {

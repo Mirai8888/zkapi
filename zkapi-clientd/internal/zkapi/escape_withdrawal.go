@@ -239,10 +239,25 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 			return update(), errors.New("finish the saved deposit before withdrawing")
 		}
 		w = &addressWithdrawalRecord{NoteID: noteID, Destination: destination, Mode: "escape", Phase: "escape_decision"}
+		// initiationRefused is a paymaster that sponsors no escape
+		// initiation (escapes disabled, the published default) while a
+		// sponsored finalization passes its pre-flight: the escape is still
+		// reserved for the transit account, so --fees wallet initiates it
+		// bound to that account and --fees payout, once it is on chain,
+		// finalizes it sponsored and forwards the payout.
+		var initiationRefused error
 		if options.Fees == "payout" {
 			// Design 3.3: the gasless pre-flight runs before the companion
 			// reserves the exit for the transit account.
 			payeeHasCode, err := h.gaslessPrepareCheck(ctx, config, options, gaslessKindEscape, wallet.Note.Balance, destination)
+			if GaslessRefusalCode(err) == "escapes_disabled" {
+				initiationRefused = err
+				if payeeHasCode, err = h.gaslessPrepareCheck(ctx, config, options, gaslessKindFinalize, wallet.Note.Balance, destination); err != nil {
+					// Nothing is reserved: the escape is wallet-paid
+					// throughout, bound to the payout address.
+					return update(), refuse("escapes_disabled", "the paymaster does not sponsor escape initiations, and a sponsored finalization is not available either (%v); use --fees wallet, which pays both the initiation and the finalization from the local signing address", err)
+				}
+			}
 			if err != nil {
 				return update(), err
 			}
@@ -263,6 +278,9 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		record.Withdrawal, record.Phase = w, "withdrawal_pending"
 		if err := h.saveAddress(record); err != nil {
 			return update(), err
+		}
+		if initiationRefused != nil {
+			return update(), initiationRefused
 		}
 	case w.Mode != "escape":
 		// A mutual close the companion could not complete turns into an
@@ -291,6 +309,16 @@ func (h *FundingHandler) EscapeAddress(ctx context.Context, destination string, 
 		}
 		if w.UserOp != nil && w.Phase != "op_reverted" && w.Phase != "gasless_refused" {
 			return update(), errors.New("a sponsored close operation is in flight; finish it with zkapi-clientd withdraw --to " + w.Destination)
+		}
+		// A close operation the bundler dropped (gasless_refused) may still
+		// be included until its valid_until: looked for first, as before
+		// every other fallback that discards it. Found, the note is closed
+		// and paid by that close, which is followed (under a quote request,
+		// refused with the resume command) instead of becoming an escape.
+		if late, err := h.lateGaslessOperation(ctx, config, record); err != nil {
+			return update(), err
+		} else if late {
+			return h.resumeGaslessClose(ctx, config, record, update)
 		}
 		// The reservation (and so a transit account the proof binds) stays.
 		*w = addressWithdrawalRecord{NoteID: w.NoteID, Destination: w.Destination, Mode: "escape", Phase: "escape_decision", FeePayer: w.FeePayer, ProofDestination: w.ProofDestination, Transit: w.Transit, StartBlock: w.StartBlock}
@@ -970,6 +998,14 @@ func (h *FundingHandler) completeEscape(ctx context.Context, config fundingConfi
 		return update(), err
 	}
 	w.FinalizeHash, w.Payout, w.Amount, w.PayoutCredited, w.ConcessionExceededBound = strings.ToLower(hash), paid, paid, credited, matched.ExceededBound
+	if w.UserOp != nil && gaslessKindOf(w.UserOp.Kind) == gaslessKindEscape {
+		// A finalization another transaction made: the operation still
+		// journaled is the sponsored initiation, on chain since (its
+		// InitiateHash and debt are recorded). It authorized the proof's
+		// B − c at initiation, which a raise lowered: kept, it would no
+		// longer match the record's Amount (the payout just read).
+		w.UserOp = nil
+	}
 	w.CompletedOnPinnedRPC = config.ExitRPC == ""
 	w.SettlementHash = strings.ToLower(hash)
 	if w.Transit != nil {

@@ -2227,6 +2227,9 @@ func (h *FundingHandler) transitBalance(ctx context.Context, env *gaslessEnviron
 	return balance, note.Status == noteClosed, nil
 }
 
+// errTransitEmpty is the --sweep of a transit account that holds nothing.
+var errTransitEmpty = errors.New("the transit account holds nothing to sweep")
+
 // transitSweepIntent is the wallet-paid transaction --sweep signs next: the
 // account's creation when S has no code, else its sweep.
 func (h *FundingHandler) transitSweepIntent(ctx context.Context, env *gaslessEnvironment) (kind, to, data string, err error) {
@@ -2242,7 +2245,7 @@ func (h *FundingHandler) transitSweepIntent(ctx context.Context, env *gaslessEnv
 		return "", "", "", err
 	}
 	if balance.Sign() == 0 {
-		return "", "", "", errors.New("the transit account holds nothing to sweep")
+		return "", "", "", errTransitEmpty
 	}
 	return "transit_sweep", env.account.Hex(), "0x" + selectorTransitSweep, nil
 }
@@ -2297,9 +2300,13 @@ func (h *FundingHandler) followTransitTransaction(ctx context.Context, config fu
 			}
 		case "gasless_claim":
 			w.ClaimHash = strings.ToLower(pending.Hash)
+			payee := "0x" + addressABIWord(strings.ToLower(w.Destination))
 			for _, log := range receipt.Logs {
-				if !log.Removed && strings.EqualFold(log.Address, w.Transit.Paymaster) && len(log.Topics) == 2 && strings.EqualFold(log.Topics[0], paymasterCreditClaimedTopic) && isHex(log.Data, 32) {
+				if !log.Removed && strings.EqualFold(log.Address, w.Transit.Paymaster) && len(log.Topics) == 2 && strings.EqualFold(log.Topics[0], paymasterCreditClaimedTopic) && strings.EqualFold(log.Topics[1], payee) && isHex(log.Data, 32) {
+					// The credit reached Y: nothing waits in the paymaster
+					// any more, so new deposits are no longer held back.
 					w.ReceivedWei = new(big.Int).SetBytes(common.FromHex(log.Data)).String()
+					w.PaymasterCredited, w.PayoutCredited = false, false
 				}
 			}
 		}
@@ -2615,13 +2622,28 @@ func (h *FundingHandler) transitAction(ctx context.Context, config fundingConfig
 			return update(), err
 		}
 		if credit.Sign() == 0 {
-			return update(), errors.New("the paymaster holds no credit for this destination; it was claimed already")
+			// claimCredit is permissionless: someone else delivered the
+			// credit. Nothing waits in the paymaster any more (what reached
+			// Y is not known here, so no figure is shown for it).
+			w.PaymasterCredited, w.PayoutCredited, w.ReceivedWei = false, false, ""
+			if err := h.saveAddress(record); err != nil {
+				return update(), err
+			}
+			return update(), errors.New("the paymaster holds no credit for this destination; it was claimed already, and the withdrawal no longer waits for it")
 		}
 		if err := h.signAddressTransaction(ctx, config, record, "gasless_claim", env.paymaster.Hex(), w.transitClaimCalldata()); err != nil {
 			return update(), err
 		}
 	case options.Sweep:
 		kind, to, data, err := h.transitSweepIntent(ctx, env)
+		if errors.Is(err, errTransitEmpty) && w.FundsWaitingInTransit {
+			// Someone else swept or forwarded the balance (S.sweep() and a
+			// FORWARD pay Y whoever sends them): nothing waits in S.
+			w.FundsWaitingInTransit = false
+			if saveErr := h.saveAddress(record); saveErr != nil {
+				return update(), saveErr
+			}
+		}
 		if err != nil {
 			return update(), err
 		}

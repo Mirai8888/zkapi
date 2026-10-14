@@ -198,6 +198,9 @@ func setGaslessStatus(status *AddressWithdrawalStatus, w *addressWithdrawalRecor
 	if w.Phase == "op_reverted" && w.UserOp != nil && status.GaslessRefusal == "" {
 		status.GaslessRefusal = w.UserOp.Revert
 	}
+	// Read from the record as this run left it (a claim may have just
+	// delivered the credit), never kept from an earlier snapshot.
+	status.PaymasterCredited, status.PaymasterAddress = false, ""
 	if w.PaymasterCredited {
 		status.PaymasterCredited, status.PaymasterAddress = true, w.Transit.Paymaster
 	}
@@ -656,7 +659,7 @@ func setGaslessMessage(status *AddressWithdrawalStatus) bool {
 		case status.PaymasterCredited:
 			status.Message = fmt.Sprintf("The sponsored withdrawal closed the note, but the payout could not be pushed to %[1]s (it rejected the ETH or needed more than 100,000 gas), so the paymaster %[2]s holds it as a credit; nothing has arrived at %[1]s yet. Once %[1]s accepts a plain ETH transfer, anyone can deliver it with zkapi-clientd withdraw --claim-credit --to %[1]s (claimCredit(%[1]s) on the paymaster; data %[3]s).", status.Destination, status.PaymasterAddress, status.ClaimCalldata)
 		case status.FundsWaitingInTransit:
-			status.Message = fmt.Sprintf("The private note is closed, and the payout waits in the transit account %s. Deliver it to %s with zkapi-clientd withdraw --collect --to %s (a sponsored operation; the fee is taken from the payout) or zkapi-clientd withdraw --sweep --to %s (paid by the local signing address).", status.TransitAccount, status.Destination, status.Destination, status.Destination)
+			status.Message = fmt.Sprintf("The private note is closed, and the payout waits in the transit account %s. Deliver it to %s with zkapi-clientd withdraw --sweep --to %s (paid by the local signing address), or with zkapi-clientd withdraw --collect --to %s (a sponsored operation; the fee is taken from the payout) when the paymaster holds evidence for a sponsored forward (a sponsored operation of this withdrawal was included and reverted, or another transaction finalized its sponsored escape).", status.TransitAccount, status.Destination, status.Destination, status.Destination)
 			if status.GaslessRefusal != "" {
 				status.Message = fmt.Sprintf("The sponsored forward stopped: %s. ", status.GaslessRefusal) + status.Message
 			}

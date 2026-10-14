@@ -94,6 +94,7 @@ var (
 	selectorFactoryGetAddress       = selectorOf("getAddress(address,address)")
 	selectorAccountCreationCodeHash = selectorOf("accountCreationCodeHash()")
 	selectorFactoryPaymaster        = selectorOf("paymaster()")
+	selectorFactoryImplementation   = selectorOf("implementation()")
 	// ZkApiWithdrawalPaymaster.
 	selectorPaymasterEntryPoint = selectorOf("entryPoint()")
 	selectorPaymasterVault      = selectorOf("vault()")
@@ -174,14 +175,20 @@ var (
 // policy the paymaster enforces, which the client mirrors. Absent or null,
 // the option is hidden and the wallet-paid path is exactly as before.
 type gaslessProfile struct {
-	EntryPoint                string                `json:"entry_point_address"`
-	EntryPointCode            string                `json:"entry_point_runtime_codehash"`
-	SenderCreator             string                `json:"sender_creator_address"`
-	SenderCreatorCode         string                `json:"sender_creator_runtime_codehash"`
-	Paymaster                 string                `json:"withdrawal_paymaster_address"`
-	PaymasterCode             string                `json:"withdrawal_paymaster_runtime_codehash"`
-	Factory                   string                `json:"withdrawal_account_factory_address"`
-	FactoryCode               string                `json:"withdrawal_account_factory_runtime_codehash"`
+	EntryPoint        string `json:"entry_point_address"`
+	EntryPointCode    string `json:"entry_point_runtime_codehash"`
+	SenderCreator     string `json:"sender_creator_address"`
+	SenderCreatorCode string `json:"sender_creator_runtime_codehash"`
+	Paymaster         string `json:"withdrawal_paymaster_address"`
+	PaymasterCode     string `json:"withdrawal_paymaster_runtime_codehash"`
+	Factory           string `json:"withdrawal_account_factory_address"`
+	FactoryCode       string `json:"withdrawal_account_factory_runtime_codehash"`
+	// The transit accounts' logic: every transit account is a proxy that
+	// delegatecalls it, so its code decides where the account's balance
+	// goes. The factory's constructor creates it; nothing but its runtime
+	// codehash pins it.
+	Implementation            string                `json:"withdrawal_account_implementation_address"`
+	ImplementationCode        string                `json:"withdrawal_account_implementation_runtime_codehash"`
 	AccountCreationCode       string                `json:"account_creation_code"`
 	AccountCreationCodeHash   string                `json:"account_creation_code_keccak256"`
 	BundlerURL                string                `json:"bundler_url"`
@@ -432,12 +439,12 @@ func (g *gaslessProfile) validate() (gaslessProfile, error) {
 		return gaslessProfile{}, fmt.Errorf("%w: this deployment publishes no gasless paymaster", errGaslessUnavailable)
 	}
 	profile := *g
-	for _, address := range []string{profile.EntryPoint, profile.SenderCreator, profile.Paymaster, profile.Factory} {
+	for _, address := range []string{profile.EntryPoint, profile.SenderCreator, profile.Paymaster, profile.Factory, profile.Implementation} {
 		if !isHex(address, 20) || common.HexToAddress(address) == (common.Address{}) {
 			return profile, invalid("names an invalid contract address")
 		}
 	}
-	for _, code := range []string{profile.EntryPointCode, profile.SenderCreatorCode, profile.PaymasterCode, profile.FactoryCode, profile.AccountCreationCodeHash} {
+	for _, code := range []string{profile.EntryPointCode, profile.SenderCreatorCode, profile.PaymasterCode, profile.FactoryCode, profile.ImplementationCode, profile.AccountCreationCodeHash} {
 		if !isHex(code, 32) {
 			return profile, invalid("names an invalid code hash")
 		}
@@ -445,6 +452,11 @@ func (g *gaslessProfile) validate() (gaslessProfile, error) {
 	creation, err := hex.DecodeString(strings.TrimPrefix(profile.AccountCreationCode, "0x"))
 	if err != nil || !strings.HasPrefix(profile.AccountCreationCode, "0x") || len(creation) == 0 || !strings.EqualFold(crypto.Keccak256Hash(creation).Hex(), profile.AccountCreationCodeHash) {
 		return profile, invalid("carries an account creation code that does not hash to its pin")
+	}
+	// The proxy creation code embeds the logic every transit account
+	// delegatecalls: the pinned implementation.
+	if !bytes.Contains(creation, common.HexToAddress(profile.Implementation).Bytes()) {
+		return profile, invalid("carries an account creation code for another account implementation")
 	}
 	if !strings.EqualFold(profile.EntryPointCode, gaslessEntryPointCodehash) || !strings.EqualFold(profile.SenderCreatorCode, gaslessSenderCreatorCodehash) {
 		return profile, invalid("pins an EntryPoint other than the canonical v0.7.0")
@@ -1197,9 +1209,10 @@ func (r rpcCaller) callData(ctx context.Context, to, data string) (string, error
 
 // verifyGaslessCode runs the gasless deployment checks of design 4.4 through
 // rpcURL: the runtime code of the EntryPoint, its SenderCreator, the
-// paymaster and the factory hash to the profile's pins; the paymaster names
-// the vault, the factory and the EntryPoint and reads the vault's unit; the
-// factory names the paymaster and the creation code; the paymaster's gas
+// paymaster, the factory and the transit accounts' implementation hash to
+// the profile's pins; the paymaster names the vault, the factory and the
+// EntryPoint and reads the vault's unit; the factory names the paymaster,
+// the implementation and the creation code; the paymaster's gas
 // policy is the profile's; and the factory derives the same transit account
 // as this client for a sample pair. A mismatch is gasless_unavailable, which
 // never refuses deposits or wallet-paid exits.
@@ -1217,6 +1230,10 @@ func verifyGaslessCode(ctx context.Context, client *http.Client, rpcURL string, 
 		{"the SenderCreator's runtime code", profile.SenderCreator, profile.SenderCreatorCode, d.Evidence.SenderCreatorCode},
 		{"the withdrawal paymaster's runtime code", profile.Paymaster, profile.PaymasterCode, d.Evidence.PaymasterCode},
 		{"the account factory's runtime code", profile.Factory, profile.FactoryCode, d.Evidence.FactoryCode},
+		// A paymaster whose creation code differs from the source could have
+		// its factory create other account logic while every runtime above
+		// still matches: only this pin catches it.
+		{"the transit account implementation's runtime code", profile.Implementation, profile.ImplementationCode, d.Evidence.ImplementationCode},
 	}
 	for _, code := range pins {
 		if code.evidence != "" && !strings.EqualFold(code.evidence, code.pin) {
@@ -1236,6 +1253,7 @@ func verifyGaslessCode(ctx context.Context, client *http.Client, rpcURL string, 
 		{"the paymaster's entryPoint()", profile.Paymaster, "0x" + selectorPaymasterEntryPoint, addressABIWord(strings.ToLower(profile.EntryPoint))},
 		{"the paymaster's WEI_PER_UNIT()", profile.Paymaster, "0x" + selectorWeiPerUnit, uintWord(1_000_000_000)},
 		{"the factory's paymaster()", profile.Factory, "0x" + selectorFactoryPaymaster, addressABIWord(strings.ToLower(profile.Paymaster))},
+		{"the factory's implementation()", profile.Factory, "0x" + selectorFactoryImplementation, addressABIWord(strings.ToLower(profile.Implementation))},
 		{"the factory's accountCreationCodeHash()", profile.Factory, "0x" + selectorAccountCreationCodeHash, addressABIWord(strings.ToLower(profile.AccountCreationCodeHash))},
 	} {
 		got, err := rpc.word(ctx, getter.contract, getter.selector)

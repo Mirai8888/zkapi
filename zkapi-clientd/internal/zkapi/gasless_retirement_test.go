@@ -2,8 +2,10 @@ package zkapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -128,6 +130,39 @@ func TestGaslessRetiredProfileKeepsTheSweepAndRefusesTheSponsoredCollect(t *test
 	}
 	if len(g.sends) != sends {
 		t.Fatal("the sweep contacted the bundler")
+	}
+}
+
+// S.sweep() is permissionless: when someone else emptied the transit
+// account after the profile was retired, --sweep finds nothing to sweep,
+// signs nothing and stops waiting for the payout (the sponsored --collect
+// is refused under a retired profile), so a new deposit can be funded.
+func TestGaslessRetiredProfileSweepOfAnEmptiedTransitAccountStopsWaiting(t *testing.T) {
+	f, g, quote := replayClosedForForward(t)
+	refusedForward(t, f, g, quote)
+	transit := common.HexToAddress(f.journal(t).Withdrawal.Transit.Account)
+	retireGasless(t)
+	f.h = &FundingHandler{client: f.h.client, statePath: f.h.statePath}
+	f.mu.Lock()
+	g.codes[strings.ToLower(transit.Hex())] = g.vectors.TransitRuntimeCode
+	g.balances[strings.ToLower(transit.Hex())] = new(big.Int)
+	f.mu.Unlock()
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 1234567); !errors.Is(err, errWithdrawalPayoutWaiting) {
+		t.Fatalf("a deposit while the payout waits: %v", err)
+	}
+	sweep := payoutContext(addressWithdrawalOptions{Sweep: true})
+	if _, err := f.h.QuoteAddressWithdrawal(sweep, withdrawalTestDestination, f.noteID, "", false); err == nil || !strings.Contains(err.Error(), "holds nothing to sweep") {
+		t.Fatalf("a sweep of an empty transit account: %v", err)
+	}
+	record := f.journal(t)
+	if w := record.Withdrawal; record.Pending != nil || w.FundsWaitingInTransit || w.Phase != "complete" {
+		t.Fatalf("the record still waits for the payout: %+v", w)
+	}
+	if status, err := f.h.AddressWithdrawal(context.Background()); err != nil || status.FundsWaitingInTransit {
+		t.Fatalf("status: %+v %v", status, err)
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 1234567); errors.Is(err, errWithdrawalPayoutWaiting) {
+		t.Fatalf("a deposit after the third-party sweep: %v", err)
 	}
 }
 

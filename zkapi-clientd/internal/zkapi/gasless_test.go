@@ -1131,10 +1131,55 @@ func TestGaslessWithdrawalCreditedPayoutIsClaimed(t *testing.T) {
 	if err != nil || status.Phase != "complete" || status.ReceivedWei != credited.String() || f.journal(t).Pending != nil || f.journal(t).Withdrawal.ClaimHash != strings.ToLower(record.Pending.Hash) {
 		t.Fatalf("claim completion: %+v %v", status, err)
 	}
+	// Delivered: nothing waits in the paymaster, the status says what
+	// arrived, and a new deposit is no longer held back.
+	if status.PaymasterCredited || status.PayoutCredited || strings.Contains(status.Message, "nothing has arrived") || !strings.Contains(status.Message, credited.String()) {
+		t.Fatalf("the claimed credit still shows as waiting: %+v", status)
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 1234567); err != nil {
+		t.Fatalf("a deposit after the claim: %v", err)
+	}
+	// The deposit retired the withdrawal; the claim stays in the history.
+	if record := f.journal(t); record.Withdrawal != nil || len(record.History) == 0 || record.History[len(record.History)-1].Kind != "gasless_claim" {
+		t.Fatalf("the withdrawal was not retired for the deposit: %+v", record.Withdrawal)
+	}
 	// Restart keeps the journal valid.
 	f.h = &FundingHandler{client: f.h.client, statePath: f.h.statePath}
-	if _, err := f.h.AddressWithdrawal(context.Background()); err != nil {
-		t.Fatal(err)
+	if status, err := f.h.AddressWithdrawal(context.Background()); err != nil || status.PaymasterCredited {
+		t.Fatalf("after a restart: %+v %v", status, err)
+	}
+}
+
+// claimCredit is permissionless: when someone else delivered the credit
+// first, --claim-credit finds credits(Y) at zero, signs nothing and stops
+// waiting for the credit, so a new deposit can be funded.
+func TestGaslessWithdrawalCreditClaimedByAThirdPartyStopsWaiting(t *testing.T) {
+	f, g := newGaslessWithdrawalFixture(t)
+	ctx := payoutContext(payoutFees)
+	hash := f.sponsoredClose(t)
+	charged := big.NewInt(11)
+	credited := new(big.Int).Sub(gaslessPayoutWei, charged)
+	g.mineUserOp(t, hash, true, fixtureSettlement{Received: gaslessPayoutWei, Charged: charged, Credited: credited})
+	if status, err := f.h.WithdrawAddress(ctx, withdrawalTestDestination, f.noteID); err != nil || !status.PaymasterCredited {
+		t.Fatalf("credited: %+v %v", status, err)
+	}
+	f.mu.Lock()
+	g.credits[strings.ToLower(withdrawalTestDestination)] = new(big.Int)
+	f.mu.Unlock()
+	claim := payoutContext(addressWithdrawalOptions{ClaimCredit: true})
+	if _, err := f.h.QuoteAddressWithdrawal(claim, withdrawalTestDestination, f.noteID, "", false); err == nil || !strings.Contains(err.Error(), "claimed already") {
+		t.Fatalf("a claim of a delivered credit: %v", err)
+	}
+	record := f.journal(t)
+	if w := record.Withdrawal; record.Pending != nil || w.PaymasterCredited || w.PayoutCredited || w.ReceivedWei != "" || w.Phase != "complete" {
+		t.Fatalf("the record still waits for the credit: %+v", w)
+	}
+	status, err := f.h.AddressWithdrawal(context.Background())
+	if err != nil || status.PaymasterCredited || status.PayoutCredited || strings.Contains(status.Message, "nothing has arrived") {
+		t.Fatalf("status: %+v %v", status, err)
+	}
+	if _, err := f.h.QuoteAddressDeposit(context.Background(), 1234567); errors.Is(err, errWithdrawalPayoutWaiting) {
+		t.Fatalf("a deposit after the third-party claim: %v", err)
 	}
 }
 
@@ -1227,6 +1272,12 @@ func TestGaslessWithdrawalFallsBackToTheWalletAndSweeps(t *testing.T) {
 	}
 	if _, err := f.h.QuoteAddressDeposit(context.Background(), 1234567); !errors.Is(err, errWithdrawalPayoutWaiting) {
 		t.Fatalf("a deposit while the payout waits: %v", err)
+	}
+	// The refused operation was never included, so the paymaster holds no
+	// evidence for a sponsored forward: --collect is refused and names
+	// --sweep (CLI_ZKAPI.md, gasless_refused then --fees wallet).
+	if _, err := f.h.QuoteAddressWithdrawal(payoutContext(addressWithdrawalOptions{Collect: true}), withdrawalTestDestination, f.noteID, "", false); err == nil || !strings.Contains(err.Error(), "no evidence") || !strings.Contains(err.Error(), "--sweep") {
+		t.Fatalf("a sponsored collect after a refused operation: %v", err)
 	}
 	// The wallet-paid sweep and claim never contact a bundler: they work in
 	// a fresh process where none resolves (the bundler was given only on
@@ -1467,6 +1518,31 @@ func TestGaslessWithdrawalPreflightRefusesBeforeReserving(t *testing.T) {
 	}
 }
 
+// The transit accounts' implementation is pinned like the other gasless
+// contracts: a profile without its address or runtime codehash, or whose
+// account creation code embeds another implementation, disables --fees
+// payout (gasless_unavailable) before any chain read.
+func TestGaslessProfileRequiresTheAccountImplementationPin(t *testing.T) {
+	for name, edit := range map[string]func(map[string]any){
+		"no implementation address":  func(g map[string]any) { delete(g, "withdrawal_account_implementation_address") },
+		"no implementation codehash": func(g map[string]any) { delete(g, "withdrawal_account_implementation_runtime_codehash") },
+		"another implementation": func(g map[string]any) {
+			g["withdrawal_account_implementation_address"] = "0x" + strings.Repeat("ab", 20)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, _ := newGaslessWithdrawalFixture(t)
+			installGaslessProfile(t, func(gasless map[string]any) any {
+				edit(gasless)
+				return gasless
+			})
+			if err := f.h.client.CheckGaslessDeployment(context.Background()); !errors.Is(err, errGaslessUnavailable) || !strings.Contains(err.Error(), "gasless object") {
+				t.Fatalf("accepted: %v", err)
+			}
+		})
+	}
+}
+
 // Design 4.4: the gasless deployment checks run through the pinned and the
 // exit RPC before the first gasless prepare; a mismatch disables --fees
 // payout and nothing else.
@@ -1475,8 +1551,12 @@ func TestGaslessDeploymentChecksDisableOnlyThePayoutPath(t *testing.T) {
 		"paymaster code":   func(g *gaslessFixture) { g.codes[strings.ToLower(g.paymaster.Hex())] = "0x6001" },
 		"factory code":     func(g *gaslessFixture) { g.codes[strings.ToLower(g.factory.Hex())] = "0x6002" },
 		"entry point code": func(g *gaslessFixture) { g.codes[strings.ToLower(g.entryPoint.Hex())] = "0x6003" },
-		"gas policy":       func(g *gaslessFixture) { g.profile.GasPolicy.MarginGas = 1 },
-		"another vault":    func(g *gaslessFixture) { g.vault = common.HexToAddress("0x1234") },
+		// Other transit account logic behind honest factory, paymaster and
+		// EntryPoint runtimes (a constructor can deploy anything).
+		"implementation code":    func(g *gaslessFixture) { g.codes[strings.ToLower(g.profile.Implementation)] = "0x6004" },
+		"factory implementation": func(g *gaslessFixture) { g.implementation = common.HexToAddress("0x" + strings.Repeat("ab", 20)) },
+		"gas policy":             func(g *gaslessFixture) { g.profile.GasPolicy.MarginGas = 1 },
+		"another vault":          func(g *gaslessFixture) { g.vault = common.HexToAddress("0x1234") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			f, g := newGaslessWithdrawalFixture(t)

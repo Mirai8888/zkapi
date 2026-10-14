@@ -134,6 +134,8 @@ type deploymentEvidence struct {
 	SenderCreatorCode string `json:"sender_creator_runtime_keccak256,omitempty"`
 	PaymasterCode     string `json:"paymaster_runtime_keccak256,omitempty"`
 	FactoryCode       string `json:"factory_runtime_keccak256,omitempty"`
+	// ImplementationCode pins the transit accounts' logic.
+	ImplementationCode string `json:"account_implementation_runtime_keccak256,omitempty"`
 }
 
 // deployed reports whether this is a deployed vault rather than a placeholder.

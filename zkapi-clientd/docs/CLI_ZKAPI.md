@@ -151,7 +151,8 @@ refuses deposits with `deployment_mismatch`; exits stay available.
 `config --exit-rpc-url URL` saves your own Ethereum RPC (HTTPS, or plain HTTP
 to a node on this machine; no credentials, query or fragment). Deployment
 checks use it as well. An escape then reads the chain and sends its
-transactions only through it: the balance, nonce, fee and simulation reads,
+transactions only through it (a gasless escape's operations excepted, see
+below): the balance, nonce, fee and simulation reads,
 the receipts, the raise and finalization logs, and the wallet companion's
 exit state (note status, known roots, logs for a tree rebuild). The pinned
 RPC, which the operator may run, is never asked in its place: a call your
@@ -167,7 +168,16 @@ or paid. Even so, no lock is released before this machine's clock says the
 released proof is dead, and a defeat it reports is read again on every run.
 But a pinned RPC that fakes the escape's receipts and logs can make it look
 finalized and paid while the note stays open on chain, where the operator
-can sweep it at expiry. Set an exit RPC before you escape; without one, check
+can sweep it at expiry. A gasless escape (`--escape --fees payout`: its
+initiation or its sponsored finalization) is not a transaction the exit RPC
+sends: it is an ERC-4337 operation sent with `eth_sendUserOperation` to the
+bundler, which is the deployment's, so the operator's, unless you set your
+own (`config --bundler-url URL`, or `--bundler-url` on the command). That
+bundler sees the escape before inclusion and can delay or drop it (an
+initiation is given up 60 s before its proof's `valid_until`); only the
+reads and the inclusion check go through the exit RPC. To escape without
+depending on the operator, use `--fees wallet` or your own bundler. Set an
+exit RPC before you escape; without one, check
 through your own node or a block explorer that the payout reached the
 destination (a completed escape's status repeats this). The companion takes
 the same setting from `--exit-rpc-url` or `ZKAPI_EXIT_RPC_URL`.
@@ -467,8 +477,10 @@ failed push.
 
 How it works. Before anything is reserved, the client checks the gasless
 contracts against this release's pins (the runtime code of the EntryPoint,
-its SenderCreator, the paymaster and the factory, the paymaster's vault,
-factory, unit and gas policy, and the factory's address derivation) through
+its SenderCreator, the paymaster, the factory and the transit accounts'
+implementation, which every transit account delegatecalls, the paymaster's
+vault, factory, unit and gas policy, the factory's paymaster,
+implementation and creation code, and its address derivation) through
 the pinned RPC and your exit RPC when one is set, asks the bundler for its
 chain and EntryPoints, reads the paymaster's live policy and deposit and the
 vault's pause, and checks the fee against the private balance. A mismatch or
@@ -555,9 +567,14 @@ command), and `--sweep` delivers it wallet-paid (`--sweep` and
 sponsored path stopped before the note closed; rerun `--to` to try again, or
 `--fees wallet`, which reuses the plan bound to `S` (the companion's
 reservation pins it), pays the fee from the local signing address, and leaves
-the payout in `S` for `--sweep` or `--collect` (the forward of `S`'s balance
-stays sponsored whatever paid the close); while that wallet-paid close is
-not signed yet, `--fees payout` takes it back to the sponsored path. A
+the payout in `S`, which `--sweep` delivers (wallet-paid). `--collect` (a
+sponsored forward) applies only when the paymaster recorded evidence for
+`S`: a sponsored close or finalization of this withdrawal that was included
+and reverted, a sponsored escape another transaction finalized, or the
+owner's `allowForward`; a refused operation was never included and leaves
+none, so `--collect` is then refused and names `--sweep`. While that
+wallet-paid close is not signed yet, `--fees payout` takes it back to the
+sponsored path. A
 payout the paymaster could not push to the
 destination (it rejected the ETH or needed more than 100,000 gas) is credited
 there; `--claim-credit` delivers it with a wallet-paid `claimCredit`. A new
@@ -637,11 +654,16 @@ the paymaster's reserve, the finalization's expected charge at today's fee
 expected charges and the debt (`estimated_received_wei`), as estimates, since the
 finalization is quoted at its own fees after the challenge period (what the
 destination receives at least is stated by that quote). When the paymaster
-has escapes disabled (`escapes_disabled`), initiate with `--fees wallet`;
-once the escape is on chain, `withdraw --escape --to --fees payout` takes
-the sponsored path back for its finalization from the transit account (the
-sponsored path takes over a wallet-paid escape whenever none of its
-transactions is pending). Phases: `op_built`/`op_submitted` →
+has escapes disabled (`escapes_disabled`, the default of a deployment), the
+refused `--fees payout` run still reserves the escape for the transit account
+when a sponsored finalization passes its pre-flight: initiate with `--fees
+wallet` (bound to the transit account); once the escape is on chain,
+`withdraw --escape --to --fees payout` takes the sponsored path back for its
+finalization from the transit account (the sponsored path takes over a
+wallet-paid escape bound to the transit account whenever none of its
+transactions is pending). When a sponsored finalization would be refused too,
+nothing is reserved and the refusal names only `--fees wallet`: that escape
+is bound to the payout address and its finalization is wallet-paid as well. Phases: `op_built`/`op_submitted` →
 `escape_pending` → `escape_initiated` → `finalize_op_built` /
 `finalize_op_submitted` → `finalize_pending` → `complete`. When someone else
 finalized the escape (the vault paid the transit account), the same

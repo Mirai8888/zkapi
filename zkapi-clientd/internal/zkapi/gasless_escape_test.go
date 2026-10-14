@@ -236,6 +236,60 @@ func TestGaslessEscapeFinalizedByAThirdPartyIsForwarded(t *testing.T) {
 	}
 }
 
+// A sponsored escape whose concession the operator raised and that someone
+// else finalized: the record completes with the lowered payout, and the
+// initiation's operation (which authorized the proof's B − c, no longer the
+// record's Amount) is retired, so the journal still loads on the next run
+// and the payout waiting in the transit account can be forwarded.
+func TestGaslessEscapeRaisedAndFinalizedByAThirdPartyKeepsTheJournalValid(t *testing.T) {
+	f, g := newGaslessEscapeFixture(t)
+	ctx := payoutContext(payoutFees)
+	hash := f.sponsoredEscape(t)
+	w := f.journal(t).Withdrawal
+	transit := common.HexToAddress(w.Transit.Account)
+	g.mineUserOp(t, hash, true, fixtureSettlement{Charged: big.NewInt(1_500_000_000_000_000)})
+	f.escape.deadline = uint64(time.Now().Unix()) + 3600
+	if status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_initiated" {
+		t.Fatalf("initiated: %+v %v", status, err)
+	}
+	if w = f.journal(t).Withdrawal; w.UserOp == nil || w.UserOp.Kind != "escape" {
+		t.Fatalf("the fixture no longer journals the initiation's operation: %+v", w.UserOp)
+	}
+	// The operator raised the concession by 900; a third party finalized
+	// and the vault paid the lowered payout to the transit account.
+	const raised = 900
+	paid := uint64(gaslessTestBalance - raised)
+	third := "0x" + strings.Repeat("d", 64)
+	raise := map[string]any{"address": addressTestVault, "topics": []string{escapeConcessionRaisedTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord(w.Nullifier) + fmt.Sprintf("%064x%064x", raised, paid), "removed": false}
+	finalized := map[string]any{"address": addressTestVault, "topics": []string{escapeFinalizedEventTopic, fmt.Sprintf("0x%064x", f.noteID)}, "data": "0x" + addressABIWord(w.Nullifier) + fmt.Sprintf("%064x", paid) + addressWord(transit), "transactionHash": third}
+	paidWei := new(big.Int).Mul(new(big.Int).SetUint64(paid), big.NewInt(1_000_000_000))
+	f.mu.Lock()
+	f.logs = append(f.logs, raise, finalized)
+	f.receipts[third] = map[string]any{"transactionHash": third, "status": "0x1", "blockNumber": "0x10", "blockHash": f.canonical, "to": addressTestVault, "logs": []map[string]any{finalized}}
+	f.closeNote(uint32(f.noteID))
+	delete(g.pending, uint32(f.noteID))
+	g.balances[strings.ToLower(transit.Hex())] = new(big.Int).Set(paidWei)
+	f.mu.Unlock()
+	f.escape.chainPhase, f.escape.deadline, f.escape.payout = "closed", uint64(time.Now().Unix())-1, paid
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "complete" || status.Amount != paid || !status.FundsWaitingInTransit {
+		t.Fatalf("the raised third-party finalization was not adopted: %+v %v", status, err)
+	}
+	if w := f.journal(t).Withdrawal; w.Amount != paid || w.FinalizeHash != third || w.InitiateHash == "" {
+		t.Fatalf("record: %+v", w)
+	}
+	// The next run loads the journal (every funding and withdrawal command
+	// starts from it), and the payout in the transit account is forwarded.
+	f.h = &FundingHandler{client: f.h.client, statePath: f.h.statePath}
+	if status, err := f.h.AddressWithdrawal(context.Background()); err != nil || status.Phase != "complete" || !status.FundsWaitingInTransit {
+		t.Fatalf("the journal no longer loads: %+v %v", status, err)
+	}
+	quote, err := f.h.QuoteAddressWithdrawal(payoutContext(addressWithdrawalOptions{Collect: true}), withdrawalTestDestination, f.noteID, "", false)
+	if err != nil || quote.UserOpKind != "forward" || quote.PayoutWei != paidWei.String() {
+		t.Fatalf("forward quote: %+v %v", quote, err)
+	}
+}
+
 // The automatic forward after a third-party finalization is an operation
 // like any other: when its fee may exceed the uneconomic fraction of what
 // the transit account holds, it is refused as gasless_uneconomic (naming
@@ -355,6 +409,93 @@ func TestGaslessEscapeDisabledIsInitiatedWalletPaidAndFinalizedSponsored(t *test
 	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
 	if err != nil || status.Phase != "complete" || status.ReceivedWei != paidOut.String() || status.FundsWaitingInTransit || status.OwedPaidWei != "0" {
 		t.Fatalf("completion: %+v %v", status, err)
+	}
+}
+
+// Escapes disabled from the start (the published default): the first
+// --fees payout run is refused as escapes_disabled, but the escape is still
+// reserved for the transit account (the sponsored finalization passed its
+// pre-flight), so the advice holds: --fees wallet initiates the escape bound
+// to the transit account, and --fees payout on the escape on chain
+// finalizes it sponsored and delivers the payout to the destination.
+func TestGaslessEscapeDisabledFromTheStartIsStillFinalizedSponsored(t *testing.T) {
+	f, g := newGaslessEscapeFixture(t)
+	ctx := payoutContext(payoutFees)
+	g.escapesEnabled = false
+	status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if GaslessRefusalCode(err) != "escapes_disabled" || !strings.Contains(err.Error(), "--fees wallet") || !strings.Contains(err.Error(), "--fees payout") {
+		t.Fatalf("a fresh escape with escapes disabled: %+v %v", status, err)
+	}
+	w := f.journal(t).Withdrawal
+	if w == nil || w.Transit == nil || w.FeePayer != "payout" || w.ProofDestination != w.Transit.Account || w.Phase != "escape_decision" || len(f.escape.prepares) != 0 {
+		t.Fatalf("the escape was not reserved for the transit account: %+v", w)
+	}
+	transit := common.HexToAddress(w.Transit.Account)
+	wallet := payoutContext(addressWithdrawalOptions{Fees: "wallet"})
+	if status, err := f.h.EscapeAddress(wallet, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_decision" || status.FeePayer != "wallet" {
+		t.Fatalf("wallet decision: %+v %v", status, err)
+	}
+	if len(f.escape.prepares) != 1 || !strings.EqualFold(fmt.Sprint(f.escape.prepares[0]["destination"]), transit.Hex()) {
+		t.Fatalf("the companion did not reserve the exit for the transit account: %+v", f.escape.prepares)
+	}
+	quote, err := f.h.QuoteAddressEscape(wallet, withdrawalTestDestination, f.noteID, &[]uint64{0}[0], "")
+	if err != nil || quote.Kind != "escape" || quote.FeePolicy != "low" {
+		t.Fatalf("wallet quote: %+v %v", quote, err)
+	}
+	if _, err := f.h.ApproveAddressEscape(wallet, quote.ID); err != nil {
+		t.Fatal(err)
+	}
+	record := f.journal(t)
+	w = record.Withdrawal
+	if initiate := f.accepted[record.Pending.Hash]; record.Pending.Kind != "escape" || hex.EncodeToString(initiate.Data()[4+10*32+12:4+11*32]) != strings.ToLower(transit.Hex()[2:]) {
+		t.Fatal("the wallet-paid initiation is not bound to the transit account")
+	}
+	f.mine(t, record.Pending.Hash, false)
+	f.mu.Lock()
+	g.pending[uint32(f.noteID)] = fixturePending{nullifier: new(big.Int).SetBytes(common.FromHex(w.Nullifier)), finalBalance: gaslessTestBalance, destination: transit}
+	f.mu.Unlock()
+	f.escape.deadline = uint64(time.Now().Unix()) + 3600
+	if status, err := f.h.EscapeAddress(wallet, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.Phase != "escape_initiated" {
+		t.Fatalf("initiated: %+v %v", status, err)
+	}
+	if status, err := f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, ""); err != nil || status.FeePayer != "payout" {
+		t.Fatalf("the sponsored path did not take over: %+v %v", status, err)
+	}
+	f.escape.deadline, f.escape.payout = uint64(time.Now().Unix())-1, gaslessTestBalance
+	quote, err = f.h.QuoteAddressEscape(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || quote.Kind != "escape_finalize" || quote.UserOpKind != "finalize" || quote.FeePolicy != "payout" {
+		t.Fatalf("finalization quote: %+v %v", quote, err)
+	}
+	if status, err := f.h.ApproveAddressEscape(ctx, quote.ID); err != nil || status.Phase != "finalize_op_submitted" {
+		t.Fatalf("finalization: %+v %v", status, err)
+	}
+	finalizeCharge := big.NewInt(400_000_000_000_000)
+	paidOut := new(big.Int).Sub(gaslessPayoutWei, finalizeCharge)
+	g.mineUserOp(t, g.sends[0], true, fixtureSettlement{Received: gaslessPayoutWei, Charged: finalizeCharge, PaidOut: paidOut})
+	status, err = f.h.EscapeAddress(ctx, withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "complete" || status.ReceivedWei != paidOut.String() || status.FundsWaitingInTransit {
+		t.Fatalf("completion: %+v %v", status, err)
+	}
+}
+
+// When escapes are disabled and a sponsored finalization would be refused
+// too (here: its fee would take too much of a small payout), nothing is
+// reserved and the refusal names only --fees wallet, which then escapes to
+// the payout address.
+func TestGaslessEscapeDisabledWithoutASponsoredFinalizationReservesNothing(t *testing.T) {
+	f, g := newGaslessEscapeFixture(t)
+	f.walletBalance, f.planBalance = 8_000_000, 8_000_000
+	g.escapesEnabled = false
+	_, err := f.h.EscapeAddress(payoutContext(payoutFees), withdrawalTestDestination, f.noteID, nil, "")
+	if GaslessRefusalCode(err) != "escapes_disabled" || !strings.Contains(err.Error(), "--fees wallet") || strings.Contains(err.Error(), "--fees payout") || !strings.Contains(err.Error(), "gasless_uneconomic") {
+		t.Fatalf("refusal: %v", err)
+	}
+	if w := f.journal(t).Withdrawal; w != nil || len(f.escape.prepares) != 0 {
+		t.Fatalf("something was reserved: %+v", w)
+	}
+	status, err := f.h.EscapeAddress(payoutContext(addressWithdrawalOptions{Fees: "wallet"}), withdrawalTestDestination, f.noteID, nil, "")
+	if err != nil || status.Phase != "escape_decision" || status.TransitAccount != "" || !strings.EqualFold(fmt.Sprint(f.escape.prepares[0]["destination"]), withdrawalTestDestination) {
+		t.Fatalf("wallet decision: %+v %v", status, err)
 	}
 }
 

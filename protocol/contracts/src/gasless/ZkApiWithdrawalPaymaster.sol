@@ -261,16 +261,23 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
 
     error NotEntryPoint();
     error SponsorshipPaused();
-    /// @notice A sponsorship of this key is already in flight in this transaction: the EntryPoint
-    ///         validates a whole bundle before it executes any of it, so a second operation of the
-    ///         same key (the same close replayed at the next nonce) is refused in validation rather
-    ///         than reverted in execution at the float's expense. An ERC-4337 bundler never
-    ///         includes two operations of one sender in a bundle, so this fires only against a
-    ///         non-compliant or malicious bundler; when it does, the whole bundle fails on-chain
-    ///         validation (the bundler pays, nothing is counted), and ERC-7562 GREP-040 lets that
-    ///         bundler ban the paymaster. Clients therefore replace a pending operation only at the
-    ///         same nonce (a fee bump) and never build a new operation for a key while an older one
-    ///         may still be in a mempool.
+    /// @notice A sponsorship of this key, or of this note, is already in flight in this transaction:
+    ///         the EntryPoint validates a whole bundle before it executes any of it, so a second
+    ///         operation that the first would make fail is refused in validation rather than
+    ///         reverted in execution at the float's expense. Two locks, both transient:
+    ///         - the attempts key (the same close replayed at the next nonce). An ERC-4337 bundler
+    ///           never includes two operations of one sender in a bundle, so this one fires only
+    ///           against a non-compliant or malicious bundler. Clients therefore replace a pending
+    ///           operation only at the same nonce (a fee bump) and never build a new operation for
+    ///           a key while an older one may still be in a mempool.
+    ///         - the note of a CLOSE, ESCAPE or FINALIZE, key = keccak256(abi.encode(bytes32("note"),
+    ///           uint256(noteId))): an escape and a close of one note, or closes at two of its
+    ///           nullifiers, have different keys and, from different transit accounts, may be
+    ///           bundled by a compliant bundler, yet at most one of them can execute.
+    ///         Either way the whole bundle fails on-chain validation (the bundler pays, nothing is
+    ///         counted). A bundler's pre-send simulation returns the FailedOp at its index, so it
+    ///         drops that operation and resubmits the rest; ERC-7562 GREP-040 lets it throttle or
+    ///         ban the paymaster for it.
     error SponsorshipInFlight(bytes32 key);
     error BadPaymasterData();
     error FeeAboveCap(uint256 fee, uint256 cap);
@@ -487,6 +494,19 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
             locked := tload(key)
         }
         if (locked != 0) revert SponsorshipInFlight(key);
+        // The same holds across keys of one note: an ESCAPE and a CLOSE of a note, or CLOSEs at two
+        // of its nullifiers, have different keys, and when their senders differ a compliant bundler
+        // bundles them. Every one passes the note's state checks, at most one executes, and the
+        // rest revert after the full verification at the float's expense, with nothing reaching
+        // their senders for a FORWARD to recover. One sponsorship per note per transaction too.
+        bytes32 noteLock;
+        if (kind != KIND_FORWARD) {
+            noteLock = _noteLock(o.noteId);
+            assembly ("memory-safe") {
+                locked := tload(noteLock)
+            }
+            if (locked != 0) revert SponsorshipInFlight(noteLock);
+        }
         // Own storage, in the outer frame: the count persists for every included operation
         // whatever its execution and postOp do.
         attempts[key] = used + 1;
@@ -497,6 +517,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
         address sender = f.sender;
         assembly ("memory-safe") {
             tstore(key, 1)
+            if noteLock { tstore(noteLock, 1) }
             tstore(sender, add(tload(sender), 1))
         }
         emit Sponsored(key, sender, payee, kind, o.noteId, maxCost);
@@ -718,9 +739,12 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
         Ctx memory c = abi.decode(context, (Ctx));
         address sender = c.sender;
         bytes32 key = c.key;
-        // The outcome is state now: release the key and count this sponsorship of the sender out.
+        // The outcome is state now: release the key and the note, and count this sponsorship of
+        // the sender out.
+        bytes32 noteLock = c.kind == KIND_FORWARD ? bytes32(0) : _noteLock(c.noteId);
         assembly ("memory-safe") {
             tstore(key, 0)
+            if noteLock { tstore(noteLock, 0) }
             let inFlight := tload(sender)
             if inFlight { tstore(sender, sub(inFlight, 1)) }
         }
@@ -931,6 +955,16 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
         if (kind == KIND_FINALIZE) return keccak256(abi.encode("finalize", noteId));
         if (kind == KIND_FORWARD) return keccak256(abi.encode("forward", sender));
         revert InvalidKind();
+    }
+
+    /// @dev The transient slot of a note's in-flight lock (see SponsorshipInFlight). A hash, so it
+    ///      coincides neither with an attempts key (other tags) nor with a sender's slot (an address).
+    function _noteLock(uint32 noteId) private pure returns (bytes32 slot) {
+        assembly ("memory-safe") {
+            mstore(0x00, "note")
+            mstore(0x20, noteId)
+            slot := keccak256(0x00, 0x40)
+        }
     }
 
     /// @notice The pinned gas policy, for the profile and the clients' cross-check.

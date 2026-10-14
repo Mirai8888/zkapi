@@ -213,6 +213,65 @@ contract GriefingTest is GaslessTestBase {
         assertTrue(success, "alone, the finalization is sponsored");
     }
 
+    /// Two sponsored operations on one note under different keys, from two transit accounts (so a
+    /// compliant bundler bundles them): an escape and a close of the note, or closes at two of its
+    /// nullifiers. All pass the note's state checks, at most one can execute, and the rest would
+    /// revert after the full verification at the float's expense with nothing reaching their
+    /// senders. The note is locked like a key: the bundle fails validation, nothing is charged or
+    /// counted, and each operation alone is sponsored as usual.
+    function test_twoOperationsOnOneNoteInOneBundleFailValidation() public {
+        address payee2 = address(0x9A7EF);
+        uint32 id = _bigNote(42);
+        bytes32 noteLock = keccak256(abi.encode(bytes32("note"), uint256(id)));
+        (PackedUserOperation memory escape,) = _escapeOpFor(payee2, id, 2001, 2002, BIG - 2_000_000, 1_000_000);
+        (PackedUserOperation memory close,) = _closeOp(id, 2001, BIG - 1_000_000);
+        (PackedUserOperation memory close2,) = _closeOpFor(payee2, id, 3001, BIG - 1_000_000);
+        assertTrue(escape.sender != close.sender, "different transit accounts");
+        uint256 depositBefore = entryPoint.balanceOf(address(paymaster));
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](2);
+        ops[0] = escape;
+        ops[1] = close;
+        (bool ok, bytes memory data) = _tryHandleOps(ops);
+        assertFalse(ok, "an escape and a close of one note fail validation");
+        (string memory reason, bytes memory inner) = _failedOpWithRevert(data);
+        assertEq(reason, "AA33 reverted");
+        assertEq(inner, abi.encodeWithSelector(ZkApiWithdrawalPaymaster.SponsorshipInFlight.selector, noteLock));
+
+        // two closes of the note at different nullifiers
+        ops[0] = close;
+        ops[1] = close2;
+        (ok, data) = _tryHandleOps(ops);
+        assertFalse(ok, "two closes of one note fail validation");
+        (reason, inner) = _failedOpWithRevert(data);
+        assertEq(reason, "AA33 reverted");
+        assertEq(inner, abi.encodeWithSelector(ZkApiWithdrawalPaymaster.SponsorshipInFlight.selector, noteLock));
+
+        assertEq(entryPoint.balanceOf(address(paymaster)), depositBefore, "uncharged");
+        assertEq(paymaster.lostWei(), 0, "no loss recorded");
+        assertEq(paymaster.attempts(_escapeKey(id)), 0, "nothing counted");
+        assertEq(paymaster.attempts(_closeKey(2001)), 0);
+        assertEq(paymaster.attempts(_closeKey(3001)), 0);
+        assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Active));
+        assertFalse(paymaster.stranded(close.sender));
+
+        // alone, the escape is sponsored; the lock is per note, so the note's finalization and a
+        // close of another note share a bundle
+        Vm.Log[] memory logs = _handle(escape);
+        (bool success,,) = _userOpEvent(logs);
+        assertTrue(success, "alone, the escape is sponsored");
+        assertEq(uint256(_status(id)), uint256(Types.NoteStatus.PendingWithdrawal));
+        vm.warp(_deadline(id));
+        uint32 id2 = _bigNote(43);
+        (PackedUserOperation memory closeOther,) = _closeOp(id2, 4001, BIG - 1_000_000);
+        ops[0] = _finalizeOpFor(payee2, id);
+        ops[1] = closeOther;
+        logs = _handleOps(ops);
+        assertEq(_count(logs, address(paymaster), ZkApiWithdrawalPaymaster.Settled.selector), 2, "both settled");
+        assertEq(uint256(_status(id)), uint256(Types.NoteStatus.Closed));
+        assertEq(uint256(_status(id2)), uint256(Types.NoteStatus.Closed));
+    }
+
     /// Two notes of one transit account, closed in one bundle: each sponsorship is counted for
     /// the sender separately, so both forward, settle and pay the payee.
     function test_twoNotesOfOneAccountInOneBundle() public {

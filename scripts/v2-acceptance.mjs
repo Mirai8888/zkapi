@@ -189,6 +189,30 @@ export function drillTiming(timing = TIMING) {
     return { ...checks, ok: Object.entries(checks).every(([key, value]) => key === 'settlement_window_seconds' || value) };
 }
 
+// The bundler URL a profile may publish: the rule every client applies to
+// it, so no client refuses a URL another accepts. zkapi-clientd's
+// ValidateBundlerURL takes https, or plain http to a loopback host, with no
+// credentials, query or fragment (and, finding any of these, refuses the
+// whole gasless object); the SDK's bundlerUrl() takes https, or http to
+// localhost or 127.0.0.1, with no credentials. A URL must pass both: a
+// hosted bundler keyed in its query (`?apikey=...`) would disable every clientd
+// user's gasless path.
+export const BUNDLER_URL_RULE = 'bundler_url is null or an https URL (or http to localhost or 127.0.0.1) '
+    + 'without credentials, query or fragment';
+export function isProfileBundlerUrl(value) {
+    if (typeof value !== 'string' || /[\s?#\\]/.test(value)) return false;
+    const authority = /^(https?):\/\/([^/]+)(\/.*)?$/.exec(value);
+    if (!authority || authority[2].includes('@')) return false;
+    let url;
+    try {
+        url = new URL(value);
+    } catch {
+        return false;
+    }
+    if (url.username || url.password || url.search || url.hash) return false;
+    return url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname));
+}
+
 // The `gasless` object of a profile (gasless withdrawals over ERC-4337,
 // design §4.3): the pins of the EntryPoint, its SenderCreator, the paymaster,
 // the transit-account factory and the account logic, the 74-byte creation
@@ -200,7 +224,7 @@ export function drillTiming(timing = TIMING) {
 // the uneconomic rule. Null for a deployment without the paymaster.
 export function gaslessProfile(finalized, bundlerUrl = null) {
     if (finalized.withdrawalPaymaster == null) return null;
-    assert.ok(bundlerUrl === null || (typeof bundlerUrl === 'string' && /^https?:\/\//.test(bundlerUrl)), 'bundler_url is null or an http(s) URL');
+    assert.ok(bundlerUrl === null || isProfileBundlerUrl(bundlerUrl), BUNDLER_URL_RULE);
     const gp = finalized.paymasterGasPolicy;
     const policy = finalized.paymasterPolicy;
     const ceilings = finalized.paymasterFeeCeilings;

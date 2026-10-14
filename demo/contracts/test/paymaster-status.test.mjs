@@ -26,6 +26,7 @@ const PAYEE = '0x0000000000000000000000000000000000000bee';
 const S1 = '0x0000000000000000000000000000000000000a01';
 const S2 = '0x0000000000000000000000000000000000000a02';
 const S3 = '0x0000000000000000000000000000000000000a03';
+const S4 = '0x0000000000000000000000000000000000000a04';
 const X = '0x0000000000000000000000000000000000000a99'; // a sender the paymaster never sponsored
 
 const hex = value => `0x${BigInt(value).toString(16)}`;
@@ -60,7 +61,7 @@ const hash = n => word(0x2000 + n);
 const revertBytes = [64n, 4n, 0xdeadbeefn << 224n];
 
 /// The chain's logs, in emission order (log index), each as eth_getLogs returns it.
-function chainLogs() {
+function chainLogs(more = () => {}) {
     const logs = [];
     const emit = (address, block, name, topics, data) => logs.push({
         address, blockNumber: hex(block), logIndex: hex(logs.length), transactionHash: word(0x3000 + logs.length),
@@ -95,6 +96,7 @@ function chainLogs() {
     emit(EP, 112, 'PostOpRevertReason', [hash(6), X], [0n, ...revertBytes]); // a sender the paymaster never named
     emit(EP, 113, 'UserOperationPrefundTooLow', [hash(7), S3], [0n]);
     emit(EP, 113, 'UserOperationPrefundTooLow', [hash(8), X], [0n]);
+    more(emit);
     return logs;
 }
 
@@ -109,10 +111,10 @@ function matches(filter, log) {
 }
 
 /// A fake node: the state the status reads, the logs above, and every eth_getLogs filter sent.
-function fakeNode({ chainId = 31_337n, latest = 120n, stranded = { [S3]: 1n }, owed = { [S1]: 500n, [S2]: 0n } } = {}) {
-    const logs = chainLogs();
+function fakeNode({ chainId = 31_337n, latest = 120n, stranded = { [S3]: 1n }, owed = { [S1]: 500n, [S2]: 0n }, more,
+    balances = { [P]: 7n, [S3]: 42n }, codes = { [S1]: '0xef0100', [S2]: '0xef0100', [S3]: '0xef0100' } } = {}) {
+    const logs = chainLogs(more);
     const filters = [];
-    const balances = { [P]: 7n, [S3]: 42n };
     const calls = (to, data) => {
         const method = data.slice(0, 10);
         const argument = `0x${data.slice(-40)}`;
@@ -141,6 +143,7 @@ function fakeNode({ chainId = 31_337n, latest = 120n, stranded = { [S3]: 1n }, o
             case 'eth_blockNumber': return hex(latest);
             case 'eth_call': return calls(params[0].to.toLowerCase(), params[0].data);
             case 'eth_getBalance': return hex(balances[params[0].toLowerCase()] ?? 0n);
+            case 'eth_getCode': return codes[params[0].toLowerCase()] ?? '0x';
             case 'eth_getLogs': filters.push(params[0]); return logs.filter(log => matches(params[0], log));
             default: return fail(`unexpected ${method}`);
         }
@@ -178,7 +181,8 @@ const EXPECTED = {
     unaccounted_balance_wei: '7',
     open_owed_total_wei: '500',
     open_owed: { [S1]: { from_events_wei: '500', on_chain_wei: '500' } },
-    stranded_open: [{ account: S3, since_block: 107, transaction: word(0x3000 + 16), stranded_flag_on_chain: true, balance_wei: '42' }],
+    stranded_open: [{ account: S3, since_block: 107, transaction: word(0x3000 + 16), evidence: 'stranded', stranded_flag_on_chain: true,
+        has_code: true, balance_wei: '42' }],
     events: {
         from_block: 100,
         to_block: 120,
@@ -250,6 +254,27 @@ test('paymaster status: the block range, and the reconciliation against the chai
     const quiet = fakeNode();
     await paymasterStatus({ deployment: DEPLOYMENT, rpc: quiet.rpc, fromBlock: 107n, toBlock: 120n });
     assert.deepEqual(quiet.filters.map(filter => filter.address), [P, EP]);
+});
+
+test('paymaster status: an account the owner allowed to forward may have no code yet, and says so', async () => {
+    // A close replayed before any sponsored operation: the vault paid S4 directly, S4's
+    // first sponsored operation (carrying its initCode) failed validation, so S4 holds the
+    // payout with no code. The owner's allowForward(S4) lists it; sweep() to it would be a
+    // no-op transfer, so the report says the factory must create it first.
+    const node = fakeNode({ more: emit => emit(P, 114, 'ForwardAllowed', [S4], []), stranded: { [S3]: 1n, [S4]: 1n },
+        balances: { [P]: 7n, [S3]: 42n, [S4]: 9n } });
+    const status = await paymasterStatus({ deployment: DEPLOYMENT, rpc: node.rpc });
+    assert.deepEqual(status.stranded_open, [
+        EXPECTED.stranded_open[0],
+        { account: S4, since_block: 114, transaction: word(0x3000 + node.logs.length - 1), evidence: 'forward_allowed',
+            stranded_flag_on_chain: true, has_code: false, balance_wei: '9' },
+    ]);
+    // Once created, the same entry reports code; the evidence is still the owner's.
+    const created = fakeNode({ more: emit => emit(P, 114, 'ForwardAllowed', [S4], []), stranded: { [S3]: 1n, [S4]: 1n },
+        codes: { [S3]: '0xef0100', [S4]: '0x6080' } });
+    const after = await paymasterStatus({ deployment: DEPLOYMENT, rpc: created.rpc });
+    assert.deepEqual(after.stranded_open.map(entry => [entry.account, entry.evidence, entry.has_code]),
+        [[S3, 'stranded', true], [S4, 'forward_allowed', true]]);
 });
 
 test('paymaster status refuses a manifest that is not a finalized paymaster deployment, and another chain', async () => {

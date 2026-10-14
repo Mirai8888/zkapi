@@ -190,7 +190,8 @@ its own field names (`--format clientd`). It checks the setup directory's
 verifying keys against the manifest, refuses a legacy `deployment_id`, and
 writes the signing-key coordinates, decimal strings in the manifest, as the
 `0x` hex every consumer parses; `--bundler-url URL` names the operator's
-bundler in the profiles' `gasless` object ([below](#gasless-withdrawals)). The
+bundler in the profiles' `gasless` object (`https`, without credentials, query
+or fragment; [below](#operating-gasless-withdrawals)). The
 [migration runbook](migration-concession-vault.md#b2-production-sepolia), step
 5, gives the commands.
 
@@ -448,7 +449,13 @@ bundler, Rundler or Alto) against the operator's RPC. Whitelist the paymaster
 and the factory (both are staked) so the bundler exempts them from
 reputation. Set `beneficiary` to a fee account, and fund the bundler's EOA
 with ETH. Publish its URL in every profile with `scripts/deployment-profile.mjs
---bundler-url` (`gasless.bundler_url`). Users may set their own bundler:
+--bundler-url` (`gasless.bundler_url`). The URL must be `https` (or `http` to
+`localhost` or `127.0.0.1`) with no credentials, query or fragment, a URL
+both clients accept: zkapi-clientd refuses a profile `bundler_url` with a
+query, fragment or credentials and then reports gasless withdrawals as
+unavailable, so the generator refuses such a URL. A hosted bundler that
+takes its API key in the query (`?apikey=…`) cannot be published as is; put
+a proxy in front of it that adds the key. Users may set their own bundler:
 `client.setBundlerUrl` in the SDK, `--bundler-url` or `zkapi.bundler_url` in
 zkapi-clientd.
 
@@ -556,7 +563,9 @@ destination `S`, or through a funded helper.
 - the open escape debt per transit account (`open_owed`, from the events and
   checked against `owed(S)`);
 - `stranded_open`: transit accounts stranded or allowed without a later
-  forward or sweep, with their balances;
+  forward or sweep, with their balances, the event that listed each
+  (`evidence`: `stranded` from postOp, or `forward_allowed` from the
+  owner's `allowForward`) and whether it has code yet (`has_code`);
 - the operations the paymaster paid for (`user_operations`);
 - the EntryPoint's alarms for its senders (`entry_point_alarms`).
 
@@ -677,9 +686,16 @@ cast send "$VAULT" 'finalizeEscapeWithdrawal(uint32)' "$NOTE_ID" --rpc-url "$RPC
 cast send "$S" 'sweep()' --rpc-url "$RPC_URL" --account "$PAYER_ACCOUNT"
 ```
 
-For a stranded balance, only the `sweep()`. Every `S` that
-`paymaster-status.mjs` lists was created by a sponsored operation and has
-code; a balance that reached an `S` with no code needs
+For a stranded balance, only the `sweep()`, and only once `S` has code.
+An `S` that `paymaster-status.mjs` lists with `evidence: "stranded"` ran a
+sponsored operation, so it has code. One listed with `evidence:
+"forward_allowed"` may not: `allowForward(S)` is the lever for a close
+replayed before any sponsored operation, whose operation carrying `S`'s
+initCode then failed validation, so `S` holds the payout with no code until
+a FORWARD lands. A `sweep()` sent to an `S` with no code succeeds and does
+nothing: the balance stays and the entry stays listed. Check `has_code` in
+the report (or `cast code "$S" --rpc-url "$RPC_URL"`, which prints `0x` for
+none), and where it is false run
 `cast send "$FACTORY" 'createAccount(address,address)' "$OWNER" "$PAYEE"`
 first, with the owner and payee its client holds. `sweep()` pays the payee
 and settles `S`'s debt on the way.

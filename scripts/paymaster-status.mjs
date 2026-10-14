@@ -6,7 +6,8 @@
 // totalCredits), and what its events say since deployBlock: sponsorships and settlements, failed
 // sponsorships, shortfalls, credited payouts, the escape debt still open per transit account
 // (EscapeInitiationOwed minus Settled.owedPaid, Collected.owedPaid and DebtWrittenOff, checked
-// against owed(S)), transit accounts stranded without a later FORWARD settlement or sweep, and
+// against owed(S)), transit accounts stranded without a later FORWARD settlement or sweep (each
+// with the event that listed it, Stranded or ForwardAllowed, and whether it has code yet), and
 // the EntryPoint's alarms for the paymaster's senders (PostOpRevertReason,
 // UserOperationPrefundTooLow: the float paid and recorded nothing).
 //
@@ -210,7 +211,7 @@ export async function paymasterStatus({ deployment, rpc, fromBlock, toBlock, chu
             }
             case 'Stranded':
             case 'ForwardAllowed':
-                strandedAt.set(addressOf(log.topics[0]), at);
+                strandedAt.set(addressOf(log.topics[0]), { ...at, evidence: log.name === 'Stranded' ? 'stranded' : 'forward_allowed' });
                 break;
             case 'DebtWrittenOff':
                 addOwed(addressOf(log.topics[0]), -log.words[0]);
@@ -231,7 +232,13 @@ export async function paymasterStatus({ deployment, rpc, fromBlock, toBlock, chu
     for (const [account, at] of strandedAt) {
         if (!later(at, settledAt.get(account))) continue;
         const [flag] = await callWords(rpc, paymaster, 'stranded(address)', [account], 1);
-        strandedOpen.push({ account, since_block: Number(at.block), transaction: at.tx, stranded_flag_on_chain: flag === 1n,
+        // Stranded is emitted in postOp, after S's own operation ran, so S has code. ForwardAllowed
+        // (the owner's allowForward) may name an S whose creating operation never landed (a close
+        // replayed before any sponsored operation): sweep() on an S without code is a no-op
+        // transfer, so has_code says whether factory.createAccount(owner, payee) comes first.
+        const code = await rpc('eth_getCode', [account, 'latest']);
+        strandedOpen.push({ account, since_block: Number(at.block), transaction: at.tx, evidence: at.evidence,
+            stranded_flag_on_chain: flag === 1n, has_code: typeof code === 'string' && code !== '0x' && code !== '0x0',
             balance_wei: str(BigInt(await rpc('eth_getBalance', [account, 'latest']))) });
     }
 

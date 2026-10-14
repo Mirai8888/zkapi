@@ -1,13 +1,27 @@
 name: zkAPI client daemon tests
 on:
+  # Besides its own tree, clientd's tests read shared fixtures (transit-vectors.json,
+  # the EntryPoint and SenderCreator runtimes, the withdrawal and calldata golden
+  # vectors, the exit rules and the dev setup) and mirror the gasless contracts' constants: a PR that
+  # changes only those must still run them (scripts/v2-acceptance.test.mjs checks the list).
   pull_request:
     paths:
       - 'zkapi-clientd/**'
       - '.github/workflows/zkapi-clientd-test.yml'
+      - 'protocol/contracts/test/fixtures/**'
+      - 'protocol/contracts/src/gasless/**'
+      - 'protocol/rust/crates/zkapi-client/tests/vectors/**'
+      - 'protocol/setup/v2-concession-dev/**'
+      - 'crates/zkapi-serverd/tests/fixtures/**'
   push:
     paths:
       - 'zkapi-clientd/**'
       - '.github/workflows/zkapi-clientd-test.yml'
+      - 'protocol/contracts/test/fixtures/**'
+      - 'protocol/contracts/src/gasless/**'
+      - 'protocol/rust/crates/zkapi-client/tests/vectors/**'
+      - 'protocol/setup/v2-concession-dev/**'
+      - 'crates/zkapi-serverd/tests/fixtures/**'
 permissions:
   contents: read
 jobs:

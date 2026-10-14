@@ -5,7 +5,7 @@ import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
     CHAIN_ID, INFERENCE_CHARGE, SDK_REQUEST_BOUND, TIMING, challengeFees, drillTiming, gasLedger, gaslessProfile, localJSON, mockOaOrg,
-    mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
+    isProfileBundlerUrl, mockProvider, proxyAuthorized, proxyJsonRpc, trustedDeployment,
 } from './v2-acceptance.mjs';
 import { CANONICAL_ENTRY_POINT, ENTRY_POINT_V070_CODEHASH, GAS_POLICY_SCALARS, SENDER_CREATOR, SENDER_CREATOR_V070_CODEHASH,
     accountCreationCode, hexToBytes, keccak256 } from './expected-codehashes.mjs';
@@ -434,6 +434,11 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     assert.equal(deploymentProfile(finalized, { ...services, bundlerUrl: 'http://127.0.0.1:4337' }).gasless.bundler_url, 'http://127.0.0.1:4337');
     assert.throws(() => deploymentProfile(finalized, { ...services, bundlerUrl: 'http://bundler.example/rpc' }), /https URL/);
     assert.throws(() => deploymentProfile(finalized, { ...services, bundlerUrl: 'ftp://bundler.example' }), /https URL/);
+    // A hosted bundler's key in the query would pass the SDK but make
+    // zkapi-clientd refuse the whole gasless object: refused here.
+    assert.throws(() => deploymentProfile(finalized, { ...services, bundlerUrl: 'https://api.pimlico.io/v2/11155111/rpc?apikey=K' }),
+        /without credentials, query or fragment/);
+    assert.throws(() => gaslessProfile(finalized, 'https://api.pimlico.io/v2/11155111/rpc?apikey=K'), /without credentials, query or fragment/);
     // A pin that is missing or malformed fails by name instead of reaching a profile.
     for (const name of ['entryPoint', 'senderCreator', 'withdrawalAccountFactory', 'paymasterRuntimeCodehash', 'factoryRuntimeCodehash',
         'accountImplementationRuntimeCodehash', 'accountCreationCode', 'accountCreationCodeKeccak256']) {
@@ -493,6 +498,101 @@ test('deployment profiles: the gasless object of a paymaster deployment, in the 
     assert.notEqual(refusedFraction.status, 0);
     assert.match(refusedFraction.stderr, /deployment field requestChargeCap: 50000.5 is not an exact integer/);
     fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('deployment profiles: a published bundler URL is one every client accepts', async () => {
+    const { bundlerUrl: sdkBundlerUrl } = await import('../sdk/services/zkapiGasless.mjs');
+    // zkapi-clientd's ValidateBundlerURL (gasless.go, ValidateExitRPCURL):
+    // https or loopback http, no credentials, query or fragment. Mirrored
+    // here, at least as strictly (checked case by case against Go's net/url).
+    const clientdAccepts = value => {
+        if (/[\s\\]/.test(value)) return false;
+        const match = /^(https?):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(value);
+        if (!match || match[2] === '' || match[2].includes('@') || match[4] !== undefined || match[5] !== undefined) return false;
+        if (match[1] === 'https') return true;
+        const host = match[2].replace(/:\d*$/, '').replace(/^\[(.*)\]$/, '$1');
+        return host === 'localhost' || /^127\./.test(host) || host === '::1';
+    };
+    const sdkAccepts = value => {
+        try {
+            sdkBundlerUrl(value);
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const accepted = ['https://bundler.example/rpc', 'https://bundler.example', 'https://bundler.example:8443/v2/11155111/rpc',
+        'http://127.0.0.1:4337', 'http://localhost:4337/rpc'];
+    const refused = ['https://api.pimlico.io/v2/11155111/rpc?apikey=K', 'https://bundler.example/rpc?', 'https://bundler.example/rpc#k',
+        'https://bundler.example/rpc#', 'https://user:pass@bundler.example/rpc', 'https://key@bundler.example/rpc', 'https://@bundler.example/rpc',
+        'http://bundler.example/rpc', 'http://[::1]:4337', 'http://127.0.0.2:4337', 'ftp://bundler.example', 'https:///rpc',
+        'https:bundler.example', ' https://bundler.example/rpc', 'https://bundler.example/r pc', '', 'bundler.example'];
+    for (const url of accepted) {
+        assert.ok(isProfileBundlerUrl(url), `${url} is publishable`);
+        assert.ok(clientdAccepts(url), `zkapi-clientd accepts ${url}`);
+        assert.ok(sdkAccepts(url), `the SDK accepts ${url}`);
+    }
+    for (const url of refused) assert.ok(!isProfileBundlerUrl(url), `${url} is refused`);
+    // Nothing the generator accepts is refused by either client.
+    for (const url of [...accepted, ...refused].filter(isProfileBundlerUrl)) {
+        assert.ok(clientdAccepts(url) && sdkAccepts(url), url);
+    }
+});
+
+test('CI: zkapi-clientd\'s tests run when a file they read outside zkapi-clientd/ changes', async () => {
+    // zkapi-clientd-test.yml is path-filtered. Its Go tests also read shared fixtures
+    // (transit-vectors.json, the EntryPoint runtime, the golden and exit-rule vectors, the
+    // dev setup), so a PR that changes only those (a paymaster constant and its regenerated
+    // vectors) must still run them, or clientd drifts from the contracts unseen.
+    const { readFileSync, readdirSync } = await import('node:fs');
+    const path = await import('node:path');
+    const root = new URL('..', import.meta.url).pathname;
+    const workflow = readFileSync(path.join(root, '.github/workflows/zkapi-clientd-test.yml'), 'utf8');
+    const filters = {};
+    let event = null;
+    let inPaths = false;
+    for (const line of workflow.split('\n')) {
+        const eventLine = /^  ([a-z_]+):\s*$/.exec(line);
+        if (eventLine) [event, inPaths] = [eventLine[1], false];
+        else if (/^\S/.test(line)) [event, inPaths] = [null, false];
+        else if (event && /^    paths:\s*$/.test(line)) [inPaths, filters[event]] = [true, []];
+        else if (inPaths && /^      - /.test(line)) filters[event].push(line.replace(/^      - /, '').trim().replace(/^'(.*)'$/, '$1'));
+        else if (inPaths && /^    \S/.test(line)) inPaths = false;
+    }
+    assert.deepEqual(Object.keys(filters).sort(), ['pull_request', 'push']);
+    // A directory a test reads (a setup dir) is covered by its own `dir/**`.
+    const covered = (patterns, file) => patterns.some(pattern => pattern.endsWith('/**')
+        ? `${file}/`.startsWith(pattern.slice(0, -2)) : pattern === file);
+    // Every path a clientd test names outside its tree: filepath.Join("..", ..., "x", ...) or "../../../x".
+    const external = new Set();
+    const walk = dir => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) walk(full);
+            else if (entry.name.endsWith('_test.go')) {
+                const source = readFileSync(full, 'utf8');
+                // The literal leading arguments of a filepath.Join (a fixture dir when the file name is a variable).
+                const named = [...source.matchAll(/filepath\.Join\(((?:\s*"[^"]*"\s*,?)+)/g)]
+                    .map(match => [...match[1].matchAll(/"([^"]*)"/g)].map(part => part[1]).join('/'))
+                    .concat([...source.matchAll(/"((?:\.\.\/)+[^"]+)"/g)].map(match => match[1]));
+                for (const relative of named) {
+                    if (!relative.startsWith('../')) continue;
+                    const file = path.relative(root, path.resolve(path.dirname(full), relative));
+                    if (!file.startsWith('..') && !file.startsWith('zkapi-clientd/')) external.add(file);
+                }
+            }
+        }
+    };
+    walk(path.join(root, 'zkapi-clientd'));
+    assert.ok(external.has('protocol/contracts/test/fixtures/transit-vectors.json'), [...external].join(', '));
+    assert.ok(external.has('protocol/contracts/test/fixtures'), 'the EntryPoint and SenderCreator runtimes, read by a variable name');
+    for (const file of external) {
+        for (const [name, patterns] of Object.entries(filters)) {
+            assert.ok(covered(patterns, file), `zkapi-clientd-test.yml's ${name} paths leave out ${file}, which zkapi-clientd's tests read`);
+        }
+    }
+    // The paymaster's and factory's sources, whose constants clientd mirrors.
+    for (const patterns of Object.values(filters)) assert.ok(covered(patterns, 'protocol/contracts/src/gasless/ZkApiWithdrawalPaymaster.sol'));
 });
 
 // ---------------------------------------------------------------- the mini bundler (scripts/acceptance/mini-bundler.mjs)

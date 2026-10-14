@@ -34,7 +34,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseDeployment } from './expected-codehashes.mjs';
-import { trustedDeployment } from './v2-acceptance.mjs';
+import { isProfileBundlerUrl, trustedDeployment } from './v2-acceptance.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // The setup directory of each setup ID a deployment may use.
@@ -79,8 +79,9 @@ export function deploymentProfile(finalized, { deploymentId, protocolServerUrl, 
         assert.ok(typeof value === 'string' && value, `${name} is required`);
     }
     assert.ok(Number.isSafeInteger(settlementWindowSeconds) && settlementWindowSeconds > 0, 'settlementWindowSeconds is required');
-    assert.ok(bundlerUrl === null || (typeof bundlerUrl === 'string' && /^https:\/\/|^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(bundlerUrl)),
-        '--bundler-url is an https URL (or loopback http)');
+    assert.ok(bundlerUrl === null || isProfileBundlerUrl(bundlerUrl),
+        '--bundler-url is an https URL (or http to localhost or 127.0.0.1) without credentials, query or fragment: '
+        + 'zkapi-clientd refuses a profile whose bundler URL carries any of these, so a hosted bundler\'s API key cannot ride in the URL');
     assert.ok(bundlerUrl === null || finalized.withdrawalPaymaster != null, '--bundler-url names a bundler for a deployment without the paymaster');
     const profile = trustedDeployment(finalized, { deploymentId, protocolServerUrl, indexerUrl, rpcUrl, priceFeed, keyHashes,
         settlementWindowSeconds, inferenceBase, verifierUrl, bundlerUrl });

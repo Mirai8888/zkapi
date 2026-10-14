@@ -34,8 +34,16 @@ const GASLESS_PREFLIGHT_BEFORE_FEES = ['bundler_unavailable', 'bundler_wrong_cha
 // Silent EntryPoint refusals a bundler may answer a send with are rebuilt at
 // most this many times (the dry run of `prepare` is bounded the same way).
 const GASLESS_BUNDLER_REBUILD_LIMIT = 2;
-const GASLESS_PRIVACY_NOTE = 'The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data) and receives the payout. A fresh account, which needs no ETH, breaks the link to your funding history.';
-const GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT = 'The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data); the payout goes to the address you chose. A fresh owner account, which needs no ETH, breaks the link to your funding history.';
+// What the bundler learns (design: the operator-run bundler pre-discloses escapes unless the user names their own).
+const GASLESS_BUNDLER_NOTE = 'The bundler (the operator’s unless you set your own) sees the operation, with its note, transit account and payout address, together with this browser’s IP address and timing before it is included; for an escape it learns of the exit before the chain does. A bundler you choose keeps that from the operator.';
+const GASLESS_PRIVACY_NOTE = `The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data) and receives the payout. A fresh account, which needs no ETH, breaks the link to your funding history. ${GASLESS_BUNDLER_NOTE}`;
+const GASLESS_PRIVACY_NOTE_SEPARATE_PAYOUT = `The connected account becomes the on-chain owner of this withdrawal’s transit account (visible in the account’s creation data); the payout goes to the address you chose. A fresh owner account, which needs no ETH, breaks the link to your funding history. ${GASLESS_BUNDLER_NOTE}`;
+// The record phases claimWithdrawalFinalization accepts (browserWalletStore's claimBrowserWithdrawalFinalization).
+const FINALIZATION_CLAIMABLE_PHASES = new Set(['pending', 'finalizing', 'awaiting_wallet', 'ambiguous']);
+// The vault call a close or escape is priced with before its proof exists:
+// 836 nonzero bytes (16 gas each in preVerificationGas, where a zero byte
+// costs 4), so the quoted maxCost bounds the signed operation's.
+const WORST_CASE_EXIT_CALL = `0x${'ff'.repeat(836)}`;
 const GASLESS_PAYOUT_CONTRACT_WARNING = 'The payout address is a contract. It must accept ETH within 100,000 gas, or the paymaster only credits the payout for a later claim (claimGaslessCredit).';
 // Ethereum's `finalized` block tag is authoritative when the wallet RPC
 // supports it. A confirmation-depth fallback keeps recovery moving on older
@@ -2578,7 +2586,7 @@ class ZkapiClient extends EventTarget {
             this.rememberWithdrawal(null);
             await this.refresh();
             onStatus(sponsoredPlan
-                ? `Withdrawal closed to its transit account. ${GASLESS_MESSAGES.transit_funds_waiting}`
+                ? `Withdrawal closed to its transit account. ${await this.transitFundsMessage(durablePrepared)}`
                 : 'Withdrawal returned. Finality is being checked safely in the background.');
             return { status: 'closed', event, receipt, ...(sponsoredPlan ? { fundsWaitingInTransit: true, transitAccount: destination } : {}) };
         }
@@ -3072,7 +3080,7 @@ class ZkapiClient extends EventTarget {
         const owner = transit.owner || sender;
         const payee = transit.payee || context.payout || sender;
         const initCode = withInitCode ? transitInitCode({ factory: pins.factory, owner, payee }) : '0x';
-        const vaultCall = kind === KIND.forward ? '0x' : kind === KIND.finalize ? encodeFinalizeEscape(noteId ?? 0) : `0x${'00'.repeat(836)}`;
+        const vaultCall = kind === KIND.forward ? '0x' : kind === KIND.finalize ? encodeFinalizeEscape(noteId ?? 0) : WORST_CASE_EXIT_CALL;
         const draft = gas => buildUserOperation({
             sender, nonce: 0n, initCode, callData: encodeTransitWithdraw(vaultCall), gas, fees, paymaster: pins.paymaster, feeCapWei: state.policy.flatFeeWei
         });
@@ -4088,7 +4096,14 @@ class ZkapiClient extends EventTarget {
             await browserWalletRuntime.rememberPreparedWithdrawalUserOpOutcome(submission, { success: false, transitBalanceWei: balance }).catch(() => null);
             const status = await this.readBrowserWithdrawalStatus(noteId, null, { request: reader });
             await browserWalletRuntime.markPreparedWithdrawalRetryable(transactionHash, submission).catch(() => null);
-            await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission).catch(() => null);
+            // The reverted operation (under every hash it was journaled
+            // under) is not a late inclusion to look for again: a retry
+            // signs a new operation at the next nonce.
+            const revertedHash = String(settlement.event?.userOpHash || hash || '').toLowerCase();
+            const journaledHashes = (current?.userOpHashes || []).map(value => String(value).toLowerCase());
+            const reverted = [revertedHash, String(hash || '').toLowerCase(),
+                ...(journaledHashes.includes(revertedHash) || journaledHashes.includes(String(hash || '').toLowerCase()) ? journaledHashes : [])];
+            await browserWalletRuntime.releasePreparedWithdrawalUserOp(submission, { reverted }).catch(() => null);
             if (status.status === 'closed' && (stranded || balance > 0n)) {
                 // Someone else closed the note with the same public calldata:
                 // the payout reached S and a sponsored forward collects it.
@@ -4305,7 +4320,13 @@ class ZkapiClient extends EventTarget {
         if (!settlement) throw new Error('The bundle transaction carries no settlement of this finalization.');
         if (!settlement.success) {
             await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { transactionHash: settlement.transactionHash }).catch(() => null);
-            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { finalizeUserOp: null, finalizeUserOpPhase: 'reverted' }).catch(() => null);
+            // Its hashes are set aside as reverted: a retry looks for no
+            // earlier inclusion of them and builds a new operation.
+            const journaled = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId).catch(() => null) || withdrawal;
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                finalizeUserOp: null, finalizeUserOpPhase: 'reverted',
+                ...this.revertedRecordUserOpFields(journaled, 'finalize', [hash, settlement.event?.userOpHash])
+            }).catch(() => null);
             const after = await this.readBrowserWithdrawalStatus(noteId, null, { request: context.reader });
             if (after.status === 'closed') {
                 onStatus('A third party finalized this escape first. Collecting the payout from the transit account…');
@@ -4353,6 +4374,34 @@ class ZkapiClient extends EventTarget {
             { amounts: journalValue(amounts) });
         return { status: 'closed', event, receipt, userOpHash: hash, transactionHash: submittedHash, amounts: journalValue(amounts),
             ...(credited ? { paymasterCredited: true } : {}) };
+    }
+
+    /**
+     * The status line for a payout waiting in a plan's or record's transit
+     * account S. A sponsored forward is named only when the paymaster holds
+     * the evidence its forward rule requires (stranded[S], or
+     * escapeNotePlusOne[S] of a closed escape: a sponsored close or
+     * finalization that reverted, or a sponsored escape); a wallet-paid
+     * close or escape to S leaves none, so only sweepTransit is named.
+     * Read-only, through the journaled paymaster; any failure names the sweep.
+     */
+    async transitFundsMessage(record, { reader = null } = {}) {
+        const context = this.recordReaderContext(record, reader || this.gaslessReader());
+        if (!context) return GASLESS_MESSAGES.transit_sweep_needed;
+        try {
+            const S = context.transit.account;
+            if (decodeBool(await this.gaslessCall(context.reader, context.pins.paymaster, encodeStranded(S)), 'stranded')) {
+                return GASLESS_MESSAGES.transit_funds_waiting;
+            }
+            const notePlusOne = decodeWord(await this.gaslessCall(context.reader, context.pins.paymaster, encodeEscapeNotePlusOne(S)), 'escapeNotePlusOne');
+            if (notePlusOne !== 0n) {
+                const status = await this.readBrowserWithdrawalStatus(Number(notePlusOne - 1n), null, { request: context.reader });
+                if (status.status === 'closed') return GASLESS_MESSAGES.transit_funds_waiting;
+            }
+        } catch {
+            // Unknown evidence: the sweep works either way.
+        }
+        return GASLESS_MESSAGES.transit_sweep_needed;
     }
 
     /**
@@ -4458,7 +4507,11 @@ class ZkapiClient extends EventTarget {
         const S = transit.account;
         const settlement = settlementOf(outcome.receipt, { entryPoint: pins.entryPoint, paymaster: pins.paymaster, hash: outcome.hash, sender: S, payee: transit.payee });
         if (!settlement?.success) {
-            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, { forwardUserOp: null, forwardUserOpPhase: null }).catch(() => null);
+            const journaled = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId).catch(() => null) || withdrawal;
+            await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
+                forwardUserOp: null, forwardUserOpPhase: null,
+                ...(settlement ? this.revertedRecordUserOpFields(journaled, 'forward', [outcome.hash, settlement.event?.userOpHash]) : {})
+            }).catch(() => null);
             const error = gaslessError('gasless_op_reverted', { reason: settlement?.revert?.decoded?.code || null, transactionHash: outcome.transactionHash, userOpHash: outcome.hash });
             await this.refresh({ quiet: true });
             throw error;
@@ -4749,7 +4802,7 @@ class ZkapiClient extends EventTarget {
         if (!preflight.verdict.available) return { ...base, available: false, reason: preflight.verdict.reason, message: preflight.verdict.message, data: preflight.verdict.data };
         try {
             const built = await this.buildGaslessOperation(context, {
-                kind, vaultCall: `0x${'00'.repeat(836)}`, nullifier: nullifier ?? 0n, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: preflight.state
+                kind, vaultCall: WORST_CASE_EXIT_CALL, nullifier: nullifier ?? 0n, noteId, payoutWei, feeCapWei, allowExpensiveGas, state: preflight.state
             });
             const code = await context.reader({ method: 'eth_getCode', params: [payout, 'latest'] }).catch(() => '0x');
             return {
@@ -4897,16 +4950,37 @@ class ZkapiClient extends EventTarget {
         return found;
     }
 
-    /** The hashes a record's journaled operation under `prefix` may have been included under (the op body may be released already). */
+    /**
+     * The hashes a record's journaled operation under `prefix` may have been
+     * included under (the op body may be released already); those of an
+     * operation whose inclusion already settled as reverted
+     * (`${prefix}RevertedUserOpHashes`) are not looked for again.
+     */
     recordUserOpHashes(record, prefix) {
+        const reverted = new Set((record?.[`${prefix}RevertedUserOpHashes`] || []).map(hash => String(hash).toLowerCase()));
         return [...new Set([...(record?.[`${prefix}UserOpHashes`] || []), record?.[`${prefix}UserOpHash`]].filter(Boolean)
-            .map(hash => String(hash).toLowerCase()))];
+            .map(hash => String(hash).toLowerCase()))].filter(hash => !reverted.has(hash));
+    }
+
+    /**
+     * The fields that set a record's operation under `prefix` aside as
+     * reverted: every hash it was journaled under (one nonce: none of them
+     * can land any more) and `extra`, so a retry builds a new operation.
+     */
+    revertedRecordUserOpFields(record, prefix, extra = []) {
+        const hashes = [...this.recordUserOpHashes(record, prefix), ...extra.filter(Boolean).map(hash => String(hash).toLowerCase())];
+        return {
+            [`${prefix}RevertedUserOpHashes`]: [...new Set([...(record?.[`${prefix}RevertedUserOpHashes`] || []).map(hash => String(hash).toLowerCase()),
+                ...hashes])]
+        };
     }
 
     /** Whether a record's finalization or forward operation was journaled but its bundle transaction is not known yet. */
     recordUserOpUnresolved(record, prefix) {
-        // 'reverted': its inclusion was found and released (nothing to record again).
-        return this.recordUserOpHashes(record, prefix).length > 0 && record[`${prefix}UserOpPhase`] !== 'reverted'
+        // 'reverted': its inclusion was found and released (nothing to record
+        // again); 'settled': its settlement is recorded (finality later drops
+        // the bundle transaction hash, not the outcome).
+        return this.recordUserOpHashes(record, prefix).length > 0 && !['reverted', 'settled'].includes(record[`${prefix}UserOpPhase`])
             && !record[`${prefix}TransactionHash`]
             && !(record[`${prefix}TransactionHashes`] || []).length;
     }
@@ -4990,7 +5064,13 @@ class ZkapiClient extends EventTarget {
             [`${prefix}UserOpPhase`]: settlement.success ? 'settled' : 'reverted',
             ...(settlement.success ? { payoutVerified: settlement.payoutVerified } : {})
         } : {};
-        if (prefix === 'finalize') {
+        if (prefix === 'finalize' && !record.finalizeSubmissionId && !FINALIZATION_CLAIMABLE_PHASES.has(record.phase)) {
+            // Past finality there is no finalization left to claim: only the
+            // outcome is recorded, so the record is not looked at again.
+            await browserWalletRuntime.updateWithdrawal(record.recordId, {
+                [`${prefix}UserOpPhase`]: found.success === false ? 'reverted' : 'settled', ...settled
+            });
+        } else if (prefix === 'finalize') {
             const claim = record.finalizeSubmissionId ? {
                 recordId: record.recordId, submissionId: record.finalizeSubmissionId, operationId: record.finalizeOperationId,
                 generation: record.finalizeGeneration, deploymentId: record.deploymentId, chainId: record.chainId,
@@ -5025,18 +5105,20 @@ class ZkapiClient extends EventTarget {
         // lateUserOperation does).
         const reader = this.gaslessReader();
         for (const record of records) {
-            try {
-                const context = this.recordReaderContext(record, reader);
-                if (!context) continue;
-                for (const prefix of ['finalize', 'forward']) {
-                    if (!this.recordUserOpUnresolved(record, prefix)) continue;
+            const context = this.recordReaderContext(record, reader);
+            if (!context) continue;
+            // Each operation on its own: a finalization that cannot be
+            // recorded never keeps the forward from being looked for.
+            for (const prefix of ['finalize', 'forward']) {
+                if (!this.recordUserOpUnresolved(record, prefix)) continue;
+                try {
                     const fromBlock = record[`${prefix}UserOpBlock`] ?? record.startBlockNumber ?? null;
                     const found = await this.findUserOperationInclusion(context, this.recordUserOpHashes(record, prefix), fromBlock);
                     if (!found) continue;
                     await this.rememberRecordUserOpInclusion(record, prefix, found, reader);
+                } catch (error) {
+                    console.warn(`Unable to recover the sponsored ${prefix} operation of ${record.recordId}.`, error);
                 }
-            } catch (error) {
-                console.warn(`Unable to recover the sponsored operations of ${record.recordId}.`, error);
             }
         }
     }
@@ -6048,7 +6130,7 @@ class ZkapiClient extends EventTarget {
             });
             this.rememberWithdrawal(null);
             onStatus(sponsoredClose.fundsWaitingInTransit
-                ? `This balance is closed to its transit account. ${GASLESS_MESSAGES.transit_funds_waiting}`
+                ? `This balance is closed to its transit account. ${await this.transitFundsMessage(durable)}`
                 : payoutVerified || sponsoredClose.payoutVerified
                     ? 'Withdrawal returned. Finality is being checked safely in the background.'
                     : 'This balance is closed. Its payment is being checked in Payment history.');
@@ -7191,7 +7273,7 @@ class ZkapiClient extends EventTarget {
                             try {
                                 const balance = toBigInt(await read({ method: 'eth_getBalance', params: [record.transit.account, 'latest'] }), 'balance');
                                 transitFields = { fundsWaitingInTransit: balance > 0n, transitBalanceWei: balance.toString() };
-                                if (balance > 0n && record.fundsWaitingInTransit !== true) onStatus(GASLESS_MESSAGES.transit_funds_waiting);
+                                if (balance > 0n && record.fundsWaitingInTransit !== true) onStatus(await this.transitFundsMessage(record, { reader: read }));
                             } catch {
                                 transitFields = {};
                             }
@@ -7778,7 +7860,8 @@ class ZkapiClient extends EventTarget {
             await browserWalletRuntime.releaseWithdrawalFinalization(withdrawal.recordId, { submission });
             await browserWalletRuntime.updateWithdrawal(withdrawal.recordId, {
                 finalizeUserOp: null, finalizeUserOpPhase: 'reverted', finalizeUserOpSubmittedAt: null, finalizeUserOpFollowedAt: null,
-                finalizeUserOpRevertedTransactionHash: found.transactionHash
+                finalizeUserOpRevertedTransactionHash: found.transactionHash,
+                ...this.revertedRecordUserOpFields(withdrawal, 'finalize', [found.userOpHash])
             });
             const released = await browserWalletRuntime.currentWithdrawal(withdrawal.recordId) || withdrawal;
             const after = await this.readBrowserWithdrawalStatus(Number(withdrawal.noteId), null, { request: reader });
@@ -8020,7 +8103,7 @@ class ZkapiClient extends EventTarget {
         onStatus(credited
             ? `${ESCAPE_PAYOUT_CREDITED_MESSAGE} Finality is being checked safely in the background.`
             : sponsoredRecord
-                ? `Escape finalized to its transit account. ${GASLESS_MESSAGES.transit_funds_waiting}`
+                ? `Escape finalized to its transit account. ${await this.transitFundsMessage(withdrawal)}`
                 : 'Escape withdrawal returned. Finality is being checked safely in the background.');
         return { status: 'closed', event, receipt, ...(credited ? { payoutCredited: true } : {}),
             ...(sponsoredRecord && !credited ? { fundsWaitingInTransit: true, transitAccount: withdrawal.destination } : {}) };

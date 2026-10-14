@@ -193,7 +193,8 @@ test('a sponsored close creates the transit account, signs the hash once, journa
     assert.equal(await prepared(), null);
     assert.equal(proofs(h, 'mutual').length, 1);
     // Status text: the privacy sentence, the minimum received before signing, the settlement after.
-    assert.ok(statuses.some(message => /becomes the on-chain owner/.test(message) && /fresh (owner )?account/.test(message)));
+    assert.ok(statuses.some(message => /becomes the on-chain owner/.test(message) && /fresh (owner )?account/.test(message)
+        && /bundler .* sees the operation, with its note, transit account and payout address, together with this browser’s IP address/.test(message)));
     assert.ok(statuses.some(message => /receives at least 0\.4\d+ ETH/.test(message)), statuses.join('\n'));
     assert.ok(statuses.some(message => /settled: charged 0\.005 ETH, 0\.495 ETH paid out/.test(message)), statuses.join('\n'));
     assert.equal(amounts[0].minimumReceived, (wei(500_000_000) - BigInt(amounts[0].maxCost) - BigInt(VECTORS.policy.flat_fee_wei)).toString());
@@ -694,6 +695,10 @@ test('the direct-call fallback pays from the wallet to the transit account, then
     assert.equal(saved.payout, PAYEE);
     assert.equal(saved.transit.account, S);
     assert.ok(statuses.some(message => /sits in this withdrawal’s transit account/.test(message)));
+    // A wallet-paid close leaves the paymaster no evidence: only the sweep is named, and a sponsored forward is refused.
+    assert.ok(statuses.some(message => /Sweep it to the payout address from a funded wallet \(sweepTransit\)/.test(message)), statuses.join('\n'));
+    assert.ok(!statuses.some(message => /sponsored forward/.test(message)), statuses.join('\n'));
+    await assert.rejects(client.collectTransitBalance(saved.recordId, () => {}), { code: 'transit_not_stranded' });
     // The sweep: createAccount first (S has no code), then sweep(); Collected proves the payout.
     const createHash = `0x${'ca'.repeat(32)}`;
     const sweepHash = `0x${'5a'.repeat(32)}`;
@@ -785,6 +790,8 @@ test('gaslessWithdrawalQuote and gaslessAvailability never prove, prompt or send
     assert.equal(quote.bundlerUrl, BUNDLER_URL);
     assert.equal(quote.attemptsLeft, 3);
     assert.match(quote.privacy, /fresh account/);
+    assert.match(quote.privacy, /bundler \(the operator’s unless you set your own\) sees the operation/, 'what the bundler learns is disclosed');
+    assert.match(quote.privacy, /IP address and timing before it is included; for an escape it learns of the exit before the chain does/);
     assert.equal(proofs(h, 'mutual').length + proofs(h, 'escape').length, 0, 'no proof');
     assert.deepEqual(wallet.calls, [], 'no prompt, no wallet read');
     assert.equal(wallet.sent.length, 0);
@@ -2426,4 +2433,135 @@ test('a sponsored close in flight when the profile retired its pins settles from
     assert.equal(paid.fundsWaitingInTransit, true, 'the payout waits in S for sweepTransit');
     assert.equal(s.wallet.sent.length, 1);
     assert.equal(s.bundler.sent.length, sentBefore, 'nothing re-sent');
+});
+
+test('a sponsored close that reverts while the note stays active is retried with a new operation, not re-settled from the reverted one', async () => {
+    const { chain, bundler, wallet, withdraw, S, record, prepared, closeKey, closeBundle } = await scenario();
+    // The vault call runs out of gas: SponsorshipFailed, nothing stranded, the note stays Active.
+    bundler.autoMine = () => ({
+        success: false,
+        extraLogs: [logs.sponsorshipFailed(chain.paymaster, { key: closeKey, sender: S, kind: 1n, noteId: BigInt(NOTE_ID), actualGasCost: 10n ** 15n })],
+        effects: chainState => chainState.paymasterState.attempts.set(closeKey, (chainState.paymasterState.attempts.get(closeKey) ?? 0n) + 1n)
+    });
+    await assert.rejects(within(5_000, withdraw('mutual'), 'reverted close'), { code: 'gasless_op_reverted' });
+    const reverted = bundler.sent[0].hash;
+    const plan = await prepared();
+    assert.ok(plan, 'the plan stays for a retry');
+    assert.ok(!(plan.staleUserOpHashes || []).includes(reverted), 'a reverted inclusion is not a late inclusion to settle again');
+    assert.equal(wallet.signatures.length, 1);
+    // The retry the error message names: a new operation is signed, sent and settles the close.
+    bundler.autoMine = closeBundle();
+    const result = await within(5_000, withdraw('mutual'), 'retried close');
+    assert.equal(result.status, 'closed');
+    assert.equal(bundler.sent.length, 2, 'a new operation was sent');
+    assert.notEqual(bundler.sent[1].hash, reverted);
+    assert.equal(wallet.signatures.length, 2);
+    assert.equal(result.userOpHash, bundler.sent[1].hash);
+    assert.equal((await record()).userOpSuccess, true);
+});
+
+test('a sponsored finalization that reverted while the escape stays pending is retried with a new operation at the next nonce', async () => {
+    const s = await interruptedSponsoredFinalization();
+    const { bundler, client, recordId } = s;
+    bundler.release();
+    bundler.mine(s.finalizeHash, revertedFinalizeBundle(s));
+    await assert.rejects(within(5_000, client.finalizeEscape(recordId, () => {}), 'the reverted finalization'), { code: 'gasless_op_reverted' });
+    let saved = await s.record();
+    assert.equal(saved.phase, 'pending');
+    assert.equal(saved.finalizeUserOpPhase, 'reverted');
+    // The retry the error message names: a new operation, at the next nonce, settles the finalization.
+    const sent = bundler.sent.length;
+    bundler.autoMine = () => sponsoredFinalizeBundle(s);
+    const result = await within(5_000, client.finalizeEscape(recordId, () => {}), 'the retried finalization');
+    assert.equal(result.status, 'closed');
+    assert.equal(bundler.sent.length, sent + 1, 'a new operation was sent');
+    const retried = bundler.sent.at(-1);
+    assert.notEqual(retried.hash, s.finalizeHash);
+    assert.equal(unpackNonce(retried.op.nonce).sequence, unpackNonce(bundler.sent.find(entry => entry.hash === s.finalizeHash).op.nonce).sequence + 1n);
+    assert.equal(result.userOpHash, retried.hash);
+    saved = await s.record();
+    assert.equal(saved.finalizeUserOpPhase, 'settled');
+    assert.equal(saved.finalizeUserOpHash, retried.hash);
+    assert.deepEqual(saved.finalizeRevertedUserOpHashes, [s.finalizeHash], 'the reverted hash is set aside, never looked for again');
+});
+
+test('a sponsored finalization past finality is not looked for again on every escape sync', async () => {
+    const s = await interruptedSponsoredFinalization();
+    const { bundler, chain, client, recordId } = s;
+    bundler.release();
+    bundler.autoMine = () => sponsoredFinalizeBundle(s);
+    bundler.mine(s.finalizeHash, sponsoredFinalizeBundle(s));
+    const finalized = await within(5_000, client.finalizeEscape(recordId, () => {}), 'the sponsored finalization');
+    assert.equal(finalized.status, 'closed');
+    // Finality: the sanitized record drops the bundle transaction hash and keeps the operation hashes and their outcome.
+    await runtime.updateWithdrawal(recordId, { phase: 'closed' }, { sanitize: true });
+    let saved = await s.record();
+    assert.equal(saved.finalizeTransactionHash, undefined);
+    assert.equal(saved.finalizeUserOpPhase, 'settled');
+    assert.equal(client.recordUserOpUnresolved(saved, 'finalize'), false);
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
+    try {
+        const getLogs = () => chain.calls.filter(call => call.method === 'eth_getLogs').length;
+        const before = getLogs();
+        for (let pass = 0; pass < 2; pass += 1) await client.recoverGaslessRecordOperations();
+        assert.equal(getLogs(), before, 'no log search for a settled finalization');
+        // An outcome finality overtook (the op still journaled as submitted) is recorded once, without a claim, then left alone.
+        await runtime.updateWithdrawal(recordId, { finalizeUserOpPhase: 'op_submitted' });
+        await client.recoverGaslessRecordOperations();
+        saved = await s.record();
+        assert.equal(saved.phase, 'closed');
+        assert.equal(saved.finalizeUserOpPhase, 'settled');
+        const after = getLogs();
+        await client.recoverGaslessRecordOperations();
+        assert.equal(getLogs(), after);
+    } finally {
+        console.warn = warn;
+    }
+    assert.deepEqual(warnings, []);
+});
+
+test('the pre-proof quote is an upper bound on the signed operation: its vault call is sized as worst-case nonzero calldata', async () => {
+    const { client, bundler, withdraw, closeBundle, amounts } = await scenario();
+    const quote = await client.gaslessWithdrawalQuote('mutual', { destination: PAYEE });
+    assert.equal(quote.available, true);
+    bundler.autoMine = closeBundle();
+    await within(5_000, withdraw('mutual'), 'a sponsored close');
+    const signed = bundler.sent[0].op;
+    assert.equal(BigInt(signed.maxFeePerGas), BigInt(quote.fees.maxFeePerGas), 'the same fees, so the gas alone decides');
+    assert.ok(BigInt(quote.gas.preVerificationGas) >= BigInt(signed.preVerificationGas),
+        `quoted preVerificationGas ${quote.gas.preVerificationGas} below the signed ${BigInt(signed.preVerificationGas)}`);
+    assert.ok(BigInt(quote.maxCost) >= BigInt(amounts[0].maxCost), 'the quoted maxCost bounds the signed one');
+    assert.ok(BigInt(quote.minimumReceivedWei) <= BigInt(amounts[0].minimumReceived), 'the quoted minimum is never above the one shown at signing');
+});
+
+test('with escapes disabled, a direct escape started from the wallet is finalized from the wallet: no plan is bound to the transit account', async () => {
+    const { h, chain, wallet, client, withdraw, nullifier, state, record } = await scenario({ profile: { escapesEnabled: false }, allow: WALLET_SENDS });
+    const refused = await withdraw('escape').then(() => null, error => error);
+    assert.equal(refused?.code, 'escapes_disabled');
+    assert.equal(proofs(h, 'escape').length, 0, 'refused before any proof, so nothing binds the transit account');
+    assert.doesNotMatch(refused.message, /can still be sponsored/);
+    assert.match(refused.message, /otherwise finalize it from the wallet/);
+    // The wallet-paid start the message names: an ordinary escape to the payout address, not to S.
+    const deadline = Math.floor(Date.now() / 1_000) - 10;
+    const escapeHash = `0x${'e5'.repeat(32)}`;
+    wallet.onSend = transaction => {
+        assert.equal(low(transaction.to), low(VAULT));
+        chain.head += 1;
+        chain.receipts.set(escapeHash, { transactionHash: escapeHash, blockNumber: `0x${chain.head.toString(16)}`, status: '0x1',
+            logs: [logs.escapeInitiated(VAULT, { noteId: BigInt(NOTE_ID), nullifier: BigInt(nullifier), finalBalance: BigInt(state.current_balance),
+                destination: PAYEE, challengeDeadline: BigInt(deadline) })] });
+        chain.noteStatus(NOTE_ID, 2);
+        chain.setPending(NOTE_ID, { nullifier: BigInt(nullifier), finalBalance: BigInt(state.current_balance), destination: PAYEE,
+            challengeDeadline: BigInt(deadline), stateBalance: BigInt(state.current_balance), conceded: 0n, nextNullifier: 0x5n });
+        return escapeHash;
+    };
+    const started = await within(5_000, withdraw('escape', { fees: 'wallet' }), 'wallet-paid escape');
+    assert.equal(started.status, 'pending_withdrawal');
+    const saved = await record();
+    assert.equal(low(saved.destination), low(PAYEE));
+    assert.equal(saved.feePayer, undefined);
+    // Its finalization cannot be sponsored: the record has no transit account.
+    await assert.rejects(client.finalizeEscape(started.recordId, () => {}, { fees: 'payout' }), { code: 'gasless_plan_mismatch' });
 });

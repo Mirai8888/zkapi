@@ -4188,17 +4188,22 @@ class BrowserWalletRuntime extends EventTarget {
     /**
      * Forget an operation that will not be included (past its proof,
      * replaced by one with other bytes); its hashes stay in
-     * `staleUserOpHashes` so a late inclusion is still recognized.
+     * `staleUserOpHashes` so a late inclusion is still recognized. The
+     * `reverted` hashes (an inclusion already settled as reverted) are
+     * dropped instead: a retry builds a new operation rather than settling
+     * that inclusion again.
      */
-    async releasePreparedWithdrawalUserOp(submission) {
+    async releasePreparedWithdrawalUserOp(submission, { reverted = [] } = {}) {
         return withBrowserWalletLock(this.manifest.deployment_id, async () => {
             await this.reload();
             const prepared = this.runtime.preparedWithdrawal;
             if (!prepared || !this.preparedSubmissionMatches(prepared, submission, { allowSettled: true })) return null;
             const staleBlocks = [prepared.staleSubmittedAtBlock, prepared.submittedAtBlock].filter(value => value != null).map(Number);
+            const dropped = new Set(reverted.filter(Boolean).map(hash => String(hash).toLowerCase()));
             const next = {
                 ...prepared,
-                staleUserOpHashes: [...new Set([...(prepared.staleUserOpHashes || []), ...(prepared.userOpHashes || [])])],
+                staleUserOpHashes: [...new Set([...(prepared.staleUserOpHashes || []), ...(prepared.userOpHashes || [])])]
+                    .filter(hash => !dropped.has(String(hash).toLowerCase())),
                 // The earliest block a released operation was tracked from: the inclusion search of its hashes starts there.
                 ...(staleBlocks.length ? { staleSubmittedAtBlock: Math.min(...staleBlocks) } : {})
             };

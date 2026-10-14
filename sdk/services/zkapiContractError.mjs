@@ -131,7 +131,7 @@ const CONTRACT_ERRORS = Object.freeze({
     // BadSuccessor()
     '0x13549e75': { code: 'bad_successor', message: 'The escape proof does not name its successor nullifier.' },
     // EscapesDisabled()
-    '0xead7d4d4': { code: 'escapes_disabled', message: 'The operator does not sponsor escape initiations. Start the escape from a wallet; its finalization can still be sponsored.' },
+    '0xead7d4d4': { code: 'escapes_disabled', message: 'The operator does not sponsor escape initiations. Start the escape from a wallet. Its finalization can be sponsored only when the escape pays this withdrawal’s transit account (it continues a sponsored withdrawal already proved for it); otherwise finalize it from the wallet as well.' },
     // EscapeAlreadySponsored(uint32)
     '0x7fcde504': { code: 'escape_already_sponsored', message: 'An escape of this balance was already sponsored once.', args: ['noteId'] },
     // EscapeEvidencePending(uint32)

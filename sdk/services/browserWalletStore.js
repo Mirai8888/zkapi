@@ -2352,14 +2352,17 @@ export async function updateBrowserWithdrawal(recordId, changes = {}, {
  * 'submitted' as for a wallet-paid exit), `staleUserOpHashes[]` (the hashes
  * of operations released before inclusion, kept across a re-proof, with
  * `staleSubmittedAtBlock`, the earliest block their inclusion is searched
- * from), and after
+ * from; an operation whose inclusion settled as reverted is dropped from it),
+ * and after
  * the receipt `userOpSuccess`, `chargedWei`, `owedPaidWei`, `receivedWei`,
  * `paidOutWei`, `paymasterCredited`, `paymasterCreditedWei`,
  * `initiationDebtWei`. On a `withdrawals[]` record: `feePayer`, `payout`,
  * `transit`, `userOpHash`, `userOpHashes`, the amounts, `initiationDebtWei`,
  * `finalizeUserOp`, `finalizeUserOpHash`, `finalizeUserOpHashes[]`,
  * `finalizeUserOpPhase`, `finalizeUserOpFollowedAt`, `forwardUserOp`, `forwardUserOpHash`,
- * `forwardUserOpHashes[]`, `forwardUserOpPhase`, `forwardTransactionHash`,
+ * `forwardUserOpHashes[]`, `forwardUserOpPhase`, `finalizeRevertedUserOpHashes[]` and
+ * `forwardRevertedUserOpHashes[]` (hashes whose inclusion settled as reverted,
+ * never looked for again, so a retry builds a new operation), `forwardTransactionHash`,
  * `sweepTransactionHash`, `transitCreateTransactionHash`,
  * `creditClaimTransactionHash`, `fundsWaitingInTransit`, `transitBalanceWei`.
  * A paymaster credit uses its own fields (`paymasterCredited`), never the
@@ -2370,6 +2373,7 @@ export const GASLESS_WITHDRAWAL_FIELDS = Object.freeze([
     'feePayer', 'payout', 'transit', 'userOpHash', 'userOpHashes', 'staleUserOpHashes', 'userOpSuccess', 'chargedWei', 'owedPaidWei',
     'receivedWei', 'paidOutWei', 'paymasterCredited', 'paymasterCreditedWei', 'initiationDebtWei', 'finalizeUserOpHash',
     'finalizeUserOpHashes', 'finalizeUserOpPhase', 'forwardUserOpHash', 'forwardUserOpHashes', 'forwardUserOpPhase',
+    'finalizeRevertedUserOpHashes', 'forwardRevertedUserOpHashes',
     'forwardTransactionHash', 'sweepTransactionHash', 'transitCreateTransactionHash', 'creditClaimTransactionHash',
     'fundsWaitingInTransit', 'transitBalanceWei'
 ]);

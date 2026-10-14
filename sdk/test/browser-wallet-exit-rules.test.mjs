@@ -367,12 +367,14 @@ test('E2.4: a retry after nullifier_used still waits for T, asks no second clear
         clearances += 1;
         throw new HttpError('The nullifier is used.', 409, 'nullifier_used');
     };
-    const waitsForT = error => {
+    // T is W + 15 min after the wallet's own request record.
+    const waitsForTFrom = since => error => {
         assert.equal(error.code, 'request_settlement_pending');
         assert.equal(error.data.clearance_error_code, 'nullifier_used');
-        assert.equal(error.data.escape_at, (created + W + 900) * 1_000);
+        assert.equal(error.data.escape_at, (since + W + 900) * 1_000);
         return true;
     };
+    const waitsForT = waitsForTFrom(created);
     // Any UI retries after an error: every retry decides as the first did.
     for (let attempt = 0; attempt < 3; attempt += 1) {
         await assert.rejects(h.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForT);
@@ -391,19 +393,29 @@ test('E2.4: a retry after nullifier_used still waits for T, asks no second clear
     const forced = await h.runtime.prepareWithdrawal('escape', DESTINATION, { earlyConcession: 'bound' });
     assert.equal(forced.decision.rule, 'E3.forced');
     assert.equal(forced.public_inputs.conceded, BOUND);
-    // At T the mutual request escapes conceding the bound (E3.T).
-    const later = await walletWithResolvedRequest();
-    later.server.clearance = () => { throw new HttpError('The nullifier is used.', 409, 'nullifier_used'); };
-    await assert.rejects(later.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForT);
-    const restore = Date.now;
-    Date.now = () => (created + W + 900) * 1_000 + 60_000;
+    // At T the mutual request escapes conceding the bound (E3.T). The second
+    // wallet's request is made later (here a full second, as when its record
+    // lands past a wall-clock second boundary): its T is its own.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 1_000;
     try {
-        const plan = await later.runtime.prepareWithdrawal('mutual', DESTINATION);
-        assert.equal(plan.mode, 'escape');
-        assert.equal(plan.decision.rule, 'E3.T');
-        assert.equal(plan.public_inputs.conceded, BOUND);
+        const later = await walletWithResolvedRequest();
+        const laterCreated = Math.floor((await records())[0].createdAt / 1_000);
+        assert.ok(laterCreated > created);
+        later.server.clearance = () => { throw new HttpError('The nullifier is used.', 409, 'nullifier_used'); };
+        await assert.rejects(later.runtime.prepareWithdrawal('mutual', DESTINATION), waitsForTFrom(laterCreated));
+        const shifted = Date.now;
+        Date.now = () => (laterCreated + W + 900) * 1_000 + 60_000;
+        try {
+            const plan = await later.runtime.prepareWithdrawal('mutual', DESTINATION);
+            assert.equal(plan.mode, 'escape');
+            assert.equal(plan.decision.rule, 'E3.T');
+            assert.equal(plan.public_inputs.conceded, BOUND);
+        } finally {
+            Date.now = shifted;
+        }
     } finally {
-        Date.now = restore;
+        Date.now = realNow;
     }
 });
 

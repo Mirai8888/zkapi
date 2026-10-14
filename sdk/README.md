@@ -552,6 +552,18 @@ dry run, the logs, the bundle receipt) go to the exit RPC when one is set and
 on the vault's chain, then to the pinned RPC, never to the wallet provider,
 so `S` and `Y` do not reach the wallet vendor; a host that wants the wallet
 provider read as a last resort sets `client.gaslessReadsViaWallet = true`.
+The bundler is not covered by that: `eth_sendUserOperation` and the
+follow-up calls go straight from the browser to it (neither the read RPC
+ladder nor the `transport` given to `configureBrowserSdk` carries them), and
+by default it is the operator's (`gasless.bundler_url`). It sees the
+operation before inclusion, with the note and its proof, the transit account
+`S`, the owner and the payout address `Y` (in the account's creation data),
+together with the browser's IP address and timing; for an escape it learns of
+the exit before the chain does. On the wallet-paid path the vault call goes through the
+wallet's RPC instead. For unlinkability from the operator, use a bundler the
+user chooses (`client.setBundlerUrl(url)`, or a host transport through
+`provider.zkapiBundler`). The status before signing and the quote's
+`privacy` field say so too.
 
 Before signing, `onStatus` shows the only statement the SDK can make: the
 payout address receives at least `payout − maxCost − flatFee − owed`, where
@@ -585,12 +597,17 @@ receipt. Every number is cross-checked against the paymaster's `quote`
 (`payout_below_gas`); a fee above 25% of the payout (the profile's
 `uneconomic_fraction_percent`) is refused with `gasless_uneconomic` unless
 the host passes `allowExpensiveGas: true`. The rule is
-`(maxCost + flatFee) × 100 / payout > uneconomic_fraction_percent`; with the
+`(maxCost + flatFee) × 100 / payout > uneconomic_fraction_percent`. With the
 committed policy's default limits (about 1.5–1.8 million gas in all, more
-with the account's creation) and `maxFeePerGas = 2 × 30 gwei + tip`, `maxCost`
-is about 0.1 ETH at a 30 gwei base fee, so payouts under about 0.4 ETH keep
-the wallet path by default; the exact threshold for the current fees comes
-from the quote below. `client.gaslessWithdrawalQuote(mode, { destination, feeCapWei,
+with the account's creation), `maxCost` is those limits times `maxFeePerGas`,
+and the default `maxSponsoredCost` of 0.05 ETH refuses every operation above
+a `maxFeePerGas` of about 28 gwei (a base fee of about 13 gwei) with
+`max_cost_above_policy`, whatever the payout (docs/deployment.md, fee
+bounds). Within that bound, at a 10 gwei base fee and a 1 gwei tip
+(`maxFeePerGas` 21 gwei), a close that creates `S` has a `maxCost` of about
+0.035 ETH, so payouts under about 0.14 ETH (more with a flat fee) keep the
+wallet path by default; the exact threshold for the current fees comes from
+the quote below. `client.gaslessWithdrawalQuote(mode, { destination, feeCapWei,
 allowExpensiveGas })` returns these numbers (`available`, `reason`,
 `transitAccount`, `amounts`, `fees`, `gas`, `minimumReceivedWei`, which is
 null for an escape, and `estimatedReceivedWei`, set only for one) without
@@ -690,9 +707,16 @@ address is refused as a different destination); the payout then waits in `S`
 ETH-holding account; the paymaster deducts what `S` owes and pushes the rest.
 
 Escapes: `withdraw('escape', …, { fees: 'payout' })` sponsors the initiation
-only while the operator enables it (`escapes_disabled` otherwise; the
-finalization can still be sponsored after a wallet-paid start to `S`). An
-initiation pays nothing now: its charge is recorded as `S`'s debt
+only while the operator enables it (`escapes_disabled` otherwise, refused
+before any proof). A direct escape refused this way binds no plan to `S`:
+started again with `{ fees: 'wallet' }` it pays the connected account or the
+destination, and its finalization is wallet-paid too (`finalizeEscape(…, {
+fees: 'payout' })` refuses it with `gasless_plan_mismatch`). Only an escape
+that continues a sponsored plan already proved for `S` (a sponsored mutual
+request the exit rules turned into an escape, refused after its proof) is
+started from the wallet to `S` with `{ fees: 'wallet' }` and can have its
+finalization sponsored. An initiation pays nothing now: its charge is
+recorded as `S`'s debt
 (`initiationDebtWei` on the record) and deducted at finalization, together
 with the finalization's own charge. `client.finalizeEscape(recordId,
 onStatus, { fees })` defaults to `'payout'` for such a record, runs only
@@ -916,7 +940,7 @@ Each of these errors carries a `shortMessage` for display.
 | Tree rebuild | `tree_logs_unavailable`, `tree_note_missing`, `tree_rebuild_timeout`, `tree_root_refused`, `wrong_network` (each with `error.data.exit_path_unavailable`) |
 | Exit RPC | `exit_rpc_invalid`, `exit_rpc_unsaved` |
 | Sponsored withdrawals (refused before any prompt) | `gasless_unavailable` (`error.data.reason`: `not_pinned`, `gasless_profile_invalid`, `gasless_deployment_mismatch`), `gasless_policy_mismatch`, `bundler_unavailable` (`error.data.fallbacks`), `bundler_wrong_chain`, `bundler_unsupported_entry_point`, `bundler_url_invalid`, `bundler_url_unsaved`, `sponsorship_paused`, `escapes_disabled`, `escape_already_sponsored`, `paymaster_underfunded`, `exits_paused` (`error.data.reopenAt`), `gas_above_paymaster_ceiling` (`error.data`, wei as bigints: `baseFeePerGas`, `maxPriorityFeePerGas`, `neededMaxFeePerGas` = base + tip, the amount compared with the ceiling, `wantedMaxFeePerGas` = 2 × base + tip, `maxFeeCeiling`), `max_cost_above_policy`, `payout_below_gas`, `gasless_uneconomic`, `gasless_attempts_exhausted`, `gasless_fee_above_cap`, `gasless_estimate_above_cap`, `gas_limit_out_of_range` (a gas field outside the paymaster's policy; `error.data`: `name`, `value`, `floor`, `cap`), `gasless_plan_mismatch`, `gasless_record_not_pinned` (`error.data.reason`: `not_pinned`, `pins_mismatch`; recover with `withdraw(mode, …, { fees: 'wallet' })` while the note has not left the vault, then with `sweepTransit`, `claimGaslessCredit` or `finalizeEscape(…, { fees: 'wallet' })`, as `error.data.alternatives` lists them), `wrong_owner_account` (`error.data.expected`), `entry_point_hash_mismatch` |
-| Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `bundler_rejected` (the bundler refused the send with AA25 or AA10 although the chain disagrees; `error.data`: `method`, `aa`, `rpcCode`, `rpcMessage`), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `user_op_pending` (`finalizeEscape(…, { fees: 'wallet' })` while a sponsored finalization sent before the profile stopped pinning its paymaster may still land; `error.data.userOpHash`, `retryAfterMs`), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting`, `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
+| Sponsored withdrawals (after a submission) | `signature_rejected` (also a bundler's ERC-7769 `-32507`), `paymaster_underfunded` (also a bundler's `-32508`: the float cannot cover every pending operation; neither code is re-signed), `escape_not_due` (a sponsored finalization the latest block has not reached the deadline for within three minutes; `error.data.validAfter`, `blockTimestamp`), `bundler_hash_mismatch` (a status, the chain decides), `bundler_rejected` (the bundler refused the send with AA25 or AA10 although the chain disagrees; `error.data`: `method`, `aa`, `rpcCode`, `rpcMessage`), `gasless_op_expired` (proved again), `gasless_op_pending` (journaled, checked in the background), `user_op_pending` (`finalizeEscape(…, { fees: 'wallet' })` while a sponsored finalization sent before the profile stopped pinning its paymaster may still land; `error.data.userOpHash`, `retryAfterMs`), `gasless_fee_bump_exhausted`, `gasless_op_reverted` (`error.data.reason`, the vault error; the record may hold `fundsWaitingInTransit`), `transit_funds_waiting` (a forward is sponsored), `transit_sweep_needed` (a status after a wallet-paid exit to `S`, which leaves the paymaster no evidence: only `sweepTransit` collects it), `transit_not_stranded`, `transit_balance_empty`; the EntryPoint's `AA..` reasons map to `sender_already_constructed` and `nonce_rejected` (handled silently), `signature_rejected`, `paymaster_underfunded`, `paymaster_time_window`, `paymaster_rejected` and the paymaster's own errors above |
 
 ## Credited escape payouts
 

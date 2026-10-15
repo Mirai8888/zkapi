@@ -9,8 +9,10 @@
 #   zkapi-tor-cli.sh set_model anthropic/claude-haiku-4.5
 #   zkapi-tor-cli.sh stop
 #
-# State (server pid, active model, conversation history) lives under
-# /tmp/zkapi-tor-cli.<uid>/ — the script itself is stateless between calls.
+# State (server pid, model, conversation history) lives under
+# <config>/zkapi-clientd/cli/ — the ONE state root, so a conversation
+# survives reboots, sandbox resets, and handoff between environments:
+# stop in one world, start in the other, continue asking.
 #
 # Identity model (matches zkapi-serve-tor.sh):
 #   * One long-lived Tor client; guards persist across runs.
@@ -28,7 +30,8 @@ here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 if [ -f "$here/.config/zkapi-clientd/config.json" ]; then export XDG_CONFIG_HOME="$here/.config"; fi
 SERVE="$here/zkapi-serve-tor.sh"
 API="http://127.0.0.1:8787/v1"
-STATE_DIR="/tmp/zkapi-tor-cli.$(id -u)"
+CFG_DIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
+STATE_DIR="$CFG_DIR/cli"
 PID_FILE="$STATE_DIR/server.pid"
 MODEL_FILE="$STATE_DIR/model"
 CONV_FILE="$STATE_DIR/conv.json"
@@ -187,7 +190,9 @@ except Exception:
     sys.stderr.write(json.dumps(body)[:400] + "\n")
     sys.exit(5)
 msgs.append({"role": "assistant", "content": content})
-json.dump(msgs, open(conv, "w"))
+with open(conv + ".tmp", "w") as f:
+    json.dump(msgs, f)
+os.replace(conv + ".tmp", conv)   # atomic: power cut cannot tear the conversation
 print(content)
 PY
 }
@@ -278,7 +283,11 @@ case "${1:-}" in
     ;;
   ask)
     [ $# -ge 2 ] || die "usage: $0 ask \"follow-up\""
-    server_running || die "no conversation server is running; use start_conversation"
+    if ! server_running; then
+      hint=""
+      [ -s "$CFG_DIR/daemon.lock" ] && hint=" (the wallet profile is claimed by: $(cat "$CFG_DIR/daemon.lock" 2>/dev/null) — if that is a live stack in another environment, continue the conversation there, or 'stop' it first)"
+      die "no conversation server is running; use start_conversation$hint"
+    fi
     warm_policy || true
     run_chat append "$2"
     ;;

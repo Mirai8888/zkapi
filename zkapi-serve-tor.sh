@@ -41,15 +41,53 @@ rand_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0)
 socks_port="$(rand_port)"
 ctl_port="$(rand_port)"
 
-# Claim the profile BEFORE bootstrapping Tor: if another daemon (possibly one
-# invisible in another environment, e.g. a sandbox sharing this filesystem)
-# holds daemon.lock, fail in seconds rather than after a minute of Tor.
-"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
-"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || {
-  CFGDIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
-  echo "zkapi-serve-tor: cannot claim the config profile (lock: $CFGDIR/daemon.lock, held by: $(cat "$CFGDIR/daemon.lock" 2>/dev/null || echo 'unknown')). Stop that zkapi-clientd where it runs before starting this one." >&2
-  exit 1
+# The claim is split in two, deliberately:
+#   * a PURE lock probe (flock -n) runs before bootstrapping Tor — it fails
+#     fast and drives the cooperative handover without touching any service
+#     logic; do NOT use `config --relay-url` here, because config runs health
+#     checks that need the relay (Tor) already alive;
+#   * the actual relay-URL write happens after bootstrap, when its checks can
+#     succeed through the live relay.
+# Ownership is a cooperative token, not a fight: $CONFIG_DIR/owner holds a
+# monotonic epoch plus holder pid/host. A launcher that sees its epoch changed
+# knows another world claimed the wallet while it sat idle, and retires
+# itself (running its cleanup, releasing daemon.lock and the wallet). The
+# claiming side bumps the epoch and waits for the lock to actually release,
+# so there is never a window with two spenders — only a handover. (A
+# SUSPENDED holder can't poll its epoch; then this degrades to manual, never
+# to a double spend: flock and the issuer's one-lease-per-note guard money.)
+OWNER="$CONFIG_DIR/owner"
+owner_epoch() { awk 'NR==1{print $1}' "$OWNER" 2>/dev/null; }
+epoch=""
+take_ownership() {
+  exec 9>"$CONFIG_DIR/owner.lock"
+  flock 9
+  epoch=$(( $(owner_epoch || echo 0) + 1 ))
+  printf '%s %s %s\n' "$epoch" "$$" "$(hostname)" > "$OWNER.tmp"
+  mv -f "$OWNER.tmp" "$OWNER"
+  exec 9>&-
 }
+have_lock() { flock -n "$CONFIG_DIR/daemon.lock" true 2>/dev/null; }
+
+# No "$BIN" calls until the lock is ours: the config command runs health
+# checks (and a transient check-mode service) that hang or mislead while
+# another daemon holds the profile. Pure probes only, until we own it.
+if ! have_lock; then
+  holder="$(cat "$CONFIG_DIR/daemon.lock" 2>/dev/null || echo '?')"
+  echo "zkapi-serve-tor: profile held by $holder; requesting handover (epoch bump)..." >&2
+  take_ownership
+  waited=0
+  while [ "$waited" -lt "${ZKAPI_TAKEOVER_WAIT:-60}" ]; do
+    sleep 1; waited=$((waited + 1))
+    have_lock && break
+  done
+  have_lock || {
+    echo "zkapi-serve-tor: still held after ${ZKAPI_TAKEOVER_WAIT:-60}s (holder: $holder). If that environment is suspended it cannot hand over cooperatively; stop that zkapi-clientd first." >&2
+    exit 1
+  }
+fi
+take_ownership
+echo "zkapi-serve-tor: owner epoch $epoch (pid $$ host $(hostname))" >&2
 
 tor --ClientOnly 1 --PublishServerDescriptor 0 \
     --SocksPort "127.0.0.1:${socks_port}" \
@@ -64,17 +102,34 @@ coverpid=""
 child=""
 cleanup() {
   rc=$?
+  [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
   [ -n "$coverpid" ] && kill -KILL "$coverpid" 2>/dev/null
   [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
   [ -n "$torpid" ] && kill -KILL "$torpid" 2>/dev/null
   rm -f "$datadir/socks_port" "$datadir/control_port"
-  # Restore direct mode so later non-Tor runs don't fail closed on a dead port.
-  "$BIN" config --relay-url "" >/dev/null 2>&1 || true
+  # Restore direct mode so later non-Tor runs don't fail closed on a dead
+  # port — but only while WE are still the owner: after a handover the new
+  # owner's relay setting must survive our exit.
+  if [ -z "$epoch" ] || [ "$(owner_epoch)" = "$epoch" ]; then
+    "$BIN" config --relay-url "" >/dev/null 2>&1 || true
+  fi
   exit $rc
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+
+# Retirement watchdog: poll the ownership token; concede on claim-over.
+(
+  while sleep 5; do
+    if [ "$(owner_epoch)" != "$epoch" ]; then
+      echo "zkapi-serve-tor: profile claimed over by epoch $(owner_epoch); retiring" >&2
+      kill -TERM "$$" 2>/dev/null
+      exit 0
+    fi
+  done
+) &
+watchdog=$!
 
 elapsed=0
 shown=0
@@ -99,7 +154,8 @@ coverpid=$!
 # messages inside the window cost ~seconds; only the ~5-minute rotation pays
 # the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
 echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
-echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
+"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
+"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >&2 || { echo "zkapi-serve-tor: failed to save relay URL" >&2; exit 1; }
 "$BIN" serve &
 child=$!
 rc=0

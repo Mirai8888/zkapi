@@ -7,6 +7,7 @@
 #   zkapi-tor-cli.sh ask "What word did I ask you to remember?"
 #   zkapi-tor-cli.sh list_models
 #   zkapi-tor-cli.sh set_model anthropic/claude-haiku-4.5
+#   zkapi-tor-cli.sh stop
 #
 # State (server pid, active model, conversation history) lives under
 # /tmp/zkapi-tor-cli.<uid>/ — the script itself is stateless between calls.
@@ -290,6 +291,13 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
     [ $# -ge 2 ] || { echo "current model: $(active_model)"; exit 0; }
     printf '%s\n' "$2" > "$MODEL_FILE"
     echo "model set: $2"
+    ;;
+  stop)
+    # Clean handoff between environments: stops ONLY the stack this world's
+    # CLI started (its pid file lives in this world's /tmp). A daemon in the
+    # other world is left alone — the lock names its holder if there is one.
+    stop_server
+    echo "conversation server stopped (wallet, keys and tor state persist under the config dir)"
     ;;
   *)
     usage; exit 2

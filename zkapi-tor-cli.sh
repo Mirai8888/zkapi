@@ -11,12 +11,14 @@
 # State (server pid, active model, conversation history) lives under
 # /tmp/zkapi-tor-cli.<uid>/ — the script itself is stateless between calls.
 #
-# Semantics:
-#   * make_single_request and start_conversation always run against a FRESH
-#     server: kill any running one, relaunch zkapi-serve-tor.sh (new throwaway
-#     Tor client => new network identity), wait for the API, then ask.
-#   * ask adds to the current conversation and does NOT restart anything.
-#   * default model: openai/gpt-6-astra-pro (change with set_model).
+# Identity model (matches zkapi-serve-tor.sh):
+#   * One long-lived Tor client; guards persist across runs.
+#   * make_single_request and start_conversation signal NEWNYM on the Tor
+#     control port: a brand-new circuit for every conversation, no process
+#     restart. If the server is not running they start it (bootstrap wait).
+#   * ask adds to the current conversation without touching circuits, so the
+#     whole conversation shares one exit path (and the daemon reuses one
+#     ephemeral key across it while the budget matches).
 set -uo pipefail
 
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
@@ -44,6 +46,18 @@ mkdir -p "$STATE_DIR" || exit 1
 die() { echo "zkapi-tor-cli: $*" >&2; exit 1; }
 
 api_up() { curl -sf -m 25 "$API/models" -o /dev/null 2>/dev/null; }
+
+server_alive() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+
+# rotate_circuit — ask the running Tor (same guards, same process) for fresh
+# circuits via SIGNAL NEWNYM. Returns non-zero if unreachable, in which case
+# the caller falls back to a full restart.
+rotate_circuit() {
+  local ctl
+  ctl="$(cat "$here/.tor-state/control_port" 2>/dev/null)" || return 1
+  python3 "$here/zkapi-tor-ctl.py" "$ctl" newnym >/dev/null || return 1
+  echo "new circuit signaled for this conversation (guards unchanged)" >&2
+}
 
 server_running() {
   [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && api_up
@@ -228,12 +242,14 @@ usage() {
 case "${1:-}" in
   make_single_request)
     [ $# -ge 2 ] || die "usage: $0 make_single_request \"question\""
-    stop_server; start_server; ensure_ready; warm_policy || true
+    if server_alive; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    ensure_ready; warm_policy || true
     run_chat fresh "$2"
     ;;
   start_conversation)
     [ $# -ge 2 ] || die "usage: $0 start_conversation \"first message\""
-    stop_server; start_server; ensure_ready; warm_policy || true
+    if server_alive; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    ensure_ready; warm_policy || true
     run_chat fresh "$2"
     ;;
   ask)

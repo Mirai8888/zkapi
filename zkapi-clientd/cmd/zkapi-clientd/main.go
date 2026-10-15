@@ -201,15 +201,21 @@ func serve(ctx context.Context, dir string, c config.Config, out io.Writer) erro
 func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
 	logger := log.New(out, "zkapi-clientd ", log.LstdFlags)
 	logger.Print("Starting local API service")
-	lock, err := os.OpenFile(filepath.Join(dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lockPath := filepath.Join(dir, "daemon.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return errors.New("a zkAPI client daemon is already using this config directory")
+		return fmt.Errorf("a zkAPI client daemon is already using this config directory (lock file: %s%s)", lockPath, config.LockHint(lockPath))
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	// Record the holder so a lock error elsewhere (for example a shell in a
+	// different environment sharing this filesystem) can name this process.
+	host, _ := os.Hostname()
+	_ = lock.Truncate(0)
+	_, _ = lock.WriteAt([]byte(fmt.Sprintf("pid=%d host=%s exe=zkapi-clientd-serve", os.Getpid(), host)), 0)
 	// Configuration may have been edited after command dispatch but before
 	// acquiring the service lock. Never start with that stale snapshot.
 	saved, err := config.Load(dir)

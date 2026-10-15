@@ -24,10 +24,14 @@ here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # the checkout; otherwise fall back to the standard user config directory.
 if [ -f "$here/.config/zkapi-clientd/config.json" ]; then export XDG_CONFIG_HOME="$here/.config"; fi
 BIN="$here/zkapi-clientd/bin/zkapi-clientd"
+# ONE state root for everything: config, bridge tokens, wallet keys, locks,
+# and the Tor client's directory. A checkout's money lives where its state
+# lives; two stacks collide only if they point at the same directory.
+CONFIG_DIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
 [ -x "$BIN" ] || { echo "zkapi-serve-tor: daemon not found at $BIN" >&2; exit 1; }
 command -v tor >/dev/null 2>&1 || { echo "zkapi-serve-tor: tor not in PATH" >&2; exit 127; }
 
-datadir="$here/.tor-state"
+datadir="$CONFIG_DIR/tor"
 mkdir -p "$datadir" && chmod 700 "$datadir" || exit 1
 log="$datadir/tor.log"; : > "$log"
 
@@ -43,7 +47,7 @@ ctl_port="$(rand_port)"
 "$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
 "$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || {
   CFGDIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
-  echo "zkapi-serve-tor: cannot claim the config profile (lock: $CFGDIR/daemon.lock, held by: $(cat "$CFGDIR/daemon.lock" 2>/dev/null || echo 'unknown')). Stop that zkapi-clientd where it runs, or rerun with ZKAPI_TORCLI_FORCE_TAKEOVER=1 to seize it." >&2
+  echo "zkapi-serve-tor: cannot claim the config profile (lock: $CFGDIR/daemon.lock, held by: $(cat "$CFGDIR/daemon.lock" 2>/dev/null || echo 'unknown')). Stop that zkapi-clientd where it runs before starting this one." >&2
   exit 1
 }
 

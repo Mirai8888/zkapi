@@ -58,7 +58,7 @@ server_running() { api_up; }
 # the caller falls back to a full restart.
 rotate_circuit() {
   local ctl
-  ctl="$(cat "$here/.tor-state/control_port" 2>/dev/null)" || return 1
+  ctl="$(cat "${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}/tor/control_port" 2>/dev/null)" || return 1
   python3 "$here/zkapi-tor-ctl.py" "$ctl" newnym >/dev/null || return 1
   rm -f "$STATE_DIR/warm.ts"   # new circuit: the policy cache may be stale
   echo "new circuit signaled for this conversation (guards unchanged)" >&2
@@ -72,16 +72,11 @@ stop_server() {
   [ -f "$PID_FILE" ] && kill -TERM "$(cat "$PID_FILE")" 2>/dev/null
   local elapsed=0
   while api_up && [ "$elapsed" -lt 20 ]; do sleep 0.5; elapsed=$((elapsed + 1)); done
-  # Only this CLI's own stack is stopped by default. Sandboxes and the host
-  # can see each other's processes here, so a blind global sweep would kill
-  # another world's HEALTHY daemon (its "orphan" is someone else's server).
-  # ZKAPI_TORCLI_FORCE_TAKEOVER=1 opts into the sweep when you really do want
-  # to seize the profile from whatever holds it.
-  if [ "${ZKAPI_TORCLI_FORCE_TAKEOVER:-0}" = "1" ]; then
-    pkill -x zkapi-clientd 2>/dev/null
-    pkill -x zkapi-walletd 2>/dev/null
-    pkill -x tor 2>/dev/null
-  fi
+  # Only this CLI's own stack is ever stopped. A live profile held by a
+  # daemon in another environment is not an orphan to sweep: flock dies with
+  # its holder, and the money layer (issuer one-lease-per-note, companion
+  # wallet lock) already makes concurrent spenders impossible. If the claim
+  # fails, the launcher names the holder; the user decides.
   rm -f "$PID_FILE"
 }
 

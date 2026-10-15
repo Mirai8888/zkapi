@@ -27,4 +27,3 @@ out*.txt
 resp-*.json
 *-body.json
 models.json
-.tor-state/

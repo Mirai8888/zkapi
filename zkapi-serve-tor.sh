@@ -41,7 +41,11 @@ ctl_port="$(rand_port)"
 # invisible in another environment, e.g. a sandbox sharing this filesystem)
 # holds daemon.lock, fail in seconds rather than after a minute of Tor.
 "$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
-"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || { echo "zkapi-serve-tor: cannot update relay URL; another zkapi-clientd holds the config (see daemon.lock holder info, or run zkapi-install-companion.sh for clearer errors)" >&2; exit 1; }
+"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || {
+  CFGDIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
+  echo "zkapi-serve-tor: cannot claim the config profile (lock: $CFGDIR/daemon.lock, held by: $(cat "$CFGDIR/daemon.lock" 2>/dev/null || echo 'unknown')). Stop that zkapi-clientd where it runs, or rerun with ZKAPI_TORCLI_FORCE_TAKEOVER=1 to seize it." >&2
+  exit 1
+}
 
 tor --ClientOnly 1 --PublishServerDescriptor 0 \
     --SocksPort "127.0.0.1:${socks_port}" \

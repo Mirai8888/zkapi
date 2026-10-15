@@ -72,10 +72,16 @@ stop_server() {
   [ -f "$PID_FILE" ] && kill -TERM "$(cat "$PID_FILE")" 2>/dev/null
   local elapsed=0
   while api_up && [ "$elapsed" -lt 20 ]; do sleep 0.5; elapsed=$((elapsed + 1)); done
-  # sweep orphans (an untracked daemon/companion would hold the loopback ports)
-  pkill -x zkapi-clientd 2>/dev/null
-  pkill -x zkapi-walletd 2>/dev/null
-  pkill -x tor 2>/dev/null   # the stack owns a .tor-state tor; sweep it too
+  # Only this CLI's own stack is stopped by default. Sandboxes and the host
+  # can see each other's processes here, so a blind global sweep would kill
+  # another world's HEALTHY daemon (its "orphan" is someone else's server).
+  # ZKAPI_TORCLI_FORCE_TAKEOVER=1 opts into the sweep when you really do want
+  # to seize the profile from whatever holds it.
+  if [ "${ZKAPI_TORCLI_FORCE_TAKEOVER:-0}" = "1" ]; then
+    pkill -x zkapi-clientd 2>/dev/null
+    pkill -x zkapi-walletd 2>/dev/null
+    pkill -x tor 2>/dev/null
+  fi
   rm -f "$PID_FILE"
 }
 

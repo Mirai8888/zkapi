@@ -479,31 +479,58 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
     echo "zkapi-tor-cli: waiting for the current lease to settle before closing the note..." >&2
     ensure_ready || die "withdraw: a lease is stuck unsettled; run again after it settles"
     echo "zkapi-tor-cli: preparing note withdrawal to $dest..." >&2
-    resp=""; code=""
-    resp="$(curl -s -m 60 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d "{\"mode\": \"${ZKAPI_WITHDRAW_MODE:-mutual}\", \"destination\": \"$dest\"}" "$COMPANION/wallet/withdraw")"
-    code="$(printf '%s' "$resp" | python3 -c 'import json,sys
-try: print((json.load(sys.stdin).get("error") or {}).get("code") or "")
-except Exception: print("")' 2>/dev/null)"
-    case "$code" in
-      withdrawal_pending|withdrawal_conflict)
-        # A withdrawal is already prepared (possibly toward our funding
-        # address). Resume it rather than fight the locked destination: the
-        # note pays out where it was promised, and the public sweep step
-        # below routes everything onward to $dest anyway.
-        echo "zkapi-tor-cli: a withdrawal is already prepared; resuming it (its saved destination stands; the final sweep will still deliver to $dest)." >&2 ;;
-      "") : ;;
-      *) printf '%s\n' "$resp" >&2; die "withdraw: the wallet refused to prepare the withdrawal" ;;
+    # The DAEMON's /admin/withdrawal API is the one that signs, broadcasts
+    # and tracks the close (the companion's raw /wallet/withdraw only stages
+    # a plan in this build). Phases mirror the binary's guided flow.
+    st="$(funding_api GET /admin/withdrawal)" || die "withdraw: withdrawal status unreachable"
+    wparse() { printf '%s' "$st" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+    phase="$(wparse phase)"; note="$(wparse note_id)"
+    case "$phase" in
+      no_note|complete)
+        echo "zkapi-tor-cli: no open note to withdraw." >&2 ;;
+      ready|quoted)
+        n=0
+        while :; do
+          quote="$(funding_api POST /admin/withdrawal/quote "{\"destination\": \"$dest\", \"note_id\": ${note:-0}}")" || die "withdraw: could not quote the withdrawal"
+          qid="$(printf '%s' "$quote" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" || die "withdraw: withdrawal quote had no ID"
+          if [ "$n" = 0 ]; then
+            printf '%s' "$quote" | python3 -c '
+import json,sys
+q=json.load(sys.stdin)
+eth=int(q.get("amount_wei") or 0)
+eth=eth*10**9 if eth and int(q.get("principal_wei") or 0)==0 else (int(q.get("principal_wei") or 0) or eth)
+print("Withdrawal quote: %.6f ETH to %s (est. network fee %.6f ETH)" % (eth/1e18, q.get("destination") or "?", int(q.get("expected_fee_wei") or 0)/1e18), file=sys.stderr)' >&2
+            echo "zkapi-tor-cli: auto-approving the withdrawal (the daemon signs and broadcasts)." >&2
+          fi
+          st="$(funding_api POST /admin/withdrawal/approve "{\"quote_id\": \"$qid\"}")" && break
+          n=$((n + 1)); [ "$n" -ge 6 ] && die "withdraw: withdrawal approval keeps losing the fee-quote race; try again in a minute (public RPC fee data is unstable)"
+          echo "zkapi-tor-cli: fee quote expired; re-quoting..." >&2; sleep 2
+        done ;;
+      withdrawal_pending)
+        sdest="$(wparse destination)"; [ -z "$sdest" ] && sdest="$dest"
+        [ "$sdest" != "$dest" ] && echo "zkapi-tor-cli: a withdrawal to $sdest is already in progress; resuming it (the funding sweep still forwards everything at your funding address to $dest)." >&2
+        st="$(funding_api POST /admin/withdrawal "{\"destination\": \"$sdest\", \"note_id\": ${note:-0}}")" || die "withdraw: could not resume the saved withdrawal" ;;
+      confirming|waiting_settlement|waiting_funds)
+        st="$(funding_api GET /admin/withdrawal)" ;;
+      reverted)
+        die "withdraw: the previous withdrawal reverted; run '$BIN config --menu' once to choose retry vs manual confirm" ;;
+      *)
+        die "withdraw: withdrawal in unexpected phase '$phase' (run '$BIN config --menu' once for recovery)" ;;
     esac
-    echo "zkapi-tor-cli: confirming withdrawal (generates the close proof; give it a minute)..." >&2
-    curl -sf -m 600 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d '{}' "$COMPANION/wallet/withdraw/confirm" >/dev/null || die "withdraw: confirmation failed (a saved withdrawal is resumable — run again)"
     waited=0
     while :; do
-      has="$(curl -sf -m 8 -H "Authorization: Bearer $btoken" "$COMPANION/wallet/status" | python3 -c 'import json,sys;print("yes" if json.load(sys.stdin).get("has_note") else "no")' 2>/dev/null)"
-      [ "$has" = no ] && break
-      [ "$waited" -ge "${ZKAPI_WITHDRAW_WAIT:-420}" ] && die "withdraw: the note is still open after ${ZKAPI_WITHDRAW_WAIT:-420}s; run again to resume (progress is saved)"
+      phase="$(printf '%s' "$st" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("phase",""))' 2>/dev/null)"
+      echo "zkapi-tor-cli: withdrawal $phase" >&2
+      case "$phase" in
+        complete|no_note) break ;;
+        withdrawal_pending|confirming|quoted|waiting_settlement|waiting_funds) ;;
+        *) [ "$waited" -gt 0 ] && die "withdraw: withdrawal entered phase '$phase' (progress saved; re-run to resume)" ;;
+      esac
+      [ "$waited" -ge "${ZKAPI_WITHDRAW_WAIT:-600}" ] && die "withdraw: still $phase after ${ZKAPI_WITHDRAW_WAIT:-600}s; re-run the same command to resume"
       sleep 5; waited=$((waited + 5))
+      st="$(funding_api GET /admin/withdrawal)" || die "withdraw: lost contact while $phase"
     done
-    echo "zkapi-tor-cli: note closed; its remaining balance is on its way to $dest." >&2
+    echo "zkapi-tor-cli: note closed; its remaining balance is on its way to your destination." >&2
     # sweep the funding address's own ETH if it holds anything worth a transaction
     eoa_wei="$(funding_api GET /admin/funding/address | python3 -c 'import json,sys;print(int(json.load(sys.stdin).get("eth_balance") or 0))' 2>/dev/null || echo 0)"
     if [ "${eoa_wei:-0}" -ge 50000000000000 ]; then  # >= 0.00005 ETH: worth a tx

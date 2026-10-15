@@ -7,6 +7,8 @@
 #   zkapi-tor-cli.sh ask "What word did I ask you to remember?"
 #   zkapi-tor-cli.sh list_models
 #   zkapi-tor-cli.sh set_model anthropic/claude-haiku-4.5
+#   zkapi-tor-cli.sh fund                   show funding address/balance
+#   zkapi-tor-cli.sh fund --amount 0.005    quote + approve + open a channel
 #   zkapi-tor-cli.sh stop
 #
 # State (server pid, model, conversation history) lives under
@@ -29,6 +31,7 @@ here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # otherwise the standard user config directory is used, matching the daemon.
 if [ -f "$here/.config/zkapi-clientd/config.json" ]; then export XDG_CONFIG_HOME="$here/.config"; fi
 SERVE="$here/zkapi-serve-tor.sh"
+BIN="$here/zkapi-clientd/bin/zkapi-clientd"
 API="http://127.0.0.1:8787/v1"
 CFG_DIR="${ZKAPI_CLIENTD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd}"
 STATE_DIR="$CFG_DIR/cli"
@@ -132,6 +135,96 @@ wallet_state() {
   token="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["zkapi"]["bridge_token"])' "$CONFIG_DIR/config.json" 2>/dev/null)" || { echo unreachable; return; }
   json="$(curl -sf -m 5 -H "Authorization: Bearer $token" "$COMPANION/wallet/status" 2>/dev/null)" || { echo unreachable; return; }
   printf '%s' "$json" | python3 -c 'import json,sys; print("pending" if json.load(sys.stdin).get("pending_request") else "ready")' 2>/dev/null || echo unreachable
+}
+
+# ---- wallet bootstrap: set up, fund, open a channel, chat ----------------
+# The chat pipeline needs an open note (channel). Rather than failing at
+# request time, every chat command checks the wallet companion first (a free
+# local call) and shepherds the missing pieces:
+#   no funds   -> show the funding address and a recommended amount
+#   funds, no note -> quote + auto-approve + watch the deposit until active
+MIN_WEI=5000000000000000   # 0.005 ETH
+wallet_note_state() {  # "none" | "empty" | "ok" | "" (unknown/unreachable)
+  local token json
+  token="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["zkapi"]["bridge_token"])' "$CONFIG_DIR/config.json" 2>/dev/null)" || return 0
+  json="$(curl -sf -m 8 -H "Authorization: Bearer $token" "$COMPANION/wallet/status" 2>/dev/null)" || return 0
+  printf '%s' "$json" | python3 -c '
+import json,sys
+s=json.load(sys.stdin)
+if not s.get("has_note"): print("none")
+else:
+    b=(s.get("note") or {}).get("current_balance") or 0
+    print("ok" if b>0 else "empty")' 2>/dev/null
+}
+
+funding_api() {  # <METHOD> <PATH> [json-body] — the daemon's admin funding API
+  local method="$1" path="$2" body="${3:-}" token mtoken listen
+  token="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("api_key",""))' "$CONFIG_DIR/config.json" 2>/dev/null)"
+  mtoken="$(cat "$CONFIG_DIR/management-token" 2>/dev/null)"
+  listen="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("listen","127.0.0.1:8787"))' "$CONFIG_DIR/config.json" 2>/dev/null)"
+  curl -sf -m 90 -X "$method" -H "Authorization: Bearer $token" \
+       -H "X-OA-Management-Token: $mtoken" -H "Content-Type: application/json" \
+       ${body:+-d "$body"} "http://$listen$path"
+}
+
+wei2eth() { python3 -c 'print(f"{int(sys.argv[1])/1e18:.6f}")' "${1:-0}" 2>/dev/null || echo "?"; }
+
+funding_advice() {
+  echo "To use zkAPI, fund your zkAPI payment address (shown above)." >&2
+  echo "  * Recommended: at least ${ZKAPI_FUND_RECOMMENDED:-0.005} ETH." >&2
+  echo "  * You may send any amount you like; unspent money stays yours and" >&2
+  echo "    keeps working - spending only happens as you chat." >&2
+  echo "  * Risk of sending less: the most expensive models will refuse," >&2
+  echo "    while cheaper models may still work. Start small if unsure." >&2
+  echo "  * Re-run this command (or your question) after sending; the deposit" >&2
+  echo "    is detected and the channel opens automatically." >&2
+}
+
+show_funding_state() {
+  local s; s="$(funding_api GET /admin/funding/address)" || { echo "zkapi-tor-cli: funding API unreachable (is the server up?)" >&2; return 1; }
+  printf '%s' "$s" | python3 -c '
+import json,sys
+s=json.load(sys.stdin)
+print("zkAPI payment address: %s" % s.get("address"))
+print("Available balance: %.6f ETH" % (int(s.get("eth_balance") or 0)/1e18))
+if s.get("phase"): print("state:", s["phase"], s.get("message") or "")' >&2
+}
+
+open_channel() {  # quote + auto-approve + watch until the note is active
+  local amount="${ZKAPI_FUND_AMOUNT:-0.005}" units quote qid s phase waited=0
+  units="$(python3 -c 'print(int(round(float(sys.argv[1])*1e9)))' "$amount")" || return 1
+  quote="$(funding_api POST /admin/funding/quote "{\"amount\": $units}")" || { echo "zkapi-tor-cli: could not get a deposit quote." >&2; show_funding_state; return 1; }
+  printf '%s' "$quote" | python3 -c '
+import json,sys
+q=json.load(sys.stdin)
+short=(q.get("shortfall_wei") or "").lstrip("0")
+if short:
+    print("Needs top-up: %.6f ETH more (recommended %.6f with buffer)." % (int(q["shortfall_wei"])/1e18, int(q.get("recommended_topup_wei") or 0)/1e18), file=sys.stderr)
+    print("Send on-chain to:", q.get("address"), file=sys.stderr)
+    sys.exit(1)
+print(q["id"])' || { funding_advice; return 1; }  # capture the id or bail with advice
+  qid="$(printf '%s' "$quote" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+  echo "zkapi-tor-cli: quote ok (${amount} ETH); auto-approving (broadcasts one transaction; tune via ZKAPI_FUND_AMOUNT)." >&2
+  s="$(funding_api POST /admin/funding/approve "{\"quote_id\": \"$qid\"}")" || { echo "zkapi-tor-cli: approval failed." >&2; return 1; }
+  while :; do
+    phase="$(printf '%s' "$s" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("phase",""))' 2>/dev/null)"
+    echo "zkapi-tor-cli: channel deposit $phase" >&2
+    [ "$phase" = active ] && { echo "zkapi-tor-cli: channel is open." >&2; return 0; }
+    [ "$waited" -ge "${ZKAPI_FUND_WAIT:-420}" ] && { echo "zkapi-tor-cli: still $phase after ${ZKAPI_FUND_WAIT:-420}s; re-run your question once it confirms." >&2; return 1; }
+    sleep 5; waited=$((waited + 5))
+    s="$(funding_api POST /admin/funding/deposit "{\"amount\": $units}")" || return 1
+  done
+}
+
+ensure_wallet() {  # 0 = usable or unknown (speculate); 1 = handled, stop
+  local state
+  state="$(wallet_note_state)" || true
+  case "$state" in
+    ok|"") return 0 ;;
+  esac
+  echo "zkapi-tor-cli: no open zkAPI channel yet; provisioning..." >&2
+  show_funding_state || true
+  open_channel
 }
 
 # ensure_ready — if a previous lease is mid-settlement (the 60-90s window),
@@ -294,6 +387,7 @@ case "${1:-}" in
     [ $# -ge 2 ] || die "usage: $0 make_single_request \"question\""
     guard_inflight
     if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    ensure_wallet || exit 1
     warm_policy || true
     run_chat fresh "$2"
     ;;
@@ -301,6 +395,7 @@ case "${1:-}" in
     [ $# -ge 2 ] || die "usage: $0 start_conversation \"first message\""
     guard_inflight
     if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    ensure_wallet || exit 1
     warm_policy || true
     run_chat fresh "$2"
     ;;
@@ -320,6 +415,7 @@ case "${1:-}" in
         die "could not start a conversation server$hint"
       }
     fi
+    ensure_wallet || exit 1
     warm_policy || true
     run_chat append "$2"
     ;;
@@ -332,6 +428,10 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
     [ $# -ge 2 ] || { echo "current model: $(active_model)"; exit 0; }
     printf '%s\n' "$2" > "$MODEL_FILE"
     echo "model set: $2"
+    ;;
+  fund)
+    if show_funding_state; then :; fi
+    if [ $# -ge 2 ] && [ "$1" = "--amount" ]; then open_channel; fi
     ;;
   stop)
     # Clean handoff between environments: stops ONLY the stack this world's

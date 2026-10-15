@@ -469,7 +469,21 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
     echo "zkapi-tor-cli: waiting for the current lease to settle before closing the note..." >&2
     ensure_ready || die "withdraw: a lease is stuck unsettled; run again after it settles"
     echo "zkapi-tor-cli: preparing note withdrawal to $dest..." >&2
-    resp="$(curl -sf -m 60 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d "{\"mode\": \"${ZKAPI_WITHDRAW_MODE:-mutual}\", \"destination\": \"$dest\"}" "$COMPANION/wallet/withdraw")" || die "withdraw: the wallet refused to prepare the withdrawal"
+    resp=""; code=""
+    resp="$(curl -s -m 60 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d "{\"mode\": \"${ZKAPI_WITHDRAW_MODE:-mutual}\", \"destination\": \"$dest\"}" "$COMPANION/wallet/withdraw")"
+    code="$(printf '%s' "$resp" | python3 -c 'import json,sys
+try: print((json.load(sys.stdin).get("error") or {}).get("code") or "")
+except Exception: print("")' 2>/dev/null)"
+    case "$code" in
+      withdrawal_pending|withdrawal_conflict)
+        # A withdrawal is already prepared (possibly toward our funding
+        # address). Resume it rather than fight the locked destination: the
+        # note pays out where it was promised, and the public sweep step
+        # below routes everything onward to $dest anyway.
+        echo "zkapi-tor-cli: a withdrawal is already prepared; resuming it (its saved destination stands; the final sweep will still deliver to $dest)." >&2 ;;
+      "") : ;;
+      *) printf '%s\n' "$resp" >&2; die "withdraw: the wallet refused to prepare the withdrawal" ;;
+    esac
     echo "zkapi-tor-cli: confirming withdrawal (generates the close proof; give it a minute)..." >&2
     curl -sf -m 600 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d '{}' "$COMPANION/wallet/withdraw/confirm" >/dev/null || die "withdraw: confirmation failed (a saved withdrawal is resumable — run again)"
     waited=0

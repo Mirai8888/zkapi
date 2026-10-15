@@ -510,8 +510,8 @@ print("  then re-run the same withdraw command - it resumes from saved state.", 
             printf '%s' "$quote" | python3 -c '
 import json,sys
 q=json.load(sys.stdin)
-eth=int(q.get("amount_wei") or 0)
-eth=eth*10**9 if eth and int(q.get("principal_wei") or 0)==0 else (int(q.get("principal_wei") or 0) or eth)
+pw=int(q.get("principal_wei") or 0); aw=int(q.get("amount_wei") or 0); ag=int(q.get("amount") or 0)
+eth=pw or aw or (ag*10**9 if ag else 0)  # withdrawal quotes carry `amount` in GWEI units
 print("Withdrawal quote: %.6f ETH to %s (est. network fee %.6f ETH)" % (eth/1e18, q.get("destination") or "?", int(q.get("expected_fee_wei") or 0)/1e18), file=sys.stderr)' >&2
             echo "zkapi-tor-cli: auto-approving the withdrawal (the daemon signs and broadcasts)." >&2
           fi

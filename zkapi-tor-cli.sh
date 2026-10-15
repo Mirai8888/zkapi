@@ -493,6 +493,19 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
         while :; do
           quote="$(funding_api POST /admin/withdrawal/quote "{\"destination\": \"$dest\", \"note_id\": ${note:-0}}")" || die "withdraw: could not quote the withdrawal"
           qid="$(printf '%s' "$quote" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')" || die "withdraw: withdrawal quote had no ID"
+          short="$(printf '%s' "$quote" | python3 -c 'import json,sys;print(int((json.load(sys.stdin).get("shortfall_wei") or "0").lstrip("0") or 0))' 2>/dev/null || echo 0)"
+          if [ "${short:-0}" -gt 0 ]; then
+            printf '%s' "$quote" | python3 -c '
+import json,sys
+q=json.load(sys.stdin)
+b=int(q.get("balance_wei") or 0); r=int(q.get("required_fee_wei") or 0); s=int(q.get("shortfall_wei") or 0)
+print("zkapi-tor-cli: closing the note costs ~%.6f ETH in network fees, but the" % (r/1e18), file=sys.stderr)
+print("  withdrawal pays them from your funding address, which holds %.6f ETH." % (b/1e18), file=sys.stderr)
+print("  Send at least %.6f ETH (plus the %.6f ETH fee buffer for drift) to:" % (s/1e18, int(q.get("fee_buffer_wei") or 0)/1e18), file=sys.stderr)
+print("    %s" % q.get("address"), file=sys.stderr)
+print("  then re-run the same withdraw command - it resumes from saved state.", file=sys.stderr)' >&2
+            exit 0
+          fi
           if [ "$n" = 0 ]; then
             printf '%s' "$quote" | python3 -c '
 import json,sys

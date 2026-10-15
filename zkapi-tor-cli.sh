@@ -277,8 +277,18 @@ ensure_ready() {
 # per-PID marker for the life of every chat request; markers older than
 # 6 minutes (past the 300s request timeout) are stale by definition and
 # ignored, so a crashed CLI cannot wedge the wallet.
-inflight() {  # my own marker (if this is a chat command) is not 'in flight'
-  find "$STATE_DIR" -maxdepth 1 -name 'active.*' ! -name "active.$$" -mmin -6 2>/dev/null | grep -q .
+inflight() {  # a marker only counts while its owner process is alive (the
+  # marker's mtime bounds the other direction: a SIGKILL'd owner is caught
+  # by the 6-minute staleness rule; a 9-seconds-ago kill by /proc here)
+  local f p
+  for f in "$STATE_DIR"/active.*; do
+    [ -e "$f" ] || continue
+    [ "$f" = "$STATE_DIR/active.$$" ] && continue
+    p="${f##*active.}"
+    [ -d "/proc/$p" ] || { rm -f "$f"; continue; }
+    [ -n "$(find "$f" -mmin -6 2>/dev/null)" ] && return 0
+  done
+  return 1
 }
 guard_inflight() {
   if [ "${ZKAPI_FORCE_TAKEOVER:-0}" != "1" ] && inflight; then

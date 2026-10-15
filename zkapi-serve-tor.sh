@@ -103,6 +103,7 @@ child=""
 cleanup() {
   rc=$?
   [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
+  [ -n "${configpid:-}" ] && kill -KILL "$configpid" 2>/dev/null
   [ -n "$coverpid" ] && kill -KILL "$coverpid" 2>/dev/null
   [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
   [ -n "$torpid" ] && kill -KILL "$torpid" 2>/dev/null
@@ -154,8 +155,15 @@ coverpid=$!
 # messages inside the window cost ~seconds; only the ~5-minute rotation pays
 # the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
 echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
-"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
-"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >&2 || { echo "zkapi-serve-tor: failed to save relay URL" >&2; exit 1; }
+config_edit() {  # tracked child: cleanup can kill it; timeout bounds it
+  local rc=0
+  timeout 90 "$BIN" config "$@" & configpid=$!
+  wait "$configpid" || rc=$?
+  configpid=""
+  return $rc
+}
+config_edit --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
+config_edit --relay-url "socks5://127.0.0.1:${socks_port}" || { echo "zkapi-serve-tor: failed to save relay URL" >&2; exit 1; }
 "$BIN" serve &
 child=$!
 rc=0

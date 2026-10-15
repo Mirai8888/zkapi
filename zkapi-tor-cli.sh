@@ -47,7 +47,11 @@ die() { echo "zkapi-tor-cli: $*" >&2; exit 1; }
 
 api_up() { curl -sf -m 25 "$API/models" -o /dev/null 2>/dev/null; }
 
-server_alive() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+# The API answering IS the server being up — whoever started it (this CLI,
+# zkapi-serve-tor.sh directly, an earlier session). Circuit rotation works
+# either way because it goes through the control port recorded in .tor-state.
+server_running() { api_up; }
+
 
 # rotate_circuit — ask the running Tor (same guards, same process) for fresh
 # circuits via SIGNAL NEWNYM. Returns non-zero if unreachable, in which case
@@ -56,6 +60,7 @@ rotate_circuit() {
   local ctl
   ctl="$(cat "$here/.tor-state/control_port" 2>/dev/null)" || return 1
   python3 "$here/zkapi-tor-ctl.py" "$ctl" newnym >/dev/null || return 1
+  rm -f "$STATE_DIR/warm.ts"   # new circuit: the policy cache may be stale
   echo "new circuit signaled for this conversation (guards unchanged)" >&2
 }
 
@@ -64,12 +69,13 @@ server_running() {
 }
 
 stop_server() {
-  [ -f "$PID_FILE" ] || return 0
-  local pid elapsed=0
-  pid="$(cat "$PID_FILE")"
-  kill -TERM "$pid" 2>/dev/null || true
-  while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 15 ]; do sleep 0.5; elapsed=$((elapsed + 1)); done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  [ -f "$PID_FILE" ] && kill -TERM "$(cat "$PID_FILE")" 2>/dev/null
+  local elapsed=0
+  while api_up && [ "$elapsed" -lt 20 ]; do sleep 0.5; elapsed=$((elapsed + 1)); done
+  # sweep orphans (an untracked daemon/companion would hold the loopback ports)
+  pkill -x zkapi-clientd 2>/dev/null
+  pkill -x zkapi-walletd 2>/dev/null
+  pkill -x tor 2>/dev/null   # the stack owns a .tor-state tor; sweep it too
   rm -f "$PID_FILE"
 }
 
@@ -191,10 +197,13 @@ PY
 # retry. The companion's /oa/v1/status is static deployment metadata and never
 # carries the policy.
 warm_policy() {
-  local n elapsed=0
+  local n elapsed=0 stamp="$STATE_DIR/warm.ts"
+  # within 2 minutes of the last successful warm, assume still warm; a cold
+  # surprise is still caught by run_chat's retry-with-warm path
+  if [ -f "$stamp" ] && [ $(( $(date +%s) - $(stat -c %Y "$stamp" 2>/dev/null || echo 0) )) -lt 120 ]; then return 0; fi
   while :; do
     n="$(curl -sf -m 40 "$API/models" 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("data") or []))' 2>/dev/null)"
-    [ "${n:-0}" -gt 0 ] 2>/dev/null && return 0
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then touch "$stamp"; return 0; fi
     [ "$elapsed" -ge "${ZKAPI_TORCLI_WARM_TIMEOUT:-180}" ] && return 1
     echo "waiting for the reviewed-model policy to load (${elapsed}s)..." >&2
     sleep 5; elapsed=$((elapsed + 5))
@@ -205,7 +214,7 @@ warm_policy() {
 # the cold-policy race: warm the policy cache and retry the identical request.
 # History is only persisted on success, so the retry never double-appends.
 run_chat() {
-  local mode="$1" text="$2" errf out rc
+  local mode="$1" text="$2" errf out rc tried_settle=0
   errf="$(mktemp)"
   if out="$(py_chat "$mode" "$text" 2>"$errf")"; then
     printf '%s\n' "$out"; rm -f "$errf"; return 0
@@ -214,13 +223,26 @@ run_chat() {
   if [ "$rc" -eq 2 ]; then
     rm -f "$errf"; die "no active conversation (or its history was lost); use start_conversation"
   fi
-  if [ "$rc" -eq 3 ] && grep -q model_budget_unavailable "$errf"; then
-    echo "model policy was cold; warming and retrying once..." >&2
-    if warm_policy; then
-      if out="$(py_chat "$mode" "$text" 2>"$errf")"; then
-        printf '%s\n' "$out"; rm -f "$errf"; return 0
-      fi
-      rc=$?
+  # Speculative first: a live lease in its reuse window answers fine even
+  # though /wallet/status says pending_request (that flag is true for the
+  # whole life of an unsettled lease — it does NOT mean 'blocked'). Only an
+  # actual failure means the lease rotated; then wait for settlement (with
+  # one settle nudge after 30s) and retry the identical request once.
+  if [ "$rc" -eq 3 ]; then
+    if grep -q model_budget_unavailable "$errf"; then
+      echo "model policy cold or model retired; warming and retrying..." >&2
+      warm_policy && {
+        out="$(py_chat "$mode" "$text" 2>"$errf")" && { printf '%s\n' "$out"; rm -f "$errf"; return 0; }
+        rc=$?
+      }
+    fi
+    if [ "$rc" -eq 3 ] && [ "$tried_settle" -eq 0 ]; then
+      tried_settle=1
+      echo "request failed (lease probably rotating); waiting for readiness and retrying once..." >&2
+      ensure_ready && {
+        out="$(py_chat "$mode" "$text" 2>"$errf")" && { printf '%s\n' "$out"; rm -f "$errf"; return 0; }
+        rc=$?
+      }
     fi
   fi
   cat "$errf" >&2
@@ -242,20 +264,20 @@ usage() {
 case "${1:-}" in
   make_single_request)
     [ $# -ge 2 ] || die "usage: $0 make_single_request \"question\""
-    if server_alive; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
-    ensure_ready; warm_policy || true
+    if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    warm_policy || true
     run_chat fresh "$2"
     ;;
   start_conversation)
     [ $# -ge 2 ] || die "usage: $0 start_conversation \"first message\""
-    if server_alive; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
-    ensure_ready; warm_policy || true
+    if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
+    warm_policy || true
     run_chat fresh "$2"
     ;;
   ask)
     [ $# -ge 2 ] || die "usage: $0 ask \"follow-up\""
     server_running || die "no conversation server is running; use start_conversation"
-    ensure_ready; warm_policy || true
+    warm_policy || true
     run_chat append "$2"
     ;;
   list_models)

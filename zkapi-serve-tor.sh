@@ -80,6 +80,13 @@ python3 "$here/zkapi-cover-traffic.py" --socks "127.0.0.1:${socks_port}" \
     --rate "${ZKAPI_COVER_RATE:-5}" --log "$datadir/cover.log" &
 coverpid=$!
 
+# Conversations should ride one ephemeral provider key for its whole life
+# (issuer TTL is 300s; the daemon clamps reuse to the earlier of window end
+# and key expiry, so this is the key's full lifetime and never past it).
+# Ask messages inside the window cost ~seconds; only the ~5-minute rotation
+# pays the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
+"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
+
 "$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || { echo "failed to save relay URL" >&2; exit 1; }
 echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
 "$BIN" serve &

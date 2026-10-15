@@ -284,9 +284,17 @@ case "${1:-}" in
   ask)
     [ $# -ge 2 ] || die "usage: $0 ask \"follow-up\""
     if ! server_running; then
-      hint=""
-      [ -s "$CFG_DIR/daemon.lock" ] && hint=" (the wallet profile is claimed by: $(cat "$CFG_DIR/daemon.lock" 2>/dev/null) — if that is a live stack in another environment, continue the conversation there, or 'stop' it first)"
-      die "no conversation server is running; use start_conversation$hint"
+      # The server may be live in ANOTHER environment (whose loopback is
+      # invisible here) or absent entirely. Either way: claim it and serve
+      # locally. History and model live in the shared state root, so the
+      # conversation continues; the handover token makes any other world's
+      # stack retire itself.
+      echo "zkapi-tor-cli: no local server; claiming the profile and starting one here..." >&2
+      start_server || {
+        hint=""
+        [ -s "$CFG_DIR/daemon.lock" ] && hint=" (held by: $(cat "$CFG_DIR/daemon.lock" 2>/dev/null); if that environment is suspended it cannot hand over — stop it there first)"
+        die "could not start a conversation server$hint"
+      }
     fi
     warm_policy || true
     run_chat append "$2"

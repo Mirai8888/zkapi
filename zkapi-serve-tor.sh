@@ -155,12 +155,20 @@ coverpid=$!
 # messages inside the window cost ~seconds; only the ~5-minute rotation pays
 # the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
 echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
-config_edit() {  # tracked child: cleanup can kill it; timeout bounds it
-  local rc=0
-  timeout 90 "$BIN" config "$@" & configpid=$!
-  wait "$configpid" || rc=$?
-  configpid=""
-  return $rc
+config_edit() {  # tracked child: cleanup can kill it; timeout bounds it.
+  # The config command runs health checks whose dependencies (public RPC,
+  # indexer, issuer) are occasionally flaky; the saved state is unchanged by
+  # a failure, so retry a few times before giving up.
+  local rc=0 n=0
+  while :; do
+    timeout 90 "$BIN" config "$@" & configpid=$!
+    wait "$configpid" || rc=$?
+    configpid=""
+    [ "$rc" = 0 ] && return 0
+    n=$((n + 1)); [ "$n" -ge 3 ] && return "$rc"
+    echo "zkapi-serve-tor: config attempt $n failed; retrying in 5s..." >&2
+    sleep 5
+  done
 }
 config_edit --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
 config_edit --relay-url "socks5://127.0.0.1:${socks_port}" || { echo "zkapi-serve-tor: failed to save relay URL" >&2; exit 1; }

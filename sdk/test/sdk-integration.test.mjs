@@ -143,7 +143,7 @@ test('a deployed profile builds under the new publicPath with its pinned keys, r
     } finally { await fs.rm(temp, { recursive: true, force: true }); }
 });
 
-test('host builds refuse a profile of another setup, a development mainnet and unpinned keys', async () => {
+test('host builds refuse a profile of another setup and unpinned keys, and build a single-party mainnet', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'zkapi-sdk-assets-'));
     try {
         const { rewrite, module } = await packageCopy(temp);
@@ -162,15 +162,17 @@ test('host builds refuse a profile of another setup, a development mainnet and u
             /request\.vk does not match/);
         await assert.rejects(attempt('sepolia', sepolia({ withdrawal_proving_key_sha256: '0'.repeat(64) }), 'pk'),
             /withdrawal\.pk does not match/);
-        // No single-party setup reaches mainnet, whatever the profile says.
-        await assert.rejects(attempt('mainnet', deployedProfile('mainnet'), 'mainnet'), { code: 'development_setup_on_mainnet' });
+        // A single-party mainnet vault (deployed with ALLOW_DEV_SETUP=1) builds like any other
+        // network: its profile pins the bundle's setup.
+        const mainnet = await attempt('mainnet', deployedProfile('mainnet'), 'mainnet');
+        await fs.access(mainnet.directory);
         // A manifest that relabels the bundle's setup is refused: the
         // WebAssembly itself reports the setup it was built for.
         await rewrite({ profiles: { sepolia: sepolia({ setup_id: 'mpc-1' }) }, manifest: { setupId: 'mpc-1' } });
         await assert.rejects(module.verifyBrowserSdkAssets(), { code: 'setup_mismatch' });
         await assert.rejects(module.buildBrowserSdkAssets({ outDir: out('relabelled'), network: 'sepolia', build }),
             { code: 'setup_mismatch' });
-        for (const name of ['setup', 'circuit', 'revision', 'vk', 'pk', 'mainnet', 'relabelled']) {
+        for (const name of ['setup', 'circuit', 'revision', 'vk', 'pk', 'relabelled']) {
             await assert.rejects(fs.access(out(name)), `${name}: nothing was written`);
         }
         // A deployed profile may say so, as the finalized manifest, serverd,

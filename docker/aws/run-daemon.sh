@@ -2,7 +2,8 @@
 # Keep private seeds and provider credentials in the process environment.
 set -eu
 
-# Match the artifacts installed by docker/Dockerfile; allow an explicit override.
+# Match the artifacts installed by docker/Dockerfile (which sets this to the
+# development setup in an ALLOW_DEV_SETUP=1 image); allow an explicit override.
 ZKAPI_PROOF_SETUP_DIR=${ZKAPI_PROOF_SETUP_DIR:-/srv/zkapi/protocol/setup/v2-concession}
 # The deployment manifest (trusted_deployment profile) compose.yml mounts.
 ZKAPI_DEPLOYMENT_MANIFEST=${ZKAPI_DEPLOYMENT_MANIFEST:-/srv/zkapi/deployment.json}

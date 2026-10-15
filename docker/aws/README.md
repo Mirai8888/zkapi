@@ -4,7 +4,8 @@ This image runs the native ETH API, indexer and escape challenger of circuit
 `zkapi-v2-concession-v1` (vault revision 3) with the exact
 `protocol/setup/v2-concession` artifacts, the multi-party ceremony setup
 `mpc-1`. A release build loads only the pinned ceremony keys, so the daemons
-refuse to start until G-SETUP has committed them; a vault of circuit
+refuse to start until G-SETUP has committed them, unless the image is built for
+a [single-party setup](#single-party-setup); a vault of circuit
 `zkapi-v2-note-bound-v1` keeps its own stack from the
 `release/v2-note-bound` branch. Supply the matching vault/signing keys, the
 deployment manifest and pinned native oracle configuration. A revision-3
@@ -54,6 +55,24 @@ daemons refuse an empty value for others at startup, for example
 `ZKAPI_REQUEST_LIMIT_MAX_USD_MICROS` and `ZKAPI_CHALLENGE_PRIORITY_FEE_PER_GAS_WEI`.
 `ZKAPI_ALLOW_LEGACY_CLEARANCE=true` is refused: this circuit signs a clearance
 only against a kind-2 ownership proof.
+
+### Single-party setup
+
+A vault deployed with `Deploy.s.sol`'s `ALLOW_DEV_SETUP=1` on the development
+setup `dev` (see [Single-party setup](../../docs/deployment.md#single-party-setup):
+whoever generated those keys can forge every proof) needs images built for it:
+
+```sh
+sudo ALLOW_DEV_SETUP=1 docker compose -f docker/aws/compose.yml --profile challenge build server gateway signer
+```
+
+Compose passes the value to both Dockerfiles. The daemons are then built with
+`zkapi-proof`'s `dev-setup` feature and load
+`/srv/zkapi/protocol/setup/v2-concession-dev` (the image's
+`ZKAPI_PROOF_SETUP_DIR`), and the gateway serves that setup's proving keys.
+Health and attestation then report `setup_id` `dev`, and `deployment.json`
+must pin it. Build without the variable for a ceremony vault: a default image
+refuses development keys.
 
 ### Signing seeds
 
@@ -732,7 +751,8 @@ sudo docker compose -f docker/aws/compose.yml logs --tail=50 server challenger
 ```
 
 Verify that health and attestation report protocol 2, the selected chain, the
-configured vault, `circuit_id` `zkapi-v2-concession-v1`, `setup_id` `mpc-1`,
+configured vault, `circuit_id` `zkapi-v2-concession-v1`, `setup_id` `mpc-1`
+(`dev` for a [single-party](#single-party-setup) image),
 `exit_concession` 1 and the deployment's `settlement_window_seconds`. Confirm
 the server log lines `server signing keys match the vault's immutable keys` and
 `the vault, adapter and Poseidon library match the deployment manifest`, and

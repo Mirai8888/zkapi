@@ -8,9 +8,11 @@ license.workspace = true
 [dependencies]
 zkapi-types = { path = "../../protocol/rust/crates/zkapi-types" }
 zkapi-core = { path = "../../protocol/rust/crates/zkapi-core" }
-# Never enable `dev-setup` here: production binaries load only the pinned
-# ceremony keys (`zkapi-proof --bin release_policy_check` checks the Docker
-# build). The tests enable it through the dev-dependency below.
+# Never enable `dev-setup` here: a default production build loads only the
+# pinned ceremony keys, and a single-party image asks for the feature on its
+# command line (docker/Dockerfile's ALLOW_DEV_SETUP=1). `zkapi-proof --bin
+# release_policy_check` checks the Docker build. The tests enable it through
+# the dev-dependency below.
 zkapi-proof = { path = "../../protocol/rust/crates/zkapi-proof" }
 anyhow = { workspace = true }
 axum = { workspace = true }

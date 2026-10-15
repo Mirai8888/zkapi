@@ -1,14 +1,18 @@
 # Development setup for `zkapi-v2-concession-v1` (setup id `dev`)
 
-These keys are for tests, CI, fixtures and the Sepolia drill vault only.
+These keys are for tests, CI, fixtures, the Sepolia drill vault, and a vault
+deliberately deployed on a single-party setup with `ALLOW_DEV_SETUP=1`
+([Single-party setup](../../../docs/deployment.md#single-party-setup)).
 They are single-party Groth16 keys generated with OS randomness, so whoever
-ran the generator could have kept the toxic waste. **Release builds refuse
-them**: every key file starts with the header
-`zkapi-v2-concession-v1/dev/<request|withdrawal>\0`, and only builds of
-`zkapi-proof` with the `dev-setup` feature accept the `dev` setup id
-(`cargo run --release -p zkapi-proof --bin release_policy_check` checks the
-release side). The production setup is the multi-party ceremony in
-[`../v2-concession`](../v2-concession/README.md) (setup id `mpc-1`).
+ran the generator could have kept the toxic waste and could forge every proof
+of a vault that uses them. **Default release builds refuse them**: every key
+file starts with the header `zkapi-v2-concession-v1/dev/<request|withdrawal>\0`,
+and only builds of `zkapi-proof` with the `dev-setup` feature accept the `dev`
+setup id, which a production build gets only when asked (`ALLOW_DEV_SETUP=1`,
+or `--setup dev` for the browser bundle; `cargo run --release -p zkapi-proof
+--bin release_policy_check` checks the release side). The production setup is
+the multi-party ceremony in [`../v2-concession`](../v2-concession/README.md)
+(setup id `mpc-1`).
 
 ## Contents
 

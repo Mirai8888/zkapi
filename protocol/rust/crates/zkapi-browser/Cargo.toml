@@ -13,8 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # loads only `dev` keys and `browser_setup_id()` returns "dev". Without it the
 # bundle is for the ceremony setup (`mpc-1`, pinned in zkapi-proof) and loads
 # only those keys. `scripts/build-browser-client.sh --setup dev` turns it on;
-# the SDK build refuses to pair a bundle with a profile of another setup, and
-# a mainnet profile with anything but `mpc-1`.
+# the SDK build refuses to pair a bundle with a profile of another setup.
 dev-setup = ["zkapi-proof/dev-setup"]
 
 [dependencies]

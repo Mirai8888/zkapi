@@ -6,6 +6,16 @@ umask 022 # Release artifacts contain public binaries/assets, never wallet state
 # The wallet companion is this repository's crates/zkapi-companion at the
 # pinned ZKAPI_SOURCE_COMMIT, prepared by prepare-zkapi.sh; its proving setup
 # is that commit's protocol/setup/v2-concession.
+#
+# ALLOW_DEV_SETUP=1 builds a single-party release instead, for a vault
+# deployed with Deploy.s.sol's ALLOW_DEV_SETUP=1, whose setup's generator can
+# forge every proof: the companion gets zkapi-proof's dev-setup feature and the
+# release bundles protocol/setup/v2-concession-dev.
+case "${ALLOW_DEV_SETUP:-}" in
+    '' | 1) ;;
+    *) echo 'ALLOW_DEV_SETUP must be 1 or unset' >&2; exit 1 ;;
+esac
+proof_setup=v2-concession${ALLOW_DEV_SETUP:+-dev}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/../.." && pwd)
 version=${1:?Usage: build-native.sh VERSION OUTPUT_DIRECTORY PREPARED_ZKAPI_DIRECTORY}
@@ -37,17 +47,17 @@ trap 'rm -rf "$stage"' EXIT
 cd "$repo_dir/zkapi-clientd"
 CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.version=$version" -o "$stage/zkapi-clientd" ./cmd/zkapi-clientd
 cd "$zkapi_dir"
-cargo build --release --locked -p zkapi-companion --bin zkapi-walletd
+cargo build --release --locked ${ALLOW_DEV_SETUP:+--features=zkapi-proof/dev-setup} -p zkapi-companion --bin zkapi-walletd
 python3 "$script_dir/verify-zkapi-source.py" "$zkapi_dir" "$ZKAPI_SOURCE_COMMIT"
 install -m 755 target/release/zkapi-walletd "$stage/zkapi-walletd"
 mkdir -p "$stage/share/zkapi-clientd/proof-setup"
-# A release build loads only the pinned ceremony keys (setup id mpc-1). Until
-# they are committed, this directory holds no keys and the check below stops
-# the build.
-cp -R protocol/setup/v2-concession/. "$stage/share/zkapi-clientd/proof-setup/"
+# A default release build loads only the pinned ceremony keys (setup id
+# mpc-1). Until they are committed, protocol/setup/v2-concession holds no keys
+# and the check below stops the build.
+cp -R "protocol/setup/$proof_setup/." "$stage/share/zkapi-clientd/proof-setup/"
 for proof_file in request.pk request.vk withdrawal.pk withdrawal.vk manifest.json; do
     if [[ ! -s "$stage/share/zkapi-clientd/proof-setup/$proof_file" ]]; then
-        echo "protocol/setup/v2-concession has no $proof_file: a release bundles the pinned ceremony (mpc-1) keys" >&2
+        echo "protocol/setup/$proof_setup has no $proof_file: a release bundles the keys of its setup (the pinned ceremony keys, mpc-1, unless ALLOW_DEV_SETUP=1)" >&2
         exit 1
     fi
 done

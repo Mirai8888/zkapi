@@ -12,7 +12,7 @@ export const REQUIRED_CIRCUIT_ID = 'zkapi-v2-concession-v1';
 export const ASSET_MANIFEST_SCHEMA = 2;
 /** Setups a bundle can be built for (scripts/build-browser-client.sh --setup). */
 export const BUNDLE_SETUP_IDS = Object.freeze(['dev', 'mpc-1']);
-/** The only setup a mainnet profile may use. */
+/** The ceremony setup, which the default production bundle is built for. */
 export const PRODUCTION_SETUP_ID = 'mpc-1';
 /**
  * The new build is served under its own path, next to the legacy
@@ -79,9 +79,9 @@ export async function verifyBrowserSdkAssets() {
 /**
  * Refuse a profile this bundle must not be built for: a placeholder
  * (`deployment_status: "not_deployed"`) or a status other than "deployed",
- * another circuit or setup, a mainnet
- * profile on a development setup, a vault without the concession exit, or
- * keys other than the shipped ones.
+ * another circuit or setup, a vault without the concession exit, or keys
+ * other than the shipped ones. A single-party (`dev`) profile builds on any
+ * network, mainnet included: its vault was deployed with ALLOW_DEV_SETUP=1.
  */
 export function assertDeployableProfile(config, manifest, network, hashes) {
     const trusted = config?.trusted_deployment;
@@ -104,10 +104,6 @@ export function assertDeployableProfile(config, manifest, network, hashes) {
     if (trusted.setup_id !== manifest.setupId) {
         throw codedError('setup_mismatch',
             `The ${network} profile pins setup ${trusted.setup_id}; this bundle is built for ${manifest.setupId}.`);
-    }
-    if (Number(trusted.chain_id) === 1 && manifest.setupId !== PRODUCTION_SETUP_ID) {
-        throw codedError('development_setup_on_mainnet',
-            `A mainnet profile needs the ${PRODUCTION_SETUP_ID} setup, not ${manifest.setupId}.`);
     }
     if (trusted.exit_concession !== 1) {
         throw codedError('exit_concession_required',

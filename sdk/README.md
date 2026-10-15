@@ -216,10 +216,12 @@ The helper emits `browser-config.json`, `assets/zkapiWasmWorker.js`,
 artifact hashes, the WebAssembly's own circuit and setup, and the profile's
 proving- and verifying-key pins before writing anything. It refuses a
 placeholder profile (`deployment_not_deployed`), a profile of another circuit
-(`incompatible_proof_circuit`) or setup (`setup_mismatch`), a profile without
-`exit_concession: 1` (`exit_concession_required`), and a mainnet profile on
-any setup but the ceremony's `mpc-1` (`development_setup_on_mainnet`). Both
-shipped profiles are `not_deployed` placeholders until their vaults exist.
+(`incompatible_proof_circuit`) or setup (`setup_mismatch`), and a profile
+without `exit_concession: 1` (`exit_concession_required`). A single-party
+(`dev`) bundle builds for any network whose profile pins `dev`, mainnet
+included: such a vault was deployed with `ALLOW_DEV_SETUP=1` and trusts its
+setup's generator not to forge proofs. Both shipped profiles are
+`not_deployed` placeholders until their vaults exist.
 The default `publicPath` is `/zkapi/v2c/`: proving keys are fetched with
 `cache: 'force-cache'`, so new keys need URLs the legacy build never used.
 The host supplies its esbuild implementation, controls its CSP/rewrites, and

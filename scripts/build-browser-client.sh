@@ -11,9 +11,10 @@
 #
 # --setup selects the bundle's setup: `mpc-1` (the ceremony keys pinned in
 # zkapi-proof, the production bundle) or `dev` (the development setup in
-# protocol/setup/v2-concession-dev, for CI, tests and the drill vault; it
-# enables zkapi-browser's dev-setup feature). The SDK build refuses to pair a
-# bundle with a profile of another setup, and mainnet with anything but mpc-1.
+# protocol/setup/v2-concession-dev, for CI, tests, the drill vault and any
+# vault deployed with Deploy.s.sol's ALLOW_DEV_SETUP=1; it enables
+# zkapi-browser's dev-setup feature). The SDK build refuses to pair a bundle
+# with a profile of another setup.
 #
 # Reproducibility: the toolchain is rust-toolchain.toml's (rustc 1.99.0) and
 # wasm-bindgen-cli 0.2.117; Cargo.lock is used as is (--locked); the target

@@ -74,12 +74,13 @@ import {SetupPolicy} from "./SetupPolicy.sol";
 ///                         must match it. Required except on local chains (default
 ///                         protocol/setup/v2-concession-dev). SetupPolicy decides which setups
 ///                         may deploy: off local chains the single-party dev and rehearsal
-///                         setups need ALLOW_DEV_SETUP=1 and mainnet refuses them, and an
-///                         mpc-1 setup must have the verifying keys of the committed
+///                         setups need ALLOW_DEV_SETUP=1, and an mpc-1 setup must have the
+///                         verifying keys of the committed
 ///                         protocol/setup/v2-concession/manifest.json.
-///           ALLOW_DEV_SETUP – 1 deploys a dev or rehearsal setup off local chains (the
-///                         Sepolia drill vault only; never mainnet); recorded in the
-///                         manifest as allowDevSetup. Default 0.
+///           ALLOW_DEV_SETUP – 1 deploys a dev or rehearsal setup off local chains, mainnet
+///                         included (the Sepolia drill vault, or a vault that trusts its
+///                         setup's generator not to forge proofs); recorded in the manifest
+///                         as allowDevSetup. Default 0.
 ///           POSEIDON_ADDRESS – an already deployed Bn254Poseidon to link; its runtime codehash
 ///                         must equal the compiled library's at that address. Unset deploys a
 ///                         fresh library.
@@ -262,8 +263,10 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
         console2.log("proofAdapter ", address(d.adapter));
         console2.log("poseidon     ", d.poseidon, d.poseidonReused ? "(reused)" : "(deployed)");
         console2.log("setup        ", setup.circuitId, setup.setupId);
-        if (setup.allowDevSetup && !local) {
-            console2.log("WARNING: single-party setup deployed under ALLOW_DEV_SETUP=1 (drill vault only)");
+        if (setup.allowDevSetup && !local && !_eq(setup.setupId, CEREMONY_SETUP_ID)) {
+            console2.log(
+                "WARNING: single-party setup deployed under ALLOW_DEV_SETUP=1: whoever generated its keys can forge every proof"
+            );
         }
         console2.log("vault codehash");
         console2.logBytes32(address(d.vault).codehash);
@@ -349,7 +352,7 @@ contract DeployScript is Script, SigningKeyChecks, SetupPolicy {
             facts.ceremonyRequestVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.request");
             facts.ceremonyWithdrawalVkHash = vm.parseJsonBytes32(ceremony, ".vk_keccak256.withdrawal");
         }
-        _checkSetupPolicy(facts, block.chainid, local, setup.allowDevSetup);
+        _checkSetupPolicy(facts, local, setup.allowDevSetup);
     }
 
     /// The gasless block's inputs. The variables are read and bounded before the EntryPoint is

@@ -213,9 +213,9 @@ jobs:
       # between 2^63 and 2^64, which the manifest must carry as a decimal
       # string, and the third keys off the curve, which it must refuse. On
       # Sepolia's and mainnet's chain IDs the single-party dev setup needs
-      # ALLOW_DEV_SETUP=1 (the drill vault), mainnet refuses it even then, and
-      # an mpc-1 label is refused until protocol/setup/v2-concession pins the
-      # ceremony keys (and then needs their verifying keys).
+      # ALLOW_DEV_SETUP=1 and deploys with it, and an mpc-1 label is refused
+      # until protocol/setup/v2-concession pins the ceremony keys (and then
+      # needs their verifying keys).
       # A dry run without an RPC starts from an empty state, which has no
       # EntryPoint v0.7.0 runtime, so these runs pass GASLESS=0 (the manifest
       # then carries withdrawalPaymaster: null); the gasless block is refused
@@ -254,14 +254,15 @@ jobs:
           GASLESS=1 refuses "ENTRY_POINT is not EntryPoint v0.7.0" simulate deployment-no-entrypoint.json 31337 $DEV_KEYS
           (
             export OWNER=0x000000000000000000000000000000000000dEaD TREASURY=0x000000000000000000000000000000000000bEEF MAX_PAUSE_DURATION_SECONDS=604800
-            refuses "setup dev is single-party: off local chains it deploys only the drill vault, with ALLOW_DEV_SETUP=1" \
-              simulate deployment-sepolia.json 11155111 $WIDE_KEYS
-            ALLOW_DEV_SETUP=1 simulate deployment-sepolia-drill.json 11155111 $WIDE_KEYS
-            check deployment-sepolia-drill.json 11155111 1 $WIDE_KEYS
+            for chain in 11155111 1; do
+              refuses "setup dev is single-party: off local chains it deploys only with ALLOW_DEV_SETUP=1" \
+                simulate deployment-single-party.json "$chain" $WIDE_KEYS
+              ALLOW_DEV_SETUP=1 simulate "deployment-single-party-$chain.json" "$chain" $WIDE_KEYS
+              check "deployment-single-party-$chain.json" "$chain" 1 $WIDE_KEYS
+            done
             # Off local chains the paymaster's stake and deposit amounts have no defaults, and are
             # required before the chain is looked at.
             GASLESS=1 ALLOW_DEV_SETUP=1 refuses "PAYMASTER_STAKE_WEI" simulate deployment-sepolia-no-stake.json 11155111 $WIDE_KEYS
-            ALLOW_DEV_SETUP=1 refuses "mainnet needs the ceremony setup \(mpc-1\)" simulate deployment-mainnet.json 1 $WIDE_KEYS
             sed 's/"setup_id": "dev"/"setup_id": "mpc-1"/' "$ZKAPI_SETUP_DIR/manifest.json" > ../../.demo/relabelled-mpc-1.json
             for chain in 11155111 1; do
               SETUP_MANIFEST="$PWD/../../.demo/relabelled-mpc-1.json" \

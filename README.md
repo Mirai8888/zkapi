@@ -115,7 +115,9 @@ authorization and settlement.
 The keys in `protocol/setup/v2-concession` (the ceremony's, once G-SETUP has
 run) must match the vault's immutable verifier and the client's pinned proof
 artifacts; `protocol/setup/v2-concession-dev` holds the development keys for
-tests and the drill vault. The `setup` command generates new development keys;
+tests, the drill vault and vaults deliberately deployed on a single-party setup
+([Single-party setup](docs/deployment.md#single-party-setup)). The `setup`
+command generates new development keys;
 it is not part of connecting a client to the configured vault.
 
 ## Protocol details

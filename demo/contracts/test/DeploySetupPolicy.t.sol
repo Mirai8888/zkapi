@@ -6,19 +6,18 @@ import {SetupPolicy} from "../script/SetupPolicy.sol";
 
 /// @dev Exposes the deployment script's setup policy.
 contract DeploySetupPolicyHarness is SetupPolicy {
-    function check(SetupFacts memory setup, uint256 chainId, bool local, bool allowDevSetup) external pure {
-        _checkSetupPolicy(setup, chainId, local, allowDevSetup);
+    function check(SetupFacts memory setup, bool local, bool allowDevSetup) external pure {
+        _checkSetupPolicy(setup, local, allowDevSetup);
     }
 }
 
-/// @dev Deploy.s.sol deploys a single-party setup (dev, rehearsal) freely on local chains, off
-///      local chains only with ALLOW_DEV_SETUP=1 and never on mainnet, and an mpc-1 setup off local
+/// @dev Deploy.s.sol deploys a single-party setup (dev, rehearsal) freely on local chains and off
+///      local chains (mainnet included) only with ALLOW_DEV_SETUP=1, and an mpc-1 setup off local
 ///      chains only with the committed ceremony manifest's verifying keys, so neither the label nor
-///      a self-made manifest gets a forgeable vault onto a public chain.
+///      a self-made manifest gets a forgeable vault onto a public chain without the opt-in. The
+///      policy depends on the chain only through `local`; CI simulates the script on Sepolia's and
+///      mainnet's chain IDs.
 contract DeploySetupPolicyTest is Test {
-    uint256 constant LOCAL = 31_337;
-    uint256 constant SEPOLIA = 11_155_111;
-    uint256 constant MAINNET = 1;
     // The committed dev setup's verifying-key hashes (protocol/setup/v2-concession-dev).
     bytes32 constant DEV_REQUEST_VK = 0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872;
     bytes32 constant DEV_WITHDRAWAL_VK = 0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd;
@@ -26,10 +25,9 @@ contract DeploySetupPolicyTest is Test {
     bytes32 constant CEREMONY_WITHDRAWAL_VK = keccak256("ceremony withdrawal vk");
 
     string constant SINGLE_PARTY_DEV =
-        "setup dev is single-party: off local chains it deploys only the drill vault, with ALLOW_DEV_SETUP=1";
+        "setup dev is single-party: off local chains it deploys only with ALLOW_DEV_SETUP=1";
     string constant SINGLE_PARTY_REHEARSAL =
-        "setup rehearsal is single-party: off local chains it deploys only the drill vault, with ALLOW_DEV_SETUP=1";
-    string constant MAINNET_NEEDS_CEREMONY = "mainnet needs the ceremony setup (mpc-1)";
+        "setup rehearsal is single-party: off local chains it deploys only with ALLOW_DEV_SETUP=1";
     string constant NOT_PINNED =
         "mpc-1 is not pinned yet: protocol/setup/v2-concession/manifest.json lands with the ceremony keys (G-SETUP step 7)";
     string constant NOT_THE_CEREMONY =
@@ -58,71 +56,55 @@ contract DeploySetupPolicyTest is Test {
     }
 
     function test_singlePartySetupsDeployFreelyOnLocalChains() public view {
-        harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), LOCAL, true, false);
-        harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), 1337, true, false);
+        harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), true, false);
+        harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), true, false);
     }
 
-    /// Off local chains (Sepolia, or any other public chain) a single-party setup needs the drill
-    /// vault's explicit opt-in.
+    /// Off local chains (Sepolia, mainnet or any other public chain) a single-party setup needs the
+    /// explicit opt-in, whether or not the ceremony keys are pinned.
     function test_singlePartySetupsNeedTheOptInOffLocalChains() public {
-        uint256[3] memory chains = [SEPOLIA, 17_000, 8453];
-        for (uint256 i = 0; i < chains.length; ++i) {
+        bool[2] memory pinned = [false, true];
+        for (uint256 i = 0; i < pinned.length; ++i) {
             vm.expectRevert(bytes(SINGLE_PARTY_DEV));
-            harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), chains[i], false, false);
+            harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, pinned[i]), false, false);
             vm.expectRevert(bytes(SINGLE_PARTY_REHEARSAL));
-            harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), chains[i], false, false);
-            harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), chains[i], false, true);
-            harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), chains[i], false, true);
-        }
-    }
-
-    function test_mainnetRefusesSinglePartySetupsEvenWithTheOptIn() public {
-        bool[2] memory optIn = [false, true];
-        for (uint256 i = 0; i < optIn.length; ++i) {
-            vm.expectRevert(bytes(MAINNET_NEEDS_CEREMONY));
-            harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), MAINNET, false, optIn[i]);
-            vm.expectRevert(bytes(MAINNET_NEEDS_CEREMONY));
-            harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), MAINNET, false, optIn[i]);
+            harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, pinned[i]), false, false);
+            harness.check(_facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, pinned[i]), false, true);
+            harness.check(_facts("rehearsal", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, pinned[i]), false, true);
         }
     }
 
     /// Before the ceremony keys are pinned no mpc-1 setup deploys off a local chain, whatever its
-    /// manifest claims: a relabelled dev setup, or any self-made one.
+    /// manifest claims (a relabelled dev setup, or any self-made one) and whatever the opt-in says.
     function test_mpc1NeedsTheCommittedCeremonyPins() public {
-        uint256[2] memory chains = [SEPOLIA, MAINNET];
-        for (uint256 i = 0; i < chains.length; ++i) {
-            vm.expectRevert(bytes(NOT_PINNED));
-            harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), chains[i], false, true);
-            vm.expectRevert(bytes(NOT_PINNED));
-            harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, false), chains[i], false, false);
-        }
+        vm.expectRevert(bytes(NOT_PINNED));
+        harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), false, true);
+        vm.expectRevert(bytes(NOT_PINNED));
+        harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, false), false, false);
     }
 
     /// Once pinned, an mpc-1 setup deploys only with both of the ceremony's verifying-key hashes.
     function test_mpc1MustMatchBothCeremonyVerifyingKeys() public {
-        uint256[2] memory chains = [SEPOLIA, MAINNET];
-        for (uint256 i = 0; i < chains.length; ++i) {
-            harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), chains[i], false, false);
-            vm.expectRevert(bytes(NOT_THE_CEREMONY));
-            harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), chains[i], false, true);
-            vm.expectRevert(bytes(NOT_THE_CEREMONY));
-            harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, DEV_WITHDRAWAL_VK, true), chains[i], false, false);
-            vm.expectRevert(bytes(NOT_THE_CEREMONY));
-            harness.check(_facts("mpc-1", DEV_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), chains[i], false, false);
-        }
+        harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), false, false);
+        vm.expectRevert(bytes(NOT_THE_CEREMONY));
+        harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, true), false, true);
+        vm.expectRevert(bytes(NOT_THE_CEREMONY));
+        harness.check(_facts("mpc-1", CEREMONY_REQUEST_VK, DEV_WITHDRAWAL_VK, true), false, false);
+        vm.expectRevert(bytes(NOT_THE_CEREMONY));
+        harness.check(_facts("mpc-1", DEV_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), false, false);
         // Local chains accept an mpc-1 setup that is not pinned (testing the import pipeline).
-        harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), LOCAL, true, false);
+        harness.check(_facts("mpc-1", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false), true, false);
     }
 
     function test_refusesOtherCircuitsAndUnknownSetupIds() public {
         SetupPolicy.SetupFacts memory facts = _facts("dev", DEV_REQUEST_VK, DEV_WITHDRAWAL_VK, false);
         facts.circuitId = "zkapi-v2-note-bound-v1";
         vm.expectRevert(bytes("SETUP_MANIFEST is not a zkapi-v2-concession-v1 setup"));
-        harness.check(facts, LOCAL, true, false);
+        harness.check(facts, true, false);
         string[3] memory unknown = ["mpc-2", "", "DEV"];
         for (uint256 i = 0; i < unknown.length; ++i) {
             vm.expectRevert(bytes("SETUP_MANIFEST names an unknown setup_id"));
-            harness.check(_facts(unknown[i], CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), LOCAL, true, true);
+            harness.check(_facts(unknown[i], CEREMONY_REQUEST_VK, CEREMONY_WITHDRAWAL_VK, true), true, true);
         }
     }
 }

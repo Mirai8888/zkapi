@@ -5,6 +5,10 @@ x-daemon: &daemon
   build:
     context: ../..
     dockerfile: docker/Dockerfile
+    # 1 builds a single-party image (README.md, "Single-party setup"); the
+    # gateway takes the same value.
+    args:
+      ALLOW_DEV_SETUP: ${ALLOW_DEV_SETUP:-}
   entrypoint: ["zkapi-run"]
   restart: unless-stopped
   read_only: true
@@ -142,6 +146,8 @@ services:
     build:
       context: ../..
       dockerfile: docker/aws/Dockerfile.gateway
+      args:
+        ALLOW_DEV_SETUP: ${ALLOW_DEV_SETUP:-}
     user: "101:101"
     entrypoint: ["nginx", "-g", "daemon off;"]
     restart: unless-stopped

@@ -29,6 +29,14 @@
 //!    these builds. `cargo tree` resolves without compiling, so this works
 //!    while the root crates do not build. It may refresh a stale root
 //!    `Cargo.lock`.
+//!
+//!    Each of these builds may still be built for a single-party vault (one
+//!    deployed with `Deploy.s.sol`'s `ALLOW_DEV_SETUP=1`, which trusts its
+//!    setup's generator not to forge proofs) by asking on its command line:
+//!    `ALLOW_DEV_SETUP=1` for `docker/Dockerfile` and `build-native.sh`,
+//!    `--setup dev` for `build-browser-client.sh`. The check resolves each
+//!    build without that opt-in, so what it guards is that no build accepts
+//!    development keys unless it was asked to.
 //! 3. **The ceremony setup.** `protocol/setup/v2-concession` must agree with
 //!    the pins. While `CEREMONY_VK_KECCAK256` is `None`, the directory holds
 //!    no keys (committed keys would be refused by every release build). Once
@@ -216,7 +224,8 @@ fn proof_features(
 }
 
 /// Check each production build of `builds`, paths relative to `repository`:
-/// `zkapi-proof` without `dev-setup`.
+/// `zkapi-proof` without `dev-setup` unless the build asks for it on its
+/// command line (which `cargo tree` does not see).
 fn check_production_builds(repository: &Path, builds: &[ProductionBuild]) -> Result<()> {
     for build in builds {
         let script_path = repository.join(build.script);
@@ -234,7 +243,9 @@ fn check_production_builds(repository: &Path, builds: &[ProductionBuild]) -> Res
             !features.iter().any(|feature| feature == DEV_SETUP_FEATURE),
             "the production build of {} ({packages:?} in {}) gives zkapi-proof the features \
              {features:?}: a package of that build enables {DEV_SETUP_FEATURE} on a normal \
-             dependency, so the binaries would accept development keys",
+             dependency, so the binaries would accept development keys without being asked \
+             to (a single-party build asks on its command line: ALLOW_DEV_SETUP=1 or \
+             --setup dev)",
             build.script,
             build.manifest
         );
@@ -386,7 +397,7 @@ fn main() -> Result<()> {
     println!(
         "release policy ok: accepts {RELEASE_SETUP_IDS:?} with pinned verifying keys ({}); \
          refuses the development setup and relabelled development keys; no production build \
-         enables {DEV_SETUP_FEATURE}",
+         enables {DEV_SETUP_FEATURE} unless asked (ALLOW_DEV_SETUP=1 or --setup dev)",
         if CEREMONY_VK_KECCAK256.is_some() {
             "the ceremony setup loads"
         } else {

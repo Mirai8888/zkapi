@@ -14,9 +14,11 @@
 //!
 //! Features:
 //! * `dev-setup` makes the build *accept* development and rehearsal keys
-//!   ([`compact::check_setup_accepted`]). Only tests, CI and the drill vault
-//!   enable it; production binaries never do, directly or through feature
-//!   unification.
+//!   ([`compact::check_setup_accepted`]). Tests and CI enable it, and so do
+//!   the production builds of a single-party vault, but only when asked on
+//!   their command line (`ALLOW_DEV_SETUP=1`, or `--setup dev` for the
+//!   browser bundle); no production binary gets it through a dependency or
+//!   feature unification.
 //! * `dev-fixtures` exposes [`dev`]. It changes no acceptance policy.
 //!
 //! Generating development keys ([`compact::setup`]) needs neither feature.

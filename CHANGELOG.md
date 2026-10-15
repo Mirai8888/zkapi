@@ -23,6 +23,17 @@ Folded into 0.2.0's notes at release.
   for the operator. The wallet-pays path is unchanged and remains the
   default. The local acceptance runs the gasless scenarios through a mini
   bundler ([v2 acceptance](docs/v2-acceptance.md), rows 24 to 31).
+- **Single-party vaults on any chain.** `Deploy.s.sol` no longer refuses a
+  `dev` or `rehearsal` setup on Mainnet: off local chains, Mainnet included,
+  it needs `ALLOW_DEV_SETUP=1` as before. The operator images
+  (`docker/Dockerfile`, `Dockerfile.gateway`, through `compose.yml`) and
+  zkapi-clientd's `build-native.sh` take `ALLOW_DEV_SETUP=1` to build with
+  `zkapi-proof/dev-setup` and ship the development setup, and the SDK build no
+  longer refuses a mainnet profile on `dev` (`development_setup_on_mainnet` is
+  gone). Default builds still accept only the pinned `mpc-1` keys, and
+  `release_policy_check` still fails if a production build gets `dev-setup`
+  without asking. A single-party vault trusts its setup's generator, who can
+  forge every proof ([Single-party setup](docs/deployment.md#single-party-setup)).
 
 ### Breaking
 

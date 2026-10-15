@@ -193,8 +193,10 @@ files carry the header `zkapi-v2-concession-v1/<setup_id>/<kind>\0`. Release
 builds accept only the ceremony setup `mpc-1` whose verifying-key hashes equal
 the pins in `compact.rs`; the committed development setup `dev`
 ([v2-concession-dev](setup/v2-concession-dev/README.md)) loads only with the
-`dev-setup` feature. The adapter exposes `CIRCUIT_ID_HASH`, `REQUEST_VK_HASH`
-and `WITHDRAWAL_VK_HASH`. Setup files, Solidity verification keys, WASM, and
+`dev-setup` feature, which production builds enable only when built for a
+single-party vault (`ALLOW_DEV_SETUP=1`). The adapter exposes
+`CIRCUIT_ID_HASH`, `REQUEST_VK_HASH` and `WITHDRAWAL_VK_HASH`. Setup files,
+Solidity verification keys, WASM, and
 SDK asset hashes must remain paired. See [the ceremony setup](setup/v2-concession/README.md)
 for the ceremony, its trust assumptions and how to audit it. The keys of the
 legacy circuit `zkapi-v2-note-bound-v1` stay in [setup/v2](setup/v2/README.md)

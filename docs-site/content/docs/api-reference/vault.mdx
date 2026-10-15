@@ -331,6 +331,7 @@ deployment manifest and proof assets must match these deployed values, and
 clients pin the runtime code hashes of the vault, adapter and Poseidon library
 and check them on chain. `Deploy.s.sol` requires an explicit `OWNER`,
 `TREASURY`, setup manifest and `MAX_PAUSE_DURATION_SECONDS` outside local
-chains, refuses a single-party setup on mainnet, and writes a provisional
+chains, deploys a single-party setup there only with `ALLOW_DEV_SETUP=1`
+(mainnet included), and writes a provisional
 manifest that `scripts/expected-codehashes.mjs --finalize` checks on chain
 before it records the deployment.

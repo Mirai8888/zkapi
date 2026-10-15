@@ -93,8 +93,9 @@ its port unpublished; the public API reverse proxy must never route to it.
 
 The server, browser/client proving keys, verifier, and daemon must all use the
 same deployment and circuit setup. A release build loads only the ceremony
-keys (`mpc-1`) pinned in `zkapi-proof`; the drill vault's daemon is built with
-the `dev-setup` feature.
+keys (`mpc-1`) pinned in `zkapi-proof`; the daemon of a single-party vault
+(the drill vault, or one deployed with `ALLOW_DEV_SETUP=1`) is built with the
+`dev-setup` feature (the Docker image's `ALLOW_DEV_SETUP=1` build argument).
 
 ## Database access and startup
 

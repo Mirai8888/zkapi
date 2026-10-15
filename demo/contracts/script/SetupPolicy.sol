@@ -4,10 +4,10 @@ pragma solidity ^0.8.28;
 /// @title SetupPolicy – which proving setup Deploy.s.sol may deploy a vault for (design sections
 ///        10.2 and 10.4), kept apart from the script so it can be tested without deploying.
 /// @notice The dev and rehearsal setups are single-party: whoever generated them can forge every
-///         proof, including defeat evidence. They deploy freely on local chains, off local chains
-///         only for the drill vault with the explicit ALLOW_DEV_SETUP=1, and never on mainnet. The
-///         mpc-1 label is not trusted by itself: off local chains, an mpc-1 setup must have the
-///         verifying-key hashes of the committed ceremony manifest
+///         proof, including defeat evidence. They deploy freely on local chains, and off local
+///         chains (mainnet included) only with the explicit ALLOW_DEV_SETUP=1, which the manifest
+///         records as allowDevSetup. The mpc-1 label is not trusted by itself: off local chains,
+///         an mpc-1 setup must have the verifying-key hashes of the committed ceremony manifest
 ///         (protocol/setup/v2-concession/manifest.json). zkapi-proof's release_policy_check keeps
 ///         that manifest absent until CEREMONY_VK_KECCAK256 pins the ceremony keys (G-SETUP step 7)
 ///         and equal to the pins afterwards, so before the ceremony no mpc-1 setup deploys off a
@@ -32,19 +32,16 @@ abstract contract SetupPolicy {
         bytes32 ceremonyWithdrawalVkHash;
     }
 
-    /// Reverts unless a vault on `chainId` may be deployed for `setup`. `local` is a local chain
-    /// (31337 or 1337); `allowDevSetup` is ALLOW_DEV_SETUP=1, the drill vault's opt-in.
-    function _checkSetupPolicy(SetupFacts memory setup, uint256 chainId, bool local, bool allowDevSetup) internal pure {
+    /// Reverts unless a vault may be deployed for `setup`. `local` is a local chain (31337 or
+    /// 1337); `allowDevSetup` is ALLOW_DEV_SETUP=1, the single-party opt-in.
+    function _checkSetupPolicy(SetupFacts memory setup, bool local, bool allowDevSetup) internal pure {
         require(_eq(setup.circuitId, CIRCUIT_ID), "SETUP_MANIFEST is not a zkapi-v2-concession-v1 setup");
         bool singleParty = _eq(setup.setupId, DEV_SETUP_ID) || _eq(setup.setupId, REHEARSAL_SETUP_ID);
         if (singleParty) {
-            require(chainId != 1, "mainnet needs the ceremony setup (mpc-1)");
             require(
                 local || allowDevSetup,
                 string.concat(
-                    "setup ",
-                    setup.setupId,
-                    " is single-party: off local chains it deploys only the drill vault, with ALLOW_DEV_SETUP=1"
+                    "setup ", setup.setupId, " is single-party: off local chains it deploys only with ALLOW_DEV_SETUP=1"
                 )
             );
             return;

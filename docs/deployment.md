@@ -125,7 +125,7 @@ with `forge script`. The script links the library itself; no
 | `MAX_PAUSE_DURATION_SECONDS` | Longest a pause blocks escapes and closes; at least twice the challenge period. Required except on local chains (default 7 days). Plan 3,888,000 (45 days) on Mainnet |
 | `REQUEST_CHARGE_CAP` | Per-request gwei limit; the script default is 1,000,000, the published deployments use 50,000, so pass it explicitly |
 | `SETUP_MANIFEST` | The setup's `manifest.json`; the adapter's hashes must match it. Required except on local chains (default `protocol/setup/v2-concession-dev`) |
-| `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains: the Sepolia drill vault only, never Mainnet, which refuses it. Recorded as `allowDevSetup`; default 0 |
+| `ALLOW_DEV_SETUP` | `1` deploys a `dev` or `rehearsal` setup off local chains, Mainnet included ([Single-party setup](#single-party-setup)). Recorded as `allowDevSetup`; default 0 |
 | `POSEIDON_ADDRESS` | An already deployed `Bn254Poseidon` to link; its runtime code hash must equal the compiled library's. Unset deploys a fresh library |
 | `CHAIN_ID` | Optional expected chain ID; a mismatch aborts |
 | `GASLESS` | `1` (default) deploys the gasless-withdrawal paymaster after the vault; `0` skips the block and writes `withdrawalPaymaster: null`. A `forge script` dry run without an RPC has no EntryPoint code, so it needs `GASLESS=0`. An Anvil started with a public chain ID (for example Sepolia's 11155111, as the acceptance harness does) is a public chain to the script: it needs the etched runtimes and explicit `PAYMASTER_STAKE_WEI`, `FACTORY_STAKE_WEI` and `PAYMASTER_DEPOSIT_WEI`, or `GASLESS=0` |
@@ -141,8 +141,8 @@ with `forge script`. The script links the library itself; no
 | `PAYMASTER_MAX_FEE_CEILING_WEI`, `PAYMASTER_PRIORITY_FEE_CEILING_WEI` | Fee ceilings per gas the paymaster accepts; defaults 100 gwei and 3 gwei (Sepolia: 200 gwei), at most 500 gwei and 20 gwei, and the priority ceiling must not exceed the max ceiling |
 | `PAYMASTER_FEE_KEEPER` | Optional key that may re-set the fee ceilings (`setFeeCeilings`) |
 
-The setup policy is enforced by the script: off local chains a single-party
-setup needs `ALLOW_DEV_SETUP=1` and Mainnet refuses it, and an `mpc-1` setup
+The setup policy is enforced by the script: off local chains (Mainnet
+included) a single-party setup needs `ALLOW_DEV_SETUP=1`, and an `mpc-1` setup
 must have the verifying keys of the committed
 `protocol/setup/v2-concession/manifest.json`, which the ceremony commits with
 its keys. Local chains accept any setup id.
@@ -260,6 +260,33 @@ and the migration runbook.
 Use a fresh directory when intentionally generating a new Groth16 setup.
 Keep challenger coverage and persistent server/indexer state available whenever
 the vault holds funds.
+
+### Single-party setup
+
+A vault may run on a single-party setup (`dev`) on any chain, Mainnet
+included, before the ceremony keys exist. Its trust differs from a ceremony
+vault's: whoever generated the setup could have kept its toxic waste and can
+then forge every proof, including withdrawals of any note and defeat evidence,
+so depositors trust that party with the vault's funds. Every step opts in
+explicitly, and default builds still accept only the pinned `mpc-1` keys:
+
+- **Contracts:** `ALLOW_DEV_SETUP=1` with
+  `SETUP_MANIFEST=protocol/setup/v2-concession-dev/manifest.json` (absolute,
+  or relative to `demo/contracts`). The script logs a warning and the manifest
+  records `allowDevSetup: true`.
+- **Operator image:** build with `ALLOW_DEV_SETUP=1` (see
+  [the operator runbook](../docker/aws/README.md#single-party-setup)): the
+  daemons get `zkapi-proof`'s `dev-setup` feature, and the daemon and gateway
+  images carry `protocol/setup/v2-concession-dev`. A binary built outside
+  Docker needs `--features zkapi-proof/dev-setup`.
+- **Browser SDK:** `scripts/build-browser-client.sh --setup dev` and
+  `node scripts/sync-sdk-assets.mjs --setup dev --network mainnet`; the SDK
+  build pairs the bundle with a profile that pins setup `dev`.
+- **zkapi-clientd:** `ALLOW_DEV_SETUP=1 zkapi-clientd/scripts/build-native.sh …`
+  builds the companion with `dev-setup` and bundles the development setup.
+
+`release_policy_check` still fails if any of these builds gets `dev-setup`
+without being asked, through a dependency or feature unification.
 
 ### Gasless withdrawals
 

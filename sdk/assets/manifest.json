@@ -2,24 +2,24 @@
   "schema": 2,
   "circuitId": "zkapi-v2-concession-v1",
   "setupId": "dev",
-  "sourceRevision": "e9951bacd62c6ae927d06196ad78b45db4f9c492",
+  "sourceRevision": "a3f4a0f2508611cb1fd910a1e22bfc36ecfca559",
   "toolchain": {
     "rustc": "1.99.0",
     "wasmBindgen": "0.2.117"
   },
   "vkKeccak256": {
-    "request": "0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872",
-    "withdrawal": "0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd"
+    "request": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+    "withdrawal": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
   },
   "files": {
     "wasm/zkapi_browser.js": "2b2f102cddf32302c87bbc38d650dff9294e904c6a248bb9372ab293667c6bb0",
-    "wasm/zkapi_browser_bg.wasm": "48cc9c052a16853ed1914d077848040446eeb0166777df25801e3f362f986094",
+    "wasm/zkapi_browser_bg.wasm": "cb140028b5aeb00389e8b240524178a8fcb42a3ade8bda91e042b278002d982f",
     "wasm/zkapi_browser.d.ts": "ad916e76886df32058db4cf401e97ff184c1fe7149bbffb17712156bc0bb5949",
     "wasm/zkapi_browser_bg.wasm.d.ts": "6a982a8f8b5d57bbb2697b3627d518d6e168b00f66363c5fa7334bf16db82b53",
-    "assets/proofs/request.pk": "99155d9863693ab4bcb70459563f21e19c7fd55f40a3c87733fbea8de715ab56",
-    "assets/proofs/withdrawal.pk": "b9b94b9fcd6ac96c2539d396ee583e8968299a51ca2b13cb2035e62085ab0c30",
-    "assets/proofs/request.vk": "2f0d787b32ee7e153dda038443eef4463dd59accd1d27eb751061b6a053aef81",
-    "assets/config/sepolia.json": "7d9f2671ce135b0a4ca353c8ccfe41b2b054d94ef47be150d3704a6d45b489a1",
-    "assets/config/mainnet.json": "fb8c580a56c27accad2394c35a32bd46336892830f657b8fa5d30f24ae2849d7"
+    "assets/proofs/request.pk": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+    "assets/proofs/withdrawal.pk": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+    "assets/proofs/request.vk": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+    "assets/config/sepolia.json": "5fc67d5d29c819e4e5a7c4a955673754d254a77e8dae068882db9dd09f9cbc41",
+    "assets/config/mainnet.json": "f3d220ead5696b282c84217435fa2c98d5ea071c171264009ae45a5dc28a906e"
   }
 }

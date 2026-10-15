@@ -7,6 +7,7 @@
 #   zkapi-tor-cli.sh ask "What word did I ask you to remember?"
 #   zkapi-tor-cli.sh list_models
 #   zkapi-tor-cli.sh set_model anthropic/claude-haiku-4.5
+#   zkapi-tor-cli.sh withdraw <addr> [eth]  return note balance to an address
 #   zkapi-tor-cli.sh fund                   show funding address/balance
 #   zkapi-tor-cli.sh fund --amount 0.005    quote + approve + open a channel
 #   zkapi-tor-cli.sh stop
@@ -157,14 +158,38 @@ else:
     print("ok" if b>0 else "empty")' 2>/dev/null
 }
 
+wallet_note_balance_eth() {  # entire note balance as a decimal ETH string
+  local token json
+  token="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["zkapi"]["bridge_token"])' "$CONFIG_DIR/config.json" 2>/dev/null)" || return 1
+  json="$(curl -sf -m 8 -H "Authorization: Bearer $token" "$COMPANION/wallet/status" 2>/dev/null)" || return 1
+  printf '%s' "$json" | python3 -c '
+import json,sys
+s=json.load(sys.stdin)
+b=(s.get("note") or {}).get("current_balance")
+if not b: sys.exit(1)
+print(("%d" % (b/1e18)) if b % 10**9 == 0 else ("%.18f" % (b/1e18)).rstrip("0"))' 2>/dev/null
+}
+
 funding_api() {  # <METHOD> <PATH> [json-body] — the daemon's admin funding API
   local method="$1" path="$2" body="${3:-}" token mtoken listen
   token="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("api_key",""))' "$CONFIG_DIR/config.json" 2>/dev/null)"
   mtoken="$(cat "$CONFIG_DIR/management-token" 2>/dev/null)"
   listen="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("listen","127.0.0.1:8787"))' "$CONFIG_DIR/config.json" 2>/dev/null)"
-  curl -sf -m 90 -X "$method" -H "Authorization: Bearer $token" \
-       -H "X-OA-Management-Token: $mtoken" -H "Content-Type: application/json" \
-       ${body:+-d "$body"} "http://$listen$path"
+  local resp bodyf code
+  bodyf="$(mktemp)"
+  code="$(curl -s -m 90 -o "$bodyf" -w '%{http_code}' -X "$method" -H "Authorization: Bearer $token" \
+    -H "X-OA-Management-Token: $mtoken" -H "Content-Type: application/json" \
+    ${body:+-d "$body"} "http://$listen$path" 2>/dev/null)"
+  case "$code" in
+    2*) cat "$bodyf" ;;
+    *)  python3 - "$bodyf" "$code" <<'PY' 1>&2
+import json,sys
+try: print("funding API:", json.load(open(sys.argv[1])).get("error", "http %s" % sys.argv[2]))
+except Exception: print("funding API: http %s" % sys.argv[2])
+PY
+      rm -f "$bodyf"; return 1 ;;
+  esac
+  rm -f "$bodyf"
 }
 
 wei2eth() { python3 -c 'print(f"{int(sys.argv[1])/1e18:.6f}")' "${1:-0}" 2>/dev/null || echo "?"; }
@@ -428,6 +453,57 @@ for m in json.load(sys.stdin)["data"]: print(m["id"])'
     [ $# -ge 2 ] || { echo "current model: $(active_model)"; exit 0; }
     printf '%s\n' "$2" > "$MODEL_FILE"
     echo "model set: $2"
+    ;;
+  withdraw)
+    shift
+    [ $# -ge 1 ] || die "usage: $0 withdraw <0x-address>   (closes the note, sends its remaining balance out, then sweeps the funding address)"
+    dest="$1"
+    printf '%s' "$dest" | grep -qE '^0x[0-9a-fA-F]{40}$' || die "withdraw: '$dest' is not a 0x address"
+    if ! server_running; then
+      guard_inflight
+      echo "zkapi-tor-cli: starting the server to reach the wallet..." >&2
+      start_server
+    fi
+    btoken="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["zkapi"]["bridge_token"])' "$CONFIG_DIR/config.json" 2>/dev/null)" || die "withdraw: no bridge token in config"
+    # any live lease must settle before the note can close
+    echo "zkapi-tor-cli: waiting for the current lease to settle before closing the note..." >&2
+    ensure_ready || die "withdraw: a lease is stuck unsettled; run again after it settles"
+    echo "zkapi-tor-cli: preparing note withdrawal to $dest..." >&2
+    resp="$(curl -sf -m 60 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d "{\"mode\": \"${ZKAPI_WITHDRAW_MODE:-mutual}\", \"destination\": \"$dest\"}" "$COMPANION/wallet/withdraw")" || die "withdraw: the wallet refused to prepare the withdrawal"
+    echo "zkapi-tor-cli: confirming withdrawal (generates the close proof; give it a minute)..." >&2
+    curl -sf -m 600 -X POST -H "Authorization: Bearer $btoken" -H "Content-Type: application/json" -d '{}' "$COMPANION/wallet/withdraw/confirm" >/dev/null || die "withdraw: confirmation failed (a saved withdrawal is resumable — run again)"
+    waited=0
+    while :; do
+      has="$(curl -sf -m 8 -H "Authorization: Bearer $btoken" "$COMPANION/wallet/status" | python3 -c 'import json,sys;print("yes" if json.load(sys.stdin).get("has_note") else "no")' 2>/dev/null)"
+      [ "$has" = no ] && break
+      [ "$waited" -ge "${ZKAPI_WITHDRAW_WAIT:-420}" ] && die "withdraw: the note is still open after ${ZKAPI_WITHDRAW_WAIT:-420}s; run again to resume (progress is saved)"
+      sleep 5; waited=$((waited + 5))
+    done
+    echo "zkapi-tor-cli: note closed; its remaining balance is on its way to $dest." >&2
+    # sweep the funding address's own ETH if it holds anything worth a transaction
+    eoa_wei="$(funding_api GET /admin/funding/address | python3 -c 'import json,sys;print(int(json.load(sys.stdin).get("eth_balance") or 0))' 2>/dev/null || echo 0)"
+    if [ "${eoa_wei:-0}" -ge 50000000000000 ]; then  # >= 0.00005 ETH: worth a tx
+      echo "zkapi-tor-cli: sweeping the funding address ($(wei2eth "$eoa_wei") ETH) to $dest too..." >&2
+      quote="$(funding_api POST /admin/return/quote "{\"destination\": \"$dest\"}")" || { echo "zkapi-tor-cli: could not quote the public sweep (run 'withdraw' again later)." >&2; exit 0; }
+      qid="$(printf '%s' "$quote" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+      state="$(funding_api POST /admin/return/approve "{\"quote_id\": \"$qid\"}")" || die "withdraw: public sweep approval failed"
+      waited=0
+      while :; do
+        phase="$(printf '%s' "$state" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("phase",""))' 2>/dev/null)"
+        echo "zkapi-tor-cli: public sweep $phase" >&2
+        [ "$phase" = complete ] && break
+        [ "$phase" != return_pending ] && [ "$phase" != confirming ] && break
+        [ "$waited" -ge "${ZKAPI_WITHDRAW_WAIT:-420}" ] && { echo "zkapi-tor-cli: public sweep still $phase after ${ZKAPI_WITHDRAW_WAIT:-420}s; run again to resume." >&2; exit 1; }
+        sleep 5; waited=$((waited + 5))
+        state="$(funding_api POST /admin/return '{}')" || die "withdraw: lost contact during the public sweep"
+      done
+      printf '%s' "$state" | python3 -c '
+import json,sys
+s=json.load(sys.stdin)
+h=s.get("transaction_hash") or ""
+print("Funding sweep done." + (" Transaction: %s" % h if h else ""))' >&2
+    fi
+    echo "zkapi-tor-cli: withdrawn. To start spending again, just ask a question — a fresh channel opens automatically." >&2
     ;;
   fund)
     if show_funding_state; then :; fi

@@ -37,6 +37,12 @@ rand_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0)
 socks_port="$(rand_port)"
 ctl_port="$(rand_port)"
 
+# Claim the profile BEFORE bootstrapping Tor: if another daemon (possibly one
+# invisible in another environment, e.g. a sandbox sharing this filesystem)
+# holds daemon.lock, fail in seconds rather than after a minute of Tor.
+"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
+"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || { echo "zkapi-serve-tor: cannot update relay URL; another zkapi-clientd holds the config (see daemon.lock holder info, or run zkapi-install-companion.sh for clearer errors)" >&2; exit 1; }
+
 tor --ClientOnly 1 --PublishServerDescriptor 0 \
     --SocksPort "127.0.0.1:${socks_port}" \
     --ControlPort "127.0.0.1:${ctl_port}" \
@@ -80,14 +86,11 @@ python3 "$here/zkapi-cover-traffic.py" --socks "127.0.0.1:${socks_port}" \
     --rate "${ZKAPI_COVER_RATE:-5}" --log "$datadir/cover.log" &
 coverpid=$!
 
-# Conversations should ride one ephemeral provider key for its whole life
-# (issuer TTL is 300s; the daemon clamps reuse to the earlier of window end
-# and key expiry, so this is the key's full lifetime and never past it).
-# Ask messages inside the window cost ~seconds; only the ~5-minute rotation
-# pays the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
-"$BIN" config --key-reuse-window-seconds "${ZKAPI_KEY_REUSE_WINDOW:-300}" >/dev/null 2>&1 || true
-
-"$BIN" config --relay-url "socks5://127.0.0.1:${socks_port}" >/dev/null || { echo "failed to save relay URL" >&2; exit 1; }
+# Conversations ride one ephemeral provider key for its whole life (issuer
+# TTL is 300s; the daemon clamps reuse to key expiry, never past it). Ask
+# messages inside the window cost ~seconds; only the ~5-minute rotation pays
+# the retire-and-reissue ceremony. ZKAPI_KEY_REUSE_WINDOW tunes it down.
+echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
 echo "zkapi-serve-tor: route saved as socks5://127.0.0.1:${socks_port} (cover traffic ~${ZKAPI_COVER_RATE:-5}/s); serving (plain, no torify)" >&2
 "$BIN" serve &
 child=$!

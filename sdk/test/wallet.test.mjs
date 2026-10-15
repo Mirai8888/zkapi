@@ -18,14 +18,14 @@ test("escape-period labels follow the deployed vault duration", () => {
   assert.equal(wallet.escapePeriodBadge(30), "30s");
 });
 
-test("deposit calldata uses the deployed vault signature and 32 static siblings", () => {
+test("deposit calldata uses the deployed vault signature: commitment and amount, no siblings", () => {
   const plan = {
     commitment: "0x2a",
     zero_path: Array.from({ length: 32 }, (_, index) => `0x${(index + 1).toString(16)}`),
   };
   const encoded = wallet.encodeDeposit(plan, 100_000n);
-  assert.ok(encoded.startsWith("0xc588341c"));
-  assert.equal(encoded.length, 2 + 8 + (34 * 64));
+  assert.ok(encoded.startsWith("0x56d2e1ea"));
+  assert.equal(encoded.length, 2 + 8 + (2 * 64));
   assert.equal(encoded.slice(10, 74), wallet.abiWord("0x2a"));
   assert.equal(encoded.slice(74, 138), wallet.abiWord(100_000n));
 });

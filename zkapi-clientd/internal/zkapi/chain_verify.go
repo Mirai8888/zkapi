@@ -429,12 +429,9 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	if err := checkDeviceClock(snapshot.Time); err != nil {
 		return "", fmt.Errorf("%v; no deposit was signed", err)
 	}
-	data := "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", deposit.Amount)
-	for _, sibling := range refreshed.ZeroPath {
-		data += addressABIWord(sibling)
-	}
+	data := depositCalldata(deposit.Commitment, deposit.Amount)
 	calldata, err := hex.DecodeString(data[2:])
-	if err != nil || len(calldata) != 4+34*32 {
+	if err != nil || len(calldata) != depositCalldataLength {
 		return "", errors.New("invalid deposit call data")
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
@@ -446,26 +443,76 @@ func (h *FundingHandler) bindDepositPath(ctx context.Context, config fundingConf
 	return data, nil
 }
 
+// depositSelector is deposit(bytes32 commitment, uint128 amount) of vault revision 3: the vault
+// appends the leaf to its tree itself, so the calldata carries no siblings and a signed deposit
+// lands at the prepared slot or any later one, never below it.
+const depositSelector = "56d2e1ea"
+
+// depositCalldataLength is the selector and the two argument words.
+const depositCalldataLength = 4 + 2*32
+
+func depositCalldata(commitment string, amount uint64) string {
+	return "0x" + depositSelector + addressABIWord(commitment) + fmt.Sprintf("%064x", amount)
+}
+
+// isDepositCalldata reports whether data is a deposit call of the vault.
+func isDepositCalldata(data []byte) bool {
+	return len(data) == depositCalldataLength && hex.EncodeToString(data[:4]) == depositSelector
+}
+
+// depositPathDigest identifies a signed deposit's arguments (commitment and amount).
 func depositPathDigest(calldata []byte) string {
-	digest := sha256.Sum256(calldata[68:])
+	digest := sha256.Sum256(calldata[4:])
 	return "0x" + hex.EncodeToString(digest[:])
 }
 
-// signedDepositSlot returns the recorded slot only when it describes the
-// exact zero path inside this signed deposit transaction.
+// legacyDepositSelector is deposit(bytes32,uint128,uint256[32]) of vault revision 2, whose
+// calldata carried the slot's 32 sibling words; saved records may still hold such transactions.
+const legacyDepositSelector = "c588341c"
+
+const legacyDepositCalldataLength = 4 + 34*32
+
+// signedDepositSlot returns the recorded slot only when this saved deposit
+// transaction was signed for it: a revision-3 deposit of this note at the
+// slot's signed nonce, or a revision-2 deposit carrying exactly the sibling
+// words the slot's digest names.
 func signedDepositSlot(deposit *depositRecord, saved *addressTransaction) (*depositSlot, bool) {
 	if deposit == nil || deposit.Slot == nil || saved == nil || saved.Kind != "deposit" {
 		return nil, false
 	}
 	raw, err := hex.DecodeString(strings.TrimPrefix(saved.Raw, "0x"))
 	var tx types.Transaction
-	if err != nil || tx.UnmarshalBinary(raw) != nil || len(tx.Data()) != 4+34*32 || hex.EncodeToString(tx.Data()[:4]) != "c588341c" {
+	if err != nil || tx.UnmarshalBinary(raw) != nil {
 		return nil, false
 	}
-	if !strings.EqualFold(depositPathDigest(tx.Data()), deposit.Slot.PathSHA256) {
-		return nil, false
+	data := tx.Data()
+	if isDepositCalldata(data) {
+		if !deposit.Slot.Signed || tx.Nonce() != deposit.Slot.SignedNonce {
+			return nil, false
+		}
+		if !strings.EqualFold(depositPathDigest(data), deposit.Slot.PathSHA256) {
+			return nil, false
+		}
+		return deposit.Slot, true
 	}
-	return deposit.Slot, true
+	if len(data) == legacyDepositCalldataLength && hex.EncodeToString(data[:4]) == legacyDepositSelector {
+		digest := sha256.Sum256(data[68:])
+		if strings.EqualFold("0x"+hex.EncodeToString(digest[:]), deposit.Slot.PathSHA256) {
+			return deposit.Slot, true
+		}
+	}
+	return nil, false
+}
+
+// recordSignedDepositSlot ties the slot the pending deposit was prepared for
+// (bindDepositPath) to the transaction just signed for it, by its nonce.
+func (h *FundingHandler) recordSignedDepositSlot(record *addressFundingRecord, deposit *depositRecord) error {
+	if deposit == nil || deposit.Slot == nil || record == nil || record.Pending == nil || record.Pending.Kind != "deposit" {
+		return nil
+	}
+	deposit.Slot.Signed = true
+	deposit.Slot.SignedNonce = record.Pending.Nonce
+	return h.save(*deposit)
 }
 
 // checkDepositRevert decides whether a finalized failed deposit may be retired.
@@ -637,9 +684,26 @@ func signedDepositSlots(deposit *depositRecord, record *addressFundingRecord) []
 	}) {
 		return slots
 	}
-	for _, entry := range noteDepositTransactions(record, deposit) {
+	transactions := noteDepositTransactions(record, deposit)
+	for _, entry := range transactions {
 		if _, ok := signedDepositSlot(deposit, &entry); ok {
 			return append(slots, *current)
+		}
+	}
+	// A revision-3 deposit transaction no kept slot accounts for (a record
+	// whose signed slots were lost) is searched from the current slot: a
+	// slot searched in vain only costs comparisons, one missed hides a
+	// landed deposit.
+	if !current.Signed {
+		for _, entry := range transactions {
+			raw, err := hex.DecodeString(strings.TrimPrefix(entry.Raw, "0x"))
+			var tx types.Transaction
+			if err != nil || tx.UnmarshalBinary(raw) != nil || !isDepositCalldata(tx.Data()) {
+				continue
+			}
+			if !slices.ContainsFunc(slots, func(slot depositSlot) bool { return slot.Signed && slot.SignedNonce == tx.Nonce() }) {
+				return append(slots, *current)
+			}
 		}
 	}
 	return slots
@@ -662,7 +726,7 @@ func noteDepositTransactions(record *addressFundingRecord, deposit *depositRecor
 			continue
 		}
 		data := tx.Data()
-		if len(data) != 4+34*32 || hex.EncodeToString(data[:4]) != "c588341c" || !strings.EqualFold(hex.EncodeToString(data[4:36]), addressABIWord(deposit.Commitment)) || hex.EncodeToString(data[36:68]) != fmt.Sprintf("%064x", deposit.Amount) {
+		if !isDepositCalldata(data) || !strings.EqualFold(hex.EncodeToString(data[4:36]), addressABIWord(deposit.Commitment)) || hex.EncodeToString(data[36:68]) != fmt.Sprintf("%064x", deposit.Amount) {
 			continue
 		}
 		deposits = append(deposits, entry)

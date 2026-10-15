@@ -114,8 +114,18 @@ func noteLeaf(noteID uint32, commitment *big.Int, amount, expiry uint64) *big.In
 	return poseidonHash(domainLeaf, new(big.Int).SetUint64(uint64(noteID)), commitment, new(big.Int).SetUint64(amount), new(big.Int).SetUint64(expiry))
 }
 
+// merkleNode mirrors v2::merkle_node (the vault's MerkleUpdateLib.poseidonNodeHash): one
+// permutation of the state (domainNode, left, right), rate lane one. The domain sits in the
+// capacity lane, so a node costs one permutation and cannot collide with a poseidonHash
+// output, whose capacity lane starts at zero.
 func merkleNode(left, right *big.Int) *big.Int {
-	return poseidonHash(domainNode, left, right)
+	state := [poseidonWidth]*big.Int{
+		new(big.Int).Set(domainNode),
+		new(big.Int).Mod(left, bn254ScalarModulus),
+		new(big.Int).Mod(right, bn254ScalarModulus),
+	}
+	poseidonPermute(&state)
+	return state[1]
 }
 
 var merkleZeroHashes = sync.OnceValue(func() [merkleDepth + 1]*big.Int {

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "../src/libraries/ReentrancyGuardTransient.sol";
 import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {IZkApiProofAdapter} from "../src/interfaces/IZkApiProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
@@ -103,7 +103,7 @@ contract NativeEthVaultTest is Test {
         uint256 zero;
         for (uint256 level; level < 32; ++level) {
             siblings[level] = zero;
-            zero = Bn254Poseidon.hash3(0x7a6b6170692e76322e6e6f6465, zero, zero);
+            zero = Bn254Poseidon.compress(0x7a6b6170692e76322e6e6f6465, zero, zero);
         }
         adapter = new NativeProofFixture();
         vault = new ZkApiVault(
@@ -114,7 +114,7 @@ contract NativeEthVaultTest is Test {
 
     function deposit() internal {
         vm.prank(user);
-        vault.deposit{value: uint256(UNITS) * 1 gwei}(bytes32(uint256(42)), UNITS, siblings);
+        vault.deposit{value: uint256(UNITS) * 1 gwei}(bytes32(uint256(42)), UNITS);
     }
 
     /// A close (kind 1) or an escape (kind 0, successor nullifier 100) from the state at
@@ -162,9 +162,9 @@ contract NativeEthVaultTest is Test {
     function test_nativeRejectsWrongOrMissingValue() public {
         vm.startPrank(user);
         vm.expectRevert(Errors.InvalidNativeValue.selector);
-        vault.deposit(bytes32(uint256(42)), UNITS, siblings);
+        vault.deposit(bytes32(uint256(42)), UNITS);
         vm.expectRevert(Errors.InvalidNativeValue.selector);
-        vault.deposit{value: uint256(UNITS) * 1 gwei + 1}(bytes32(uint256(42)), UNITS, siblings);
+        vault.deposit{value: uint256(UNITS) * 1 gwei + 1}(bytes32(uint256(42)), UNITS);
         vm.stopPrank();
         assertEq(vault.nextNoteId(), 0);
         assertEq(address(vault).balance, 0);
@@ -172,7 +172,7 @@ contract NativeEthVaultTest is Test {
 
     function test_nativeRejectsUnsafeLedgerAmount() public {
         vm.expectRevert(Errors.InvalidNativeValue.selector);
-        vault.deposit(bytes32(uint256(42)), 9_007_199_254_740_992, siblings);
+        vault.deposit(bytes32(uint256(42)), 9_007_199_254_740_992);
     }
 
     function test_nativeRejectsInvalidRequestChargeCap() public {
@@ -319,7 +319,7 @@ contract NativeEthVaultTest is Test {
         recipient.setAccepting(true);
         vault.claimEscapePayout(address(recipient));
         assertFalse(recipient.reentered());
-        assertEq(recipient.reentryError(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        assertEq(recipient.reentryError(), ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
         assertEq(address(recipient).balance, 700_000 gwei);
         assertEq(vault.escapePayoutCredits(address(recipient)), 0);
         assertEq(address(vault).balance, 0);
@@ -356,7 +356,7 @@ contract NativeEthVaultTest is Test {
     /// signature change fails here instead of silently in a client. Values from the design
     /// (circuit zkapi-v2-concession-v1, vault revision 3).
     function test_clientFacingSelectorsAndTopicsArePinned() public view {
-        assertEq(vault.deposit.selector, bytes4(0xc588341c));
+        assertEq(vault.deposit.selector, bytes4(0x56d2e1ea));
         assertEq(vault.mutualClose.selector, bytes4(0x72cd2e44));
         assertEq(vault.initiateEscapeWithdrawal.selector, bytes4(0xa38d62aa));
         assertEq(vault.challengeEscapeWithdrawal.selector, bytes4(0xda0ce43d));
@@ -371,7 +371,6 @@ contract NativeEthVaultTest is Test {
         assertEq(vault.challengedNullifiers.selector, bytes4(0x6cda756a));
         assertEq(vault.knownRoots.selector, bytes4(0x12ad7381));
         assertEq(vault.isKnownRoot.selector, bytes4(0xa6232a93));
-        assertEq(vault.rootRetiredAt.selector, bytes4(0x7600ff88));
         assertEq(vault.effectiveExpiry.selector, bytes4(0x7cb4a03c));
         assertEq(vault.CONCESSION_ESCAPE_VERSION.selector, bytes4(0x5e00b426));
         assertEq(vault.ROOT_HISTORY_WINDOW.selector, bytes4(0x1fe72de0));

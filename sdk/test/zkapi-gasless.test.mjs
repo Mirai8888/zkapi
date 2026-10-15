@@ -103,7 +103,8 @@ test('the EIP-191 digest of the hash is what the owner signs, and the vector sig
     assert.equal(`0x${C.signature.slice(2, 66)}`, low(C.signature_r));
     assert.equal(`0x${C.signature.slice(66, 130)}`, low(C.signature_s));
     assert.equal(Number.parseInt(C.signature.slice(130), 16), Number(C.signature_v));
-    assert.notEqual(recover(digest, `0x${C.signature.slice(2, 130)}1c`), low(V.owner), 'the other v recovers another key');
+    const otherV = Number(C.signature_v) === 27 ? '1c' : '1b';
+    assert.notEqual(recover(digest, `0x${C.signature.slice(2, 130)}${otherV}`), low(V.owner), 'the other v recovers another key');
     assert.throws(() => eip191Digest('0x1234'), /32 bytes/);
 });
 
@@ -179,7 +180,7 @@ test('the gas policy normalizes from both spellings, compares with the contractâ
     const vectors = normalizeGasPolicy(V.gas_policy);
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.ok(sameGasPolicy(vectors, profile), 'postop_* / call_cap and post_op_* / call_hard_cap pin the same constants');
-    assert.deepEqual(profile.defaults.callDefault.map(String), ['687500', '762500', '295000', '97500']);
+    assert.deepEqual(profile.defaults.callDefault.map(String), ['642500', '680000', '287500', '97500']);
     assert.equal(profile.defaults.postOpDefault, 270_000n);
     assert.equal(vectors.finalizeReserveGas, vectors.pvgFloor + vectors.verificationFloor + vectors.callFloor[2] + vectors.pmVerificationFloor + vectors.postOpFloor);
     assert.equal(vectors.finalizeReserveGas.toString(), V.gas_policy.finalize_reserve_gas);
@@ -223,21 +224,21 @@ test('the profile pins are read, validated and absent when the deployment has no
 test('gas fields come from the pinned policy within every floor and cap, never from an estimate', () => {
     const fields = gasFields({ gasPolicy, kind: KIND.close, withInitCode: true, calldataBytes: 1_764 });
     assert.deepEqual(fields, {
-        callGasLimit: 687_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
-        paymasterVerificationGasLimit: 450_000n, paymasterPostOpGasLimit: 275_000n
+        callGasLimit: 642_500n, verificationGasLimit: 300_000n, preVerificationGas: 21_000n + 16n * 1_764n + 10_000n,
+        paymasterVerificationGasLimit: 430_000n, paymasterPostOpGasLimit: 275_000n
     });
     assert.equal(gasFields({ gasPolicy, kind: KIND.close, withInitCode: false, calldataBytes: 0 }).verificationGasLimit, 80_000n);
     assert.equal(gasFields({ gasPolicy, kind: KIND.forward, calldataBytes: 0 }).callGasLimit, 97_500n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 762_500n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 295_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.escape, calldataBytes: 0 }).callGasLimit, 680_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.finalize, calldataBytes: 0 }).callGasLimit, 287_500n);
     // Profile defaults win; the live callCap bounds the call limit; the pvg clamps to the floor and the cap.
     const profile = normalizeGasPolicy(gaslessProfileFromVectors({ spelling: 'profile' }).gas_policy);
     assert.equal(gasFields({ gasPolicy: profile, kind: KIND.close, calldataBytes: 0 }).paymasterPostOpGasLimit, 270_000n);
-    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 650_000n }).callGasLimit, 650_000n);
+    assert.equal(gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, callCap: 600_000n }).callGasLimit, 600_000n);
     assert.equal(preVerificationGasFor(gasPolicy, 0), gasPolicy.pvgFloor);
     assert.equal(preVerificationGasFor(gasPolicy, 100_000), gasPolicy.pvgCap);
     // An override outside the range is refused with the field index of GasLimitOutOfRange.
-    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 599_999n } }),
+    assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { callGasLimit: 539_999n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 2);
     assert.throws(() => gasFields({ gasPolicy, kind: KIND.close, calldataBytes: 0, overrides: { paymasterPostOpGasLimit: 350_001n } }),
         error => error.code === 'gas_limit_out_of_range' && error.data.field === 4);

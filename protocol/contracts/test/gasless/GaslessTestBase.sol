@@ -275,7 +275,7 @@ abstract contract GaslessTestBase is VaultTestBase {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         vm.setNonce(DEPLOYER, 0);
         vm.startPrank(DEPLOYER);
@@ -303,9 +303,8 @@ abstract contract GaslessTestBase is VaultTestBase {
     /// Deposits a note of `amount` gwei units at the next slot.
     function _depositUnits(uint256 commitment, uint128 amount) internal returns (uint32 id) {
         id = vault.nextNoteId();
-        uint256[32] memory path = _path(id);
         vm.prank(user);
-        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(commitment), amount, path);
+        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(commitment), amount);
     }
 
     function _bigNote(uint256 commitment) internal returns (uint32 id) {

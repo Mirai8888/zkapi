@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -712,16 +713,15 @@ func TestAddressFundingApprovesExactAmountRefreshesPathAndDepositsOnce(t *testin
 		t.Fatal("invalid deposit transaction")
 	}
 	// The prepared "0x0" path was replaced by the refreshed empty-slot path,
-	// bound to the indexer slot the deposit targets.
+	// bound to the indexer slot the deposit targets; the calldata carries
+	// only the commitment and the amount (vault revision 3).
 	f.mu.Lock()
 	_, path := f.tree()
 	f.mu.Unlock()
-	expectedPath := ""
-	for _, sibling := range fieldHexes(path) {
-		expectedPath += addressABIWord(sibling)
+	if data := hex.EncodeToString(tx.Data()); len(data) != 8+64*2 || !strings.HasPrefix(data, depositSelector) {
+		t.Fatal("deposit calldata is not deposit(bytes32,uint128)")
 	}
-	data := hex.EncodeToString(tx.Data())
-	if len(data) != 8+64*34 || !strings.HasSuffix(data, expectedPath) || strings.HasSuffix(data, strings.Repeat(addressABIWord("0x0"), 32)) {
+	if refreshed := f.savedDeposit(t).ZeroPath; !slices.Equal(refreshed, fieldHexes(path)) || slices.Equal(refreshed, slices.Repeat([]string{"0x0"}, 32)) {
 		t.Fatal("deposit witness was not refreshed")
 	}
 	if saved, err := f.h.readAddressDeposit(fundingConfig{ChainID: 1, Contract: addressTestVault, Token: addressTestToken}); err != nil || saved.Slot == nil || saved.Slot.NoteID != addressTestFirstNote {

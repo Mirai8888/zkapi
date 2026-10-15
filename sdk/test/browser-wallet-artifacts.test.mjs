@@ -136,11 +136,11 @@ test('static proof keys are the concession development setup and match its manif
         assert.equal(manifest.files[`assets/proofs/${file}`], setupManifest.files[file], file);
     }
     assert.equal(sha256(path.join(root, 'assets/proofs/request.pk')),
-        '99155d9863693ab4bcb70459563f21e19c7fd55f40a3c87733fbea8de715ab56');
+        '7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba');
     assert.equal(sha256(path.join(root, 'assets/proofs/withdrawal.pk')),
-        'b9b94b9fcd6ac96c2539d396ee583e8968299a51ca2b13cb2035e62085ab0c30');
+        '43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1');
     assert.equal(sha256(path.join(root, 'assets/proofs/request.vk')),
-        '2f0d787b32ee7e153dda038443eef4463dd59accd1d27eb751061b6a053aef81');
+        '11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf');
     // Each key file names its circuit, setup and kind.
     for (const kind of ['request', 'withdrawal']) {
         const header = `zkapi-v2-concession-v1/${manifest.setupId}/${kind}\0`;

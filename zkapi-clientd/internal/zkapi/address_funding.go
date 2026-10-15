@@ -572,6 +572,9 @@ func (h *FundingHandler) fundAddressLocked(ctx context.Context, amount uint64) (
 		return update(), err
 	}
 	if kind == "deposit" {
+		if err := h.recordSignedDepositSlot(record, deposit); err != nil {
+			return update(), err
+		}
 		depositStage = "pending"
 	}
 	return update(), nil

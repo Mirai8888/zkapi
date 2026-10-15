@@ -3,11 +3,11 @@ pragma solidity ^0.8.28;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {ZkApiVault} from "../ZkApiVault.sol";
 import {Types} from "../libraries/Types.sol";
 import {MerkleUpdateLib} from "../libraries/MerkleUpdateLib.sol";
+import {ReentrancyGuardTransient} from "../libraries/ReentrancyGuardTransient.sol";
 import {IZkApiProofAdapter} from "../interfaces/IZkApiProofAdapter.sol";
 import {IEntryPoint, IPaymaster, PackedUserOperation, UserOpGas} from "./IERC4337.sol";
 import {ZkApiWithdrawalAccount} from "./ZkApiWithdrawalAccount.sol";
@@ -29,7 +29,7 @@ import {ZkApiWithdrawalAccountFactory} from "./ZkApiWithdrawalAccountFactory.sol
 ///      that never reverts within its gas floor (no loops, no bubbling external call, guarded
 ///      arithmetic). Validation never reads block time, number or gas price, calls only contracts
 ///      with code, reads only its own and the vault's storage and writes only its own.
-contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
+contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuardTransient, IPaymaster {
     using UserOpGas for PackedUserOperation;
 
     // ------------------------------------------------------------------------------ kinds and keys
@@ -68,9 +68,9 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
     ///         the real Groth16 adapter (adapterVerifyCold), a treasury that uses its whole
     ///         100,000-gas push and a never-used treasury or destination (25,000, EIP-161), under
     ///         the 63/64 rule, plus 20,000.
-    uint256 internal constant CALL_FLOOR_CLOSE = 600_000;
-    uint256 internal constant CALL_FLOOR_ESCAPE = 650_000;
-    uint256 internal constant CALL_FLOOR_FINALIZE = 260_000;
+    uint256 internal constant CALL_FLOOR_CLOSE = 540_000;
+    uint256 internal constant CALL_FLOOR_ESCAPE = 540_000;
+    uint256 internal constant CALL_FLOOR_FINALIZE = 250_000;
     uint256 internal constant CALL_FLOOR_FORWARD = 80_000;
     /// @notice Upper bounds of callGasLimit per kind; the owner's callCap may only sit at or below.
     uint256 internal constant CALL_HARD_CAP_CLOSE = 950_000;
@@ -98,7 +98,7 @@ contract ZkApiWithdrawalPaymaster is Ownable2Step, ReentrancyGuard, IPaymaster {
     ///         vault state, or paymasterValidationCold) plus VALIDATION_GAS_SLACK, rounded up to
     ///         10,000; both measurements fit under the cap with 20,000 to spare; the cap is
     ///         MAX_VERIFICATION_GAS minus VALIDATION_GAS_SLACK.
-    uint256 internal constant PM_VERIFICATION_FLOOR = 420_000;
+    uint256 internal constant PM_VERIFICATION_FLOOR = 400_000;
     uint256 internal constant PM_VERIFICATION_CAP = 496_000;
     /// @notice postOp's own gas on a CLOSE or FORWARD settling path with a plain transfer to a
     ///         funded EOA (postOpEoa): POSTOP_BASE_GAS + EOA_PUSH_GAS is pinned at or under the

@@ -38,12 +38,12 @@
     "repository_path": "protocol/setup/v2-concession",
     "circuit_id": "zkapi-v2-concession-v1",
     "setup_id": "dev",
-    "request_proving_key_sha256": "99155d9863693ab4bcb70459563f21e19c7fd55f40a3c87733fbea8de715ab56",
-    "request_verifying_key_sha256": "2f0d787b32ee7e153dda038443eef4463dd59accd1d27eb751061b6a053aef81",
-    "withdrawal_proving_key_sha256": "b9b94b9fcd6ac96c2539d396ee583e8968299a51ca2b13cb2035e62085ab0c30",
-    "withdrawal_verifying_key_sha256": "3ddc3e2b17f0830413187f7ee34c2337e5277092dc1f190a1d907a954665b1cc",
-    "request_vk_keccak256": "0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872",
-    "withdrawal_vk_keccak256": "0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd"
+    "request_proving_key_sha256": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+    "request_verifying_key_sha256": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+    "withdrawal_proving_key_sha256": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+    "withdrawal_verifying_key_sha256": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9",
+    "request_vk_keccak256": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+    "withdrawal_vk_keccak256": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
   },
   "clearance_signing_key": {
     "x": "0x2b8dc190013bb10de72398ca462027f21b7a35eb6cb957b9319d76bd3c3c1b7d",

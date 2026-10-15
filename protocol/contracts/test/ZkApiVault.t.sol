@@ -27,11 +27,10 @@ contract ZkApiVaultTest is VaultTestBase {
         for (uint256 level = 0; level < 32; ++level) {
             root = _hashNode(root, emptySiblings[level]);
         }
-        uint256[32] memory path = _path(0);
         vm.expectEmit(address(vault));
         emit Events.NoteDeposited(0, bytes32(uint256(42)), DEPOSIT, expiry, root);
         vm.prank(user);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(42)), DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(42)), DEPOSIT);
         uint32 id = 0;
         assertEq(vault.nextNoteId(), 1);
         (bytes32 commitment, uint128 amount, uint64 expiryTs, Types.NoteStatus status) = vault.notes(id);
@@ -41,23 +40,17 @@ contract ZkApiVaultTest is VaultTestBase {
         assertEq(uint256(status), uint256(Types.NoteStatus.Active));
         assertEq(vault.currentRoot(), root);
         assertTrue(vault.knownRoots(root));
-        assertEq(vault.rootRetiredAt(emptyRoot), 1_700_000_123);
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
     function test_depositRejectsBadInputs() public {
-        uint256[32] memory path = _path(0);
         vm.startPrank(user);
         vm.expectRevert(Errors.ZeroAmount.selector);
-        vault.deposit(bytes32(uint256(42)), 0, path);
+        vault.deposit(bytes32(uint256(42)), 0);
         vm.expectRevert(Errors.InvalidCommitment.selector);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(0), DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(0), DEPOSIT);
         vm.expectRevert(Errors.InvalidFelt.selector);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(type(uint256).max), DEPOSIT, path);
-        // Siblings that do not prove the slot empty against the live root.
-        path[0] = 1;
-        vm.expectRevert(Errors.StaleRoot.selector);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(uint256(42)), DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(type(uint256).max), DEPOSIT);
         vm.stopPrank();
         assertEq(vault.nextNoteId(), 0);
     }
@@ -189,6 +182,6 @@ contract ZkApiVaultTest is VaultTestBase {
     }
 
     function _hashNode(uint256 left, uint256 right) private pure returns (uint256) {
-        return Bn254Poseidon.hash3(DOMAIN_NODE, left, right);
+        return Bn254Poseidon.compress(DOMAIN_NODE, left, right);
     }
 }

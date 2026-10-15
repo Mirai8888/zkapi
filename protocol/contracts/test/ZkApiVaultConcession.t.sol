@@ -72,7 +72,6 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(conceded, SB2);
         // No Merkle work: the root and its history are untouched.
         assertEq(vault.currentRoot(), root);
-        assertEq(vault.rootRetiredAt(root), 0);
         assertEq(address(vault).balance, uint256(DEPOSIT) * 1 gwei);
     }
 
@@ -647,9 +646,9 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         uint256[32] memory path = _path(a);
         // The root of the tree that holds only note b's leaf.
         uint256 expected = _leafOf(b);
-        expected = Bn254Poseidon.hash3(DOMAIN_NODE, 0, expected);
+        expected = Bn254Poseidon.compress(DOMAIN_NODE, 0, expected);
         for (uint256 level = 1; level < 32; ++level) {
-            expected = Bn254Poseidon.hash3(DOMAIN_NODE, expected, emptySiblings[level]);
+            expected = Bn254Poseidon.compress(DOMAIN_NODE, expected, emptySiblings[level]);
         }
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.expectEmit(address(vault));
@@ -660,7 +659,6 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertEq(vault.currentRoot(), expected);
         assertTrue(vault.knownRoots(expected));
         assertTrue(vault.isKnownRoot(oldRoot));
-        assertEq(vault.rootRetiredAt(oldRoot), vm.getBlockTimestamp());
         // A second retirement finds the leaf gone.
         vm.expectRevert(Errors.StaleRoot.selector);
         vault.retireClosedLeaf(a, path);
@@ -685,7 +683,7 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         // The tree is empty again.
         uint256 empty;
         for (uint256 level = 0; level < 32; ++level) {
-            empty = Bn254Poseidon.hash3(DOMAIN_NODE, empty, empty);
+            empty = Bn254Poseidon.compress(DOMAIN_NODE, empty, empty);
         }
         assertEq(vault.currentRoot(), empty);
     }
@@ -734,8 +732,6 @@ contract ZkApiVaultConcessionTest is VaultTestBase {
         assertNotEq(vault.currentRoot(), escape.activeRoot);
         assertNotEq(vault.currentRoot(), close.activeRoot);
         // Both roots were replaced more than ROOT_HISTORY_WINDOW ago.
-        assertGt(vm.getBlockTimestamp(), vault.rootRetiredAt(escape.activeRoot) + vault.ROOT_HISTORY_WINDOW());
-        assertGt(vm.getBlockTimestamp(), vault.rootRetiredAt(close.activeRoot) + vault.ROOT_HISTORY_WINDOW());
         escape.validUntil = uint64(vm.getBlockTimestamp());
         close.validUntil = uint64(vm.getBlockTimestamp());
         _initiate(escape);

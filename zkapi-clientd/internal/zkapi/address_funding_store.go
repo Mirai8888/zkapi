@@ -166,7 +166,7 @@ func (h *FundingHandler) loadAddress(config fundingConfig) (*addressFundingRecor
 			}
 			if entry.Kind == "deposit" {
 				data := tx.Data()
-				if len(data) != 4+34*32 || hex.EncodeToString(data[:4]) != "c588341c" {
+				if !isDepositCalldata(data) {
 					return nil, errors.New("native deposit recovery call is invalid; preserve the file")
 				}
 				amount := new(big.Int).SetBytes(data[36:68])

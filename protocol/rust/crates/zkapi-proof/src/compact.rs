@@ -28,7 +28,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ec::{AdditiveGroup, AffineRepr, CurveGroup, PrimeGroup};
 use ark_ed_on_bn254::{EdwardsAffine, EdwardsProjective, Fr as EdwardsScalarField};
-use ark_ff::{BigInteger, PrimeField, UniformRand};
+use ark_ff::{BigInteger, Field, One, PrimeField, UniformRand, Zero};
 use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, SynthesisMode};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -995,6 +995,10 @@ pub struct PoseidonManifest {
     pub mds: Vec<String>,
     pub test_hash3: String,
     pub test_hash5: String,
+    /// `merkle_node(1, 2)`: one permutation of `(DOMAIN_NODE, 1, 2)`, word 1 (the note tree's
+    /// node hash, `Bn254Poseidon.compress`).
+    #[serde(default)]
+    pub test_node: String,
 }
 
 /// Generate the single-party development setup (setup id [`DEV_SETUP_ID`])
@@ -1585,7 +1589,8 @@ import {Errors} from "../libraries/Errors.sol";
 /// @title Groth16ProofAdapter
 /// @notice zkAPI verifier for circuit __CIRCUIT_ID__, setup __SETUP_ID__, generated from its
 ///         verifying keys. Verification is standard Groth16 over the 12 request and 16 withdrawal
-///         public inputs, in the order of Types.RequestPublicInputs and Types.WithdrawalPublicInputs.
+///         public inputs, in the order of Types.RequestPublicInputs and Types.WithdrawalPublicInputs;
+///         inputs of 0, 1 and 2 skip the scalar multiplication.
 contract Groth16ProofAdapter is IZkApiProofAdapter {
     /// @notice keccak256("__CIRCUIT_ID__"): the statement this adapter verifies.
     bytes32 public constant CIRCUIT_ID_HASH = __CIRCUIT_ID_HASH__;
@@ -1654,12 +1659,25 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _verifyRequest(uint256[12] memory values, Proof memory proof) private view returns (bool) {
         G1Point memory accumulator = _requestIc(0);
         for (uint256 i = 0; i < 12; ++i) {
-            if (values[i] >= SCALAR_MODULUS) return false;
-            (G1Point memory term, bool mulOk) = _scalarMul(_requestIc(i + 1), values[i]);
-            if (!mulOk) return false;
-            bool addOk;
-            (accumulator, addOk) = _add(accumulator, term);
-            if (!addOk) return false;
+            uint256 value = values[i];
+            if (value >= SCALAR_MODULUS) return false;
+            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
+            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
+            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
+            // exit's zero nextNullifier and conceded take these paths.
+            if (value == 0) continue;
+            G1Point memory point = _requestIc(i + 1);
+            G1Point memory term = point;
+            bool ok;
+            if (value == 2) {
+                (term, ok) = _add(point, point);
+                if (!ok) return false;
+            } else if (value != 1) {
+                (term, ok) = _scalarMul(point, value);
+                if (!ok) return false;
+            }
+            (accumulator, ok) = _add(accumulator, term);
+            if (!ok) return false;
         }
         return _pairing(
             _negate(proof.a), proof.b,
@@ -1672,12 +1690,25 @@ contract Groth16ProofAdapter is IZkApiProofAdapter {
     function _verifyWithdrawal(uint256[16] memory values, Proof memory proof) private view returns (bool) {
         G1Point memory accumulator = _withdrawalIc(0);
         for (uint256 i = 0; i < 16; ++i) {
-            if (values[i] >= SCALAR_MODULUS) return false;
-            (G1Point memory term, bool mulOk) = _scalarMul(_withdrawalIc(i + 1), values[i]);
-            if (!mulOk) return false;
-            bool addOk;
-            (accumulator, addOk) = _add(accumulator, term);
-            if (!addOk) return false;
+            uint256 value = values[i];
+            if (value >= SCALAR_MODULUS) return false;
+            // 0 · IC is the point at infinity, the neutral element of the sum: skipped. 1 · IC and
+            // 2 · IC need no scalar multiplication (6,000 gas) either: the point itself, and one
+            // addition. The protocol version (2), a close's kind (1), an escape's kind (0) and an
+            // exit's zero nextNullifier and conceded take these paths.
+            if (value == 0) continue;
+            G1Point memory point = _withdrawalIc(i + 1);
+            G1Point memory term = point;
+            bool ok;
+            if (value == 2) {
+                (term, ok) = _add(point, point);
+                if (!ok) return false;
+            } else if (value != 1) {
+                (term, ok) = _scalarMul(point, value);
+                if (!ok) return false;
+            }
+            (accumulator, ok) = _add(accumulator, term);
+            if (!ok) return false;
         }
         return _pairing(
             _negate(proof.a), proof.b,
@@ -1800,15 +1831,181 @@ fn poseidon_manifest() -> PoseidonManifest {
             Fr::from(4u64),
             Fr::from(5u64),
         ])),
+        test_node: field_hex(&crate::groth16::merkle_node(Fr::from(1u64), Fr::from(2u64))),
     }
+}
+
+/// The optimized Poseidon constants of the Solidity library (the form of the Poseidon reference
+/// implementation): 372 words, in the layout `Bn254Poseidon.CONSTANTS` documents. Partial rounds
+/// add one constant (the constants of the two words that skip the S-box move through the linear
+/// layer into the next round's) and multiply by a sparse matrix: the round's matrix `L` is
+/// factored as `L = M' M''` with `M'' = [[l00, l01, l02], [w1, 1, 0], [w2, 0, 1]]` and
+/// `M' = [[1, 0, 0], [0, l11, l12], [0, l21, l22]]`, and `M'`, which commutes with the next
+/// round's constant and S-box (they touch word 0 only), folds into the next round's matrix
+/// `M · M'`. The last partial round keeps its dense matrix: the full round after it mixes every
+/// word. [`optimized_poseidon_permutation`] is the permutation these constants describe; the
+/// tests check it against the plain one.
+pub(crate) fn optimized_poseidon_constants() -> Vec<Fr> {
+    const RF_HALF: usize = 4;
+    const RP: usize = 57;
+    let config = crate::groth16::poseidon_config();
+    assert_eq!(config.full_rounds, 2 * RF_HALF);
+    assert_eq!(config.partial_rounds, RP);
+    let rounds = 2 * RF_HALF + RP;
+    let m: [[Fr; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| config.mds[i][j]));
+    let mut c: Vec<[Fr; 3]> = (0..rounds)
+        .map(|r| std::array::from_fn(|i| config.ark[r][i]))
+        .collect();
+    let mat_vec = |a: &[[Fr; 3]; 3], v: [Fr; 3]| -> [Fr; 3] {
+        std::array::from_fn(|i| a[i][0] * v[0] + a[i][1] * v[1] + a[i][2] * v[2])
+    };
+    let mat_mul = |a: &[[Fr; 3]; 3], b: &[[Fr; 3]; 3]| -> [[Fr; 3]; 3] {
+        std::array::from_fn(|i| {
+            std::array::from_fn(|j| a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j])
+        })
+    };
+    let (first_partial, last_partial) = (RF_HALF, RF_HALF + RP - 1);
+    for r in first_partial..=last_partial {
+        let d = mat_vec(&m, [Fr::zero(), c[r][1], c[r][2]]);
+        c[r] = [c[r][0], Fr::zero(), Fr::zero()];
+        for i in 0..3 {
+            c[r + 1][i] += d[i];
+        }
+    }
+    let mut words = Vec::with_capacity(372);
+    for round in c.iter().take(RF_HALF) {
+        words.extend(round);
+    }
+    let mut l = m;
+    for round in c.iter().take(last_partial).skip(first_partial) {
+        let det = l[1][1] * l[2][2] - l[1][2] * l[2][1];
+        let inv = det.inverse().expect("the MDS sub-block is invertible");
+        let sub_inv = [
+            [l[2][2] * inv, -l[1][2] * inv],
+            [-l[2][1] * inv, l[1][1] * inv],
+        ];
+        let w = [
+            sub_inv[0][0] * l[1][0] + sub_inv[0][1] * l[2][0],
+            sub_inv[1][0] * l[1][0] + sub_inv[1][1] * l[2][0],
+        ];
+        words.push(round[0]);
+        words.extend(l[0]);
+        words.extend(w);
+        let m_prime = [
+            [Fr::one(), Fr::zero(), Fr::zero()],
+            [Fr::zero(), l[1][1], l[1][2]],
+            [Fr::zero(), l[2][1], l[2][2]],
+        ];
+        l = mat_mul(&m, &m_prime);
+    }
+    words.extend(c[last_partial]);
+    for row in l {
+        words.extend(row);
+    }
+    for round in c.iter().skip(RF_HALF + RP) {
+        words.extend(round);
+    }
+    assert_eq!(words.len(), 372);
+    words
+}
+
+/// The permutation [`optimized_poseidon_constants`] describes, as the Solidity library runs it.
+#[cfg(test)]
+pub(crate) fn optimized_poseidon_permutation(words: &[Fr], mut s: [Fr; 3]) -> [Fr; 3] {
+    let config = crate::groth16::poseidon_config();
+    let pow5 = |x: Fr| x.square().square() * x;
+    let dense = |s: [Fr; 3], a: &[Fr]| -> [Fr; 3] {
+        std::array::from_fn(|i| a[3 * i] * s[0] + a[3 * i + 1] * s[1] + a[3 * i + 2] * s[2])
+    };
+    let mds: Vec<Fr> = config.mds.iter().flatten().copied().collect();
+    let mut at = 0;
+    for _ in 0..4 {
+        s = dense(
+            [
+                pow5(s[0] + words[at]),
+                pow5(s[1] + words[at + 1]),
+                pow5(s[2] + words[at + 2]),
+            ],
+            &mds,
+        );
+        at += 3;
+    }
+    for _ in 0..56 {
+        let x = pow5(s[0] + words[at]);
+        let (top, w1, w2) = (&words[at + 1..at + 4], words[at + 4], words[at + 5]);
+        s = [
+            top[0] * x + top[1] * s[1] + top[2] * s[2],
+            s[1] + w1 * x,
+            s[2] + w2 * x,
+        ];
+        at += 6;
+    }
+    s = dense(
+        [
+            pow5(s[0] + words[at]),
+            s[1] + words[at + 1],
+            s[2] + words[at + 2],
+        ],
+        &words[at + 3..at + 12],
+    );
+    at += 12;
+    for _ in 0..4 {
+        s = dense(
+            [
+                pow5(s[0] + words[at]),
+                pow5(s[1] + words[at + 1]),
+                pow5(s[2] + words[at + 2]),
+            ],
+            &mds,
+        );
+        at += 3;
+    }
+    assert_eq!(at, 372);
+    s
+}
+
+/// Rewrites the generated sources of an existing setup directory from its keys: the Solidity
+/// adapter and Poseidon library, and the manifest's `poseidon` section. For a change to the
+/// generators that leaves the keys alone (the import and the round-trip test regenerate them the
+/// same way).
+pub fn refresh_setup_sources(directory: impl AsRef<Path>) -> Result<()> {
+    let directory = directory.as_ref();
+    let (request_vk, setup_id): (VerifyingKey<Bn254>, String) = decode_compressed(
+        &read_key_file(directory, REQUEST_VERIFYING_KEY_FILE)?,
+        KeyKind::Request,
+    )?;
+    let (withdrawal_vk, withdrawal_setup): (VerifyingKey<Bn254>, String) = decode_compressed(
+        &read_key_file(directory, WITHDRAWAL_VERIFYING_KEY_FILE)?,
+        KeyKind::Withdrawal,
+    )?;
+    ensure!(
+        setup_id == withdrawal_setup,
+        "the keys are of different setups"
+    );
+    let manifest_path = directory.join(SETUP_MANIFEST_FILE);
+    let mut manifest: SetupManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).context("read setup manifest")?)?;
+    manifest.poseidon = poseidon_manifest();
+    let mut manifest_json = serde_json::to_vec_pretty(&manifest).context("encode manifest")?;
+    manifest_json.push(b'\n');
+    fs::write(&manifest_path, manifest_json).context("write setup manifest")?;
+    fs::write(
+        directory.join(SOLIDITY_POSEIDON_FILE),
+        poseidon_solidity_source(),
+    )
+    .context("write Solidity Poseidon library")?;
+    fs::write(
+        directory.join(SOLIDITY_VERIFIER_FILE),
+        groth16_solidity_source(&setup_id, &request_vk, &withdrawal_vk),
+    )
+    .context("write Solidity Groth16 adapter")?;
+    Ok(())
 }
 
 fn poseidon_solidity_source() -> String {
     let config = crate::groth16::poseidon_config();
-    let round_constants = config
-        .ark
+    let constants = optimized_poseidon_constants()
         .iter()
-        .flatten()
         .map(|value| hex::encode(prime_field_bytes(value)))
         .collect::<String>();
     let mds = config
@@ -1821,126 +2018,345 @@ fn poseidon_solidity_source() -> String {
 pragma solidity ^0.8.28;
 
 /// @title Bn254Poseidon
-/// @notice Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters.
-/// @dev Width 3, rate 2, x^5 S-box, 8 full rounds, and 57 partial rounds.
+/// @notice Poseidon over the BN254 scalar field, generated from zkAPI v2's arkworks parameters:
+///         width 3, rate 2, x^5 S-box, 8 full rounds and 57 partial rounds. compress is the note
+///         tree's node hash (one permutation, the domain in the capacity lane); hash5 is the sponge
+///         (zkapi_core::v2::hash_fields) over five inputs, the note leaf.
+/// @dev The permutation is in the optimized form of the Poseidon reference implementation: every
+///      partial round adds one constant (the constants of the two words that skip the S-box are
+///      moved through the linear layer into the next round) and multiplies by a sparse matrix (the
+///      MDS matrix factored per round, the dense factor folded into the next round's matrix); the
+///      hash function is unchanged. The rounds are Yul with the state in three locals and the round
+///      constants read from memory, where each entry point copies them once.
 library Bn254Poseidon {
     uint256 internal constant FIELD_MODULUS =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
-    bytes internal constant ROUND_CONSTANTS = hex"__ROUND_CONSTANTS__";
+    /// @dev 372 words: the first 4 full rounds (3 constants each), 56 partial rounds (the
+    ///      constant, the sparse matrix's first row and its first column below the diagonal), the
+    ///      last partial round (3 constants and its dense matrix), the last 4 full rounds.
+    bytes internal constant CONSTANTS =
+        hex"__CONSTANTS__";
 
-    function hash3(uint256 a, uint256 b, uint256 c) public pure returns (uint256 result) {
+    /// @notice One permutation of the state (capacity, left, right), its first rate lane: the
+    ///         two-to-one compression of the note tree, zkapi_core::v2::compress_fields.
+    function compress(uint256 capacity, uint256 left, uint256 right) public pure returns (uint256 result) {
         uint256 freeMemoryPointer;
-        assembly ("memory-safe") { freeMemoryPointer := mload(0x40) }
-        bytes memory constants = ROUND_CONSTANTS;
-        result = _hash3(a, b, c, constants);
-        assembly ("memory-safe") { mstore(0x40, freeMemoryPointer) }
+        assembly ("memory-safe") {
+            freeMemoryPointer := mload(0x40)
+        }
+        (, result,) = _permute(capacity, left, right, _constants());
+        assembly ("memory-safe") {
+            mstore(0x40, freeMemoryPointer)
+        }
     }
 
-    function hash5(uint256 a, uint256 b, uint256 c, uint256 d, uint256 e)
-        public pure returns (uint256 result)
-    {
+    /// @notice The sponge over five inputs: zkapi_core::v2::hash_fields, the note leaf's hash.
+    function hash5(uint256 a, uint256 b, uint256 c, uint256 d, uint256 e) public pure returns (uint256 result) {
         uint256 freeMemoryPointer;
-        assembly ("memory-safe") { freeMemoryPointer := mload(0x40) }
-        bytes memory constants = ROUND_CONSTANTS;
-        uint256[3] memory state;
-        state[1] = a;
-        state[2] = b;
-        _permute(state, constants);
-        state[1] = addmod(state[1], c, FIELD_MODULUS);
-        state[2] = addmod(state[2], d, FIELD_MODULUS);
-        _permute(state, constants);
-        state[1] = addmod(state[1], e, FIELD_MODULUS);
-        _permute(state, constants);
-        result = state[1];
-        assembly ("memory-safe") { mstore(0x40, freeMemoryPointer) }
+        assembly ("memory-safe") {
+            freeMemoryPointer := mload(0x40)
+        }
+        uint256 constants = _constants();
+        (uint256 s0, uint256 s1, uint256 s2) = _permute(0, a, b, constants);
+        (s0, s1, s2) = _permute(s0, addmod(s1, c, FIELD_MODULUS), addmod(s2, d, FIELD_MODULUS), constants);
+        (, result,) = _permute(s0, addmod(s1, e, FIELD_MODULUS), s2, constants);
+        assembly ("memory-safe") {
+            mstore(0x40, freeMemoryPointer)
+        }
     }
 
-    function hash3PairPath32(
-        uint256 domain,
+    /// @notice The roots of the depth-32 tree with oldLeaf and with newLeaf at index, from the
+    ///         leaf's siblings (bottom up), and the new path's node at nodeLevel (the leaf at 0,
+    ///         the root at 32): 64 compressions with capacity as the node domain.
+    function compressPairPath32(
+        uint256 capacity,
         uint32 index,
         uint256 oldLeaf,
         uint256 newLeaf,
-        uint256[32] calldata siblings
-    ) public pure returns (uint256 oldRoot, uint256 newRoot) {
+        uint256[32] calldata siblings,
+        uint256 nodeLevel
+    ) public pure returns (uint256 oldRoot, uint256 newRoot, uint256 newNode) {
         uint256 freeMemoryPointer;
-        assembly ("memory-safe") { freeMemoryPointer := mload(0x40) }
-        bytes memory constants = ROUND_CONSTANTS;
+        assembly ("memory-safe") {
+            freeMemoryPointer := mload(0x40)
+        }
+        uint256 constants = _constants();
         oldRoot = oldLeaf;
         newRoot = newLeaf;
+        newNode = newLeaf;
+        for (uint256 level = 0; level < 32;) {
+            if (level == nodeLevel) newNode = newRoot;
+            uint256 sibling = siblings[level];
+            if (((index >> level) & 1) == 0) {
+                (, oldRoot,) = _permute(capacity, oldRoot, sibling, constants);
+                (, newRoot,) = _permute(capacity, newRoot, sibling, constants);
+            } else {
+                (, oldRoot,) = _permute(capacity, sibling, oldRoot, constants);
+                (, newRoot,) = _permute(capacity, sibling, newRoot, constants);
+            }
+            unchecked {
+                ++level;
+            }
+        }
+        if (nodeLevel >= 32) newNode = newRoot;
+        assembly ("memory-safe") {
+            mstore(0x40, freeMemoryPointer)
+        }
+    }
+
+    /// @notice The root of the depth-32 tree with leaf at index, from the leaf's siblings (bottom
+    ///         up), and the node the insertion completes: the path's node at the level of the
+    ///         lowest zero bit of index (the leaf itself when index is even; the root when every
+    ///         bit is set). An append-only tree stores that node as the left sibling of the
+    ///         insertions that follow.
+    function insertPath32(uint256 capacity, uint32 index, uint256 leaf, uint256[32] memory siblings)
+        public
+        pure
+        returns (uint256 root, uint256 completed)
+    {
+        uint256 freeMemoryPointer;
+        assembly ("memory-safe") {
+            freeMemoryPointer := mload(0x40)
+        }
+        uint256 constants = _constants();
+        root = leaf;
+        completed = leaf;
+        bool completing = true;
         for (uint256 level = 0; level < 32;) {
             uint256 sibling = siblings[level];
             if (((index >> level) & 1) == 0) {
-                oldRoot = _hash3(domain, oldRoot, sibling, constants);
-                newRoot = _hash3(domain, newRoot, sibling, constants);
+                if (completing) {
+                    completed = root;
+                    completing = false;
+                }
+                (, root,) = _permute(capacity, root, sibling, constants);
             } else {
-                oldRoot = _hash3(domain, sibling, oldRoot, constants);
-                newRoot = _hash3(domain, sibling, newRoot, constants);
+                (, root,) = _permute(capacity, sibling, root, constants);
             }
-            unchecked { ++level; }
+            unchecked {
+                ++level;
+            }
         }
-        assembly ("memory-safe") { mstore(0x40, freeMemoryPointer) }
+        if (completing) completed = root;
+        assembly ("memory-safe") {
+            mstore(0x40, freeMemoryPointer)
+        }
     }
 
-    function _hash3(uint256 a, uint256 b, uint256 c, bytes memory constants)
-        private pure returns (uint256 result)
+    /// @dev The round constants copied to memory; returns the offset of their first word.
+    function _constants() private pure returns (uint256 offset) {
+        bytes memory constants = CONSTANTS;
+        assembly ("memory-safe") {
+            offset := add(constants, 0x20)
+        }
+    }
+
+    /// @dev One Poseidon permutation: 4 full rounds, 57 partial rounds, 4 full rounds. The round
+    ///      groups are separate functions so that the stack pressure of a full round (three S-box
+    ///      outputs and a dense matrix) does not make the compiler keep the partial rounds' values
+    ///      in memory.
+    function _permute(uint256 s0, uint256 s1, uint256 s2, uint256 constants)
+        private
+        pure
+        returns (uint256, uint256, uint256)
     {
-        uint256[3] memory state;
-        state[1] = a;
-        state[2] = b;
-        _permute(state, constants);
-        state[1] = addmod(state[1], c, FIELD_MODULUS);
-        _permute(state, constants);
-        result = state[1];
+        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants);
+        (s0, s1, s2) = _partialRounds(s0, s1, s2, constants + 384);
+        (s0, s1, s2) = _lastPartialRound(s0, s1, s2, constants + 11136);
+        (s0, s1, s2) = _fullRounds(s0, s1, s2, constants + 11520);
+        return (s0, s1, s2);
     }
 
-    function _permute(uint256[3] memory state, bytes memory constants) private pure {
-        uint256 round;
-        for (; round < 4;) {
-            _round(state, constants, round, true);
-            unchecked { ++round; }
-        }
-        for (; round < 61;) {
-            _round(state, constants, round, false);
-            unchecked { ++round; }
-        }
-        for (; round < 65;) {
-            _round(state, constants, round, true);
-            unchecked { ++round; }
-        }
-    }
-
-    function _round(uint256[3] memory state, bytes memory constants, uint256 round, bool full)
-        private pure
+    /// @dev Four full rounds whose constants start at off.
+    function _fullRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
+        private
+        pure
+        returns (uint256, uint256, uint256)
     {
-        uint256 offset = round * 3;
-        state[0] = addmod(state[0], _constant(constants, offset), FIELD_MODULUS);
-        state[1] = addmod(state[1], _constant(constants, offset + 1), FIELD_MODULUS);
-        state[2] = addmod(state[2], _constant(constants, offset + 2), FIELD_MODULUS);
-        state[0] = _pow5(state[0]);
-        if (full) {
-            state[1] = _pow5(state[1]);
-            state[2] = _pow5(state[2]);
+        assembly ("memory-safe") {
+            for { let end := add(off, 384) } lt(off, end) { off := add(off, 96) } {
+                let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                let y :=
+                    addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                let z :=
+                    addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                {
+                    let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                    x := mulmod(
+                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                        x,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    )
+                }
+                {
+                    let q := mulmod(y, y, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                    y := mulmod(
+                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                        y,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    )
+                }
+                {
+                    let q := mulmod(z, z, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                    z := mulmod(
+                        mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                        z,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    )
+                }
+                s0 := addmod(
+                    addmod(
+                        mulmod(
+                            x,
+                            __M0__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        mulmod(
+                            y,
+                            __M1__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    mulmod(
+                        z,
+                        __M2__,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                )
+                s1 := addmod(
+                    addmod(
+                        mulmod(
+                            x,
+                            __M3__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        mulmod(
+                            y,
+                            __M4__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    mulmod(
+                        z,
+                        __M5__,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                )
+                s2 := addmod(
+                    addmod(
+                        mulmod(
+                            x,
+                            __M6__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        mulmod(
+                            y,
+                            __M7__,
+                            0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                        ),
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    mulmod(
+                        z,
+                        __M8__,
+                        0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                    ),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                )
+            }
         }
-        uint256 x = state[0];
-        uint256 y = state[1];
-        uint256 z = state[2];
-        state[0] = addmod(addmod(mulmod(x, __M0__, FIELD_MODULUS), mulmod(y, __M1__, FIELD_MODULUS), FIELD_MODULUS), mulmod(z, __M2__, FIELD_MODULUS), FIELD_MODULUS);
-        state[1] = addmod(addmod(mulmod(x, __M3__, FIELD_MODULUS), mulmod(y, __M4__, FIELD_MODULUS), FIELD_MODULUS), mulmod(z, __M5__, FIELD_MODULUS), FIELD_MODULUS);
-        state[2] = addmod(addmod(mulmod(x, __M6__, FIELD_MODULUS), mulmod(y, __M7__, FIELD_MODULUS), FIELD_MODULUS), mulmod(z, __M8__, FIELD_MODULUS), FIELD_MODULUS);
+        return (s0, s1, s2);
     }
 
-    function _pow5(uint256 value) private pure returns (uint256) {
-        uint256 square = mulmod(value, value, FIELD_MODULUS);
-        return mulmod(mulmod(square, square, FIELD_MODULUS), value, FIELD_MODULUS);
+    /// @dev The 56 partial rounds with a sparse matrix, constants at off (6 words each): the new
+    ///      first word is a full row, the other two gain a multiple of the S-box output.
+    function _partialRounds(uint256 s0, uint256 s1, uint256 s2, uint256 off)
+        private
+        pure
+        returns (uint256, uint256, uint256)
+    {
+        assembly ("memory-safe") {
+            let P := 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+            // Never taken (calldata is far smaller). The modulus must reach the rounds as one stack
+            // value: left a single literal, the optimizer inlines it into every use and the code
+            // transform then places each through codecopy and scratch memory, at a multiple of the
+            // gas. A second, runtime-opaque definition prevents that.
+            if gt(calldatasize(), 0xffffffffffff) { P := 1 }
+            for { let end := add(off, 10752) } lt(off, end) { off := add(off, 192) } {
+                let x := addmod(s0, mload(off), P)
+                {
+                    let q := mulmod(x, x, P)
+                    x := mulmod(mulmod(q, q, P), x, P)
+                }
+                s0 := addmod(
+                    addmod(mulmod(x, mload(add(off, 32)), P), mulmod(s1, mload(add(off, 64)), P), P),
+                    mulmod(s2, mload(add(off, 96)), P),
+                    P
+                )
+                s1 := addmod(s1, mulmod(x, mload(add(off, 128)), P), P)
+                s2 := addmod(s2, mulmod(x, mload(add(off, 160)), P), P)
+            }
+        }
+        return (s0, s1, s2);
     }
 
-    function _constant(bytes memory constants, uint256 index) private pure returns (uint256 value) {
-        assembly ("memory-safe") { value := mload(add(add(constants, 0x20), mul(index, 0x20))) }
+    /// @dev The last partial round, with its dense matrix: constants at off (3 words), the matrix
+    ///      after them (9 words, row-major).
+    function _lastPartialRound(uint256 s0, uint256 s1, uint256 s2, uint256 off)
+        private
+        pure
+        returns (uint256, uint256, uint256)
+    {
+        assembly ("memory-safe") {
+            let x := addmod(s0, mload(off), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+            let y := addmod(s1, mload(add(off, 32)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+            let z := addmod(s2, mload(add(off, 64)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+            {
+                let q := mulmod(x, x, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001)
+                x := mulmod(
+                    mulmod(q, q, 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    x,
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                )
+            }
+            s0 := addmod(
+                addmod(
+                    mulmod(x, mload(add(off, 96)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    mulmod(y, mload(add(off, 128)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                ),
+                mulmod(z, mload(add(off, 160)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+            )
+            s1 := addmod(
+                addmod(
+                    mulmod(x, mload(add(off, 192)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    mulmod(y, mload(add(off, 224)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                ),
+                mulmod(z, mload(add(off, 256)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+            )
+            s2 := addmod(
+                addmod(
+                    mulmod(x, mload(add(off, 288)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    mulmod(y, mload(add(off, 320)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                    0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+                ),
+                mulmod(z, mload(add(off, 352)), 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001),
+                0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+            )
+        }
+        return (s0, s1, s2);
     }
 }
 "#
-    .replace("__ROUND_CONSTANTS__", &round_constants);
+    .replace("__CONSTANTS__", &constants);
     for (index, value) in mds.iter().enumerate() {
         source = source.replace(&format!("__M{index}__"), value);
     }
@@ -2210,13 +2626,40 @@ mod tests {
     }
 
     #[test]
+    fn optimized_poseidon_constants_describe_the_same_permutation() {
+        let words = optimized_poseidon_constants();
+        let permute = |s: [Fr; 3]| optimized_poseidon_permutation(&words, s);
+        // The node compression (one permutation, word 1 out) and the five-input sponge (three
+        // permutations, every word carried between them), against zkapi-core's arkworks sponge.
+        for seed in 0u64..4 {
+            let (a, b, c, d, e) = (
+                Fr::from(seed * 7 + 1),
+                Fr::from(seed * 11 + 2),
+                Fr::from(seed * 13 + 3),
+                Fr::from(seed * 17 + 4),
+                Fr::from(seed * 19 + 5),
+            );
+            let domain = Fr::from_be_bytes_mod_order(b"zkapi.v2.node");
+            assert_eq!(
+                permute([domain, a, b])[1],
+                core::compress_fields(domain, a, b)
+            );
+            let s = permute([Fr::zero(), a, b]);
+            let s = permute([s[0], s[1] + c, s[2] + d]);
+            let s = permute([s[0], s[1] + e, s[2]]);
+            assert_eq!(s[1], core::hash_fields(&[a, b, c, d, e]));
+        }
+    }
+
+    #[test]
     fn request_row_budget_holds() {
         let shape = check_request_row_budget().unwrap();
         assert_eq!(shape.public_inputs, REQUEST_PUBLIC_INPUTS);
         assert_eq!(shape.domain_size, 1 << 15);
         let withdrawal = circuit_shape(KeyKind::Withdrawal).unwrap();
         assert_eq!(withdrawal.public_inputs, WITHDRAWAL_PUBLIC_INPUTS);
-        assert_eq!(withdrawal.domain_size, 1 << 16);
+        // One-permutation tree nodes brought the withdrawal circuit under 2^15 rows as well.
+        assert_eq!(withdrawal.domain_size, 1 << 15);
         eprintln!("request {shape:?}\nwithdrawal {withdrawal:?}");
     }
 

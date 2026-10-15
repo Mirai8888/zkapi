@@ -355,10 +355,11 @@ struct ToyCircuit {
 }
 
 /// The toy ceremony's powers of tau is shaped like Hermez's smallest public
-/// file that fits the circuits (power 16, truncated from a larger one): the
-/// withdrawal circuit's H query uses section 12's top block, computed with
-/// the power the file lacks.
-const TOY_POWER: u32 = 16;
+/// file that fits the circuits (power 15 since one-permutation tree nodes
+/// brought both under 2^15 rows, truncated from a larger one): both H
+/// queries use section 12's top block, computed with the power the file
+/// lacks.
+const TOY_POWER: u32 = 15;
 
 struct Toy {
     secrets: Secrets,
@@ -667,16 +668,16 @@ fn toy_ceremony_imports_end_to_end() {
     drop(ptau_bytes);
     // The file reader returns exactly the bases the keys were made from.
     let opened = Ptau::open(&ptau).unwrap();
-    assert_eq!(opened.power(), 16);
+    assert_eq!(opened.power(), TOY_POWER);
     assert_eq!(hex::encode(opened.sha256()), ptau_sha256);
     assert_eq!(
         opened.lagrange_bases(1 << 15).unwrap(),
         toy.request.bases,
         "request bases"
     );
-    // The withdrawal H query comes from section 12's top block.
+    // Both H queries come from section 12's top block.
     assert_eq!(
-        opened.lagrange_bases(1 << 16).unwrap(),
+        opened.lagrange_bases(1 << 15).unwrap(),
         toy.withdrawal.bases,
         "withdrawal bases"
     );
@@ -684,7 +685,7 @@ fn toy_ceremony_imports_end_to_end() {
     assert_eq!(opened.public_transcript(PUBLIC_PTAU), None);
     let toy_transcript = PublicPtau {
         name: "toy.ptau",
-        power: 16,
+        power: TOY_POWER,
         blake2b512: Box::leak(hex::encode(opened.blake2b512()).into_boxed_str()),
     };
     assert_eq!(

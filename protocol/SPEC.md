@@ -13,13 +13,19 @@ order, encodings, and constraints.
 - Circuit field: BN254 scalar field, modulus
   `0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001`.
 - Hash: domain-separated Poseidon, exponent 5, rate 2, capacity 1,
-  8 full rounds and 57 partial rounds.
+  8 full rounds and 57 partial rounds. Leaves, nullifiers, commitments and
+  signatures are sponge hashes with the domain as the first absorbed element;
+  a note-tree node is one permutation of `(domain "zkapi.v2.node", left,
+  right)`, its first rate lane (the domain in the capacity lane), so a node
+  costs one permutation and no sponge hash can collide with one.
 - Balance commitment: `E(B, r, L) = B*G + r*H + L*J` on Baby-JubJub,
   where `L` is the private active-note leaf.
 - Server authentication: separate Baby-JubJub Schnorr keys for state and
   clearance signatures, pinned by the deployment.
 - Note tree: depth 32, zero leaf 0, note ID as the leaf index; append-only
-  except for the retired leaves of closed notes.
+  except for the retired leaves of closed notes. The vault keeps the tree's
+  frontier and appends each deposit's leaf itself, without a Merkle proof;
+  only `retireClosedLeaf` takes siblings.
 
 [Native hash functions](rust/crates/zkapi-core/src/v2.rs) and
 [circuit constraints](rust/crates/zkapi-proof/src/groth16.rs) use the

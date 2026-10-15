@@ -4622,9 +4622,12 @@ dependencies = [
 name = "zkapi-core"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "ark-bn254",
  "ark-crypto-primitives",
  "ark-ff",
+ "hex",
+ "serde_json",
  "zkapi-types",
 ]
 

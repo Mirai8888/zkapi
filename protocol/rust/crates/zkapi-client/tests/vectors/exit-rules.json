@@ -1627,7 +1627,7 @@
       "bound_at_state": "1000000",
       "state_seq": 1,
       "exported_at": 1800000000,
-      "merkle_path_root": "0x2560114278b4ef7e23e4f23422250dc35d21da8b7aa6b4a3554d67cba4596a09",
+      "merkle_path_root": "0x18bb7959b7676a4a4b9404dc4c4d65ada97ec901d26d4719ff4fc64e2a851eb6",
       "merkle_path_siblings": 32
     }
   }

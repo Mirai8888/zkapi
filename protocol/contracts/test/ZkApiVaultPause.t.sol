@@ -55,7 +55,7 @@ contract ZkApiVaultPauseTest is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         vault = new ZkApiVault(
             treasury,
@@ -419,10 +419,9 @@ contract ZkApiVaultPauseTest is Test {
         assertTrue(vault.paused());
         vault.initiateEscapeWithdrawal(escape, "");
         vault.mutualClose(close, "");
-        uint256[32] memory path = _path(3);
         vm.prank(user);
         vm.expectRevert(Errors.Paused.selector);
-        vault.deposit{value: uint256(UNITS) * 1 gwei}(bytes32(uint256(45)), UNITS, path);
+        vault.deposit{value: uint256(UNITS) * 1 gwei}(bytes32(uint256(45)), UNITS);
 
         // The escape finalizes while still paused; the sweep never opens.
         vm.warp(_deadline(escaping));
@@ -990,9 +989,8 @@ contract ZkApiVaultPauseTest is Test {
 
     function _deposit(bytes32 commitment) private returns (uint32 id) {
         id = vault.nextNoteId();
-        uint256[32] memory path = _path(id);
         vm.prank(user);
-        vault.deposit{value: uint256(UNITS) * 1 gwei}(commitment, UNITS, path);
+        vault.deposit{value: uint256(UNITS) * 1 gwei}(commitment, UNITS);
     }
 
     function _deposit(uint256 commitment) private returns (uint32) {
@@ -1092,7 +1090,7 @@ contract ZkApiVaultPauseTest is Test {
         siblings = emptySiblings;
         siblings[0] = _leafAt(index ^ 1);
         uint32 otherPair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
+        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _leafAt(otherPair * 2), _leafAt(otherPair * 2 + 1));
     }
 
     /// A close (kind 1) or an escape (kind 0, successor nullifier + SUCCESSOR) with a 700,000

@@ -44,7 +44,7 @@ contract ZkApiVaultGroth16Test is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory parameters,) = _withdrawal("escape_a2");
@@ -479,7 +479,6 @@ contract ZkApiVaultGroth16Test is Test {
         _depositOther(3, 0x5678);
         vm.warp(vm.getBlockTimestamp() + 2 days);
         assertNotEq(vault.currentRoot(), rootA);
-        assertGt(vm.getBlockTimestamp(), uint256(vault.rootRetiredAt(rootA)) + vault.ROOT_HISTORY_WINDOW());
 
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal("escape_a2_at_root_a");
         assertEq(escape.activeRoot, rootA);
@@ -541,7 +540,6 @@ contract ZkApiVaultGroth16Test is Test {
         _retire(0);
         _depositOther(3, 0x5678);
         vm.warp(vm.getBlockTimestamp() + 2 days);
-        assertGt(vm.getBlockTimestamp(), uint256(vault.rootRetiredAt(rootAB)) + vault.ROOT_HISTORY_WINDOW());
 
         (Types.WithdrawalPublicInputs memory close, bytes memory proof) = _withdrawal("close_b0");
         assertEq(close.activeRoot, rootAB);
@@ -617,17 +615,15 @@ contract ZkApiVaultGroth16Test is Test {
 
     function _depositA() private {
         bytes32 registration = vm.parseJsonBytes32(fixtures, ".note_a_registration");
-        uint256[32] memory path = _path(0);
         vm.prank(USER);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT);
         assertEq(_leafOf(0), vm.parseJsonUint(fixtures, ".note_a_leaf"));
     }
 
     function _depositB() private {
         bytes32 registration = vm.parseJsonBytes32(fixtures, ".note_b_registration");
-        uint256[32] memory path = _path(1);
         vm.prank(USER);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(registration, DEPOSIT);
         assertEq(_leafOf(1), vm.parseJsonUint(fixtures, ".note_b_leaf"));
     }
 
@@ -639,9 +635,8 @@ contract ZkApiVaultGroth16Test is Test {
 
     function _depositOther(uint32 expectedId, uint256 commitment) private {
         assertEq(vault.nextNoteId(), expectedId);
-        uint256[32] memory path = _path(expectedId);
         vm.prank(USER);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT);
     }
 
     function _retire(uint32 noteId) private {
@@ -667,7 +662,7 @@ contract ZkApiVaultGroth16Test is Test {
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
     }
 
     function _initiate(string memory name) private returns (Types.WithdrawalPublicInputs memory, bytes memory) {

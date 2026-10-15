@@ -323,12 +323,13 @@ func (h *FundingHandler) refreshAddressDeposit(ctx context.Context, deposit *dep
 	if json.Unmarshal(raw, &refreshed) != nil || len(refreshed.ZeroPath) != 32 {
 		return "", errors.New("invalid refreshed deposit path")
 	}
-	data := "0xc588341c" + addressABIWord(deposit.Commitment) + fmt.Sprintf("%064x", deposit.Amount)
+	// deposit(bytes32,uint128): the vault appends the leaf itself (revision 3). The path stays
+	// with the record, for the note's exit proof.
+	data := depositCalldata(deposit.Commitment, deposit.Amount)
 	for _, sibling := range refreshed.ZeroPath {
 		if !isField(sibling) {
 			return "", errors.New("invalid refreshed deposit path")
 		}
-		data += addressABIWord(sibling)
 	}
 	deposit.ZeroPath = refreshed.ZeroPath
 	if err = h.save(*deposit); err != nil {

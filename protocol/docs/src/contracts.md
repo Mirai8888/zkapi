@@ -9,9 +9,16 @@ the maximum pause. Amounts are bounded by `2^53 - 1` gwei.
 [NoteLeafLib](../../contracts/src/libraries/NoteLeafLib.sol) and
 [MerkleUpdateLib](../../contracts/src/libraries/MerkleUpdateLib.sol) use the
 [BN254 Poseidon implementation](../../contracts/src/libraries/Bn254Poseidon.sol)
-shared with the circuit parameters. Only `deposit` and `retireClosedLeaf`
-update the tree; every root the vault sets is recorded in `knownRoots`, and a
-withdrawal proof may use any of them.
+shared with the circuit parameters (a leaf is the sponge over its five fields;
+a node is one permutation with the domain in the capacity lane, `compress`).
+The library is generated with the setup (`zkapi-proof`'s `refresh_setup_sources`
+example rewrites it) in the optimized form of the Poseidon reference
+implementation. Only `deposit` and `retireClosedLeaf` update the tree:
+`MerkleUpdateLib` keeps the tree's frontier, so a deposit appends its leaf
+without a Merkle proof (32 compressions) and deposits never invalidate each
+other, while a retirement proves the leaf's siblings at the live root and
+refreshes the one frontier entry it can reach. Every root the vault sets is
+recorded in `knownRoots`, and a withdrawal proof may use any of them.
 
 [Groth16ProofAdapter](../../contracts/src/adapters/Groth16ProofAdapter.sol)
 verifies the request and withdrawal statements directly and exposes

@@ -60,7 +60,7 @@ func TestEverySelectorAndTopicIsTheRealVaults(t *testing.T) {
 		"CIRCUIT_ID_HASH":           selectorCircuitIDHash,
 		"REQUEST_VK_HASH":           selectorRequestVKHash,
 		"WITHDRAWAL_VK_HASH":        selectorWithdrawalVKHash,
-		"deposit":                   "c588341c",
+		"deposit":                   depositSelector,
 	}
 	for name, ours := range selectors {
 		real, ok := layout.Selectors[name]

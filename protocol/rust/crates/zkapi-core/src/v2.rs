@@ -94,6 +94,19 @@ pub fn hash_felts(inputs: &[Felt252]) -> Felt252 {
     field_to_felt(&hash_fields(&fields))
 }
 
+/// One Poseidon permutation of the state `(capacity, left, right)`, returning
+/// its first rate lane: the two-to-one compression the note tree's nodes use.
+/// The domain sits in the capacity lane, so a node costs one permutation where
+/// the sponge over `(domain, left, right)` costs two, and no sponge hash (whose
+/// capacity lane starts at zero) can collide with a node.
+pub fn compress_fields(capacity: Fr, left: Fr, right: Fr) -> Fr {
+    let mut sponge = PoseidonSponge::new(config());
+    sponge.state[0] = capacity;
+    let inputs: &[Fr] = &[left, right];
+    sponge.absorb(&inputs);
+    sponge.squeeze_native_field_elements(1)[0]
+}
+
 fn hash_domain(label: &[u8], inputs: &[Felt252]) -> Felt252 {
     let mut fields = Vec::with_capacity(inputs.len() + 1);
     fields.push(domain(label));
@@ -122,8 +135,13 @@ pub fn note_leaf(
     )
 }
 
+/// `P(DOMAIN_NODE, left, right)[1]`: see [`compress_fields`].
 pub fn merkle_node(left: &Felt252, right: &Felt252) -> Felt252 {
-    hash_domain(DOMAIN_NODE, &[*left, *right])
+    field_to_felt(&compress_fields(
+        domain(DOMAIN_NODE),
+        felt_to_field(left),
+        felt_to_field(right),
+    ))
 }
 
 pub fn merkle_root(note_id: u32, leaf: &Felt252, siblings: &[Felt252; MERKLE_DEPTH]) -> Felt252 {

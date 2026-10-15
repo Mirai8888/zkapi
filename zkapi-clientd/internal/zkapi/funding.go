@@ -107,11 +107,13 @@ type depositRebind struct {
 	ExpiryTs   uint64 `json:"expiry_ts"`
 }
 
-// depositSlot is the empty slot a signed deposit's zero path was checked
-// against, in the indexer's tree, just before signing. PathSHA256 identifies
-// the exact 32 sibling words in that transaction's calldata. EmptyBefore
-// counts the empty slots right below NoteID in that tree: the calldata can
-// land below NoteID only in that run (see findDepositLeaf). Records written
+// depositSlot is the next free slot of the indexer's tree a signed deposit
+// was prepared for, just before signing. PathSHA256 identifies the signed
+// deposit's arguments (commitment and amount; it digested the calldata's 32
+// sibling words before vault revision 3, whose deposit carries none and lands
+// at the prepared slot or a later one). EmptyBefore counts the empty slots
+// right below NoteID in that tree: a revision-2 deposit's calldata could land
+// below NoteID only in that run (see findDepositLeaf). Records written
 // before it was kept have none. PreparedAt is the device clock's time of
 // preparation; PreparedChainAt is the block time of the indexer view the
 // path was built from (see snapshotChainTime). Slots saved by 0.1.6, by
@@ -123,6 +125,13 @@ type depositSlot struct {
 	PreparedAt      int64  `json:"prepared_at"`
 	PreparedChainAt int64  `json:"prepared_chain_at,omitempty"`
 	EmptyBefore     uint32 `json:"empty_before,omitempty"`
+	// Signed and SignedNonce record the deposit transaction signed for this
+	// slot (recordSignedDepositSlot): a revision-3 deposit's calldata names
+	// no slot, so the transaction is tied to it by its nonce. Unset until
+	// one is signed, and for slots of revision-2 deposits, whose calldata
+	// the digest identifies.
+	Signed      bool   `json:"signed,omitempty"`
+	SignedNonce uint64 `json:"signed_nonce,omitempty"`
 }
 
 // NewFundingHandler manages local custody through the authenticated CLI admin API.

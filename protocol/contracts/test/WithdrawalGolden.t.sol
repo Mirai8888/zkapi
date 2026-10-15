@@ -47,7 +47,7 @@ contract WithdrawalGoldenTest is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         adapter = new Groth16ProofAdapter();
         (Types.WithdrawalPublicInputs memory escape,) = _withdrawal(ESCAPE);
@@ -83,13 +83,11 @@ contract WithdrawalGoldenTest is Test {
         assertEq(escapeCalldata.length, 836);
         assertEq(closeCalldata.length, 836);
 
-        bytes memory depositA = abi.encodeCall(
-            ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT, _path(0))
-        );
+        bytes memory depositA =
+            abi.encodeCall(ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT));
         _call(depositA, uint256(DEPOSIT) * 1 gwei);
-        bytes memory depositB = abi.encodeCall(
-            ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT, _path(1))
-        );
+        bytes memory depositB =
+            abi.encodeCall(ZkApiVault.deposit, (vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT));
         _call(depositB, uint256(DEPOSIT) * 1 gwei);
         assertEq(vault.currentRoot(), vm.parseJsonUint(fixtures, ".root_ab"));
         assertEq(vault.currentRoot(), escape.activeRoot);

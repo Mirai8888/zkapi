@@ -108,7 +108,7 @@ contract RealAdapterTest is GaslessTestBase {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             goldenEmptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         real = new Groth16ProofAdapter();
         (escapeInputs, escapeProof) = _golden("escape_a2_concede");
@@ -132,12 +132,8 @@ contract RealAdapterTest is GaslessTestBase {
         assertEq(address(vault), escape.contractAddress, "golden vault");
         vm.deal(GOLDEN_USER, 10 ether);
         vm.startPrank(GOLDEN_USER);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(
-            vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT, _goldenPath(0)
-        );
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(
-            vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT, _goldenPath(1)
-        );
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_a_registration"), DEPOSIT);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(vm.parseJsonBytes32(fixtures, ".note_b_registration"), DEPOSIT);
         vm.stopPrank();
         assertEq(vault.currentRoot(), closeInputs.activeRoot, "golden root");
         paymaster = new ZkApiWithdrawalPaymaster(

@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ZkApiVault} from "../../src/ZkApiVault.sol";
 import {Types} from "../../src/libraries/Types.sol";
 import {Bn254Poseidon} from "../../src/libraries/Bn254Poseidon.sol";
+import {MerkleUpdateLib} from "../../src/libraries/MerkleUpdateLib.sol";
 import {NoteLeafLib} from "../../src/libraries/NoteLeafLib.sol";
 import {MockProofAdapter} from "../mocks/MockProofAdapters.sol";
 
@@ -37,10 +38,8 @@ abstract contract VaultTestBase is Test {
     uint256[32] internal emptySiblings;
 
     function _setUpVault() internal {
-        uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
-            emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            emptySiblings[level] = MerkleUpdateLib.zeroHash(level);
         }
         adapter = new MockProofAdapter();
         vault = _newVault(CHALLENGE_PERIOD, MAX_PAUSE);
@@ -65,13 +64,16 @@ abstract contract VaultTestBase is Test {
 
     // ------------------------------------------------------------------- deposits and paths
 
-    /// Deposits a note with `commitment` at the next slot (slots 0..7 of a tree whose other
-    /// leaves are as the vault left them).
+    /// Deposits a note with `commitment` at the next slot.
     function _deposit(uint256 commitment) internal returns (uint32 id) {
         id = vault.nextNoteId();
-        uint256[32] memory path = _path(id);
         vm.prank(user);
-        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT, path);
+        vault.deposit{value: uint256(DEPOSIT) * 1 gwei}(bytes32(commitment), DEPOSIT);
+    }
+
+    /// The node hash of the note tree.
+    function _node(uint256 left, uint256 right) internal pure returns (uint256) {
+        return Bn254Poseidon.compress(DOMAIN_NODE, left, right);
     }
 
     function _leafOf(uint32 noteId) internal view returns (uint256) {
@@ -87,18 +89,16 @@ abstract contract VaultTestBase is Test {
 
     mapping(uint32 => bool) internal retired;
 
-    /// Live-tree siblings for slots 0..7; later slots are empty.
+    /// Live-tree siblings for slots 0..7 (the path retireClosedLeaf takes); later slots are empty.
     function _path(uint32 index) internal view returns (uint256[32] memory siblings) {
         require(index < 8, "test tree");
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = _node(_treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
         uint32 quad = (index >> 2) ^ 1;
-        siblings[2] = Bn254Poseidon.hash3(
-            DOMAIN_NODE,
-            Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
-            Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
+        siblings[2] = _node(
+            _node(_treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)), _node(_treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
         );
     }
 

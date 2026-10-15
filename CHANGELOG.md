@@ -35,7 +35,61 @@ Folded into 0.2.0's notes at release.
   without asking. A single-party vault trusts its setup's generator, who can
   forge every proof ([Single-party setup](docs/deployment.md#single-party-setup)).
 
+### Changed
+
+- **Network fees cut across the board (vault revision 3, circuit setup
+  regenerated).** Measured with CI's pinned Forge against the previous
+  revision: `deposit` ~6,000,000 gas → ~1,000,000; `mutualClose` 427,837 →
+  387,321; `initiateEscapeWithdrawal` 574,544 → 495,463;
+  `challengeEscapeWithdrawal` 374,881 → 359,450; `raiseEscapeConcession`
+  335,128 → 319,815; `finalizeEscapeWithdrawal` 91,898 → 82,580;
+  `claimExpired` 77,509 → 72,703; a Groth16 verification about 282,000
+  instead of 316,000. The sponsored (gasless) shapes carry the lower
+  verification twice, and the paymaster's floors follow the measurements
+  (`callFloor` 540,000 / 540,000 / 250,000 / 80,000, `pmVerificationFloor`
+  400,000; the profile defaults and `finalizeReserveGas` 990,000 follow). What
+  changed:
+  - The note tree's node hash is one Poseidon permutation of
+    `(domain "zkapi.v2.node", left, right)` with the domain in the capacity
+    lane (`zkapi_core::v2::compress_fields`, `Bn254Poseidon.compress`),
+    instead of the sponge's two. Every root changes, the circuits lose about
+    7,700 constraints each (request 23,990, withdrawal 28,772 rows; both fit
+    a 2^15 QAP domain, so a 2^15 powers of tau now suffices) and proving is
+    correspondingly faster; the development setup, every fixture and vector,
+    the clientd Poseidon vectors and the sealed exit-kit fixture are
+    regenerated.
+  - `Bn254Poseidon.sol` is generated in the optimized form of the Poseidon
+    reference implementation (equivalent round constants, sparse partial
+    rounds), 2.6 times cheaper per permutation; `zkapi-proof`'s
+    `refresh_setup_sources` example rewrites a setup's Solidity sources and
+    its Poseidon manifest from its keys.
+  - The vault keeps the tree's frontier (`MerkleUpdateLib.insert`) and
+    appends a deposit's leaf itself: 32 compressions, no Merkle proof, and
+    deposits no longer race each other (`StaleRoot` is a `retireClosedLeaf`
+    revert only). `retireClosedLeaf` refreshes the one frontier entry a
+    retirement can reach.
+  - `Groth16ProofAdapter` skips the scalar multiplication for public inputs
+    of 0, 1 and 2 (the protocol version, an exit's kind, a close's zero
+    `nextNullifier` and `conceded`).
+  - A pending escape is 5 storage slots instead of 7 (`Types.Escape`); the
+    `pendingWithdrawals` and `pendingConcessions` getters keep their shapes.
+  - The vault and the paymaster use a transient reentrancy guard
+    (`ReentrancyGuardTransient`, EIP-1153), same error selector.
+
 ### Breaking
+- **`deposit(bytes32 commitment, uint128 amount)`** (selector `0x56d2e1ea`)
+  replaces `deposit(bytes32,uint128,uint256[32])`: the siblings argument is
+  gone. The SDK (`encodeDeposit`) and zkapi-clientd send the new calldata and
+  keep the deposit-time path locally for the note's exit proof; clientd ties
+  a prepared deposit slot to its signed transaction by nonce
+  (`signed_nonce`) rather than by the calldata's sibling words.
+- **The note tree's roots change** (see Changed): proofs, paths and roots
+  from any earlier deployment or fixture do not carry over, and the browser
+  bundle (`sdk/wasm`) must be rebuilt with `scripts/build-browser-client.sh
+  --setup dev` for the new node hash before it computes correct roots.
+- **`rootRetiredAt(uint256)` is removed** from the vault (informational, never
+  read on chain; `NoteDeposited` and `ClosedLeafRetired` carry every root
+  change).
 
 - None: the change is additive. Profiles without `gasless` (or with
   `gasless: null`) keep working with the wallet-pays path.

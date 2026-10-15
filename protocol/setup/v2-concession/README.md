@@ -66,8 +66,8 @@ All commands run from `protocol/rust` at the frozen circuit revision
 
    | Circuit | Constraints | Public inputs | Witnesses | QAP domain | `.r1cs` SHA-256 |
    | --- | --- | --- | --- | --- | --- |
-   | request | 31,670 | 12 | 31,378 | 2^15 | `08af67fa…e9ae4f9d` |
-   | withdrawal | 36,452 | 16 | 36,001 | 2^16 | `c3713cf8…e2f72bfb` |
+   | request | 23,990 | 12 | 23,698 | 2^15 | `704d4ede…1b23d3f6` |
+   | withdrawal | 28,772 | 16 | 28,321 | 2^15 | `c25d5c4e…2cbc13a4` |
 
 2. **Fidelity gate** (in CI, and again on the frozen circuit):
    - (a) `r1cs_export_roundtrip`: the files parse back with `ark-circom`'s
@@ -105,9 +105,9 @@ All commands run from `protocol/rust` at the frozen circuit revision
    ```
 
 3. **Powers of tau.** Use a public BN254 phase-1 transcript prepared for
-   phase 2, of at least 2^16 (the withdrawal circuit's domain): one of the
-   Hermez files in `zkapi_proof::ceremony::PUBLIC_PTAU`, for example
-   `powersOfTau28_hez_final_16.ptau`.
+   phase 2, of at least 2^15 (both circuits' domain): one of the Hermez
+   files in `zkapi_proof::ceremony::PUBLIC_PTAU`, for example
+   `powersOfTau28_hez_final_15.ptau` or `powersOfTau28_hez_final_16.ptau`.
    - Download it from the source the snarkjs README lists. Check its
      Blake2b-512 against the hash listed there (`b2sum`, or
      `openssl dgst -blake2b512` with OpenSSL 1.1 or later). `PUBLIC_PTAU`

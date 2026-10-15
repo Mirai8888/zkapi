@@ -19,8 +19,8 @@ contract DeploySetupPolicyHarness is SetupPolicy {
 ///      mainnet's chain IDs.
 contract DeploySetupPolicyTest is Test {
     // The committed dev setup's verifying-key hashes (protocol/setup/v2-concession-dev).
-    bytes32 constant DEV_REQUEST_VK = 0x4d6c1a19dafd1d93488bf60059ab458f4aa1849a405eb0b6e13fd7f3d575b872;
-    bytes32 constant DEV_WITHDRAWAL_VK = 0x293e7d3c553b79f9389f4448a8c50e79aef637161ded055d541988a0135ec5dd;
+    bytes32 constant DEV_REQUEST_VK = 0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790;
+    bytes32 constant DEV_WITHDRAWAL_VK = 0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1;
     bytes32 constant CEREMONY_REQUEST_VK = keccak256("ceremony request vk");
     bytes32 constant CEREMONY_WITHDRAWAL_VK = keccak256("ceremony withdrawal vk");
 

@@ -52,7 +52,7 @@ contract VaultHandler is Test {
         uint256 zero;
         for (uint256 level = 0; level < 32; ++level) {
             emptySiblings[level] = zero;
-            zero = Bn254Poseidon.hash3(DOMAIN_NODE, zero, zero);
+            zero = Bn254Poseidon.compress(DOMAIN_NODE, zero, zero);
         }
         vm.deal(address(this), 1_000 ether);
         roots.push(vault_.currentRoot());
@@ -68,8 +68,7 @@ contract VaultHandler is Test {
         uint32 id = vault.nextNoteId();
         if (id >= MAX_NOTES || vault.paused()) return;
         uint128 amount = uint128(bound(amountSeed, 1, 2_000_000));
-        uint256[32] memory path = _path(id);
-        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(uint256(1000 + id)), amount, path);
+        vault.deposit{value: uint256(amount) * 1 gwei}(bytes32(uint256(1000 + id)), amount);
         roots.push(vault.currentRoot());
         ++calls;
         ++done[0];
@@ -321,12 +320,12 @@ contract VaultHandler is Test {
         siblings = emptySiblings;
         siblings[0] = _treeLeaf(index ^ 1);
         uint32 pair = (index >> 1) ^ 1;
-        siblings[1] = Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
+        siblings[1] = Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(pair * 2), _treeLeaf(pair * 2 + 1));
         uint32 quad = (index >> 2) ^ 1;
-        siblings[2] = Bn254Poseidon.hash3(
+        siblings[2] = Bn254Poseidon.compress(
             DOMAIN_NODE,
-            Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
-            Bn254Poseidon.hash3(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
+            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4), _treeLeaf(quad * 4 + 1)),
+            Bn254Poseidon.compress(DOMAIN_NODE, _treeLeaf(quad * 4 + 2), _treeLeaf(quad * 4 + 3))
         );
     }
 

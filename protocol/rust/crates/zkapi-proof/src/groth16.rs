@@ -116,6 +116,30 @@ fn poseidon_hash_var(
     Ok(sponge.squeeze_field_elements(1)?[0].clone())
 }
 
+/// The note tree's node hash: one permutation of the state `(DOMAIN_NODE, left, right)`, its
+/// first rate lane (zkapi_core::v2::compress_fields). The domain sits in the capacity lane, so
+/// a node costs one permutation instead of the sponge's two and cannot collide with any sponge
+/// hash, whose capacity lane starts at zero.
+pub fn merkle_node(left: CircuitField, right: CircuitField) -> CircuitField {
+    let mut sponge = PoseidonSponge::new(poseidon_config());
+    sponge.state[0] = domain(DOMAIN_NODE);
+    let inputs: &[CircuitField] = &[left, right];
+    sponge.absorb(&inputs);
+    sponge.squeeze_native_field_elements(1)[0]
+}
+
+fn merkle_node_var(
+    cs: ConstraintSystemRef<CircuitField>,
+    left: &FpVar<CircuitField>,
+    right: &FpVar<CircuitField>,
+) -> Result<FpVar<CircuitField>, SynthesisError> {
+    let mut sponge = PoseidonSpongeVar::new(cs, poseidon_config());
+    sponge.state[0] = domain_var(DOMAIN_NODE);
+    let inputs: &[FpVar<CircuitField>] = &[left.clone(), right.clone()];
+    sponge.absorb(&inputs)?;
+    Ok(sponge.squeeze_field_elements(1)?[0].clone())
+}
+
 fn domain(label: &[u8]) -> CircuitField {
     CircuitField::from_be_bytes_mod_order(label)
 }
@@ -431,7 +455,7 @@ fn enforce_note_membership(
         let bit = &note_id.bits[level];
         let left = bit.select(&sibling, &current)?;
         let right = bit.select(&current, &sibling)?;
-        current = poseidon_hash_var(cs.clone(), &[domain_var(DOMAIN_NODE), left, right])?;
+        current = merkle_node_var(cs.clone(), &left, &right)?;
     }
     current.enforce_equal(active_root)?;
     Ok(leaf)
@@ -899,9 +923,9 @@ pub fn merkle_root(
     let mut current = leaf;
     for (level, sibling) in siblings.iter().enumerate() {
         current = if ((note_id >> level) & 1) == 0 {
-            poseidon_hash(&[domain(DOMAIN_NODE), current, *sibling])
+            merkle_node(current, *sibling)
         } else {
-            poseidon_hash(&[domain(DOMAIN_NODE), *sibling, current])
+            merkle_node(*sibling, current)
         };
     }
     current

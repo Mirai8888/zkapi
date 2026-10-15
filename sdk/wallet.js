@@ -6,7 +6,7 @@ const WITHDRAWAL_TUPLE = "(uint16,uint64,address,uint256,uint256,uint256,uint256
 const REQUEST_TUPLE = "(uint16,uint64,address,uint256,uint256,uint256,uint64,uint128,uint256,uint256,uint256,uint256)";
 
 const ABI = Object.freeze({
-  deposit: "c588341c",
+  deposit: "56d2e1ea",
   // mutualClose(WITHDRAWAL_TUPLE,bytes)
   mutualClose: "72cd2e44",
   // initiateEscapeWithdrawal(WITHDRAWAL_TUPLE,bytes)
@@ -271,15 +271,10 @@ function escapePeriodBadge(seconds) {
   return `${value}s`;
 }
 
+/** deposit(bytes32 commitment, uint128 amount): the vault appends the leaf itself (revision 3), so
+ *  the plan's zero_path (the note's siblings at deposit time) stays local, for the exit path. */
 function encodeDeposit(plan, amount) {
-  if (!Array.isArray(plan?.zero_path) || plan.zero_path.length !== 32) {
-    throw new Error("The private note has an invalid 32-level deposit path.");
-  }
-  return callData(ABI.deposit, [
-    abiWord(toBytes32(plan.commitment)),
-    abiWord(amount),
-    ...plan.zero_path.map((value) => abiWord(value)),
-  ]);
+  return callData(ABI.deposit, [abiWord(toBytes32(plan.commitment)), abiWord(amount)]);
 }
 
 function decodeBase64(value) {

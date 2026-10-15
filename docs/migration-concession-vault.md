@@ -438,7 +438,7 @@ ignore its Phases 1 to 4, which this runbook replaces.
 ## Phase A: freeze, review and trusted setup
 
 1. **Freeze** the circuits at a tagged revision (`circuit-freeze-v2c`) and
-   record the constraint counts (request 31,670, withdrawal 36,452 at the
+   record the constraint counts (request 23,990, withdrawal 28,772 at the
    current revision).
 2. **External review** of the scope listed under the mainnet gates above.
    Fix forward on `main`; any circuit change returns to step 1.
@@ -446,7 +446,7 @@ ignore its Phases 1 to 4, which this runbook replaces.
    [the ceremony setup README](../protocol/setup/v2-concession/README.md):
    - export the R1CS (`export_r1cs`) and pass the fidelity gate
      (`r1cs_export_roundtrip`, `r1cs_negative_assignments`);
-   - use a public powers of tau of at least 2^16 that is on
+   - use a public powers of tau of at least 2^15 that is on
      `ceremony::PUBLIC_PTAU`, checked against its published Blake2b-512, and
      pin its SHA-256 before the ceremony starts;
    - at least three phase-2 contributions, at least two of them by parties

@@ -102,8 +102,7 @@ contract ProbeWithholdingOperator is VaultTestBase {
 
     function _depositD() private returns (uint32 id) {
         id = vault.nextNoteId();
-        uint256[32] memory path = _path(id);
         vm.prank(user);
-        vault.deposit{value: uint256(D) * 1 gwei}(bytes32(uint256(42)), D, path);
+        vault.deposit{value: uint256(D) * 1 gwei}(bytes32(uint256(42)), D);
     }
 }

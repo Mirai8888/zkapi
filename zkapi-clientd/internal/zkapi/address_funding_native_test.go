@@ -31,7 +31,7 @@ func TestNativeFundingExactPayableDepositAndMinedRecovery(t *testing.T) {
 	tx := f.accepted[deposit.TransactionHash]
 	expected := new(big.Int).Mul(big.NewInt(amount), big.NewInt(1_000_000_000))
 	simulated, _ := new(big.Int).SetString(strings.TrimPrefix(f.estimateValue, "0x"), 16)
-	if tx.Nonce() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) || tx.Value().Cmp(expected) != 0 || simulated == nil || simulated.Cmp(expected) != 0 || len(tx.Data()) != 4+34*32 || hex.EncodeToString(tx.Data()[:4]) != "c588341c" {
+	if tx.Nonce() != 0 || !strings.EqualFold(tx.To().Hex(), addressTestVault) || tx.Value().Cmp(expected) != 0 || simulated == nil || simulated.Cmp(expected) != 0 || !isDepositCalldata(tx.Data()) {
 		t.Fatal("native signed value, calldata, or simulated value is incorrect")
 	}
 	if tx.Type() != types.DynamicFeeTxType || f.overrideReads != 2 {

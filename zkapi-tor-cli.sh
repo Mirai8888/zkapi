@@ -154,6 +154,20 @@ ensure_ready() {
   done
 }
 
+# In-flight markers: loopbacks don't cross environments, so a claimer in
+# world B cannot see a request streaming in world A. The CLI stamps a
+# per-PID marker for the life of every chat request; markers older than
+# 6 minutes (past the 300s request timeout) are stale by definition and
+# ignored, so a crashed CLI cannot wedge the wallet.
+inflight() {  # my own marker (if this is a chat command) is not 'in flight'
+  find "$STATE_DIR" -maxdepth 1 -name 'active.*' ! -name "active.$$" -mmin -6 2>/dev/null | grep -q .
+}
+guard_inflight() {
+  if [ "${ZKAPI_FORCE_TAKEOVER:-0}" != "1" ] && inflight; then
+    die "a request is in flight (this or another environment; see $STATE_DIR/active.*). Starting a server now would retire the one serving it — killing the stream AFTER the provider was billed for the message. Wait for it to finish, or set ZKAPI_FORCE_TAKEOVER=1 to interrupt deliberately."
+  fi
+}
+
 # py_chat <fresh|append> <text> — posts to the local API, keeps history in
 # CONV_FILE, prints the assistant reply. Exit 2 = no stored conversation.
 py_chat() {
@@ -268,15 +282,24 @@ usage() {
   sed -n '3,20p' "${BASH_SOURCE[0]}" | grep '^#' | cut -c3-
 }
 
+# Chat commands stamp a process-lifetime in-flight marker; it vanishes with
+# the process on any exit path, and stale-by-time rules cover kills -9.
+case "${1:-}" in
+  make_single_request|start_conversation|ask) : > "$STATE_DIR/active.$$" ;;
+esac
+trap 'case "${1:-}" in make_single_request|start_conversation|ask) rm -f "$STATE_DIR/active.$$";; esac' EXIT
+
 case "${1:-}" in
   make_single_request)
     [ $# -ge 2 ] || die "usage: $0 make_single_request \"question\""
+    guard_inflight
     if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
     warm_policy || true
     run_chat fresh "$2"
     ;;
   start_conversation)
     [ $# -ge 2 ] || die "usage: $0 start_conversation \"first message\""
+    guard_inflight
     if server_running; then rotate_circuit || { echo "could not rotate circuit; restarting server" >&2; stop_server; start_server; }; else stop_server; start_server; fi
     warm_policy || true
     run_chat fresh "$2"
@@ -289,6 +312,7 @@ case "${1:-}" in
       # locally. History and model live in the shared state root, so the
       # conversation continues; the handover token makes any other world's
       # stack retire itself.
+      guard_inflight
       echo "zkapi-tor-cli: no local server; claiming the profile and starting one here..." >&2
       start_server || {
         hint=""

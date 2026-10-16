@@ -1,0 +1,76 @@
+{
+  "circuit_id": "zkapi-v2-concession-windowed-v1",
+  "case": "withdrawal_genesis_escape",
+  "iterations": 10,
+  "load_iterations": 3,
+  "warmup_iterations": 2,
+  "rayon_threads": "1",
+  "proving_key_bytes": 5311039,
+  "verifying_key_bytes": 823,
+  "constraints": 27072,
+  "instance_variables": 17,
+  "witness_variables": 26621,
+  "proof_bytes": 256,
+  "prover_load": {
+    "samples_ms": [
+      2157.235,
+      2149.353041,
+      2144.529292
+    ],
+    "min_ms": 2144.529292,
+    "median_ms": 2149.353041,
+    "mean_ms": 2150.3724443333335,
+    "p95_ms": 2157.235,
+    "max_ms": 2157.235
+  },
+  "verifier_load": {
+    "samples_ms": [
+      0.632833,
+      0.384584,
+      0.350167
+    ],
+    "min_ms": 0.350167,
+    "median_ms": 0.384584,
+    "mean_ms": 0.4558613333333333,
+    "p95_ms": 0.632833,
+    "max_ms": 0.632833
+  },
+  "prove": {
+    "samples_ms": [
+      724.943375,
+      727.7492920000001,
+      717.125958,
+      712.047208,
+      717.45,
+      715.0953330000001,
+      725.365917,
+      723.257625,
+      796.710958,
+      739.200041
+    ],
+    "min_ms": 712.047208,
+    "median_ms": 724.1005,
+    "mean_ms": 729.8945707,
+    "p95_ms": 796.710958,
+    "max_ms": 796.710958
+  },
+  "verify": {
+    "samples_ms": [
+      1.659208,
+      1.566458,
+      1.526625,
+      1.503084,
+      1.4905000000000002,
+      1.483166,
+      1.468542,
+      1.4913750000000001,
+      1.4765,
+      1.462583
+    ],
+    "min_ms": 1.462583,
+    "median_ms": 1.4909375000000002,
+    "mean_ms": 1.5128040999999997,
+    "p95_ms": 1.659208,
+    "max_ms": 1.659208
+  }
+}

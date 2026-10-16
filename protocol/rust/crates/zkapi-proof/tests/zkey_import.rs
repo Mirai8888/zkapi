@@ -1082,9 +1082,16 @@ fn powers_of_tau_must_be_one_reference_string() {
 #[test]
 fn development_keys_round_trip_through_zkeys() {
     let dir = scratch("dev");
+    // The experimental circuit's development keys live outside the packaged
+    // setup. Keep the ordinary ceremony run's committed-dev round trip intact.
+    let development = if cfg!(feature = "windowed-circuits") {
+        setup_dir()
+    } else {
+        dev_setup_dir()
+    };
     let mut keys = Vec::new();
     for kind in [KeyKind::Request, KeyKind::Withdrawal] {
-        let bytes = std::fs::read(dev_setup_dir().join(kind.proving_key_file())).unwrap();
+        let bytes = std::fs::read(development.join(kind.proving_key_file())).unwrap();
         let (pk, _): (ProvingKey<Bn254>, _) = decode_compressed(&bytes, kind).unwrap();
         let matrices = circuit_matrices(kind).unwrap();
         let zkey = write_zkey(&pk, &matrices, None);
@@ -1114,7 +1121,7 @@ fn development_keys_round_trip_through_zkeys() {
     ] {
         assert!(
             std::fs::read(output.join(file)).unwrap()
-                == std::fs::read(dev_setup_dir().join(file)).unwrap(),
+                == std::fs::read(development.join(file)).unwrap(),
             "{file} differs after the zkey round trip"
         );
     }

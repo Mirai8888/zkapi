@@ -1,0 +1,138 @@
+{
+  "upstream_branch": "feat/client-concession-local",
+  "base_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+  "base_protocol_rust_tree": "d1df6d200e64664623bcc968efb6599c037ee5a8",
+  "host": {
+    "cpu": "Apple M5",
+    "architecture": "arm64",
+    "os": "Darwin",
+    "os_release": "25.2.0"
+  },
+  "method": {
+    "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "profile": "release",
+    "reduction": "circom",
+    "rayon_threads": 1,
+    "iterations_per_case": 10,
+    "warmups_per_case": 2,
+    "key_load_iterations": 3,
+    "constraint_counts": "Finalized synthesis with OptimizationGoal::Constraints, matching setup, proving and R1CS export.",
+    "baseline_instrumentation": "Only proof_bench reporting was updated; baseline circuit sources are unchanged from the base commit.",
+    "timing_scope": "Native CPU measurements; no browser proving or on-chain gas measurements."
+  },
+  "variants": {
+    "baseline": {
+      "circuit_id": "zkapi-v2-concession-v1",
+      "circuits": {
+        "request": {
+          "constraints": 23990,
+          "public_inputs": 12,
+          "witness_variables": 23698,
+          "domain_size": 32768
+        },
+        "withdrawal": {
+          "constraints": 28772,
+          "public_inputs": 16,
+          "witness_variables": 28321,
+          "domain_size": 32768
+        }
+      },
+      "r1cs_sha256": {
+        "request": "704d4ede7989e674f55cd2c66777d3a1c058cee4686cf2a2966184a31b23d3f6",
+        "withdrawal": "c25d5c4e4cff6b44ca1f099d4b96d05dc38d6397ca226058ef9bcce02cbc13a4"
+      },
+      "vk_keccak256": {
+        "request": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+        "withdrawal": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+      },
+      "setup_files_sha256": {
+        "request.pk": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+        "request.vk": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+        "withdrawal.pk": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+        "withdrawal.vk": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9"
+      }
+    },
+    "windowed": {
+      "feature": "windowed-circuits",
+      "circuit_id": "zkapi-v2-concession-windowed-v1",
+      "circuits": {
+        "request": {
+          "constraints": 22290,
+          "public_inputs": 12,
+          "witness_variables": 21998,
+          "domain_size": 32768
+        },
+        "withdrawal": {
+          "constraints": 27072,
+          "public_inputs": 16,
+          "witness_variables": 26621,
+          "domain_size": 32768
+        }
+      },
+      "r1cs_sha256": {
+        "request": "56c9b467f1377effdf5777995fbcff6e7901390751c6b39969ce8eed6ef5235b",
+        "withdrawal": "e1ae879141d523efea8b24782aed6df8abe995dfa74aab0b706fa2f7b8a3b078"
+      },
+      "vk_keccak256": {
+        "request": "0x3f7f00dc113633c0221d91fbf224731fd5e0694d694527f717b95ab1757d3d30",
+        "withdrawal": "0x4ca70abbc53c0b0f89f99d5127141686c5bcd4ab072b44be34720e67c34956ec"
+      },
+      "setup_files_sha256": {
+        "request.pk": "3881572c6cc5246ad8fb2333d877b33d424bd20c455cded9d22e02bdc54771a1",
+        "request.vk": "57cab5590623bd5d6e2e584c86d0ddcd0b130fc2d48dd1c59792f83e42b7d031",
+        "withdrawal.pk": "e33270c9f4b37b7bdee8b04b7add53ec71cccb1038e9e9201434a543b58b0ddc",
+        "withdrawal.vk": "077862462e7be94ccd17789ae125ac67fab8c73c0bd95d26f346bd9dd8fde910"
+      }
+    }
+  },
+  "candidate_groth16_source_sha256": "8dbf1381211bd1063d06ba783c4e543fc8391097cb2ba832e0ffa54770a26a6e",
+  "deployment": "Experimental opt-in variant with separate setup keys and circuit identity. Packaged keys and deployment assets were not regenerated.",
+  "validation": {
+    "native": {
+      "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+      "default": {
+        "passed": 68,
+        "failed": 0,
+        "ignored": 2
+      },
+      "windowed": {
+        "passed": 69,
+        "failed": 0,
+        "ignored": 2
+      },
+      "ignored_reason": "Existing tests require external ceremony files or a public powers-of-tau transcript.",
+      "suites": [
+        "library",
+        "release_policy_check",
+        "circuits",
+        "proofs",
+        "r1cs_fidelity",
+        "reduction_cross_check",
+        "zkey_import"
+      ],
+      "default_r1cs": "Matches the packaged manifest hashes exactly.",
+      "windowed_proofs": "Verified with separately generated development keys; each public input mutation is rejected.",
+      "export": "Independent ark-circom file parser and evaluator accept honest assignments and reject all negative assignments."
+    },
+    "wasm": {
+      "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "command": "cargo check --locked --release -p zkapi-browser --target wasm32-unknown-unknown --features zkapi-proof/windowed-circuits",
+      "passed": true
+    },
+    "format": {
+      "rustfmt": "1.99.0",
+      "passed": true
+    }
+  },
+  "measurement_date": "2026-10-16",
+  "candidate_source_sha256": {
+    "protocol/rust/crates/zkapi-proof/Cargo.toml": "1d0c20a561f838b644d095f8936c58e352c9ff70f0f2572c009e3a0eb4cc46a4",
+    "protocol/rust/crates/zkapi-proof/examples/proof_bench.rs": "b362cd410190a8ff5cecddc5f5955779231e6c23695f7ad58957da8e56e5aa07",
+    "protocol/rust/crates/zkapi-proof/src/bin/release_policy_check.rs": "6f8b073700ab8f45ddfb400ecab80b7ac4f3d4015da74a64c815d56cc864b24c",
+    "protocol/rust/crates/zkapi-proof/src/compact.rs": "2b1e3749cc82fdb46f608997093ba3c39627b1ea77c1bd8a1c04ebe6506e3750",
+    "protocol/rust/crates/zkapi-proof/src/groth16.rs": "8dbf1381211bd1063d06ba783c4e543fc8391097cb2ba832e0ffa54770a26a6e",
+    "protocol/rust/crates/zkapi-proof/src/lib.rs": "d714359d0e50db857f554fb3a835dddc9c5514bdb0cc42a4503a2fbbfc64f57b",
+    "protocol/rust/crates/zkapi-proof/tests/proofs.rs": "3bf9fd922581800380373484d74c98f0037ca879c2a1b75429e0c045354aa967",
+    "protocol/rust/crates/zkapi-proof/tests/zkey_import.rs": "299d262590ed7c7e010b52efffc6beb0c4d16e62b592057e8c088a8e6ace6734"
+  }
+}

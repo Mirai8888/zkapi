@@ -5,6 +5,21 @@
 //! cargo run --release -p zkapi-proof --example proof_bench -- \
 //!   ../setup/v2-concession-dev withdrawal_state_escape 5 1
 //! ```
+//!
+//! For the experimental fixed-generator variant, first create separate keys:
+//!
+//! ```text
+//! cargo run --release -p zkapi-proof --features windowed-circuits \
+//!   --example setup -- target/windowed-setup
+//! RAYON_NUM_THREADS=1 cargo run --release -p zkapi-proof \
+//!   --features windowed-circuits --example proof_bench -- \
+//!   target/windowed-setup request_state 10 2 3
+//! ZKAPI_SETUP_DIR=target/windowed-setup cargo test --release -p zkapi-proof \
+//!   --features windowed-circuits --lib --tests
+//! ```
+//!
+//! Benchmark the default variant with the same thread count and sample sizes.
+//! Counts use finalized synthesis, exactly as setup, proving and R1CS export do.
 use std::env;
 use std::fs;
 use std::hint::black_box;
@@ -13,15 +28,15 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use ark_bn254::Fr;
-use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
+use ark_relations::r1cs::{ConstraintSynthesizer, SynthesisMode};
 use base64::Engine;
 use serde::Serialize;
 use zkapi_proof::compact::{
     request_circuit, withdrawal_circuit, RequestProver, RequestVerifier, RequestWitnessData,
-    WithdrawalProver, WithdrawalVerifier, WithdrawalWitnessData,
+    WithdrawalProver, WithdrawalVerifier, WithdrawalWitnessData, CIRCUIT_ID,
 };
 use zkapi_proof::dev::{tree_with, DevDeployment, DevNote, DevRequest, DevState, DevWithdrawal};
-use zkapi_proof::groth16::{RequestCircuit, WithdrawalCircuit};
+use zkapi_proof::groth16::{synthesize, RequestCircuit, WithdrawalCircuit};
 use zkapi_types::{Felt252, RequestPublicInputsV2, WithdrawalKind, WithdrawalPublicInputsV2C};
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -96,6 +111,7 @@ impl Distribution {
 
 #[derive(Debug, Serialize)]
 struct BenchResult {
+    circuit_id: &'static str,
     case: BenchCase,
     iterations: usize,
     load_iterations: usize,
@@ -208,6 +224,7 @@ fn bench_request(
     }
 
     Ok(BenchResult {
+        circuit_id: CIRCUIT_ID,
         case,
         iterations,
         load_iterations,
@@ -280,6 +297,7 @@ fn bench_withdrawal(
     }
 
     Ok(BenchResult {
+        circuit_id: CIRCUIT_ID,
         case,
         iterations,
         load_iterations,
@@ -310,8 +328,12 @@ fn timed_load<T>(iterations: usize, mut load: impl FnMut() -> Result<T>) -> Resu
 }
 
 fn constraint_counts<C: ConstraintSynthesizer<Fr>>(circuit: C) -> Result<(usize, usize, usize)> {
-    let cs = ConstraintSystem::new_ref();
-    circuit.generate_constraints(cs.clone())?;
+    let cs = synthesize(
+        circuit,
+        SynthesisMode::Prove {
+            construct_matrices: true,
+        },
+    )?;
     if !cs.is_satisfied()? {
         bail!("benchmark circuit is not satisfied");
     }

@@ -426,7 +426,11 @@ mod tests {
     }
 
     fn dev_setup() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../setup/v2-concession-dev")
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        match std::env::var_os("ZKAPI_SETUP_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => workspace.join(dir),
+            None => workspace.join("../setup/v2-concession-dev"),
+        }
     }
 
     #[test]

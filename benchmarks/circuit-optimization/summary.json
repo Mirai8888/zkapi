@@ -1,0 +1,166 @@
+{
+  "status": "validated experimental optimization",
+  "branch": "perf/circuit-optimization",
+  "base_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+  "feature": "windowed-circuits",
+  "constraints": {
+    "request": {
+      "before": 23990,
+      "after": 22290,
+      "saved": 1700,
+      "reduction_percent": 7.086285952480198,
+      "public_inputs": 12
+    },
+    "withdrawal": {
+      "before": 28772,
+      "after": 27072,
+      "saved": 1700,
+      "reduction_percent": 5.908522174336161,
+      "public_inputs": 16
+    }
+  },
+  "proving_keys": {
+    "request": {
+      "bytes_before": 4842707,
+      "bytes_after": 4570716,
+      "reduction_percent": 5.616507461632514
+    },
+    "withdrawal": {
+      "bytes_before": 5583030,
+      "bytes_after": 5311039,
+      "reduction_percent": 4.871745270937112
+    }
+  },
+  "proof_bytes": 256,
+  "initial_native_benchmarks": [
+    {
+      "case": "request_genesis",
+      "constraints_before": 23990,
+      "constraints_after": 22290,
+      "prove_median_ms_before": 838.2817915,
+      "prove_median_ms_after": 635.5505625000001,
+      "prove_median_reduction_percent": 24.18413844314069,
+      "proving_key_bytes_before": 4842707,
+      "proving_key_bytes_after": 4570716
+    },
+    {
+      "case": "request_state",
+      "constraints_before": 23990,
+      "constraints_after": 22290,
+      "prove_median_ms_before": 857.9451455000001,
+      "prove_median_ms_after": 647.8497915,
+      "prove_median_reduction_percent": 24.48820359925914,
+      "proving_key_bytes_before": 4842707,
+      "proving_key_bytes_after": 4570716
+    },
+    {
+      "case": "withdrawal_genesis_escape",
+      "constraints_before": 28772,
+      "constraints_after": 27072,
+      "prove_median_ms_before": 910.512083,
+      "prove_median_ms_after": 724.1005,
+      "prove_median_reduction_percent": 20.473268447553373,
+      "proving_key_bytes_before": 5583030,
+      "proving_key_bytes_after": 5311039
+    },
+    {
+      "case": "withdrawal_genesis_mutual",
+      "constraints_before": 28772,
+      "constraints_after": 27072,
+      "prove_median_ms_before": 909.1247495,
+      "prove_median_ms_after": 738.7228545,
+      "prove_median_reduction_percent": 18.74351073312188,
+      "proving_key_bytes_before": 5583030,
+      "proving_key_bytes_after": 5311039
+    },
+    {
+      "case": "withdrawal_state_escape",
+      "constraints_before": 28772,
+      "constraints_after": 27072,
+      "prove_median_ms_before": 910.178375,
+      "prove_median_ms_after": 726.382208,
+      "prove_median_reduction_percent": 20.19342274529429,
+      "proving_key_bytes_before": 5583030,
+      "proving_key_bytes_after": 5311039
+    },
+    {
+      "case": "withdrawal_state_mutual",
+      "constraints_before": 28772,
+      "constraints_after": 27072,
+      "prove_median_ms_before": 959.0692919999999,
+      "prove_median_ms_after": 736.285354,
+      "prove_median_reduction_percent": 23.229180608568576,
+      "proving_key_bytes_before": 5583030,
+      "proving_key_bytes_after": 5311039
+    },
+    {
+      "case": "withdrawal_state_ownership",
+      "constraints_before": 28772,
+      "constraints_after": 27072,
+      "prove_median_ms_before": 899.7320835,
+      "prove_median_ms_after": 727.210146,
+      "prove_median_reduction_percent": 19.17481222064257,
+      "proving_key_bytes_before": 5583030,
+      "proving_key_bytes_after": 5311039
+    }
+  ],
+  "confirmation_execution_order": [
+    "baseline request_state",
+    "windowed request_state",
+    "windowed withdrawal_state_escape",
+    "baseline withdrawal_state_escape"
+  ],
+  "confirmation_native_benchmarks": [
+    {
+      "case": "request_state",
+      "baseline_prove_median_ms": 828.1332084999999,
+      "windowed_prove_median_ms": 654.925229,
+      "prove_median_reduction_percent": 20.91547322606856
+    },
+    {
+      "case": "withdrawal_state_escape",
+      "baseline_prove_median_ms": 909.036771,
+      "windowed_prove_median_ms": 739.667417,
+      "prove_median_reduction_percent": 18.631738495427708
+    }
+  ],
+  "validation": {
+    "native": {
+      "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+      "default": {
+        "passed": 68,
+        "failed": 0,
+        "ignored": 2
+      },
+      "windowed": {
+        "passed": 69,
+        "failed": 0,
+        "ignored": 2
+      },
+      "ignored_reason": "Existing tests require external ceremony files or a public powers-of-tau transcript.",
+      "suites": [
+        "library",
+        "release_policy_check",
+        "circuits",
+        "proofs",
+        "r1cs_fidelity",
+        "reduction_cross_check",
+        "zkey_import"
+      ],
+      "default_r1cs": "Matches the packaged manifest hashes exactly.",
+      "windowed_proofs": "Verified with separately generated development keys; each public input mutation is rejected.",
+      "export": "Independent ark-circom file parser and evaluator accept honest assignments and reject all negative assignments."
+    },
+    "wasm": {
+      "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "command": "cargo check --locked --release -p zkapi-browser --target wasm32-unknown-unknown --features zkapi-proof/windowed-circuits",
+      "passed": true
+    },
+    "format": {
+      "rustfmt": "1.99.0",
+      "passed": true
+    }
+  },
+  "deployment": "Experimental opt-in variant with separate setup keys and circuit identity. Packaged keys and deployment assets were not regenerated.",
+  "timing_scope": "Native CPU measurements; no browser proving or on-chain gas measurements."
+}

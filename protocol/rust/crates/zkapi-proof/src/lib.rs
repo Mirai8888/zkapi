@@ -20,9 +20,9 @@
 //!   browser bundle); no production binary gets it through a dependency or
 //!   feature unification.
 //! * `dev-fixtures` exposes [`dev`]. It changes no acceptance policy.
-//! * `windowed-circuits` selects experimental fixed-generator gadgets and
-//!   circuit identity `zkapi-v2-concession-windowed-v1`. It needs its own setup;
-//!   packaged concession-v1 keys are rejected. The default circuit is unchanged.
+//! * `windowed-circuits` selects experimental fixed- and variable-base gadgets and
+//!   circuit identity `zkapi-v2-concession-windowed-v2`. It needs its own setup;
+//!   keys from earlier circuit identities are rejected. The default circuit is unchanged.
 //!
 //! Generating development keys ([`compact::setup`]) needs neither feature.
 

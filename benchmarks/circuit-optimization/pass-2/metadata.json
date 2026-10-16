@@ -1,0 +1,193 @@
+{
+  "base_commit": "51b5ca802508b4bc18015b8e946b04546070f2a8",
+  "original_base_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+  "measurement_date": "2026-10-16",
+  "change": "Use unsigned two-bit windows for variable-base Schnorr challenge multiplication, in addition to the fixed-generator windows from the first pass.",
+  "feature": "windowed-circuits",
+  "host": {
+    "cpu": "Apple M5",
+    "architecture": "arm64",
+    "os": "Darwin",
+    "os_release": "25.2.0"
+  },
+  "method": {
+    "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "profile": "release",
+    "reduction": "circom",
+    "rayon_threads": 1,
+    "iterations_per_case": 10,
+    "warmups_per_case": 2,
+    "key_load_iterations": 3,
+    "constraint_counts": "Finalized synthesis with OptimizationGoal::Constraints, matching setup, proving and R1CS export.",
+    "baseline_instrumentation": "Use the saved original and first-pass benchmark binaries; their circuits and setup files are identified below.",
+    "timing_scope": "Native CPU measurements; no browser proving or on-chain gas measurements.",
+    "confirmation_order": [
+      "original request_state",
+      "windowed-v1 request_state",
+      "windowed-v2 request_state",
+      "windowed-v2 withdrawal_state_escape",
+      "windowed-v1 withdrawal_state_escape",
+      "original withdrawal_state_escape"
+    ]
+  },
+  "variants": {
+    "original": {
+      "circuit_id": "zkapi-v2-concession-v1",
+      "circuits": {
+        "request": {
+          "constraints": 23990,
+          "public_inputs": 12,
+          "witness_variables": 23698,
+          "domain_size": 32768
+        },
+        "withdrawal": {
+          "constraints": 28772,
+          "public_inputs": 16,
+          "witness_variables": 28321,
+          "domain_size": 32768
+        }
+      },
+      "r1cs_sha256": {
+        "request": "704d4ede7989e674f55cd2c66777d3a1c058cee4686cf2a2966184a31b23d3f6",
+        "withdrawal": "c25d5c4e4cff6b44ca1f099d4b96d05dc38d6397ca226058ef9bcce02cbc13a4"
+      },
+      "vk_keccak256": {
+        "request": "0x346b3c1414685205ebe8f7d6a1533cc2936be5f7922e90b24bf46d556d8a3790",
+        "withdrawal": "0xfe768c9fed820772e0ccc6015a82b6d5387183d1241e8b1d6361d865f30f2ae1"
+      },
+      "files": {
+        "request.pk": "7dbfde825f30f2467d1963e4f89bf807497895f499b8a9d6fc7aa6ff8844feba",
+        "request.vk": "11d68d68aff6a234763343a4d48918c29bf566c38d2487ac021b24e634362caf",
+        "withdrawal.pk": "43e327f74da63dbb06e09071d07863b23d4d2e1ebc5bf9516034c6cd9b2e9ab1",
+        "withdrawal.vk": "d816b9937021361381c52e17d554d975b8ecedeee7edbcecf1bb3393e0f0edb9"
+      },
+      "source_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+      "proving_key_bytes": {
+        "request": 4842707,
+        "withdrawal": 5583030
+      }
+    },
+    "windowed-v1": {
+      "circuit_id": "zkapi-v2-concession-windowed-v1",
+      "circuits": {
+        "request": {
+          "constraints": 22290,
+          "public_inputs": 12,
+          "witness_variables": 21998,
+          "domain_size": 32768
+        },
+        "withdrawal": {
+          "constraints": 27072,
+          "public_inputs": 16,
+          "witness_variables": 26621,
+          "domain_size": 32768
+        }
+      },
+      "r1cs_sha256": {
+        "request": "56c9b467f1377effdf5777995fbcff6e7901390751c6b39969ce8eed6ef5235b",
+        "withdrawal": "e1ae879141d523efea8b24782aed6df8abe995dfa74aab0b706fa2f7b8a3b078"
+      },
+      "vk_keccak256": {
+        "request": "0x3f7f00dc113633c0221d91fbf224731fd5e0694d694527f717b95ab1757d3d30",
+        "withdrawal": "0x4ca70abbc53c0b0f89f99d5127141686c5bcd4ab072b44be34720e67c34956ec"
+      },
+      "files": {
+        "request.pk": "3881572c6cc5246ad8fb2333d877b33d424bd20c455cded9d22e02bdc54771a1",
+        "request.vk": "57cab5590623bd5d6e2e584c86d0ddcd0b130fc2d48dd1c59792f83e42b7d031",
+        "withdrawal.pk": "e33270c9f4b37b7bdee8b04b7add53ec71cccb1038e9e9201434a543b58b0ddc",
+        "withdrawal.vk": "077862462e7be94ccd17789ae125ac67fab8c73c0bd95d26f346bd9dd8fde910"
+      },
+      "source_commit": "51b5ca802508b4bc18015b8e946b04546070f2a8",
+      "proving_key_bytes": {
+        "request": 4570716,
+        "withdrawal": 5311039
+      }
+    },
+    "windowed-v2": {
+      "circuit_id": "zkapi-v2-concession-windowed-v2",
+      "circuits": {
+        "request": {
+          "constraints": 21780,
+          "public_inputs": 12,
+          "witness_variables": 21488,
+          "domain_size": 32768
+        },
+        "withdrawal": {
+          "constraints": 26052,
+          "public_inputs": 16,
+          "witness_variables": 25601,
+          "domain_size": 32768
+        }
+      },
+      "r1cs_sha256": {
+        "request": "418100a7f3f2b1d54e27a894d9ae22fb819c771427fa73398bc58b84064cd8ee",
+        "withdrawal": "0744dc9474765f07b2979f8fa5965370921c12465178dce09381fbfe47619cb0"
+      },
+      "vk_keccak256": {
+        "request": "0x1703c34cd2f1af1ab1d3f3957737cb610dfdd5bf4cea18817a8ccd1869027a0d",
+        "withdrawal": "0xbff4303fce23cdbf7ba765a1688a60ac16c35dfce8342b70597f34693852b90d"
+      },
+      "files": {
+        "request.pk": "e4acb3662a0e6aaeae8acf06433278c29321ffb506a6d896ae0d6abe16fb7fc5",
+        "request.vk": "e6943f6004455214e5466879eeb60610ae4ba5211daa3d2eadcef96ef6e32e2e",
+        "withdrawal.pk": "cc70efcc9f868f624cac2f4e1e8c8ddfa6726ceebf47c25d623c704ec2c0ae96",
+        "withdrawal.vk": "a04283bb99af4247ba50d6f1477b748185e5ac0367efb792746310dbd12d566e"
+      },
+      "proving_key_bytes": {
+        "request": 4489116,
+        "withdrawal": 5147839
+      },
+      "source_snapshot": "candidate_source_sha256"
+    }
+  },
+  "candidate_source_sha256": {
+    "protocol/rust/crates/zkapi-proof/Cargo.toml": "fa7475a30783c0d1f8469771ac9127927f98fa5f76d38e541ca04c8eea91338c",
+    "protocol/rust/crates/zkapi-proof/examples/proof_bench.rs": "030ee76ed1cc9381873b2e3b442d423f1aa03fcdb7afa3aa3b84eaa9f02e89c0",
+    "protocol/rust/crates/zkapi-proof/src/bin/release_policy_check.rs": "6f8b073700ab8f45ddfb400ecab80b7ac4f3d4015da74a64c815d56cc864b24c",
+    "protocol/rust/crates/zkapi-proof/src/compact.rs": "b2759bf9e67f113c352fdcfbe83a7e7b9ff7f7a88ab04c8a9629750de893ae97",
+    "protocol/rust/crates/zkapi-proof/src/groth16.rs": "9b91f1c630c9720796a9f4b208f2e80bcc68fd02bf7a2ff9f6c1e9f84c3a0410",
+    "protocol/rust/crates/zkapi-proof/src/lib.rs": "904f7a5191c28153fce429d5c180377862e3e48d2358fdb4c7a79d3b84519636",
+    "protocol/rust/crates/zkapi-proof/tests/proofs.rs": "3bf9fd922581800380373484d74c98f0037ca879c2a1b75429e0c045354aa967",
+    "protocol/rust/crates/zkapi-proof/tests/zkey_import.rs": "299d262590ed7c7e010b52efffc6beb0c4d16e62b592057e8c088a8e6ace6734"
+  },
+  "previous_key_rejection": {
+    "request": true,
+    "withdrawal": true,
+    "check": "The v2 benchmark binary rejects the actual v1 setup keys before proving."
+  },
+  "wasm_check": {
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "command": "cargo check --locked --release -p zkapi-browser --target wasm32-unknown-unknown --features zkapi-proof/windowed-circuits",
+    "passed": true
+  },
+  "deployment": "Experimental opt-in variant, with circuit identity zkapi-v2-concession-windowed-v2 and newly generated local development setup keys. Older circuit identities are rejected.",
+  "validation": {
+    "native_compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "default": {
+      "passed": 69,
+      "failed": 0,
+      "ignored": 2
+    },
+    "windowed_v2": {
+      "passed": 71,
+      "failed": 0,
+      "ignored": 2
+    },
+    "ignored_reason": "Existing tests require external ceremony files or a public powers-of-tau transcript.",
+    "suites": [
+      "library",
+      "release_policy_check",
+      "circuits",
+      "proofs",
+      "r1cs_fidelity",
+      "reduction_cross_check",
+      "zkey_import"
+    ],
+    "default_r1cs": "Matches the packaged manifest hashes exactly.",
+    "variable_points": "Native arithmetic and constraint checks cover identity, prime-subgroup, order-two torsion, mixed-order points, odd lengths, subgroup-order boundaries, and full-width scalars.",
+    "proofs": "Every honest proof kind verifies; every public-input mutation fails verification; invalid statements are rejected.",
+    "export": "Independent ark-circom parsing/evaluation and reduction cross-checks pass.",
+    "key_import": "Every key-point binding gate, development zkey round trip, and toy ceremony import passes.",
+    "format": "rustfmt 1.99.0 --check passes."
+  }
+}

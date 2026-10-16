@@ -1,0 +1,154 @@
+{
+  "status": "validated experimental optimization",
+  "feature": "windowed-circuits",
+  "circuit_id": "zkapi-v2-concession-windowed-v2",
+  "base_commit": "51b5ca802508b4bc18015b8e946b04546070f2a8",
+  "original_base_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+  "constraints": {
+    "request": {
+      "counts": {
+        "original": 23990,
+        "windowed-v1": 22290,
+        "windowed-v2": 21780
+      },
+      "saved_vs_original": 2210,
+      "saved_vs_first_pass": 510,
+      "reduction_vs_original_percent": 9.212171738224262
+    },
+    "withdrawal": {
+      "counts": {
+        "original": 28772,
+        "windowed-v1": 27072,
+        "windowed-v2": 26052
+      },
+      "saved_vs_original": 2720,
+      "saved_vs_first_pass": 1020,
+      "reduction_vs_original_percent": 9.45363547893786
+    }
+  },
+  "proving_keys": {
+    "request": {
+      "bytes": {
+        "original": 4842707,
+        "windowed-v1": 4570716,
+        "windowed-v2": 4489116
+      },
+      "reduction_vs_original_percent": 7.30151545406319
+    },
+    "withdrawal": {
+      "bytes": {
+        "original": 5583030,
+        "windowed-v1": 5311039,
+        "windowed-v2": 5147839
+      },
+      "reduction_vs_original_percent": 7.794889155172013
+    }
+  },
+  "native_confirmation": [
+    {
+      "case": "request_state",
+      "prove_median_ms": {
+        "original": 837.4000625,
+        "windowed-v1": 649.761312,
+        "windowed-v2": 639.831917
+      },
+      "latency_reduction_vs_original_percent": 23.59304164728314,
+      "additional_latency_reduction_vs_first_pass_percent": 1.528160390072597
+    },
+    {
+      "case": "withdrawal_state_escape",
+      "prove_median_ms": {
+        "original": 905.4965004999999,
+        "windowed-v1": 740.213771,
+        "windowed-v2": 701.9212085
+      },
+      "latency_reduction_vs_original_percent": 22.482173248332714,
+      "additional_latency_reduction_vs_first_pass_percent": 5.173176182370687
+    }
+  ],
+  "all_candidate_cases": [
+    {
+      "case": "request_genesis",
+      "constraints": 21780,
+      "prove_median_ms": 621.282416,
+      "proving_key_bytes": 4489116
+    },
+    {
+      "case": "request_state",
+      "constraints": 21780,
+      "prove_median_ms": 635.0778750000001,
+      "proving_key_bytes": 4489116
+    },
+    {
+      "case": "withdrawal_genesis_escape",
+      "constraints": 26052,
+      "prove_median_ms": 706.219958,
+      "proving_key_bytes": 5147839
+    },
+    {
+      "case": "withdrawal_genesis_mutual",
+      "constraints": 26052,
+      "prove_median_ms": 714.465396,
+      "proving_key_bytes": 5147839
+    },
+    {
+      "case": "withdrawal_state_escape",
+      "constraints": 26052,
+      "prove_median_ms": 711.20325,
+      "proving_key_bytes": 5147839
+    },
+    {
+      "case": "withdrawal_state_mutual",
+      "constraints": 26052,
+      "prove_median_ms": 731.4356250000001,
+      "proving_key_bytes": 5147839
+    },
+    {
+      "case": "withdrawal_state_ownership",
+      "constraints": 26052,
+      "prove_median_ms": 698.3212715,
+      "proving_key_bytes": 5147839
+    }
+  ],
+  "validation": {
+    "native_compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "default": {
+      "passed": 69,
+      "failed": 0,
+      "ignored": 2
+    },
+    "windowed_v2": {
+      "passed": 71,
+      "failed": 0,
+      "ignored": 2
+    },
+    "ignored_reason": "Existing tests require external ceremony files or a public powers-of-tau transcript.",
+    "suites": [
+      "library",
+      "release_policy_check",
+      "circuits",
+      "proofs",
+      "r1cs_fidelity",
+      "reduction_cross_check",
+      "zkey_import"
+    ],
+    "default_r1cs": "Matches the packaged manifest hashes exactly.",
+    "variable_points": "Native arithmetic and constraint checks cover identity, prime-subgroup, order-two torsion, mixed-order points, odd lengths, subgroup-order boundaries, and full-width scalars.",
+    "proofs": "Every honest proof kind verifies; every public-input mutation fails verification; invalid statements are rejected.",
+    "export": "Independent ark-circom parsing/evaluation and reduction cross-checks pass.",
+    "key_import": "Every key-point binding gate, development zkey round trip, and toy ceremony import passes.",
+    "format": "rustfmt 1.99.0 --check passes."
+  },
+  "wasm_check": {
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "command": "cargo check --locked --release -p zkapi-browser --target wasm32-unknown-unknown --features zkapi-proof/windowed-circuits",
+    "passed": true
+  },
+  "previous_key_rejection": {
+    "request": true,
+    "withdrawal": true,
+    "check": "The v2 benchmark binary rejects the actual v1 setup keys before proving."
+  },
+  "deployment": "Experimental opt-in variant, with circuit identity zkapi-v2-concession-windowed-v2 and newly generated local development setup keys. Older circuit identities are rejected.",
+  "timing_scope": "Native CPU measurements; no browser proving or on-chain gas measurements."
+}

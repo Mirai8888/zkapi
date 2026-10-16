@@ -1,0 +1,6 @@
+{
+  "circuit_id": "zkapi-v2-concession-windowed-v2",
+  "summary": "pass-2/summary.json",
+  "metadata": "pass-2/metadata.json",
+  "previous_summary": "summary.json"
+}

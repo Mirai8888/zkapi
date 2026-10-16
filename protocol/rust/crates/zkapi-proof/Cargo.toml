@@ -51,7 +51,7 @@ dev-setup = []
 # chains). Changes no acceptance policy. Key generation (`compact::setup`)
 # needs no feature.
 dev-fixtures = []
-# Experimental fixed-generator gadgets. Changes the R1CS and circuit identity;
+# Experimental windowed curve gadgets. Changes the R1CS and circuit identity;
 # generate a separate setup with this feature before proving. Never use the
 # packaged concession-v1 keys or deploy this variant without its own review.
 windowed-circuits = []

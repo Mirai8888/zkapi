@@ -6,15 +6,15 @@
 //!   ../setup/v2-concession-dev withdrawal_state_escape 5 1
 //! ```
 //!
-//! For the experimental fixed-generator variant, first create separate keys:
+//! For the experimental windowed variant, first create separate keys:
 //!
 //! ```text
 //! cargo run --release -p zkapi-proof --features windowed-circuits \
-//!   --example setup -- target/windowed-setup
+//!   --example setup -- target/windowed-v2-setup
 //! RAYON_NUM_THREADS=1 cargo run --release -p zkapi-proof \
 //!   --features windowed-circuits --example proof_bench -- \
-//!   target/windowed-setup request_state 10 2 3
-//! ZKAPI_SETUP_DIR=target/windowed-setup cargo test --release -p zkapi-proof \
+//!   target/windowed-v2-setup request_state 10 2 3
+//! ZKAPI_SETUP_DIR=target/windowed-v2-setup cargo test --release -p zkapi-proof \
 //!   --features windowed-circuits --lib --tests
 //! ```
 //!

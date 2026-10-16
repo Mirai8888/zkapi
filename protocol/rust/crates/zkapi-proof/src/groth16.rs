@@ -393,6 +393,57 @@ fn windowed_fixed_generator_mul(
     Ok(result.unwrap_or_else(EdwardsVar::zero))
 }
 
+fn variable_base_mul(
+    base: &EdwardsVar,
+    bits: &[Boolean<CircuitField>],
+) -> Result<EdwardsVar, SynthesisError> {
+    #[cfg(feature = "windowed-circuits")]
+    {
+        windowed_variable_base_mul(base, bits)
+    }
+    #[cfg(not(feature = "windowed-circuits"))]
+    {
+        base.scalar_mul_le(bits.iter())
+    }
+}
+
+/// Radix-four multiplication of a variable point, using [0, P, 2P, 3P].
+/// Select each digit before adding it, rather than selecting after each
+/// individual bit addition. All additions use the complete Edwards gadget;
+/// no nonzero-point or prime-subgroup assumption is introduced.
+#[cfg(any(test, feature = "windowed-circuits"))]
+fn windowed_variable_base_mul(
+    base: &EdwardsVar,
+    bits: &[Boolean<CircuitField>],
+) -> Result<EdwardsVar, SynthesisError> {
+    let zero = EdwardsVar::zero();
+    if bits.is_empty() {
+        return Ok(zero);
+    }
+    if bits.len() == 1 {
+        return bits[0].select(base, &zero);
+    }
+    let twice = base.double()?;
+    let thrice = base + &twice;
+    let digit = |window: &[Boolean<CircuitField>]| {
+        let low = window[0].select(base, &zero)?;
+        if window.len() == 1 {
+            Ok(low)
+        } else {
+            let high = window[0].select(&thrice, &twice)?;
+            window[1].select(&high, &low)
+        }
+    };
+    let mut windows = bits.chunks(2).rev();
+    let mut result = digit(windows.next().unwrap())?;
+    for window in windows {
+        result.double_in_place()?;
+        result.double_in_place()?;
+        result += digit(window)?;
+    }
+    Ok(result)
+}
+
 fn enforce_signature(
     cs: ConstraintSystemRef<CircuitField>,
     public_key: &EdwardsVar,
@@ -413,7 +464,7 @@ fn enforce_signature(
     )?;
     let challenge_bits = challenge_hash.to_bits_le()?;
     let lhs = fixed_generator_mul(cs, EdwardsProjective::generator(), &s_bits)?;
-    let rhs = r + public_key.scalar_mul_le(challenge_bits.iter())?;
+    let rhs = r + variable_base_mul(public_key, &challenge_bits)?;
     lhs.conditional_enforce_equal(&rhs, condition)
 }
 
@@ -1138,6 +1189,85 @@ mod tests {
             let result = windowed_fixed_generator_mul(base, &bits).unwrap();
             result.enforce_equal(&EdwardsVar::constant(base)).unwrap();
             assert!(!cs.is_satisfied().unwrap(), "5P cannot equal P");
+        }
+    }
+
+    #[test]
+    fn windowed_variable_points_match_native_arithmetic_and_reduce_constraints() {
+        let mut rng = test_rng();
+        let torsion = EdwardsAffine::new_unchecked(CircuitField::ZERO, -CircuitField::ONE);
+        assert!(torsion.is_on_curve());
+        assert!(!torsion.is_in_correct_subgroup_assuming_on_curve());
+        let torsion = torsion.into_group();
+        for base in [
+            EdwardsProjective::ZERO,
+            EdwardsProjective::generator(),
+            balance_blinding_generator(),
+            torsion,
+            EdwardsProjective::generator() + torsion,
+        ] {
+            let mut vectors = Vec::new();
+            for width in [0, 1, 2, 3, 63, 128, 251, 254] {
+                vectors.push(vec![false; width]);
+                vectors.push(vec![true; width]);
+                vectors.push((0..width).map(|i| i % 2 == 0).collect());
+                vectors.push((0..width).map(|i| i + 1 == width).collect());
+                for _ in 0..4 {
+                    vectors.push((0..width).map(|_| rng.next_u64() & 1 == 1).collect());
+                }
+            }
+            let order = EdwardsScalarField::MODULUS;
+            let mut order_plus_one = order;
+            order_plus_one.add_with_carry(&ark_ff::BigInt::from(1u64));
+            for scalar in [order, order_plus_one] {
+                let mut bits = scalar.to_bits_le();
+                bits.truncate(254);
+                vectors.push(bits);
+            }
+            for native_bits in vectors {
+                let expected = base.mul_bigint(ark_ff::BigInt::<4>::from_bits_le(&native_bits));
+                let cs = ConstraintSystem::new_ref();
+                // Inputs check the curve equation without assuming subgroup
+                // membership, matching the circuit's public signing keys.
+                let base_var = EdwardsVar::new_input(cs.clone(), || Ok(base)).unwrap();
+                let bits = native_bits
+                    .iter()
+                    .map(|bit| Boolean::new_witness(cs.clone(), || Ok(*bit)).unwrap())
+                    .collect::<Vec<_>>();
+                let start = cs.num_constraints();
+                let windowed = windowed_variable_base_mul(&base_var, &bits).unwrap();
+                let windowed_rows = cs.num_constraints() - start;
+                let start = cs.num_constraints();
+                let bitwise = base_var.scalar_mul_le(bits.iter()).unwrap();
+                let bitwise_rows = cs.num_constraints() - start;
+                // EdwardsVar::value asserts prime-order membership. Compare
+                // coordinates directly so torsion inputs can be checked too.
+                let affine = expected.into_affine();
+                for actual in [&windowed, &bitwise] {
+                    assert_eq!(actual.x.value().unwrap(), affine.x, "{} bits", bits.len());
+                    assert_eq!(actual.y.value().unwrap(), affine.y, "{} bits", bits.len());
+                }
+                windowed
+                    .enforce_equal(&EdwardsVar::constant(expected))
+                    .unwrap();
+                assert!(cs.is_satisfied().unwrap());
+                if bits.len() >= 128 {
+                    assert!(
+                        windowed_rows < bitwise_rows,
+                        "{windowed_rows} >= {bitwise_rows}"
+                    );
+                }
+            }
+            let cs = ConstraintSystem::new_ref();
+            let base_var = EdwardsVar::new_input(cs.clone(), || Ok(base)).unwrap();
+            let bits = [true, false, true]
+                .iter()
+                .map(|bit| Boolean::new_witness(cs.clone(), || Ok(*bit)).unwrap())
+                .collect::<Vec<_>>();
+            let result = windowed_variable_base_mul(&base_var, &bits).unwrap();
+            let wrong = base.mul_bigint([5u64]) + EdwardsProjective::generator();
+            result.enforce_equal(&EdwardsVar::constant(wrong)).unwrap();
+            assert!(!cs.is_satisfied().unwrap());
         }
     }
 

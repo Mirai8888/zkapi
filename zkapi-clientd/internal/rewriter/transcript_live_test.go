@@ -4,8 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
+
+// Live semantic checks are deliberately partial: they cannot prove equivalence
+// or resistance to stylometric identification. Inspect the logged reconstruction.
+func TestLiveCanonicalReconstruction(t *testing.T) {
+	if os.Getenv("ZKAPI_TEST_REWRITER") != "1" {
+		t.Skip("set ZKAPI_TEST_REWRITER=1 for localhost:8012")
+	}
+	for _, sample := range []struct {
+		name, text string
+		retain     []string
+	}{
+		{"privacy", "My goal is privacy preservation. Are there any other things other than skills that go into the structured prompt that I should disable? Maybe AGENTS.md? something else?", []string{"AGENTS.md", "skills", "privacy"}},
+		{"constraints", "hey, I think this might be a cache issue, but I'm not sure. Could you suggest checks without running commands? Please don't change `/tmp/cache.json`. If a restart is needed, ask me first; otherwise just explain. Keep the answer under 100 words.", []string{"`/tmp/cache.json`", "100"}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]any{"messages": []map[string]string{{"role": "user", "content": sample.text}}})
+			draft, err := Select(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, notice, err := draft.Rewrite(context.Background(), Config{URL: "http://localhost:8012", Model: "qwen3.8-flash-next"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := notice.Texts[0]
+			for _, exact := range sample.retain {
+				if !strings.Contains(text, exact) {
+					t.Fatalf("lost protected detail %q in %q", exact, text)
+				}
+			}
+			if text == sample.text {
+				t.Fatal("sample was not reconstructed")
+			}
+			t.Logf("Reconstructed: %s", text)
+		})
+	}
+}
 
 func TestLiveLocalTranscript(t *testing.T) {
 	if os.Getenv("ZKAPI_TEST_REWRITER") != "1" {

@@ -68,8 +68,12 @@ expiry extension or weakening of settlement/payment checks.
 
 ## Privacy and semantic limits
 
-The editor is asked to normalize style without answering, adding facts, or
-changing requirements, negation, uncertainty and meaning. Code, quotes,
+The editor extracts the task, necessary context and constraints, then rebuilds
+the request in that order using concise task-first prose—not sentence-by-sentence
+proofreading. It changes structure and removes nonessential conversational or
+personal framing, with no headings for simple requests. It must not answer, add
+facts, resolve missing context, or change requirements, conditions, negation,
+uncertainty or meaningful personal context. Code, quotes,
 identifiers, paths, URLs, numbers and exact-output constraints are preserved.
 Unknown content-part types fail rather than bypassing rewriting. Known images,
 audio and file attachments are retained and are **not anonymized**.
@@ -155,10 +159,18 @@ cd /home/v/zkapi/zkapi-clientd
 ZKAPI_TEST_REWRITER=1 go test -v ./internal/rewriter -run TestLiveLocalRewriter
 ```
 
-The test passed against `http://localhost:8012`, model `qwen3.8-flash-next`, with
-no key. It requested a two-sentence hash-map explanation and returned:
-“Could you explain what a hash map is? Keep it to two sentences.” No wallet,
-zkAPI payment or live target inference was involved.
+Live tests use `http://localhost:8012`, model `qwen3.8-flash-next`, with no key.
+`TestLiveCanonicalReconstruction` checks sample reconstruction and retention of
+selected exact details; it does not prove semantic equivalence or anonymity.
+For the privacy/AGENTS.md sample, the updated instruction returned:
+“Determine whether any components other than skills, such as AGENTS.md or other
+relevant items, are included in the structured prompt and should be disabled for
+privacy preservation.” A separate conditional/cache sample retained the no-command,
+no-file-change, ask-before-restart and 100-word constraints. No wallet, zkAPI
+payment or live target inference was involved.
+
+Both protocol builds use this instruction. Restart to load a rebuilt binary;
+existing in-memory rewrites are never silently replaced during a running session.
 
 Upstream production proving keys and reviewed deployed network manifests are
 still missing. Rewriting does not bypass those gates or activate a live vault.

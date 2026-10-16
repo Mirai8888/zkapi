@@ -44,6 +44,35 @@ Selected final outputs:
 | Exact quotation | Preserved the quoted redundant phrase rather than normalizing it. |
 | Ambiguous continuation | Kept the unresolved second item and earlier assumption references. |
 
+## Compact default follow-up
+
+The default was subsequently reduced to approximately **253 tokens including the
+fixed response contract**. This is the difference in `usage.prompt_tokens`
+reported by the local endpoint for otherwise identical requests with an empty
+versus populated system message (60 versus 313); it excludes unchanged chat/input
+overhead. The `/tokenize` endpoint was unavailable, so this is an endpoint-reported
+incremental count, not an independently verified tokenizer count.
+
+Three compact revisions were each tested across the 16-case battery. The first
+retained redundant Spanish adjectives and conversational question structure. The
+second improved reconstruction but changed a budget to a strict upper limit.
+The final revision retained a short explicit budget/boundary rule and passed all
+mechanical checks, now strengthened to reject the observed Spanish redundancy
+and strict-budget wording. Manual output review found the core constraints
+preserved, with remaining limitations: the privacy rewrite can frame AGENTS.md
+as included rather than an uncertain candidate, and requested task-first ordering
+is not always followed. The allergy case retained peanut exclusion and the warning
+about traces but converted personal context into food requirements.
+
+Final selected outputs included:
+- “Provide a brief, simple overview of how photosynthesis works.”
+- “List all remaining TODOs without fixing any.”
+- “Resumir la fotosíntesis de forma breve y sin términos técnicos.”
+
+The default remains example-free. This small iterative evaluation does not prove
+perfect fidelity or stylistic anonymity, and a passing phrase screen alone is not
+sufficient evidence of semantic preservation.
+
 ## Rerun
 
 From `zkapi-clientd`, with the local editor running:

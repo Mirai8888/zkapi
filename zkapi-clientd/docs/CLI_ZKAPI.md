@@ -5,6 +5,19 @@ The public commands are `zkapi-clientd config`, `zkapi-clientd serve`,
 The client only supports zkAPI private ETH balances. Ticket issuance, import,
 redemption and ticket-based inference are not included.
 
+## Per-response costs and Tor diagnostics
+
+Every chat response logs `response cost: provider-reported USD=...` when its
+JSON/SSE `usage.cost` is present and valid and delivery completes. This is an
+**unverified provider figure**, not the wallet's ETH charge. Missing/invalid usage
+or incomplete delivery logs `unavailable`, never an invented zero. Streaming
+requests set `stream_options.include_usage=true`; extra usage frames are forwarded
+unchanged. No extra paid request or per-response key retirement is performed.
+Verified ETH charges still arrive separately at key-session settlement and can
+cover multiple responses sharing that key. Cost logs contain no prompt content
+and are emitted in normal and diagnostic modes. Successful Tor dials are silent;
+diagnostic mode reports failures only, without claiming circuit/exit verification.
+
 ## Configuration
 
 Bare `config` prints only pretty JSON with credentials/secret URL components

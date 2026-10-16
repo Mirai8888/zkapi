@@ -19,7 +19,7 @@ func LogRequests(next http.Handler, logger *log.Logger) http.Handler {
 		return next
 	}
 	var sequence atomic.Uint64
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return logResponseCosts(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if activity.DiagnosticLevel(r.Context()) == activity.SemiVerbose {
 			// Content and key/settlement diagnostics provide the compact view.
 			// Keep a one-line status for failures, without raw error strings.
@@ -82,7 +82,7 @@ func LogRequests(next http.Handler, logger *log.Logger) http.Handler {
 		// and never mistakes a partially written response for successful work.
 		next.ServeHTTP(response, r)
 		returned = true
-	})
+	}), logger)
 }
 
 func logMethod(method string) string {

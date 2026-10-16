@@ -77,9 +77,10 @@ func destinationDialer(relayURL string) (func(context.Context, string, string) (
 					}
 				}
 				started := time.Now()
-				activity.Diagnostic(ctx, "Tor connection start (SOCKS circuit selection; not global NEWNYM)")
 				conn, err := dialSOCKS5Auth(ctx, u.Host, network, address, identity)
-				activity.Diagnostic(ctx, "Tor connection finish success=%t elapsed=%.3fs (circuit build/reuse not observable via SOCKS)", err == nil, time.Since(started).Seconds())
+				if err != nil {
+					activity.Diagnostic(ctx, "Tor connection failed elapsed=%.3fs (SOCKS connection; remote details withheld)", time.Since(started).Seconds())
+				}
 				return conn, err
 			}
 			return dialSOCKS5(ctx, u.Host, network, address)

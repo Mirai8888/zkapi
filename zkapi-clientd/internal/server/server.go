@@ -230,6 +230,16 @@ func sanitize(body []byte) (json.RawMessage, bool, error) {
 			delete(values, key)
 		}
 	}
+	if stream {
+		options := map[string]json.RawMessage{}
+		if raw, ok := values["stream_options"]; ok && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &options); err != nil {
+				return nil, false, errors.New("stream_options must be an object")
+			}
+		}
+		options["include_usage"] = json.RawMessage("true")
+		values["stream_options"], _ = json.Marshal(options)
+	}
 	clean, err := json.Marshal(values)
 	return clean, stream, err
 }

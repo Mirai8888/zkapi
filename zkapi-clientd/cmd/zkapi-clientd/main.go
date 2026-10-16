@@ -277,6 +277,7 @@ type zkInference struct{ *zkapi.Client }
 
 func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
 	response, err := z.Client.Complete(ctx, body)
+	err = accessPreparationError(ctx, err)
 	var remote *zkapi.Error
 	if errors.As(err, &remote) {
 		switch remote.Code {

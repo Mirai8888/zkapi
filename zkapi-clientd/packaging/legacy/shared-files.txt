@@ -1,3 +1,5 @@
+cmd/zkapi-clientd/access_errors.go
+cmd/zkapi-clientd/access_errors_test.go
 cmd/zkapi-clientd/cover.go
 cmd/zkapi-clientd/cover_test.go
 cmd/zkapi-clientd/rewriter.go

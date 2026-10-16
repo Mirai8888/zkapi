@@ -55,7 +55,7 @@
    list-models            List supported model IDs and per-query caps
    set-model [MODEL]      Show or save the default model (--clear removes it)
  
-@@ -221,7 +235,7 @@
+@@ -221,13 +235,14 @@
  }
  
  func zkConfig(c config.Config, client *http.Client) zkapi.Config {
@@ -64,7 +64,14 @@
  }
  
  type zkInference struct{ *zkapi.Client }
-@@ -360,6 +374,10 @@
+ 
+ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.Response, error) {
+ 	response, err := z.Client.Complete(ctx, body)
++	err = accessPreparationError(ctx, err)
+ 	var remote *zkapi.Error
+ 	if errors.As(err, &remote) {
+ 		switch remote.Code {
+@@ -360,6 +375,10 @@
  		return err
  	}
  	api.DefaultModel = c.DefaultModel
@@ -75,7 +82,7 @@
  	api.RequireAPIKey = c.RequireAPIKey
  	api.Status = server.ServiceStatus{Backend: c.Backend}
  	api.Status.Network = c.ZKAPI.Network
-@@ -370,6 +388,11 @@
+@@ -370,6 +389,11 @@
  		api.ManagementToken = c.ManagementToken
  		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
  	}

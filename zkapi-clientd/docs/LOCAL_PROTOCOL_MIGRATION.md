@@ -1,11 +1,11 @@
 # Local Tor client: concession-protocol migration
 
-This worktree merges upstream `df88556` into the custom Tor client. Development
-now lives in `/home/v/zkapi` on branch `feat/client-concession-local`, including
-the prompt rewriter and target-side transcript. The migration was originally
-prepared in `/home/v/zkapi-protocol`; that worktree remains as a checkpoint.
-Legacy executables and wallet profiles are unchanged. This is a development
-build, not a deployed production release.
+This branch merges upstream `df88556` into the custom Tor client, including
+canonical prompt reconstruction, a separate target-side transcript and bounded
+cover traffic. Both selectable protocol engines share the privacy implementation.
+Legacy recovery executables and wallet profiles are preserved. This is a
+development build, not a deployed production release. See
+[building this branch](DEVELOPMENT.md) and [protocol selection](VAULT_PROTOCOL.md).
 
 ## Protocol and deployment gate
 
@@ -28,6 +28,8 @@ still requires Tor's `IsolateSOCKSAuth` configuration.
 ## Outputs
 
 - `zkapi-clientd/bin/zkapi-clientd-concession-tor`: new Go daemon.
+- `zkapi-clientd/bin/zkapi-clientd-legacy-privacy`: old protocol engine with
+  current shared privacy features, selected automatically for legacy profiles.
 - `zkapi-clientd/bin/zkapi-walletd-concession`: new Rust companion compiled
   in release mode without `dev-setup`.
 

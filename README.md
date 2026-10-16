@@ -22,6 +22,18 @@ Releases follow [semantic versioning](docs/versioning.md) on major version 0:
 until 1.0.0, any interface may change in any release. See the
 [changelog](CHANGELOG.md).
 
+## Privacy-enabled client development branch
+
+This branch adds native Tor conversation isolation, canonical prompt rewriting,
+separate target-side history, bounded cover traffic and saved vault-protocol
+selection to the local client. Start with [the client README](zkapi-clientd/README.md)
+and [build instructions](zkapi-clientd/docs/DEVELOPMENT.md).
+
+**Not a production release:** concession network manifests are undeployed and
+production proving keys are missing; legacy needs its matching historical wallet
+bundle. Neither protocol selection nor privacy features bypass these checks.
+Local wallets, binaries, proving assets and scratch outputs are excluded from Git.
+
 ## Local OpenAI-compatible API
 
 Use [zkapi-clientd](zkapi-clientd/README.md) to configure an ETH wallet and serve

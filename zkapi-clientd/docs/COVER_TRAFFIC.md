@@ -93,12 +93,12 @@ high, fix the route/endpoints or reduce the rate; the daemon deliberately does
 not change its schedule based on user request timing. A target can log the Tor
 exit and requested public path. Probes must contain no private content.
 
-## Legacy helper and release status
+## Native client and release status
 
-`zkapi-cover-traffic.py` and `zkapi-serve-tor.sh` are retained for legacy workflows.
-The wrapper still starts its own Python worker. Do not run both cover systems:
-use native `serve` for this feature, rather than the old launcher. No existing
-process or saved profile has been changed automatically.
+The obsolete root-level Python worker and shell launchers have been removed.
+Use native `serve` for both protocols. Stop any separately running older cover
+worker before enabling native cover, to avoid duplicate traffic. No existing
+process or saved profile is changed automatically.
 
 Both selected protocol engines implement this native worker from shared source;
 choosing legacy does not disable it. The new concession release still needs

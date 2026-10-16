@@ -36,13 +36,18 @@ rewrites form a separate target-side history; normal continuations send only
 new user text to the rewriter. Cache misses rewrite unknown historical user
 turns rather than passing them raw. This discloses original text to the rewriter. See [configuration, privacy limits and client display](docs/REWRITER.md).
 
-## Quick start
+## Build this branch
 
-Install or update:
+Follow [development builds and validation](docs/DEVELOPMENT.md). Published
+`clientd-v0.1.6` packages do **not** contain this branch's privacy features or
+protocol selector; do not use their installer to update this build.
 
-```sh
-curl -fsSL https://github.com/ethereum/zkapi/releases/download/clientd-v0.1.6/install.sh | bash
-```
+The examples below assume `zkapi-clientd` refers to the newly built
+`bin/zkapi-clientd-concession-tor` entry point. Global `--config-dir DIR` belongs
+**before** the command. Select the correct existing profile/protocol before any
+wallet operation; concession funding currently refuses undeployed networks.
+
+## Usage
 
 Configure your wallet:
 
@@ -94,9 +99,11 @@ if none is running. See [lifecycle details](docs/CLI_ZKAPI.md#one-command-fundin
 Leave that terminal running. In Open WebUI or another OpenAI-compatible client, set the base URL to **`http://127.0.0.1:8787/v1`** and leave the API key empty (use `local` if the app requires a value). Select a model and chat. The endpoint accepts local connections only.
 
 The default reuses an OpenRouter key for a fixed window of up to 60 seconds.
-Compatible requests from different chats, local clients, and Open WebUI's title
-and follow-up requests can share a key and its spending cap; the provider can
-link those requests. Your saved key-reuse setting is preserved across updates.
+Without Tor mode or rewriting enabled, compatible requests from different chats,
+local clients, and Open WebUI's title/follow-up requests can share a key and its
+spending cap. With Tor or rewriting enabled, unrelated message histories rotate
+the key; eligible prefix-continuing histories can reuse it. The provider can
+link requests using the same key. Your saved key-reuse setting is preserved across updates.
 Settlement starts automatically when the window ends, even without another
 request. An active response finishes first.
 For conversation-aware Tor routing, configure Tor's SOCKS port with
@@ -111,7 +118,9 @@ For a fresh key per inference request, stop `serve`, run
 With reuse disabled, settlement starts after each response. Fresh keys may wait
 for the previous key's settlement.
 
-To update, stop `serve`, rerun the install command, then start `serve` again. Your wallet is preserved. See [wallet storage and updates](docs/CLI_PACKAGING.md#wallet-storage-and-updates).
+To update this branch, stop `serve`, rebuild both engines as documented, and
+restart using the same profile. Do not replace a live wallet or proving setup.
+See [wallet storage and updates](docs/CLI_PACKAGING.md#wallet-storage-and-updates).
 
 To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks for the destination and waits for extra ETH for fees only if needed.
 

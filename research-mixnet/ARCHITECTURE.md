@@ -22,8 +22,8 @@ asynchronous research job, not a remotely streamed keystroke-by-keystroke chat.
    completion, restores locally held context, follows citations and synthesizes.
    Public sources must support reported claims. A rewrite must not invent facts.
 
-That complete flow is a design target. Only the encrypted transport and synthetic
-worker plumbing in the current lab have been implemented.
+That complete flow is a design target. Encrypted transport, synthetic worker
+plumbing and a separate-process comparison harness have been implemented.
 
 ## Decisions made for the prototype
 
@@ -33,7 +33,7 @@ worker plumbing in the current lab have been implemented.
 | Independent forward and reverse schedules | A variable or direct response stream would expose job completion patterns. |
 | Fixed cell bodies, random padding | Prevent application body length from directly encoding the task; HTTP/TCP and packet counts remain visible. |
 | Fixed epoch, bounded pools, no catch-up | Jobs do not create extra scheduled slots; overload reduces availability instead of increasing rate. |
-| Random eligible selection with residence delay | Introduces reordering; static local topology with two clients is not an anonymity experiment. |
+| Random eligible selection with residence delay | Introduces reordering; the static single-host comparison cannot establish anonymity. |
 | Replay cache without eviction in a key epoch | Reject repeated packets; capacity exhaustion stops admissions. Production needs authenticated epochs, freshness and restart-safe replay handling. |
 | Local-only synthetic worker | Exercise the transport without leaking prompts, issuing paid calls or importing a vulnerable wallet release. |
 
@@ -62,7 +62,22 @@ Long-term intersection and confirmation attacks need evaluation too.
 | 4: useful research alpha | Read-only search/source connectors behind capabilities; model-independent local jobs API | Primary-source research tasks, query/document minimization, prompt-injection tests, host allowlists, SSRF/DNS controls, redirect handling and measured p50/p95 end-to-end cost/latency. |
 | 5: funded release | Matching reviewed zkAPI deployment, proving artifacts, recovery tooling, signed reproducible packages | Ceremony and code/proof pins, exact-release deposit/request/settlement/independent-exit tests, upstream withdrawal fix, conservative spend caps and tested backups. No development setup substitution. |
 
-Stages 1–5 are open. There is no production anonymity or funded-service release
+Stage 1 now has a process-isolated, synthetic 16-client comparison with clean,
+provider-delay, worker-ingress-loss and client-disconnect scenarios. It measures
+two timestamp heuristics, completion, completed-job latency and TCP stream bytes.
+It has no independent hosts, authenticated directory/links or comprehensive active
+attacker. The complete Katzenpost reference remains blocked by its private-key
+file requirements; see [assessment](REFERENCE.md). The first part of stage 1 is
+implemented; the rest of stages 1–5 remain open.
+
+The [first process comparison](evidence/process-comparison/report.md) found an
+unfinished clean job and queued cover/work at epoch end. The immediate transport
+priority is to evaluate fixed capacity headroom and return-cover routing, then a
+bounded recovery protocol that uses predetermined slots. Low scores for two
+timestamp heuristics do not justify bypassing that work or the complete transport
+reference assessment.
+
+There is no production anonymity or funded-service release
 claim in this branch. The privacy features are independent from changing a vault
 address: existing notes always require their original compatible stack.
 

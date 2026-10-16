@@ -145,8 +145,7 @@ func Run(parent context.Context, cfg Config) (Report, error) {
 	defer func() {
 		cancel()
 		for _, n := range nodes {
-			_ = n.server.Close()
-			_ = n.listener.Close()
+			n.close()
 		}
 		wg.Wait()
 		for _, c := range clients {
@@ -309,7 +308,7 @@ func Run(parent context.Context, cfg Config) (Report, error) {
 	}
 	cancel()
 	for _, n := range nodes {
-		_ = n.server.Close()
+		n.close()
 	}
 	wg.Wait()
 	report.EpochSeconds = time.Since(started).Seconds()

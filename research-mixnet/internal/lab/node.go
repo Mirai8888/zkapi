@@ -36,6 +36,9 @@ type node struct {
 	terminal    chan terminalCell
 	onTerminal  func(terminalCell)
 	rejected    atomic.Uint64
+	beforeCell  func() bool
+	handlerMu   sync.RWMutex
+	closed      bool
 }
 
 func newNode(c *codec, mean time.Duration) (*node, error) {
@@ -61,9 +64,22 @@ func newNode(c *codec, mean time.Duration) (*node, error) {
 
 func (n *node) endpoint() string { return "http://" + n.listener.Addr().String() + "/cell" }
 
+// Close and join handlers before the owner erases its private key. Server.Close
+// alone closes sockets without waiting for handlers that are already running.
+func (n *node) close() {
+	_ = n.server.Close()
+	_ = n.listener.Close()
+	n.handlerMu.Lock()
+	n.closed = true
+	n.handlerMu.Unlock()
+}
+
 func (n *node) accept(packet []byte, now time.Time) error {
 	if len(packet) != n.codec.s.Geometry().PacketLength {
 		return errors.New("invalid cell")
+	}
+	if n.beforeCell != nil && n.beforeCell() {
+		return errors.New("synthetic loss")
 	}
 	payload, tag, cmds, err := n.codec.s.Unwrap(n.private, packet)
 	if err != nil {
@@ -106,8 +122,14 @@ func (n *node) accept(packet []byte, now time.Time) error {
 }
 
 func (n *node) handle(w http.ResponseWriter, r *http.Request) {
+	n.handlerMu.RLock()
+	defer n.handlerMu.RUnlock()
 	w.Header().Set("Content-Length", "0")
 	w.Header().Set("Cache-Control", "no-store")
+	if n.closed {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != "/cell" || r.URL.RawQuery != "" || r.Header.Get("Origin") != "" ||
 		r.ContentLength != int64(n.codec.s.Geometry().PacketLength) || r.Header.Get("Content-Type") != "application/octet-stream" {
 		w.WriteHeader(http.StatusBadRequest)

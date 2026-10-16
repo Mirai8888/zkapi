@@ -28,13 +28,25 @@ make build
 
 # Explore the latency/bandwidth tradeoff, without inference charges:
 ./bin/research-mixnet demo --rate 4 --mean-delay 100ms --duration 12s
+
+# Separate OS processes; 16 clients and four fault scenarios (~4 minutes):
+make compare
+
+# Smaller process smoke run; aggregate files only:
+./bin/research-mixnet compare --clients 4 --disconnect-clients 1 \
+  --jobs-per-client 2 --rate 4 --duration 12s --cases clean \
+  --output-dir evidence/local-process-smoke
+
+./bin/research-mixnet reference-check
 ```
 
 Build dependencies download over the network. The experiment itself binds only
 literal `127.0.0.1` addresses and contacts only those listeners. It accepts no
 real prompts, keys or wallet profiles. It does not launch a browser or GUI.
-Ctrl+C cancels the run and joins workers. Successful runs print a JSON report;
-incomplete synthetic jobs return a nonzero exit status after printing the report.
+Ctrl+C cancels the run and joins workers and peer subprocesses. The `demo` command
+returns a nonzero status for incomplete jobs. The `compare` command records
+incomplete jobs as measurements, since loss and disconnection are deliberate.
+Dropped observation events invalidate that trial's attack scores.
 
 ## What runs
 
@@ -43,7 +55,7 @@ client upload clocks -> mix F1 -> mix F2 -> mix F3 -> synthetic worker
 client download clocks <- mix R3 <- mix R2 <- mix R1 <- worker return clock
 ```
 
-Two synthetic clients share the relays by default. All edges use actual loopback
+The single-process `demo` uses two synthetic clients by default. All edges use actual loopback
 HTTP with constant-size Sphinx bodies. Each outgoing edge has its own clock,
 bounded pool, and cover generator. The worker uses an opaque single-use reply
 block (SURB), not a client callback URL. A fixed run duration keeps both traffic
@@ -60,6 +72,50 @@ directions active before, during and after a job.
   the whole disposable key epoch; a full cache fails closed rather than evicting.
 - No plaintext, IDs, keys or per-cell timestamps in the report. Keys live in
   memory. The report contains aggregate lab diagnostics, not a production metric API.
+
+## Separate-process comparison
+
+`compare` runs 16 independent client processes, six relay processes and one worker
+for the covered backend. The direct control uses 17 processes and the same
+4,522-byte Sphinx geometry on one-hop request/reply paths, without cover or mix
+delays. This controls cell framing; it is not a typical unpadded Internet request.
+Every peer generates its own disposable private key in memory. Only public
+directory data crosses the bootstrap pipe. Children receive a minimal environment
+and do not inherit wallet profiles or application credentials.
+
+Clients issue four sequential synthetic jobs, with 20 ms of synthetic thinking
+between a reply and its followup. Initial arrivals are staggered. The fixed
+24-second epoch includes idle cover after work finishes. Cases change one factor:
+
+- `clean`: no injected faults.
+- `watermark`: a synthetic provider delays each reply by 0, 375 or 750 ms.
+- `loss`: seeded 2% loss at worker ingress, affecting work and cover alike.
+- `disconnect`: two clients stop one-third into the epoch.
+
+The public seed controls workload, fault selection and predefined clock phases;
+packet entropy and pool selection always use the OS CSPRNG. Jobs are not retried.
+A lost reply stops that client's remaining sequential jobs. The report separates
+planned, submitted and completed jobs, and reports latency for completed jobs only.
+Synthetic nonces change between runs, so the exact watermark pattern also changes.
+
+Two deliberately limited attacker rules match provider receive times to the
+nearest preceding client-edge full write, or provider release times to the nearest
+following write. Inputs contain no client-edge job label. The supervisor joins
+synthetic ground truth only to score guesses. Followup scoring includes only jobs
+whose next round was actually submitted. The report includes sample counts and
+the average uniform-guess baseline for the connected population. These are fixed,
+untrained heuristics with a five-second search window, not a comprehensive
+colluding provider/guard attack. Raw observations remain in memory.
+
+Reports contain actual TCP stream read/write counters, including HTTP. They omit
+TCP/IP headers, retransmission and physical wire overhead. Per-link pending cells,
+rejected cells, failed slots and missed slots help explain availability limits.
+Single runs have small, correlated samples and do not establish anonymity.
+
+The complete Katzenpost reference is **not run**: its pinned stock generator and
+server persist identity/link private keys, conflicting with the instruction to
+keep credentials out of files. `reference-check` reports that constraint; it does
+not fabricate a third backend. See [reference assessment](REFERENCE.md).
 
 ## Read the measurements correctly
 
@@ -79,7 +135,8 @@ This is not a cap on TCP wire bytes and not a provider-cost estimate.
 
 ## Limits and next work
 
-Every node currently runs in one process under one operator on one machine.
+The demo uses one process; the comparison uses separate address spaces under one
+OS user on one machine. Those processes are not a sandbox or independent operators.
 This demonstrates protocol plumbing, **not an anonymity set**, and does not
 defeat a colluding provider and guard. There is no directory/PKI, remote link
 authentication, packet-expiry protocol, persistent replay store, SURB replenishment,

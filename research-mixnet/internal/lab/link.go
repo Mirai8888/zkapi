@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ type LinkStats struct {
 	Missed      uint64 `json:"missed_clock_slots"`
 	Dropped     uint64 `json:"queue_drops"`
 	Bytes       uint64 `json:"successful_cell_bytes"`
+	StreamOut   uint64 `json:"tcp_stream_bytes_written"`
+	StreamIn    uint64 `json:"tcp_stream_bytes_read"`
+	Pending     int    `json:"queued_cells_at_end"`
 }
 
 type link struct {
@@ -34,6 +38,10 @@ type link struct {
 	cover        func() ([]byte, error)
 	mu           sync.Mutex
 	stats        LinkStats
+	uncovered    bool
+	startAt      time.Time
+	notice       chan struct{}
+	onWrite      func(time.Time)
 }
 
 func newLink(name, target string, period time.Duration, size, capacity int, cover func() ([]byte, error)) (*link, error) {
@@ -45,11 +53,15 @@ func newLink(name, target string, period time.Duration, size, capacity int, cove
 	if ip == nil || !ip.IsLoopback() || period < 10*time.Millisecond || size < 1 || capacity < 1 || cover == nil {
 		return nil, errors.New("invalid lab link")
 	}
-	return &link{name: name, target: target, period: period, cellBytes: size, queue: newPool(capacity), cover: cover, stats: LinkStats{Name: name}}, nil
+	return &link{name: name, target: target, period: period, cellBytes: size, queue: newPool(capacity), cover: cover, stats: LinkStats{Name: name}, notice: make(chan struct{}, 1)}, nil
 }
 
 func (l *link) enqueue(packet []byte, ready time.Time) bool {
 	if len(packet) == l.cellBytes && l.queue.add(packet, ready) {
+		select {
+		case l.notice <- struct{}{}:
+		default:
+		}
 		return true
 	}
 	l.mu.Lock()
@@ -58,7 +70,15 @@ func (l *link) enqueue(packet []byte, ready time.Time) bool {
 	return false
 }
 
-func (l *link) snapshot() LinkStats { l.mu.Lock(); defer l.mu.Unlock(); return l.stats }
+func (l *link) snapshot() LinkStats {
+	l.mu.Lock()
+	stats := l.stats
+	l.mu.Unlock()
+	l.queue.mu.Lock()
+	stats.Pending = len(l.queue.cells)
+	l.queue.mu.Unlock()
+	return stats
+}
 
 func (l *link) next(now time.Time) ([]byte, bool, error) {
 	packet, err := l.queue.take(now)
@@ -73,12 +93,26 @@ func (l *link) next(now time.Time) ([]byte, bool, error) {
 }
 
 func (l *link) run(ctx context.Context) {
+	dialer := &net.Dialer{Timeout: l.period / 2}
 	transport := &http.Transport{Proxy: nil, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1, DisableCompression: true,
-		DialContext: (&net.Dialer{Timeout: l.period / 2}).DialContext, ResponseHeaderTimeout: l.period / 2}
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &countedConn{Conn: conn, link: l}, nil
+		}, ResponseHeaderTimeout: l.period / 2}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: l.period / 2,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	scheduled := time.Now().Add(l.period)
+	scheduled := l.startAt
+	if scheduled.IsZero() {
+		scheduled = time.Now().Add(l.period)
+	}
+	if l.uncovered {
+		l.runUncovered(ctx, client)
+		return
+	}
 	timer := time.NewTimer(time.Until(scheduled))
 	defer timer.Stop()
 	for {
@@ -99,25 +133,8 @@ func (l *link) run(ctx context.Context) {
 				l.stats.Queued++
 			}
 			l.mu.Unlock()
-			if err == nil && len(packet) != l.cellBytes {
-				err = errors.New("invalid cell size")
-			}
 			if err == nil {
-				req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, l.target, bytes.NewReader(packet))
-				err = requestErr
-				if err == nil {
-					req.Header.Set("Content-Type", "application/octet-stream")
-					req.Header.Set("User-Agent", "research-mixnet-lab/0.1")
-					response, sendErr := client.Do(req)
-					err = sendErr
-					if response != nil {
-						_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
-						response.Body.Close()
-						if response.StatusCode != http.StatusAccepted {
-							err = errors.New("cell not accepted")
-						}
-					}
-				}
+				err = l.send(ctx, client, packet)
 			}
 			l.mu.Lock()
 			if err != nil && ctx.Err() != nil {
@@ -136,6 +153,94 @@ func (l *link) run(ctx context.Context) {
 			l.stats.Missed += missed
 			l.mu.Unlock()
 			timer.Reset(time.Until(scheduled))
+		}
+	}
+}
+
+type countedConn struct {
+	net.Conn
+	link *link
+}
+
+func (c *countedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.link.mu.Lock()
+	c.link.stats.StreamOut += uint64(n)
+	c.link.mu.Unlock()
+	return n, err
+}
+func (c *countedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.link.mu.Lock()
+	c.link.stats.StreamIn += uint64(n)
+	c.link.mu.Unlock()
+	return n, err
+}
+
+func (l *link) send(ctx context.Context, client *http.Client, packet []byte) error {
+	if len(packet) != l.cellBytes {
+		return errors.New("invalid cell size")
+	}
+	if l.onWrite != nil {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				l.onWrite(time.Now())
+			}
+		}})
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.target, bytes.NewReader(packet))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("User-Agent", "research-mixnet-lab/0.1")
+	response, err := client.Do(req)
+	if response != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
+		response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			err = errors.New("cell not accepted")
+		}
+	}
+	return err
+}
+
+// An uncovered control retains the same Sphinx geometry and HTTP transport.
+// Only traffic scheduling and the path differ from the covered experiment.
+func (l *link) runUncovered(ctx context.Context, client *http.Client) {
+	if !l.startAt.IsZero() {
+		timer := time.NewTimer(time.Until(l.startAt))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-l.notice:
+			for {
+				packet, err := l.queue.take(time.Now())
+				if err != nil || packet == nil {
+					break
+				}
+				err = l.send(ctx, client, packet)
+				l.mu.Lock()
+				l.stats.Slots++
+				l.stats.Queued++
+				if err != nil && ctx.Err() != nil {
+					l.stats.Interrupted++
+				} else if err != nil {
+					l.stats.Failed++
+				} else {
+					l.stats.Sent++
+					l.stats.Bytes += uint64(len(packet))
+				}
+				l.mu.Unlock()
+			}
 		}
 	}
 }

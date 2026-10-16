@@ -1,8 +1,11 @@
 # Local Tor client: concession-protocol migration
 
-This worktree merges upstream `df88556` into the custom Tor client. It is
-separate from `/home/v/zkapi`, whose legacy executable and wallet profiles
-are unchanged. This is a development build, not a deployed production release.
+This worktree merges upstream `df88556` into the custom Tor client. Development
+now lives in `/home/v/zkapi` on branch `feat/client-concession-local`, including
+the prompt rewriter and target-side transcript. The migration was originally
+prepared in `/home/v/zkapi-protocol`; that worktree remains as a checkpoint.
+Legacy executables and wallet profiles are unchanged. This is a development
+build, not a deployed production release.
 
 ## Protocol and deployment gate
 

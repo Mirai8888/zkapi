@@ -10,7 +10,7 @@ original text when the caller resends its history.
 Stop the daemon before changing its configuration:
 
 ```sh
-CLIENT=/home/v/zkapi-protocol/zkapi-clientd/bin/zkapi-clientd-concession-tor
+CLIENT=/home/v/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
 $CLIENT set-rewriter --url http://localhost:8012 --model qwen3.8-flash-next
 $CLIENT set-rewriter                      # status, never prints the key
 $CLIENT set-rewriter --clear              # disable and remove the saved key
@@ -151,7 +151,7 @@ credentials/redirects, cancellation, parallel SOCKS preparation, previews and
 config preservation. The opt-in live test uses only a synthetic prompt:
 
 ```sh
-cd /home/v/zkapi-protocol/zkapi-clientd
+cd /home/v/zkapi/zkapi-clientd
 ZKAPI_TEST_REWRITER=1 go test -v ./internal/rewriter -run TestLiveLocalRewriter
 ```
 

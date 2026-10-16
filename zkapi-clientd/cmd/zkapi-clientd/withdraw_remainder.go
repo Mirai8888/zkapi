@@ -28,6 +28,9 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 	if closed.Phase != "complete" {
 		return errors.New("private withdrawal has not completed; public fee funds were not swept")
 	}
+	if closed.PayoutCredited || closed.PaymasterCredited || closed.FundsWaitingInTransit {
+		return errors.New("private payout still needs collection; public fee funds were not swept; recover with withdraw --claim, --claim-credit, --collect or --sweep as appropriate")
+	}
 	destination, err := zkapi.NormalizeWithdrawalDestination(closed.Destination)
 	if err != nil {
 		return err
@@ -71,7 +74,7 @@ func withdrawWithRemainder(ctx context.Context, c config.Config, ui setupPrompte
 }
 
 func remainderAction(closed zkapi.AddressWithdrawalStatus, state zkapi.AddressReturnStatus) (string, error) {
-	if closed.Phase != "complete" || !strings.EqualFold(closed.Address, state.Address) || closed.ChainID != state.ChainID || !fundingBalance(state.ETHBalance) {
+	if closed.Phase != "complete" || closed.PayoutCredited || closed.PaymasterCredited || closed.FundsWaitingInTransit || !strings.EqualFold(closed.Address, state.Address) || closed.ChainID != state.ChainID || !fundingBalance(state.ETHBalance) {
 		return "", errors.New("public return status does not match completed withdrawal")
 	}
 	if state.Phase == "return_pending" || state.Phase == "confirming" || state.Phase == "complete" {

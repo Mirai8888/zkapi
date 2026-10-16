@@ -89,7 +89,45 @@ and OA key before retiring it; that recovered credential never enters the
 inference cache or bridge response. A confirmed unissued cancellation advances
 the wallet only through the normal matching signed response. Missing keys,
 expiry, HTTP errors and ambiguous issuance never authorize clearing a journal.
-Stopping or failing recovery keeps the original note and request for retry.
+The journal is written and synced to disk, under a temporary name and then
+under its own, before its request is sent, and the note state it settles into
+is synced the same way before the journal is cleared, so a power loss leaves
+neither a sent request without its journal nor an empty journal file.
+A journal that was sent is never deleted without installing its signed
+response. When an unsigned answer sets one aside, it moves, whole, into an
+append-only archive (`request_archive/` in the companion's state directory,
+owner-only like the journal, never pruned, and holding the same
+prompt-free lease authorization and proof as the journal). Each record is
+written and synced under a temporary name before it gets its
+`<milliseconds>-<sequence>.json` name; other files there are ignored, and a
+record that cannot be read is skipped by recovery and treated as an
+unsettled request by withdrawal. A journal is set aside after a
+`stale_root` reply, or when withdrawal settlement finds a request the
+server reports unknown, but in both cases only once the pinned vault's
+`currentRoot()` (read over the packaged RPC) no longer equals the request's
+root and the server reports the request's nullifier unknown too; while the
+vault still has that root, or the root cannot be read, the request stays
+pending and the next lease attempt resends it unchanged. Withdrawal
+settlement also sets aside a request whose nullifier the server reports
+reserved for a clearance (an earlier withdrawal, or the operator's release
+of a stuck state), without reading the root: the server refuses every
+request at such a nullifier whatever the root, so it could never settle.
+Chats at such a state stop with `clearance_reserved_state` and keep the
+request, resending only it. Once withdrawal settlement has set it aside, a
+chat first asks the server's record of that nullifier again and proves
+nothing while the server still reports the reservation, or cannot be asked,
+so chats send no new request proof from that state. A journal is
+also set aside after the server's
+`/expire` acknowledgement of a never-admitted native request, when a wallet
+reset replaces an unspent note, and, as superseded, when the note has
+already moved past the state it was proved at. Explicit recovery
+(`/wallet/recover`), a chat request that opens a new lease, withdrawal settlement and
+withdrawal preparation also ask the server's nullifier record about
+requests archived at the note's current state, and install a finalized
+response for one of them only when it verifies. The daemon's background
+recovery, every 5 seconds, asks only about a pending request, so it sends
+nothing while the note is idle. Stopping or failing recovery keeps the
+original note and request for retry.
 
 Inference is loopback-only and key-free by default. Other local processes can
 use it. Optional local API-key authentication affects only the UI-to-daemon hop.
@@ -100,10 +138,28 @@ account/storage metadata are stripped before inference.
 
 A local Ethereum signing key and private recovery journals are stored in
 owner-only files. Public funding addresses, amounts, withdrawal destinations
-and chain transactions are visible to RPC providers and chain observers.
+and chain transactions are visible to RPC providers and chain observers. The
+client sends chain reads and transactions only to the RPC packaged with the
+release, and to your own exit RPC when you configure one
+(`config --exit-rpc-url`), and refuses a wallet companion that reports another
+RPC, indexer or protocol server. Deployment checks then also run through the
+exit RPC, and an escape reads and sends its transactions only through it, so
+that RPC's provider sees the note's exit and your interest in the vault, as
+any wallet's RPC would. A gasless escape (`--escape --fees payout`, its
+initiation or its sponsored finalization) is the exception: its operation is
+sent to the bundler, the deployment's (run by the operator) unless you set
+your own `--bundler-url`, never through the exit RPC, so that bundler learns
+of the escape before inclusion and can delay or drop it. For an escape that
+must not depend on the operator, use `--fees wallet` or your own bundler. An
+exit RPC on another chain is never trusted.
 Deposit/withdrawal QR codes are generated locally and contain only public
 payment address, chain and amount. No external QR service receives them.
 A withdrawal fee QR funds the local signing address, never the private payout.
+With `--fees payout` no local signing address pays for the withdrawal and no
+withdrawal fee QR is needed; a fresh owner key per withdrawal signs the
+operation and the payout address appears on chain only as the transit
+account's payee. The bundler (the deployment's, or your own `--bundler-url`)
+sees the operation and your client IP before inclusion, as an RPC does.
 
 Waiting for ETH and refreshing quotes do not authorize transactions. For a
 guided deposit, Enter approves the fixed principal with fees that adjust
@@ -117,18 +173,69 @@ reverts never automatically sign a replacement. Wallet state is preserved
 across updates.
 
 Successful native ETH deposits activate after the saved transaction's successful
-mined receipt, canonical block and deposit event are validated, matching the web
-wallet. Success does not wait for Ethereum finality. Failed receipts retain the
-finality gate before explicit retry; missing or ambiguous receipts preserve the
-exact signed transaction without authorizing a replacement. Withdrawals and
-public ETH returns require their own finality checks.
+mined receipt, canonical block and deposit event are validated, and two further
+sources agree: the vault's `notes(noteId)` at the receipt's block hash, and the
+zkAPI indexer's whole-tree snapshot, which must hold this deposit's leaf at that
+note. The note secret reaches the wallet companion only after they agree. The
+vault read goes to the packaged RPC, which already serves the deposit and sees
+its note ID in the public deposit event. The snapshot is the same response for
+every client, so the indexer does not learn which note is yours. Disagreement
+leaves the deposit in `verification_conflict`; nothing is activated, retired or
+replaced until a later check agrees. Success does not wait for Ethereum
+finality. Failed receipts retain the finality gate before explicit retry; a
+deposit signed by this release is also retired only after the indexer shows
+its note did not land. Because the RPC can withhold a deposit and relay it
+after that check, a retry is signed only when a bounded search of the
+indexer tree it is built from finds none of the note's earlier deposits
+(CLI_ZKAPI.md describes the bound). That search uses the same whole-tree
+snapshot. A quote repeated while the tree is unchanged reads only the tree's
+root, which is also the same response for every client. So the indexer
+still cannot tell which note is yours. Missing or ambiguous receipts preserve
+the exact signed transaction without authorizing a replacement. Withdrawals
+and public ETH returns require their own finality checks, and a withdrawal
+completes locally only after the vault and the indexer both show the note
+closed.
 
 Pre-finality activation exposes the same reorganization risk as the web wallet:
 a block can be replaced after a private note or inference credit becomes usable.
-Current wallet/indexer state does not provide complete rollback and reconciliation
-for that event. Local reset cannot undo credit already issued, and later inference
+The wallet does not provide complete rollback and reconciliation for that
+event. Local reset cannot undo credit already issued, and later inference
 or withdrawal may require recovery. Canonical receipt validation establishes the
 observed chain state, not a guarantee against a later reorganization.
+
+A withdrawal builds two withdrawal proofs. The first, an ownership proof
+(kind 2), goes to the protocol server with the clearance request; its public
+statement shows the server the note ID, the payout amount and the note
+state's nullifier before the close transaction publishes them. It names no
+destination (it is zero) and the vault accepts it neither as an escape nor
+as a close. The companion keeps the proof it sent in `exit_lock.json`
+(owner-only) so a retry resends the same statement instead of a new one, and
+it sends no chat request from that note state afterwards. The close (kind 1)
+publishes the note ID, payout and destination on chain, as before.
+
+An escape (kind 0) publishes the note ID, the balance, the destination, the
+conceded amount, the proof's validity time (to within 3 hours) and the next
+state's nullifier, which is never used. Just before it is sent, the
+companion asks the server whether that next nullifier was already spent by
+another device; the server then learns it slightly earlier than the chain
+does, and if the escape never lands, a later request at that nullifier is
+linkable to the question by timing and network address. An escape conceding
+the state's bound links the note's last request to the note ID and the
+destination for the server and the gateway, and the amount publishes that
+request's tier. An escape conceding nothing can be raised by the operator
+with the last request's signed charge, which publishes that request's public
+inputs (time, tier, root, tag) on chain. Waiting for settlement and a mutual
+close link nothing new, so the companion prefers them, and escapes only when
+the exit rules require it or you ask for an early exit. An exit kit contains
+the note secret, encrypted with your passphrase; it never leaves the files you
+write it to.
+
+A request discarded by an earlier release left no archive record, so its
+state is not recognized. When the server reports the note's current
+nullifier settled by a request the wallet holds no record of, chats and
+withdrawal stop with `receipt_journal_missing` and show that nullifier
+locally, for the owner to give the operator; giving it links the owner to
+that request.
 
 The daemon creates no request-history log files. Foreground output includes
 HTTP route/method/status/timing, local sequential `request=` numbers and local
@@ -151,6 +258,8 @@ endpoint, which is also used by the web client; that does not add ticket
 wallet, issuance or redemption support. Exact balances and prompt sizes do
 not choose the bucket.
 
-The protocol is experimental and uses a single-party Groth16 setup. See the
-repository's [note-bound commitments](../../docs/note-bound-commitments.md)
+The protocol is experimental. Release builds load only the keys of the
+multi-party setup, which has not run yet; until then the packaged profiles
+are placeholders and no note can be funded. See the
+repository's [concession exit design](../../docs/design/concession-exit.md)
 and [native ETH architecture](../../docs/architecture.md).

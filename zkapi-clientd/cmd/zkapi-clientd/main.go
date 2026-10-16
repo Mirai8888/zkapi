@@ -90,7 +90,8 @@ func run(args []string) error {
 		return nil
 	}
 	if args[0] == "withdraw" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		fmt.Println("Usage: zkapi-clientd withdraw [--public]\nWithdraw private balance, then return leftover public ETH to the same destination with a separate fee approval. Includes saved transaction recovery. Use --public for a standalone public return. Requires a terminal for destination and approval. Starts a temporary daemon if needed; never stops an existing daemon.")
+		fmt.Println("Usage: zkapi-clientd withdraw [--public | OPTIONS]\nWithout options: guided private withdrawal, then public ETH return with separate approval. --public: standalone public return. Explicit options below use the protocol's quote/approval and recovery flow without an automatic public sweep.")
+		_ = runWithdrawal(context.Background(), config.Config{}, []string{"--help"}, os.Stdout)
 		return nil
 	}
 	if (args[0] == "list-models" || args[0] == "set-model") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
@@ -111,7 +112,7 @@ func run(args []string) error {
 		if len(args) == 2 && args[1] == "--public" {
 			action = "return"
 		} else if len(args) != 1 {
-			return errors.New("use withdraw or withdraw --public; destination and approval are prompted")
+			return runConfiguredWithdrawal(ctx, dir, c, args[1:], os.Stdout)
 		}
 		ui := &terminalSetupPrompter{out: os.Stdout}
 		defer ui.Close()
@@ -158,7 +159,7 @@ func help() {
 
   config                 Show status, configure or edit settings, and prepare the wallet
   serve [--model MODEL]  Open a missing note when funded, then serve inference
-  withdraw [--public]    Withdraw private balance or return public funding ETH
+  withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
   list-models            List supported model IDs and per-query caps
   set-model [MODEL]      Show or save the default model (--clear removes it)
 
@@ -221,7 +222,7 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL)}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
 }
 
 type zkInference struct{ *zkapi.Client }
@@ -231,6 +232,15 @@ func (z zkInference) Complete(ctx context.Context, body json.RawMessage) (*http.
 	var remote *zkapi.Error
 	if errors.As(err, &remote) {
 		switch remote.Code {
+		case "receipt_journal_missing":
+			// The message names the nullifier the operator needs.
+			return nil, &server.BackendError{Status: 409, Code: "receipt_journal_missing", Message: err.Error()}
+		case "ownership_proof_sent":
+			// The note stays withdrawal-only; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "ownership_proof_sent", Message: "A withdrawal sent, or may have sent, the ownership proof of the note's current state, so no chat request is made from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal."}
+		case "clearance_reserved_state":
+			// No chat can settle this state; waiting or retrying cannot help.
+			return nil, &server.BackendError{Status: 409, Code: "clearance_reserved_state", Message: "The note's current state is reserved for withdrawal on the zkAPI server (for example because the operator released it), so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance."}
 		case "testnet_password_required":
 			return nil, &server.BackendError{Status: 401, Code: "testnet_password_required", Message: remote.Error()}
 		case "invalid_model":
@@ -325,7 +335,13 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 			return err
 		}
 		defer proxy.Close()
-		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password})
+		if warning := zkapi.LegacyWalletWarning(filepath.Join(dir, "zkapi"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
+		if warning := zkapi.LegacyFundingWarning(filepath.Join(dir, "funding"), c.ZKAPI.Network); warning != "" {
+			logger.Print(warning)
+		}
+		cmd, err := zkapi.CompanionCommand(life, zc, zkapi.CompanionConfig{Binary: c.ZKAPI.Binary, SetupDir: c.ZKAPI.ProofSetupDir, StateDir: filepath.Join(dir, "zkapi"), VerifierURL: c.VerifierURL, ProxyURL: proxy.URL, TestnetPassword: password, ExitRPCURL: c.ZKAPI.ExitRPCURL})
 		if err != nil {
 			return err
 		}
@@ -355,6 +371,15 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 	if err != nil {
 		return err
 	}
+	// Design §6.7: check the deployment on chain at startup (deposits check
+	// again before signing). A mismatch refuses deposits; exits stay open.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(life, 2*time.Minute)
+		defer cancel()
+		if err := wallet.CheckDeployment(checkCtx); err != nil {
+			logger.Printf("zkAPI deployment check: %v", err)
+		}
+	}()
 	api, err := server.New(backend, c.APIKey, c.Concurrency)
 	if err != nil {
 		return err

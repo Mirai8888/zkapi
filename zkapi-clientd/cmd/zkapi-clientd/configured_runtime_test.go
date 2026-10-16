@@ -189,6 +189,10 @@ func TestConfigPaymentRequiresConsentAndRejectsReplacedQuote(t *testing.T) {
 						_ = json.NewEncoder(w).Encode(state)
 						return
 					}
+					if r.URL.Path == prefix+"/gasless" {
+						_ = json.NewEncoder(w).Encode(map[string]any{"available": false, "reason": "gasless_unavailable"})
+						return
+					}
 					if r.URL.Path == prefix {
 						if kind == "withdrawal" {
 							state := withdrawalTestStatus("ready")

@@ -21,6 +21,22 @@ func TestRemainderActions(t *testing.T) {
 			t.Fatal(test, got, err)
 		}
 	}
+	closed.PayoutCredited = true
+	state := zkapi.AddressReturnStatus{Phase: "ready", ETHBalance: "100", Address: closed.Address, ChainID: 1}
+	if _, err := remainderAction(closed, state); err == nil {
+		t.Fatal("sweeps fee funds before credited payout collection")
+	}
+	closed.PayoutCredited = false
+	closed.PaymasterCredited = true
+	if _, err := remainderAction(closed, state); err == nil {
+		t.Fatal("sweeps fee funds before paymaster credit collection")
+	}
+	closed.PaymasterCredited = false
+	closed.FundsWaitingInTransit = true
+	if _, err := remainderAction(closed, state); err == nil {
+		t.Fatal("sweeps fee funds before transit payout collection")
+	}
+	closed.FundsWaitingInTransit = false
 	closed.Phase = "confirming"
 	if _, err := remainderAction(closed, zkapi.AddressReturnStatus{}); err == nil {
 		t.Fatal("sweeps before private completion")

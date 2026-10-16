@@ -63,6 +63,17 @@ type ZKAPI struct {
 	// Retained only to load older configurations. Each new request chooses its
 	// budget from the selected model; a saved fixed limit has no effect.
 	RequestLimitMicroUSD uint64 `json:"request_limit_micro_usd,omitempty"`
+	// ExitRPCURL is the owner's own Ethereum RPC for exits (--exit-rpc-url):
+	// deployment checks also run through it, the companion reads expiry,
+	// roots and logs through it, and exit transactions are sent through it.
+	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
+	// WithdrawalFees is how a withdrawal pays its network fee by default:
+	// "wallet" (the local signing address; the default) or "payout" (a
+	// sponsored operation paid from the payout, --fees payout).
+	WithdrawalFees string `json:"withdrawal_fees,omitempty"`
+	// BundlerURL is the owner's ERC-4337 bundler for gasless withdrawals
+	// (--bundler-url); empty uses the deployment's published bundler.
+	BundlerURL string `json:"bundler_url,omitempty"`
 }
 
 type Config struct {
@@ -212,7 +223,36 @@ func Validate(c Config) error {
 	if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() {
 		return errors.New("ZKAPI client_url must use a numeric loopback IP")
 	}
+	if c.ZKAPI.ExitRPCURL != "" && !validExitRPC(c.ZKAPI.ExitRPCURL) {
+		return errors.New("ZKAPI exit_rpc_url must be an HTTPS URL, or plain HTTP to a node on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.BundlerURL != "" && !validExitRPC(c.ZKAPI.BundlerURL) {
+		return errors.New("ZKAPI bundler_url must be an HTTPS URL, or plain HTTP to a bundler on this machine, without credentials, query or fragment")
+	}
+	if c.ZKAPI.WithdrawalFees != "" && c.ZKAPI.WithdrawalFees != "wallet" && c.ZKAPI.WithdrawalFees != "payout" {
+		return errors.New("ZKAPI withdrawal_fees must be wallet or payout")
+	}
 	return nil
+}
+
+// validExitRPC mirrors zkapi.ValidateExitRPCURL: the owner's own Ethereum RPC
+// for exits, over HTTPS or plain HTTP to this machine.
+func validExitRPC(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	if u.Hostname() == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 func Init(dir string, c Config) error {

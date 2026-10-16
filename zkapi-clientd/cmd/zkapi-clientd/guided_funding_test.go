@@ -19,11 +19,14 @@ type fundingWizardUI struct {
 	confirmations             []bool
 	asks, confirms, continues int
 	beforeContinue            func()
+	// questions records what was asked, in order.
+	questions []string
 }
 
 func (u *fundingWizardUI) Printf(format string, args ...any) { fmt.Fprintf(&u.Buffer, format, args...) }
-func (u *fundingWizardUI) Ask(context.Context, string, string) (string, error) {
+func (u *fundingWizardUI) Ask(_ context.Context, question, _ string) (string, error) {
 	u.asks++
+	u.questions = append(u.questions, question)
 	if len(u.answers) == 0 {
 		return "", errors.New("unexpected input request")
 	}
@@ -63,6 +66,7 @@ type wizardFundingFixture struct {
 	approve                                               func(string) (zkapi.AddressFundingStatus, error)
 	resume                                                func(uint64) (zkapi.AddressFundingStatus, error)
 	withdrawal                                            string
+	withdrawalStatus                                      func() zkapi.AddressWithdrawalStatus
 }
 
 func wizardState(phase string) zkapi.AddressFundingStatus {
@@ -97,6 +101,9 @@ func (f *wizardFundingFixture) Address(context.Context) (zkapi.AddressFundingSta
 	return s, nil
 }
 func (f *wizardFundingFixture) Withdrawal(context.Context) (zkapi.AddressWithdrawalStatus, error) {
+	if f.withdrawalStatus != nil {
+		return f.withdrawalStatus(), nil
+	}
 	phase := f.withdrawal
 	if phase == "" {
 		phase = "no_note"
@@ -167,6 +174,39 @@ func TestGuidedFundingWaitsForMoneyThenApprovesFreshFixedQuote(t *testing.T) {
 	for _, want := range []string{"To:", "Send at least:", "Funds available.", "Deposit confirmed.", "Private balance:"} {
 		if !strings.Contains(u.String(), want) {
 			t.Fatalf("missing %q", want)
+		}
+	}
+}
+
+// Before a new deposit replaces a credited escape's withdrawal record, and
+// while earlier credited payouts stay unclaimed, the guided setup names them
+// with their claim call. A paid withdrawal adds nothing.
+func TestGuidedFundingNamesUnclaimedEscapePayoutsBeforeANewDeposit(t *testing.T) {
+	for _, credited := range []bool{true, false} {
+		f := newWizardFixture()
+		current := "An escape of this note finalized and closed it, but the vault could not deliver the payout; call claimEscapePayout(0xdest) on the vault"
+		earlier := "An earlier escape (note 9) closed its note; call claimEscapePayout(0xother) on the vault"
+		f.withdrawalStatus = func() zkapi.AddressWithdrawalStatus {
+			return zkapi.AddressWithdrawalStatus{Phase: "complete", PayoutCredited: credited, Message: current}
+		}
+		f.address = func() zkapi.AddressFundingStatus {
+			s := wizardState("ready")
+			s.Amount, s.TransactionHash = 0, ""
+			if credited {
+				s.EscapePayoutCredits = []zkapi.EscapePayoutCredit{{Destination: "0xother", Message: earlier}}
+			}
+			return s
+		}
+		u := &fundingWizardUI{answers: []string{"20"}, confirmations: []bool{true}}
+		if err := guidedFunding(context.Background(), f, "", u, immediateWizardPoll); err != nil {
+			t.Fatal(err)
+		}
+		output := u.String()
+		for _, message := range []string{current, earlier} {
+			shown := strings.Index(output, "Unclaimed escape payout: "+message)
+			if (shown >= 0) != credited || (credited && shown > strings.Index(output, "Ready to deposit")) {
+				t.Fatalf("credited=%v: the reminder %q is missing or follows the deposit: %s", credited, message, output)
+			}
 		}
 	}
 }

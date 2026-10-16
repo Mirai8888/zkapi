@@ -2,6 +2,12 @@
 
 A local OpenAI-compatible API, paid from your private ETH balance. No OA account or OpenRouter API key needed.
 
+> **Local migration build:** this worktree targets the new concession protocol,
+> but Mainnet and Sepolia are not deployed in its shipping manifests and production
+> proving keys are not available. Do not use the older installer below to obtain
+> this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
+> binary paths, preserved Tor features, withdrawal options and deployment blockers.
+
 ## Quick start
 
 Install or update:
@@ -80,6 +86,28 @@ for the previous key's settlement.
 To update, stop `serve`, rerun the install command, then start `serve` again. Your wallet is preserved. See [wallet storage and updates](docs/CLI_PACKAGING.md#wallet-storage-and-updates).
 
 To withdraw, run `zkapi-clientd config --menu` and choose `withdraw`. It asks for the destination and waits for extra ETH for fees only if needed.
+
+Where the deployment publishes a gasless withdrawal paymaster, the menu also
+offers to pay the network fee from the payout itself ("no ETH needed"): the
+withdrawal is then carried by an ERC-4337 user operation from a transit
+account bound to your destination, signed with a fresh key per withdrawal and
+sponsored by the paymaster, which keeps a measured gas charge and pushes the
+rest to the destination. On the command line this is `zkapi-clientd withdraw
+--to ADDRESS --fees payout` (defaults: `config --withdrawal-fees payout
+--bundler-url URL`); `--collect`, `--sweep` and `--claim-credit` deliver a
+payout that is waiting in the transit account or the paymaster. See
+[gasless withdrawals](docs/CLI_ZKAPI.md#paying-the-fee-from-the-payout-gasless-withdrawals).
+
+For chain and protocol access the client uses only the RPC, zkAPI indexer and
+protocol server packaged with the release. A deposit activates only after the
+vault, read at the deposit's block, and the indexer's whole-tree snapshot both
+show it at the same note; a withdrawal finishes only after both show the note
+closed. A withdrawal first proves note ownership to the protocol server, which
+then clears the cooperative close. When the operator cannot or will not
+clear it, `zkapi-clientd withdraw --escape --to ADDRESS` exits through the
+vault alone, after its challenge period. See
+[chain verification and recovery](docs/CLI_ZKAPI.md#chain-verification-and-recovery)
+and [escape withdrawals](docs/CLI_ZKAPI.md#escape-withdrawals).
 
 [More options, including Tor, Sepolia and Docker clients](docs/CLI_ZKAPI.md) · [Installation details](docs/CLI_PACKAGING.md) · [Privacy](docs/PRIVACY.md)
 

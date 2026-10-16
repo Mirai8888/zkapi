@@ -25,13 +25,13 @@ import (
 const (
 	MainnetManifest         = "https://zkapi-mainnet.openanonymity.ai/config.json"
 	SepoliaManifest         = "https://zkapi-sepolia.openanonymity.ai/config.json"
-	CompanionRevision       = "20aa542ae98e767c0507133fd34b12a56f5ccd3d"
 	DefaultClientURL        = "http://127.0.0.1:43134"
 	DefaultInferenceBaseURL = "https://openrouter.ai/api/v1"
 )
 
-// Config is the Go-side bridge configuration. A companion must be built with
-// companion.patch; unpatched or unauthenticated daemons are rejected.
+// Config is the Go-side bridge configuration. The companion is this
+// repository's zkapi-walletd (crates/zkapi-companion); a daemon that does not
+// speak the bridge protocol or authenticate is rejected.
 type Config struct {
 	ClientURL        string        `json:"client_url"`
 	BridgeToken      string        `json:"bridge_token"`
@@ -40,6 +40,12 @@ type Config struct {
 	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
 	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
 	TorMode          bool          `json:"-"` // HTTPClient must use relay's tor:// transport
+	// ExitRPCURL is the user's own Ethereum RPC (--exit-rpc-url): deployment
+	// checks also run through it, and exit transactions are sent through it.
+	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
+	// BundlerURL is the user's ERC-4337 bundler for gasless withdrawals
+	// (--bundler-url / zkapi.bundler_url); empty uses the profile's.
+	BundlerURL string `json:"bundler_url,omitempty"`
 }
 
 type Client struct {
@@ -56,6 +62,37 @@ type Client struct {
 	config         Config
 	local          *http.Client
 	inference      *http.Client
+	// Package tests point these pins at local servers; production leaves
+	// them nil and always uses the packaged deployment manifest.
+	endpoints    *chainEndpoints
+	capabilities *deploymentCapabilities
+}
+
+// chainEndpoints are the packaged deployment's remote origins. The payment RPC
+// and indexer are independent sources: deposits and withdrawals are activated
+// or closed only when both agree, and neither string comes from the companion.
+type chainEndpoints struct{ RPC, Indexer, ProtocolServer string }
+
+func (c *Client) packagedEndpoints() (chainEndpoints, error) {
+	if c.endpoints != nil {
+		return *c.endpoints, nil
+	}
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil {
+		return chainEndpoints{}, err
+	}
+	return chainEndpoints{RPC: deployment.RPC, Indexer: deployment.IndexerURL, ProtocolServer: deployment.ProtocolServerURL}, nil
+}
+
+func (c *Client) clearanceOwnershipRequired() (bool, error) {
+	if c.capabilities != nil {
+		return c.capabilities.requiresClearanceOwnershipProof(), nil
+	}
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil {
+		return false, err
+	}
+	return deployment.requiresClearanceOwnershipProof(), nil
 }
 
 // Error is safe to return to API consumers: raw companion/provider messages
@@ -72,6 +109,37 @@ func (e *Error) Error() string {
 	if e.Code == "withdrawal_conflict" || e.Code == "withdrawal_pending" {
 		return "zkAPI withdrawal is reserved; run zkapi-clientd config --menu and choose withdraw to resume the saved destination"
 	}
+	if e.Code == "unsettled_request_state" {
+		return "zkAPI withdrawal waits for a settled note state: a chat request sent from the note's current state never settled, so the wallet sends no ownership proof from that state, and the server refused a clearance without one. Before the note expires, send one chat request through zkapi-clientd, or wait for the earlier request to settle, then run zkapi-clientd config --menu and choose withdraw again. After the note expires no chat request can settle it: choose withdraw in zkapi-clientd config --menu to send the ownership proof with an explicit acknowledgement. If the private balance stays reserved for withdrawal, contact the zkAPI operator"
+	}
+	if e.Code == "receipt_journal_missing" {
+		return "zkAPI receipt_journal_missing: the server reports the note's current state settled by a request this wallet has no record of, usually one an earlier zkapi-clientd release discarded, so neither chat requests nor a withdrawal can continue from that state (a dishonest server could claim the same). Contact the zkAPI operator before the note expires"
+	}
+	if e.Code == "unsettled_clearance_reserved" {
+		return "zkAPI withdrawal needs your acknowledgement: a chat request sent from the note's current state never settled, and the server already holds a withdrawal clearance for that state (for example because the zkAPI operator released it), so no chat request can settle it and the clearance is granted only with an ownership proof. Run zkapi-clientd config --menu and choose withdraw to review the risk and send the proof"
+	}
+	if e.Code == "ownership_proof_sent" {
+		return "zkAPI note state is withdrawal-only: a withdrawal sent, or may have sent, the ownership proof of the note's current state towards the zkAPI server, and the wallet never sends a chat request from a state whose ownership proof left (the server may hold that state's clearance), so no chat request is sent from it. Run zkapi-clientd config --menu and choose withdraw to finish the withdrawal"
+	}
+	if e.Code == "clearance_reserved_state" {
+		return "zkAPI note state is reserved for withdrawal: the server holds a withdrawal clearance for the note's current state (for example because the zkAPI operator released it) and refuses every chat request from it, so no chat request can settle it. Run zkapi-clientd config --menu and choose withdraw to withdraw the private balance"
+	}
+	switch e.Code {
+	case "escape_required":
+		return "zkAPI withdrawal needs an escape: the server cannot or will not clear a mutual close of the note's current state. Run zkapi-clientd withdraw --escape --to ADDRESS to review the escape and the amount it concedes"
+	case "conceded_mismatch":
+		return "zkAPI escape: the confirmed concession is not the one the exit rules allow now; review the escape again with zkapi-clientd withdraw --escape --to ADDRESS"
+	case "device_not_newest":
+		return "zkAPI device_not_newest: another device or backup spent the note's current state, so an escape from it would be defeated; exit from the newest state (restore the newest backup, or run zkapi-walletd exit-kit escape with the newest exit kit). Without --exit-rpc-url this was read through the pinned RPC, which the operator may run; zkapi-clientd config --exit-rpc-url URL makes every later reading come from your own RPC"
+	case "exit_locked":
+		return "zkAPI exit in progress: a withdrawal of this note is under way, so no chat request is made; finish it with zkapi-clientd withdraw"
+	case "note_near_expiry":
+		return "zkAPI note_near_expiry: the note is too close to the latest time to start an exit for a new request to settle first; withdraw the private balance"
+	case "bound_fixed_at_state":
+		return "zkAPI bound_fixed_at_state: every request from the note's current state carries the bound of the first; choose a cheaper model, or wait for the earlier request to settle"
+	case "invalid_successor":
+		return "zkAPI invalid_successor: the server signed a note state that fails the wallet's checks; it is treated as withheld. Withdraw with zkapi-clientd withdraw --escape --to ADDRESS"
+	}
 	if e.Status == http.StatusPaymentRequired {
 		return "zkAPI private balance needs funding; run zkapi-clientd config to add funding"
 	}
@@ -79,6 +147,38 @@ func (e *Error) Error() string {
 		return "zkAPI wallet has a pending lease; wait for settlement or recover it"
 	}
 	return "zkAPI " + e.Code
+}
+
+// ReceiptJournalMissingError is the companion's receipt_journal_missing: the
+// server reports the note's current state settled by a request this wallet
+// holds no journal or archive record of, usually one an earlier release
+// discarded. It unwraps to the *Error with that code.
+type ReceiptJournalMissingError struct {
+	Status int
+	// Nullifier is the note state's nullifier in the server's form
+	// (lowercase 0x hex without leading zeros), for the operator.
+	Nullifier string
+}
+
+func (e *ReceiptJournalMissingError) Error() string {
+	return (&Error{e.Status, "receipt_journal_missing"}).Error() + " and give them this nullifier: " + e.Nullifier
+}
+
+func (e *ReceiptJournalMissingError) Unwrap() error {
+	return &Error{e.Status, "receipt_journal_missing"}
+}
+
+func validNullifierText(value string) bool {
+	digits, ok := strings.CutPrefix(value, "0x")
+	if !ok || digits == "" || len(digits) > 64 || (len(digits) > 1 && digits[0] == '0') {
+		return false
+	}
+	for _, digit := range digits {
+		if !strings.ContainsRune("0123456789abcdef", digit) {
+			return false
+		}
+	}
+	return true
 }
 
 func New(config Config) (*Client, error) {
@@ -193,14 +293,25 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			// allowlisted codes cross this boundary; its diagnostic message may
 			// contain private protocol state and is never forwarded.
 			var nested struct {
-				Code string `json:"code"`
+				Code      string `json:"code"`
+				Nullifier string `json:"nullifier"`
 			}
 			_ = json.Unmarshal(failure.Error, &nested)
 			var flat string
 			_ = json.Unmarshal(failure.Error, &flat)
+			if nested.Code == "receipt_journal_missing" {
+				// The nullifier is what the operator needs; it crosses only
+				// in its canonical form.
+				if validNullifierText(nested.Nullifier) {
+					return nil, &ReceiptJournalMissingError{Status: response.StatusCode, Nullifier: nested.Nullifier}
+				}
+				return nil, &Error{response.StatusCode, nested.Code}
+			}
 			for _, code := range []string{nested.Code, flat, failure.Code} {
 				switch code {
-				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required":
+				case "lease_pending", "pending_settlement", "pending_request", "withdrawal_pending", "withdrawal_conflict", "testnet_password_required", "unsettled_request_state", "unsettled_clearance_reserved", "clearance_reserved_state", "ownership_proof_sent",
+					// Circuit zkapi-v2-concession-v1 (design §6.3, §6.4).
+					"escape_required", "conceded_mismatch", "device_not_newest", "exit_locked", "note_near_expiry", "bound_fixed_at_state", "invalid_successor", "late_successor", "exit_lock_conflict":
 					return nil, &Error{response.StatusCode, code}
 				}
 			}
@@ -230,20 +341,30 @@ func (c *Client) Check(ctx context.Context) error {
 		BillingAsset  string `json:"billing_asset"`
 		BillingUnit   string `json:"billing_unit"`
 		CircuitID     string `json:"circuit_id"`
+		// Bridge 5: the concession exit, its escape routes and the setup
+		// the companion's keys belong to.
+		ExitConcession int    `json:"exit_concession"`
+		SetupID        string `json:"setup_id"`
+		// 2: the escape routes, and /oa/v1/withdraw/escape/cancel.
+		EscapeRoutes int `json:"escape_routes_version"`
 	}
 	if json.Unmarshal(data, &result) != nil {
 		return &Error{http.StatusBadGateway, "invalid_companion_response"}
 	}
 	expected, _ := ChainID(c.config.Network)
-	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != 4 {
+	if result.ChainID != expected || result.Mode != "direct_openrouter" || !result.RequireOA || result.BridgeVersion != CompanionBridgeVersion || result.ExitConcession != 1 || result.EscapeRoutes < 2 {
 		return &Error{http.StatusBadGateway, "companion_policy_mismatch"}
 	}
-	deployment, _, err := pinnedDeployment(c.config.Network)
-	if err != nil || result.DeploymentID != deployment.ID || !strings.EqualFold(result.Contract, deployment.Contract) || result.BillingAsset != deployment.Asset || result.BillingUnit != deployment.Unit || result.CircuitID != deployment.Proof.Circuit {
+	deployment, _, err := deployedDeployment(c.config.Network)
+	if err != nil || result.DeploymentID != deployment.ID || !strings.EqualFold(result.Contract, deployment.Contract) || result.BillingAsset != deployment.Asset || result.BillingUnit != deployment.Unit || result.CircuitID != deployment.Proof.Circuit || result.SetupID != deployment.Proof.SetupID {
 		return &Error{http.StatusBadGateway, "companion_deployment_mismatch"}
 	}
 	return nil
 }
+
+// CompanionBridgeVersion is the bridge the companion must speak: 5 is circuit
+// zkapi-v2-concession-v1 with the escape routes.
+const CompanionBridgeVersion = 5
 
 // Complete passes the caller's JSON unchanged over the anonymous HTTP client.
 // Raw SSE bytes remain available to the gateway immediately; no fake streaming

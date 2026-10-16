@@ -96,6 +96,9 @@ func serveFunding(ctx context.Context, service guidedFundingService, wallet fund
 	default:
 		return errors.New("saved funding requires recovery; refusing to replace it")
 	}
+	if err := showSetupEscapePayoutCredits(ctx, service, state, ui); err != nil {
+		return err
+	}
 	var quote zkapi.AddressPaymentQuote
 	if state.Amount != 0 {
 		ui.Printf("Resuming unsigned deposit threshold: %s ETH; available funds above it will also be deposited.\n", fundingUnits(strconv.FormatUint(state.Amount, 10), 9))

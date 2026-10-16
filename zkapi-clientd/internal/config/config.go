@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 	"io"
 	"net"
 	"net/url"
@@ -15,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 // Compatible requests share a provider credential within this fixed window,
@@ -78,6 +79,7 @@ type ZKAPI struct {
 }
 
 type Config struct {
+	Cover    cover.Config    `json:"cover,omitzero"`
 	Rewriter rewriter.Config `json:"rewriter,omitzero"`
 	// ManagementToken is a separate owner-only credential. It must never be
 	// published with config.json or shared with inference API clients.
@@ -174,6 +176,9 @@ func Default() (Config, error) {
 }
 
 func Validate(c Config) error {
+	if err := c.Cover.Validate(c.RelayURL); err != nil {
+		return err
+	}
 	if err := c.Rewriter.Validate(); err != nil {
 		return err
 	}

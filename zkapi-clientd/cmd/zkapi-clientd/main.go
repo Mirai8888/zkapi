@@ -65,8 +65,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" && args[0] != "set-rewriter" {
-		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, set-model, or set-rewriter (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" && args[0] != "set-rewriter" && args[0] != "set-cover" {
+		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, set-model, set-rewriter, or set-cover (--help for usage)")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -101,12 +101,18 @@ func run(args []string) error {
 	if args[0] == "set-rewriter" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		return runRewriterConfig(dir, config.Config{}, args[1:], os.Stdout)
 	}
+	if args[0] == "set-cover" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		return runCoverConfig(dir, config.Config{}, args[1:], os.Stdout)
+	}
 	c, err := config.Load(dir)
 	if err != nil {
 		return configurationRequired(err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if args[0] == "set-cover" {
+		return runCoverConfig(dir, c, args[1:], os.Stdout)
+	}
 	if args[0] == "set-rewriter" {
 		return runRewriterConfig(dir, c, args[1:], os.Stdout)
 	}
@@ -167,6 +173,7 @@ func help() {
   serve [--model MODEL]  Open a missing note when funded, then serve inference
   withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
   set-rewriter [OPTIONS] Configure direct prompt normalization; --help for options
+  set-cover [OPTIONS]    Configure optional bounded Tor cover traffic; --help
   list-models            List supported model IDs and per-query caps
   set-model [MODEL]      Show or save the default model (--clear removes it)
 
@@ -406,6 +413,11 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		api.ManagementToken = c.ManagementToken
 		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
 	}
+	stopCover, err := startServeCover(life, c, logger)
+	if err != nil {
+		return err
+	}
+	defer stopCover()
 	httpServer := &http.Server{Handler: server.LogRequests(api, logger), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return life }}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- httpServer.Serve(listener) }()

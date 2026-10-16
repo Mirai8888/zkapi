@@ -33,6 +33,7 @@ func configuredRuntime(expected config.Config) startRuntime {
 // Serve opens a missing note through the authenticated funding flow, then stays running.
 // A reserved withdrawal or uncertain transaction is never replaced.
 func runConfiguredServe(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
+	ctx = context.WithValue(ctx, coverServeKey{}, true)
 	ui := &noninteractiveSetup{out: out}
 	runtime := configuredRuntime(expected)
 	runtime.testnet = checkSepoliaAccess

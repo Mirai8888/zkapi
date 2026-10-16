@@ -8,6 +8,14 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 > this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
 > binary paths, preserved Tor features, withdrawal options and deployment blockers.
 
+## Optional Tor cover traffic
+
+`set-cover --urls 'https://your-domain.example/cover.txt' --rate 0.2`
+configures bounded background HTTPS noise during native `serve`. Use a small
+resource you control or have permission to poll. Requires authenticated `tor://`
+routing; no wallet credit, prompt content or inference identities are used.
+Disabled by default. See [limits, setup and privacy caveats](docs/COVER_TRAFFIC.md).
+
 ## Optional prompt rewriter
 
 `set-rewriter --url http://localhost:8012 --model qwen3.8-flash-next`

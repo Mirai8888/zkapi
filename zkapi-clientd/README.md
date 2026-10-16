@@ -10,10 +10,11 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 
 ## Optional prompt rewriter
 
-`set-rewriter --url http://localhost:8011 --model qwen3.8-flash-next`
-configures direct normalization of the latest user message, with an immediate
-streamed preview. This discloses original text to the rewriter and does not
-anonymize earlier history. See [configuration, privacy limits and client display](docs/REWRITER.md).
+`set-rewriter --url http://localhost:8012 --model qwen3.8-flash-next`
+configures direct normalization with an immediate streamed preview. Saved
+rewrites form a separate target-side history; normal continuations send only
+new user text to the rewriter. Cache misses rewrite unknown historical user
+turns rather than passing them raw. This discloses original text to the rewriter. See [configuration, privacy limits and client display](docs/REWRITER.md).
 
 ## Quick start
 

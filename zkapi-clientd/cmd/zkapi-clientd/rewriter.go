@@ -62,7 +62,7 @@ func runRewriterConfig(dir string, c config.Config, args []string, out io.Writer
 	if *clear {
 		fmt.Fprintln(out, "Rewriter disabled.")
 	} else {
-		fmt.Fprintln(out, "Rewriter saved. WARNING: latest user text goes directly to this service outside Tor/zkAPI. Prior history remains unchanged; style normalization does not guarantee anonymity. Stop/restart serve to apply. No test request or payment sent.")
+		fmt.Fprintln(out, "Rewriter saved. WARNING: uncached user text goes directly to this service outside Tor/zkAPI. Target history reuses saved rewrites; cache misses rewrite historical user turns. Style normalization does not guarantee anonymity. Stop/restart serve to apply. No test request or payment sent.")
 	}
 	return nil
 }

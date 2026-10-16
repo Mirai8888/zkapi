@@ -52,19 +52,20 @@ type Config struct {
 }
 
 type Client struct {
-	leaseMu        sync.Mutex
-	usedLeases     map[[32]byte]uint64
-	requestSlot    chan struct{}
-	settlementPoll time.Duration
-	settlementWake chan struct{}
-	leaseGroup     *leaseGroup // accessed only while owning requestSlot
-	now            func() time.Time
-	cachedLease    *reusableLease // accessed only while owning requestSlot
-	conversation   conversation   // accessed only while owning requestSlot
-	keySerial      uint64         // process-local display number; contains no key material
-	config         Config
-	local          *http.Client
-	inference      *http.Client
+	rewriteTranscript rewriter.Transcript // serialized by requestSlot
+	leaseMu           sync.Mutex
+	usedLeases        map[[32]byte]uint64
+	requestSlot       chan struct{}
+	settlementPoll    time.Duration
+	settlementWake    chan struct{}
+	leaseGroup        *leaseGroup // accessed only while owning requestSlot
+	now               func() time.Time
+	cachedLease       *reusableLease // accessed only while owning requestSlot
+	conversation      conversation   // accessed only while owning requestSlot
+	keySerial         uint64         // process-local display number; contains no key material
+	config            Config
+	local             *http.Client
+	inference         *http.Client
 	// Package tests point these pins at local servers; production leaves
 	// them nil and always uses the packaged deployment manifest.
 	endpoints    *chainEndpoints
@@ -402,7 +403,7 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 		return nil, err
 	}
 	var identity string
-	if c.config.TorMode {
+	if c.config.TorMode || c.config.Rewriter.Enabled() {
 		var err error
 		previous := c.conversation.serial
 		identity, err = c.selectConversation(body)
@@ -412,7 +413,7 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 		c.reportConversation(ctx, previous)
 	}
 	// Conversation classification uses the original incoming history, never the
-	// nondeterministic rewrite. Prior turns remain as supplied by the caller.
+	// nondeterministic rewrite. Target history replays saved normalized turns.
 	if c.config.Rewriter.Enabled() {
 		var err error
 		body, err = c.rewritePrompt(ctx, body, identity)

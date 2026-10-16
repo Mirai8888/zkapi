@@ -174,10 +174,10 @@ func TestConfigValidation(t *testing.T) {
 // Explicit opt-in uses only this synthetic prompt, never a wallet or zkAPI.
 func TestLiveLocalRewriter(t *testing.T) {
 	if os.Getenv("ZKAPI_TEST_REWRITER") != "1" {
-		t.Skip("set ZKAPI_TEST_REWRITER=1 for localhost:8011")
+		t.Skip("set ZKAPI_TEST_REWRITER=1 for localhost:8012")
 	}
 	d, _ := Select(json.RawMessage(`{"messages":[{"role":"user","content":"hey, could ya explain what a hash map is? keep it to two sentences pls."}]}`))
-	_, notice, err := d.Rewrite(context.Background(), Config{URL: "http://localhost:8011", Model: "qwen3.8-flash-next"})
+	_, notice, err := d.Rewrite(context.Background(), Config{URL: "http://localhost:8012", Model: "qwen3.8-flash-next"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,13 +10,6 @@ import (
 )
 
 func (c *Client) rewritePrompt(ctx context.Context, body json.RawMessage, identity string) (json.RawMessage, error) {
-	draft, err := rewriter.Select(body)
-	if err != nil {
-		return nil, rewriter.ErrFailed
-	}
-	if draft == nil {
-		return body, nil
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// Only route preparation is speculative; no lease/payment is acquired until
@@ -26,9 +19,9 @@ func (c *Client) rewritePrompt(ctx context.Context, body json.RawMessage, identi
 		ready = make(chan error, 1)
 		go func() { ready <- relay.PrepareTor(ctx, c.config.TorEndpoint, c.config.InferenceBaseURL, identity) }()
 	}
-	rewritten, notice, err := draft.Rewrite(ctx, c.config.Rewriter)
-	if err == nil {
-		err = rewriter.Publish(ctx, notice)
+	rewritten, notice, err := c.rewriteTranscript.Rewrite(ctx, body, c.config.Rewriter)
+	if err == nil && notice != nil {
+		err = rewriter.Publish(ctx, *notice)
 	}
 	if err != nil {
 		cancel()

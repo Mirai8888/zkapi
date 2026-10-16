@@ -18,6 +18,7 @@ func TestLiveCanonicalReconstruction(t *testing.T) {
 		name, text string
 		retain     []string
 	}{
+		{"restaurants", "give me the top 5 best vegan restaurants in London, Ontario", []string{"5", "vegan", "London", "Ontario"}},
 		{"privacy", "My goal is privacy preservation. Are there any other things other than skills that go into the structured prompt that I should disable? Maybe AGENTS.md? something else?", []string{"AGENTS.md", "skills", "privacy"}},
 		{"constraints", "hey, I think this might be a cache issue, but I'm not sure. Could you suggest checks without running commands? Please don't change `/tmp/cache.json`. If a restart is needed, ask me first; otherwise just explain. Keep the answer under 100 words.", []string{"`/tmp/cache.json`", "100"}},
 	} {
@@ -36,6 +37,9 @@ func TestLiveCanonicalReconstruction(t *testing.T) {
 				if !strings.Contains(text, exact) {
 					t.Fatalf("lost protected detail %q in %q", exact, text)
 				}
+			}
+			if sample.name == "restaurants" && strings.Contains(strings.ToLower(text), "top 5 best") {
+				t.Fatal("retained redundant collocation", text)
 			}
 			if text == sample.text {
 				t.Fatal("sample was not reconstructed")

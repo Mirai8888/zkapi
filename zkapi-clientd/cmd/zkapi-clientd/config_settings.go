@@ -19,6 +19,7 @@ const settingsHelp = `Saved settings (stop serve before edits; no setup or payme
   config --rewriter-url URL --rewriter-model MODEL
          [--rewriter-api-key-env ENV | --rewriter-clear-api-key]
          [--rewriter-notice reasoning|metadata|off]
+  config --rewriter-instruction-file PATH | --rewriter-default-instruction
   config --clear-rewriter
   config --cover-urls 'https://permitted.example/resource'
          [--cover-rate 5] [--cover-concurrency 4]
@@ -51,7 +52,7 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	for _, arg := range args {
 		name := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
 		switch name {
-		case "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
+		case "rewriter-instruction-file", "rewriter-default-instruction", "network", "zkapi-binary", "proof-setup-dir", "exit-rpc-url", "bundler-url", "withdrawal-fees", "relay-url", "listen", "require-api-key", "key-reuse-window-seconds", "status", "vault-protocol", "model", "clear-model", "rewriter-url", "rewriter-model", "rewriter-api-key-env", "rewriter-clear-api-key", "rewriter-notice", "clear-rewriter", "cover-urls", "cover-rate", "cover-concurrency", "clear-cover":
 			selected = true
 		}
 	}
@@ -69,6 +70,8 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	keyEnv := f.String("rewriter-api-key-env", "", "environment variable holding rewriter key")
 	clearKey := f.Bool("rewriter-clear-api-key", false, "remove rewriter API key")
 	notice := f.String("rewriter-notice", "", "reasoning, metadata or off")
+	instructionFile := f.String("rewriter-instruction-file", "", "read and save UTF-8 style instruction (max 16 KiB)")
+	defaultInstruction := f.Bool("rewriter-default-instruction", false, "remove custom instruction; use built-in default")
 	clearEditor := f.Bool("clear-rewriter", false, "disable rewriting and remove its key")
 	urls := f.String("cover-urls", "", "permitted HTTPS destinations separated by spaces")
 	rate := f.Float64("cover-rate", cover.DefaultRate, "mean cover arrivals per second")
@@ -135,6 +138,33 @@ func runConfigSettings(dir string, args []string, out io.Writer) (bool, error) {
 	}
 	if *clearModel {
 		next.DefaultModel = ""
+	}
+	instructionEdit := seen["rewriter-instruction-file"] || seen["rewriter-default-instruction"]
+	if seen["rewriter-instruction-file"] && seen["rewriter-default-instruction"] {
+		return true, errors.New("cannot set and reset rewriter instruction together")
+	}
+	if *clearEditor && instructionEdit {
+		return true, errors.New("cannot clear and edit rewriter together")
+	}
+	if seen["rewriter-instruction-file"] {
+		file, err := os.Open(*instructionFile)
+		if err != nil {
+			return true, errors.New("cannot open rewriter instruction file")
+		}
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			file.Close()
+			return true, errors.New("rewriter instruction must be a regular file")
+		}
+		data, err := io.ReadAll(io.LimitReader(file, rewriter.MaxInstructionBytes+1))
+		file.Close()
+		if err != nil || len(data) == 0 || len(data) > rewriter.MaxInstructionBytes {
+			return true, errors.New("rewriter instruction file must contain 1–16384 bytes")
+		}
+		next.Rewriter.Instruction = string(data)
+	}
+	if *defaultInstruction {
+		next.Rewriter.Instruction = ""
 	}
 	editorEdit := seen["rewriter-url"] || seen["rewriter-model"] || seen["rewriter-api-key-env"] || seen["rewriter-clear-api-key"] || seen["rewriter-notice"]
 	if *clearEditor && editorEdit {

@@ -16,7 +16,7 @@ while IFS= read -r path; do
 done < "$here/packaging/legacy/shared-files.txt"
 cd "$work/zkapi-clientd"
 # Shared opt-in live tests stay OFF for release builds.
-unset ZKAPI_TEST_REWRITER ZKAPI_VAULT_PROTOCOL
+unset ZKAPI_TEST_REWRITER ZKAPI_EVAL_REWRITER ZKAPI_EVAL_DEFAULT ZKAPI_VAULT_PROTOCOL
 # No dev keys or companion/protocol changes: only Go privacy/client wiring.
 go test -race ./...
 go vet ./...

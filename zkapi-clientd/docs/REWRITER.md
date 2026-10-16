@@ -95,6 +95,19 @@ wire but does not anonymize you from that service or any upstream it uses.
 Identifying facts, quotes, code, attachments and traffic timing remain risks.
 Parallel rewriter/Tor activity can help an observer correlate connections.
 
+## Style instruction
+
+The default instruction reconstructs meaning with neutral task-first syntax,
+collapses redundant wording and audits constraints. It contains no worked task
+examples. See the [local candidate evaluation](REWRITER_EVALUATION.md), including
+observed failures and limits—not a guarantee of anonymity or fidelity.
+
+Override it with `config --rewriter-instruction-file PATH`, or reset with
+`config --rewriter-default-instruction`. Bare `config` shows the effective text.
+The JSON response contract and fail-closed parser remain fixed. See
+[instruction configuration](CONFIGURATION.md#rewriter-instruction) for storage,
+limits, disclosure and restart behavior.
+
 ## Immediate preview
 
 Default `--rewriter-notice reasoning` flushes a local SSE prelude as soon as the latest

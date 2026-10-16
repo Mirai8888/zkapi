@@ -15,6 +15,8 @@ internal/relay/relay.go
 internal/relay/tor_test.go
 internal/rewriter/rewriter.go
 internal/rewriter/rewriter_test.go
+internal/rewriter/instruction_test.go
+internal/rewriter/instruction_eval_test.go
 internal/rewriter/transcript.go
 internal/rewriter/transcript_live_test.go
 internal/rewriter/transcript_test.go

@@ -60,6 +60,32 @@ commands are removed. Use `config --help` for settings, and `list-models` for th
 public model catalog. `--model` validates the ID syntax without contacting the
 catalog; inference still checks current model policy.
 
+## Rewriter instruction
+
+The built-in style instruction is an example-free default, not a fixed policy:
+
+```sh
+"$CLIENT" config --rewriter-instruction-file /path/to/style-instruction.txt
+"$CLIENT" config --rewriter-default-instruction
+```
+
+The file must be nonempty UTF-8 text, at most 16 KiB. Its **contents** are saved
+as `rewriter.instruction`; the daemon does not reread the file on each request.
+Omitting this option preserves the current override. It can be saved while the
+rewriter is disabled without enabling it. Clearing the rewriter removes the
+override along with its other settings. Resetting the instruction alone preserves
+the endpoint, model, credentials and notice mode.
+
+Bare `config` shows the effective instruction and `instruction_source` (`default`
+or `custom`). The source marker is display-only. Do not put secrets in style
+instructions: they appear in config output and are sent to the editor.
+
+Custom text replaces style guidance; the daemon still appends the nonconfigurable
+JSON/count/order/no-answer contract and validates responses, with no original-text
+fallback. A conflicting custom instruction can still degrade privacy or meaning,
+or cause rewriting to fail. Restart after changing settings. Existing in-memory
+target rewrites are not silently regenerated. See [evaluation](REWRITER_EVALUATION.md).
+
 ## Explicit wallet actions
 
 ```sh

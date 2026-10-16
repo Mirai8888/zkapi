@@ -76,8 +76,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" && args[0] != "set-rewriter" && args[0] != "set-cover" && args[0] != "set-vault-protocol" {
-		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, set-model, set-rewriter, set-cover, or set-vault-protocol (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" {
+		return errors.New("unknown command; use config, serve, withdraw or list-models (--help for usage); saved settings belong under config")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -89,9 +89,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Always handle the preference editor locally, even when legacy is saved.
-	if args[0] == "set-vault-protocol" {
-		return runSetVaultProtocol(dir, args[1:], os.Stdout)
+	if args[0] == "config" {
+		if handled, err := runConfigSettings(dir, args[1:], os.Stdout); handled || err != nil {
+			return err
+		}
 	}
 	savedProtocol, err := config.LoadVaultProtocol(dir)
 	if err != nil {
@@ -124,15 +125,9 @@ func run(args []string) error {
 		_ = runWithdrawal(context.Background(), config.Config{}, []string{"--help"}, os.Stdout)
 		return nil
 	}
-	if (args[0] == "list-models" || args[0] == "set-model") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		fmt.Println("Usage: zkapi-clientd list-models\n       zkapi-clientd set-model [MODEL | --clear]\nList public model IDs/caps, or show/save/clear the default model. No payments. Stop serve before changing the saved default.")
+	if args[0] == "list-models" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		fmt.Println("Usage: zkapi-clientd list-models\nList public model IDs/caps. Set the default with config --model MODEL. No payments.")
 		return nil
-	}
-	if args[0] == "set-rewriter" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		return runRewriterConfig(dir, config.Config{}, args[1:], os.Stdout)
-	}
-	if args[0] == "set-cover" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-		return runCoverConfig(dir, config.Config{}, args[1:], os.Stdout)
 	}
 	c, err := config.Load(dir)
 	if err != nil {
@@ -140,13 +135,7 @@ func run(args []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if args[0] == "set-cover" {
-		return runCoverConfig(dir, c, args[1:], os.Stdout)
-	}
-	if args[0] == "set-rewriter" {
-		return runRewriterConfig(dir, c, args[1:], os.Stdout)
-	}
-	if args[0] == "list-models" || args[0] == "set-model" {
+	if args[0] == "list-models" {
 		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
 	}
 	if args[0] == "withdraw" {
@@ -199,18 +188,15 @@ func run(args []string) error {
 func help() {
 	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] [--vault-protocol concession|legacy] COMMAND
 
-  config                 Show status, configure or edit settings, and prepare the wallet
+  config                 Print saved config as JSON; --help for settings
+                         --setup: prepare wallet; --menu: wallet actions
   serve [--model MODEL]  Open a missing note when funded, then serve inference
   withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
-  set-rewriter [OPTIONS] Configure direct prompt normalization; --help for options
-  set-cover [OPTIONS]    Configure optional bounded Tor cover traffic; --help
   list-models            List supported model IDs and per-query caps
-  set-model [MODEL]      Show or save the default model (--clear removes it)
-  set-vault-protocol [legacy|concession|--clear]  Show/save this profile's vault stack
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
-Vault: flag > ZKAPI_VAULT_PROTOCOL > saved set-vault-protocol > concession.
+Vault: flag > ZKAPI_VAULT_PROTOCOL > saved config --vault-protocol > concession.
 Legacy selects the pinned old executable, requires a saved legacy choice or explicit --config-dir,
 and preserves native rewriter/cover settings. No automatic fallback or note conversion.
 Config: ZKAPI_CLIENTD_CONFIG_DIR or the OS user config directory / zkapi-clientd.

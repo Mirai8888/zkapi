@@ -78,7 +78,7 @@ func TestCoverConfigRequiresTorAndExplicitTargets(t *testing.T) {
 	if err != nil || after != c {
 		t.Fatal("failed update changed config")
 	}
-	if err := run([]string{"--config-dir", t.TempDir(), "set-cover", "--help"}); err != nil {
+	if err := run([]string{"--config-dir", t.TempDir(), "config", "--help"}); err != nil {
 		t.Fatal(err)
 	}
 }

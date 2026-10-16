@@ -68,7 +68,7 @@ func TestSavedLegacyNeedsNoRepeatedFlagAndEditorRemainsLocal(t *testing.T) {
 	}
 	t.Setenv("ZKAPI_CLIENTD_CONFIG_DIR", dir)
 	t.Setenv("ZKAPI_VAULT_PROTOCOL", "")
-	if err := run([]string{"set-vault-protocol", "legacy"}); err != nil {
+	if err := run([]string{"config", "--vault-protocol", "legacy"}); err != nil {
 		t.Fatal(err)
 	}
 	// No installed sibling artifact in the test directory: reaching its pin
@@ -77,7 +77,7 @@ func TestSavedLegacyNeedsNoRepeatedFlagAndEditorRemainsLocal(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "protocol executable") {
 		t.Fatal("saved legacy not selected", err)
 	}
-	if err := run([]string{"set-vault-protocol", "concession"}); err != nil {
+	if err := run([]string{"config", "--vault-protocol", "concession"}); err != nil {
 		t.Fatal("cannot switch out of legacy", err)
 	}
 	after, err := config.Load(dir)
@@ -106,7 +106,7 @@ func TestUnsafeSavedProtocolRefused(t *testing.T) {
 	if _, err := config.LoadVaultProtocol(dir); err == nil {
 		t.Fatal("symlink preference accepted")
 	}
-	if err := run([]string{"--config-dir", t.TempDir(), "set-vault-protocol", "--help"}); err != nil {
+	if err := run([]string{"--config-dir", t.TempDir(), "config", "--help"}); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -45,13 +45,14 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.BoolVar(&o.requireAPIKey, "require-api-key", false, "require a local API key for inference (default: no key required)")
 	f.BoolVar(&o.edit, "edit", false, "edit network, listener, and transport interactively")
 	f.BoolVar(&o.menu, "menu", false, "open configuration and wallet management actions")
+	f.Bool("setup", false, "explicitly prepare/fund wallet (bare config only displays JSON)")
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
 	o.fields = make(map[string]bool)
 	invalid := false
 	f.Visit(func(field *flag.Flag) {
-		if field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
+		if field.Name == "setup" || field.Name == "status" || field.Name == "api-key" || field.Name == "edit" || field.Name == "menu" {
 			return
 		}
 		if field.Name != "usd" {
@@ -313,7 +314,7 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	showClientConnection(c, ui)
 	if c.KeyReuseWindowSeconds == 0 {
 		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")
-	} else if strings.HasPrefix(c.RelayURL, "tor://") {
+	} else if strings.HasPrefix(c.RelayURL, "tor://") || c.Rewriter.Enabled() {
 		ui.Printf("Ephemeral key reuse: up to %d seconds within prefix-continuing conversations only; fresh key on each conversation change.\n", c.KeyReuseWindowSeconds)
 	} else {
 		ui.Printf("Ephemeral key reuse: fixed window up to %d seconds; different chats and local clients can share a key and its spending cap. The provider can link those requests.\n", c.KeyReuseWindowSeconds)

@@ -4,11 +4,11 @@ Save a per-profile preference, just like the default model:
 
 ```sh
 CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
-$CLIENT set-vault-protocol legacy
-$CLIENT set-vault-protocol             # show saved choice
+$CLIENT config --vault-protocol legacy
+$CLIENT config             # show saved choice
 $CLIENT serve                         # uses that choice, no repeated flag
-$CLIENT set-vault-protocol concession  # switch with daemon stopped
-$CLIENT set-vault-protocol --clear     # restore default: concession
+$CLIENT config --vault-protocol concession  # switch with daemon stopped
+$CLIENT config --vault-protocol default     # restore default: concession
 ```
 
 Use `--config-dir DIR` when editing a non-default profile. Saving legacy requires
@@ -39,7 +39,7 @@ The owner-only `vault-protocol` file in the profile stores this preference;
 `config.json` stays byte-for-byte unchanged because the legacy decoder rejects
 unknown fields. Updates use the same `daemon.lock`, stale-snapshot protection,
 atomic rename and fsync pattern as model configuration. Stop serve before edits.
-`--clear` removes the preference. No wallet/profile conversion or credential
+`config --vault-protocol default` removes the preference. No wallet/profile conversion or credential
 copying. `version`/top-level `help` report the dispatcher; command-specific help
 in legacy mode requires its valid profile.
 

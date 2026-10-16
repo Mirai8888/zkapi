@@ -1,3 +1,6 @@
+cmd/zkapi-clientd/config_display.go
+internal/config/vault_protocol.go
+internal/config/inspect.go
 cmd/zkapi-clientd/access_errors.go
 cmd/zkapi-clientd/access_errors_test.go
 cmd/zkapi-clientd/cover.go

@@ -82,9 +82,8 @@ reason to substitute the concession companion or disable verification.
 # From repository root; use an absolute binary path for service definitions.
 CLIENT="$PWD/zkapi-clientd/bin/zkapi-clientd-concession-tor"
 $CLIENT --help
-$CLIENT --config-dir /path/to/existing-profile set-vault-protocol
-$CLIENT --config-dir /path/to/existing-profile set-rewriter --help
-$CLIENT --config-dir /path/to/existing-profile set-cover --help
+$CLIENT --config-dir /path/to/existing-profile config
+$CLIENT --config-dir /path/to/existing-profile config --help
 ```
 
 Default Linux profile: `${XDG_CONFIG_HOME:-$HOME/.config}/zkapi-clientd`.

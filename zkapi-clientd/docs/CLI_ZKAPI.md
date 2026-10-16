@@ -1,13 +1,18 @@
 # Client configuration and use
 
 The public commands are `zkapi-clientd config`, `zkapi-clientd serve`,
-`zkapi-clientd withdraw`, `zkapi-clientd list-models`, and `zkapi-clientd set-model`.
+`zkapi-clientd withdraw`, and `zkapi-clientd list-models`.
 The client only supports zkAPI private ETH balances. Ticket issuance, import,
 redemption and ticket-based inference are not included.
 
 ## Configuration
 
-A new `config` creates the private configuration directory and defaults to
+Bare `config` prints only pretty JSON with credentials/secret URL components
+redacted. It has no wallet or network side effects. All saved options, including
+vault/model/rewriter/cover, are under `config`; see [settings reference](CONFIGURATION.md).
+The top-level `set-*` commands are removed.
+
+Explicit `config --setup` creates the private configuration directory and defaults to
 Ethereum Mainnet, direct HTTPS and a loopback listener at `127.0.0.1:8787`.
 It asks for the deposit amount in USD, defaulting to $20 on Enter, and shows the
 ETH amount, receiving address and locally generated QR. It waits automatically
@@ -63,24 +68,24 @@ zkapi-clientd config --exit-rpc-url https://rpc.example  # your own RPC for exit
 Use the arrow keys (or `j`/`k`) and Enter to select wallet actions and networks.
 Esc or `q` cancels a selection. Text prompts remain available when output is
 redirected. Ctrl+C stops safely and preserves saved progress; run
-`zkapi-clientd config` again to continue.
+`zkapi-clientd config --setup` again to continue.
 
 ### Model catalog and default selection
 
 ```sh
 zkapi-clientd list-models                 # sorted IDs and per-query USD caps
-zkapi-clientd set-model provider/model    # validate against live policy and save
-zkapi-clientd set-model                   # show the saved default
-zkapi-clientd set-model --clear           # remove it
+zkapi-clientd config --model provider/model    # validate syntax and save offline
+zkapi-clientd config                           # show all saved settings
+zkapi-clientd config --clear-model           # remove it
 ```
 
 These use the selected configuration profile (`--config-dir` goes before the
-command). Catalog and model validation use public endpoints through the saved
-relay/Tor transport; no funded note, running daemon, companion or paid key is
-needed. The list marks the saved default. Caps are spending authorizations,
+command). Catalog listing uses public endpoints through the saved relay/Tor
+transport; setting a model only validates syntax offline. No funded note,
+running daemon, companion or paid key is needed. The list marks the saved default. Caps are spending authorizations,
 not predicted token charges.
 
-Stop `serve` before changing the default: `set-model` uses the same exclusive
+Stop `serve` before changing the default: `config --model` uses the same exclusive
 configuration lock and atomic update as other settings, preserving credentials
 and wallet files. The saved default supplies `model` only when an inference
 request omits the field; explicit models take precedence and invalid explicit
@@ -90,7 +95,7 @@ With neither a saved default nor `--model`, the conservative funding cap applies
 Saved selection is validated again by inference policy when requests are made.
 
 The saved `default_model` field requires this updated binary; older releases
-with strict configuration decoding may reject it. Use `set-model --clear` before
+with strict configuration decoding may reject it. Use `config --clear-model` before
 rolling back to an older binary.
 
 ### One-command funding and withdrawal

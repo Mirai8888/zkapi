@@ -33,7 +33,7 @@ func TestLegacyDispatchPreservesProfileAndCommand(t *testing.T) {
 	c := legacySelectionConfig()
 	c.Rewriter = rewriter.Config{URL: "http://localhost:8012", Model: "m"}
 	c.Cover = cover.Config{Rate: 5, Concurrency: 4, URLs: "https://cover.example/static"}
-	for _, args := range [][]string{{"serve", "--model", "example/model"}, {"withdraw", "--public"}, {"config", "--usd", "20"}, {"set-rewriter"}, {"set-cover"}} {
+	for _, args := range [][]string{{"serve", "--model", "example/model"}, {"withdraw", "--public"}, {"config", "--usd", "20"}, {"config", "--setup"}, {"config", "--menu"}} {
 		bin, got, err := legacyDispatchPlan("/private/legacy", true, c, args, "/bundle/bin/zkapi-clientd-concession-tor")
 		want := append([]string{"/bundle/bin/zkapi-clientd-legacy-privacy", "--config-dir", "/private/legacy"}, args...)
 		if err != nil || bin != want[0] || !reflect.DeepEqual(got, want) {

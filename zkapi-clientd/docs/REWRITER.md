@@ -12,16 +12,17 @@ Stop the daemon before changing its configuration:
 ```sh
 # From the repository root:
 CLIENT="$PWD/zkapi-clientd/bin/zkapi-clientd-concession-tor"
-$CLIENT set-rewriter --url http://localhost:8012 --model qwen3.8-flash-next
-$CLIENT set-rewriter                      # status, never prints the key
-$CLIENT set-rewriter --clear              # disable and remove the saved key
+$CLIENT config --rewriter-url http://localhost:8012 --rewriter-model qwen3.8-flash-next
+$CLIENT config                      # status, never prints the key
+$CLIENT config --clear-rewriter              # disable and remove the saved key
 ```
 
-No API key is sent when omitted. For a keyed service, populate an environment
-variable using your secret-management method and pass `--api-key-env VARIABLE`.
+On first configuration, no API key is sent unless supplied. Partial edits preserve
+an existing key; `--rewriter-clear-api-key` explicitly removes it. For a keyed service, populate an environment
+variable using your secret-management method and pass `--rewriter-api-key-env VARIABLE`.
 The value is saved in owner-only `config.json` through the locked atomic update;
-wallet/inference/management credentials remain unchanged. Reconfiguring without
-that option clears the rewriter key. Do not put keys in URLs or shell arguments.
+wallet/inference/management credentials remain unchanged. Omitted options retain
+their saved values. Do not put keys in URLs or shell arguments.
 
 A URL can be an API base or a complete `/chat/completions` endpoint; an origin
 alone adds `/v1/chat/completions`. Remote endpoints require verified HTTPS;
@@ -96,7 +97,7 @@ Parallel rewriter/Tor activity can help an observer correlate connections.
 
 ## Immediate preview
 
-Default `--notice reasoning` flushes a local SSE prelude as soon as the latest
+Default `--rewriter-notice reasoning` flushes a local SSE prelude as soon as the latest
 user rewrite is available, before lease acquisition and target inference:
 
 - `choices[0].delta.reasoning_content`, labelled
@@ -108,7 +109,7 @@ preview; tool continuations do not repeat it. Backfilled older turns are protect
 but only a trailing user turn gets a preview. Text is quoted for unambiguous
 display. The prelude does not pause for approval: cancel to stop inference.
 
-`--notice metadata` omits the thinking delta; `--notice off` omits both.
+`--rewriter-notice metadata` omits the thinking delta; `--rewriter-notice off` omits both.
 Nonstreaming responses cannot show an immediate body preview: metadata is added
 to final JSON without changing answer/tool content (16 MiB response limit).
 

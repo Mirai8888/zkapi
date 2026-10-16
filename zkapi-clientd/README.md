@@ -8,10 +8,18 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 > this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
 > binary paths, preserved Tor features, withdrawal options and deployment blockers.
 
+## Configuration
+
+`zkapi-clientd config` prints only pretty-printed saved JSON, with credentials
+and secret-bearing URL components redacted. It never starts wallet setup.
+All saved settings now live under `config`; the top-level `set-*` commands are
+removed. See [configuration reference](docs/CONFIGURATION.md).
+
 ## Vault protocol selection
 
-`set-vault-protocol legacy|concession` saves this profile's protocol stack;
-no arguments show it, and `--clear` restores the concession default. Subsequent
+`config --vault-protocol legacy|concession` saves this profile's protocol stack;
+`config` prints all saved settings as JSON; `config --vault-protocol default`
+restores the concession default. Subsequent
 commands use the saved choice without exports or repeated flags. Optional
 `--vault-protocol` overrides it for one command. Legacy requires a compatible
 existing profile and uses a pinned legacy protocol engine/companion. Both stacks
@@ -22,7 +30,7 @@ networks. See [protocol selection and limitations](docs/VAULT_PROTOCOL.md).
 
 ## Optional Tor cover traffic
 
-`set-cover --urls 'https://your-domain.example/cover.txt' --rate 5`
+`config --cover-urls 'https://your-domain.example/cover.txt' --cover-rate 5`
 configures bounded background HTTPS noise during native `serve`. Use a small
 resource you control or have permission to poll. Requires authenticated `tor://`
 routing; no wallet credit, prompt content or inference identities are used.
@@ -30,7 +38,7 @@ Disabled by default. See [limits, setup and privacy caveats](docs/COVER_TRAFFIC.
 
 ## Optional prompt rewriter
 
-`set-rewriter --url http://localhost:8012 --model qwen3.8-flash-next`
+`config --rewriter-url http://localhost:8012 --rewriter-model qwen3.8-flash-next`
 configures direct normalization with an immediate streamed preview. Saved
 rewrites form a separate target-side history; normal continuations send only
 new user text to the rewriter. Cache misses rewrite unknown historical user
@@ -52,7 +60,7 @@ wallet operation; concession funding currently refuses undeployed networks.
 Configure your wallet:
 
 ```sh
-zkapi-clientd config
+zkapi-clientd config --setup
 ```
 
 Setup updates payment details and progress in place while you wait. Menus use
@@ -68,8 +76,9 @@ Choose a saved default model (stop the daemon before changing it):
 
 ```sh
 zkapi-clientd list-models
-zkapi-clientd set-model provider/model
-zkapi-clientd set-model         # show default; --clear removes it
+zkapi-clientd config --model provider/model
+zkapi-clientd config                 # display all settings
+zkapi-clientd config --clear-model   # remove default
 ```
 
 The default is used for requests that omit `model` and for funding recommendations.

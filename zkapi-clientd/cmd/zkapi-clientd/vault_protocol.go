@@ -65,7 +65,7 @@ func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []st
 		return "", nil, errors.New("legacy selection requires a command")
 	}
 	switch args[0] {
-	case "serve", "config", "withdraw", "list-models", "set-model", "set-rewriter", "set-cover", "version", "help":
+	case "serve", "config", "withdraw", "list-models", "version", "help":
 	default:
 		return "", nil, errors.New("command unavailable in the legacy protocol stack")
 	}

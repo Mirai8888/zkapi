@@ -1,0 +1,224 @@
+--- a/zkapi-clientd/cmd/zkapi-clientd/configured_runtime.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/configured_runtime.go
+@@ -33,6 +33,7 @@
+ // Serve opens a missing note through the authenticated funding flow, then stays running.
+ // A reserved withdrawal or uncertain transaction is never replaced.
+ func runConfiguredServe(ctx context.Context, dir string, c, expected config.Config, out io.Writer) error {
++	ctx = context.WithValue(ctx, coverServeKey{}, true)
+ 	ui := &noninteractiveSetup{out: out}
+ 	runtime := configuredRuntime(expected)
+ 	runtime.testnet = checkSepoliaAccess
+--- a/zkapi-clientd/cmd/zkapi-clientd/main.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/main.go
+@@ -65,8 +65,8 @@
+ 		help()
+ 		return nil
+ 	}
+-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" {
+-		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, or set-model (--help for usage)")
++	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" && args[0] != "set-rewriter" && args[0] != "set-cover" {
++		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, set-model, set-rewriter, or set-cover (--help for usage)")
+ 	}
+ 	if dir == "" {
+ 		dir, err = config.DefaultDir()
+@@ -97,12 +97,24 @@
+ 		fmt.Println("Usage: zkapi-clientd list-models\n       zkapi-clientd set-model [MODEL | --clear]\nList public model IDs/caps, or show/save/clear the default model. No payments. Stop serve before changing the saved default.")
+ 		return nil
+ 	}
++	if args[0] == "set-rewriter" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
++		return runRewriterConfig(dir, config.Config{}, args[1:], os.Stdout)
++	}
++	if args[0] == "set-cover" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
++		return runCoverConfig(dir, config.Config{}, args[1:], os.Stdout)
++	}
+ 	c, err := config.Load(dir)
+ 	if err != nil {
+ 		return configurationRequired(err)
+ 	}
+ 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 	defer cancel()
++	if args[0] == "set-cover" {
++		return runCoverConfig(dir, c, args[1:], os.Stdout)
++	}
++	if args[0] == "set-rewriter" {
++		return runRewriterConfig(dir, c, args[1:], os.Stdout)
++	}
+ 	if args[0] == "list-models" || args[0] == "set-model" {
+ 		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
+ 	}
+@@ -159,6 +171,8 @@
+   config                 Show status, configure or edit settings, and prepare the wallet
+   serve [--model MODEL]  Open a missing note when funded, then serve inference
+   withdraw [--public]    Withdraw private balance or return public funding ETH
++  set-rewriter [OPTIONS] Configure direct prompt normalization; --help for options
++  set-cover [OPTIONS]    Configure optional bounded Tor cover traffic; --help
+   list-models            List supported model IDs and per-query caps
+   set-model [MODEL]      Show or save the default model (--clear removes it)
+ 
+@@ -221,7 +235,7 @@
+ }
+ 
+ func zkConfig(c config.Config, client *http.Client) zkapi.Config {
+-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL)}
++	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter}
+ }
+ 
+ type zkInference struct{ *zkapi.Client }
+@@ -360,6 +374,10 @@
+ 		return err
+ 	}
+ 	api.DefaultModel = c.DefaultModel
++	api.RewriterNotice = c.Rewriter.Notice
++	if c.Rewriter.Enabled() {
++		fmt.Fprintln(out, "WARNING: rewriter enabled: uncached user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Target history replays saved rewrites; cache misses rewrite historical user turns. Style rewriting does not guarantee anonymity.")
++	}
+ 	api.RequireAPIKey = c.RequireAPIKey
+ 	api.Status = server.ServiceStatus{Backend: c.Backend}
+ 	api.Status.Network = c.ZKAPI.Network
+@@ -370,6 +388,11 @@
+ 		api.ManagementToken = c.ManagementToken
+ 		api.Admin = http.HandlerFunc(funding.ServeAdminHTTP)
+ 	}
++	stopCover, err := startServeCover(life, c, logger)
++	if err != nil {
++		return err
++	}
++	defer stopCover()
+ 	httpServer := &http.Server{Handler: server.LogRequests(api, logger), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return life }}
+ 	serverDone := make(chan error, 1)
+ 	go func() { serverDone <- httpServer.Serve(listener) }()
+--- a/zkapi-clientd/internal/config/config.go
++++ b/zkapi-clientd/internal/config/config.go
+@@ -14,7 +14,9 @@
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
+ 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+ )
+ 
+ // Compatible requests share a provider credential within this fixed window,
+@@ -66,6 +68,8 @@
+ }
+ 
+ type Config struct {
++	Cover    cover.Config    `json:"cover,omitzero"`
++	Rewriter rewriter.Config `json:"rewriter,omitzero"`
+ 	// ManagementToken is a separate owner-only credential. It must never be
+ 	// published with config.json or shared with inference API clients.
+ 	ManagementToken       string `json:"-"`
+@@ -161,6 +165,12 @@
+ }
+ 
+ func Validate(c Config) error {
++	if err := c.Cover.Validate(c.RelayURL); err != nil {
++		return err
++	}
++	if err := c.Rewriter.Validate(); err != nil {
++		return err
++	}
+ 	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
+ 		return errors.New("invalid default model ID")
+ 	}
+--- a/zkapi-clientd/internal/zkapi/client.go
++++ b/zkapi-clientd/internal/zkapi/client.go
+@@ -10,6 +10,7 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
+ 	"io"
+ 	"net"
+ 	"net/http"
+@@ -33,29 +34,32 @@
+ // Config is the Go-side bridge configuration. A companion must be built with
+ // companion.patch; unpatched or unauthenticated daemons are rejected.
+ type Config struct {
+-	ClientURL        string        `json:"client_url"`
+-	BridgeToken      string        `json:"bridge_token"`
+-	Network          string        `json:"network"` // empty means mainnet; Sepolia is explicit
+-	InferenceBaseURL string        `json:"inference_base_url"`
+-	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
+-	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
+-	TorMode          bool          `json:"-"` // HTTPClient must use relay's tor:// transport
++	Rewriter         rewriter.Config `json:"-"`
++	TorEndpoint      string          `json:"-"`
++	ClientURL        string          `json:"client_url"`
++	BridgeToken      string          `json:"bridge_token"`
++	Network          string          `json:"network"` // empty means mainnet; Sepolia is explicit
++	InferenceBaseURL string          `json:"inference_base_url"`
++	HTTPClient       *http.Client    `json:"-"` // remote HTTPS, direct or over Wisp as configured
++	KeyReuseWindow   time.Duration   `json:"-"` // fixed, in-memory window; zero disables reuse
++	TorMode          bool            `json:"-"` // HTTPClient must use relay's tor:// transport
+ }
+ 
+ type Client struct {
+-	leaseMu        sync.Mutex
+-	usedLeases     map[[32]byte]uint64
+-	requestSlot    chan struct{}
+-	settlementPoll time.Duration
+-	settlementWake chan struct{}
+-	leaseGroup     *leaseGroup // accessed only while owning requestSlot
+-	now            func() time.Time
+-	cachedLease    *reusableLease // accessed only while owning requestSlot
+-	conversation   conversation   // accessed only while owning requestSlot
+-	keySerial      uint64         // process-local display number; contains no key material
+-	config         Config
+-	local          *http.Client
+-	inference      *http.Client
++	rewriteTranscript rewriter.Transcript // serialized by requestSlot
++	leaseMu           sync.Mutex
++	usedLeases        map[[32]byte]uint64
++	requestSlot       chan struct{}
++	settlementPoll    time.Duration
++	settlementWake    chan struct{}
++	leaseGroup        *leaseGroup // accessed only while owning requestSlot
++	now               func() time.Time
++	cachedLease       *reusableLease // accessed only while owning requestSlot
++	conversation      conversation   // accessed only while owning requestSlot
++	keySerial         uint64         // process-local display number; contains no key material
++	config            Config
++	local             *http.Client
++	inference         *http.Client
+ }
+ 
+ // Error is safe to return to API consumers: raw companion/provider messages
+@@ -82,6 +86,12 @@
+ }
+ 
+ func New(config Config) (*Client, error) {
++	if err := config.Rewriter.Validate(); err != nil {
++		return nil, err
++	}
++	if config.Rewriter.Enabled() && config.TorMode && !relay.IsTor(config.TorEndpoint) {
++		return nil, errors.New("rewriter Tor preparation requires a Tor endpoint")
++	}
+ 	if config.KeyReuseWindow < 0 || config.KeyReuseWindow > 5*time.Minute {
+ 		return nil, errors.New("zkAPI key reuse window must be between zero and five minutes")
+ 	}
+@@ -272,7 +282,7 @@
+ 		return nil, err
+ 	}
+ 	var identity string
+-	if c.config.TorMode {
++	if c.config.TorMode || c.config.Rewriter.Enabled() {
+ 		var err error
+ 		previous := c.conversation.serial
+ 		identity, err = c.selectConversation(body)
+@@ -280,6 +290,15 @@
+ 			return nil, err
+ 		}
+ 		c.reportConversation(ctx, previous)
++	}
++	// Conversation classification uses the original incoming history, never the
++	// nondeterministic rewrite. Target history replays saved normalized turns.
++	if c.config.Rewriter.Enabled() {
++		var err error
++		body, err = c.rewritePrompt(ctx, body, identity)
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 	lease, err := c.waitForLease(ctx, body)
+ 	if err != nil {

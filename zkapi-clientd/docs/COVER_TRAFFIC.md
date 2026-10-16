@@ -100,7 +100,9 @@ The wrapper still starts its own Python worker. Do not run both cover systems:
 use native `serve` for this feature, rather than the old launcher. No existing
 process or saved profile has been changed automatically.
 
-The new concession release still needs reviewed deployed manifests and production
+Both selected protocol engines implement this native worker from shared source;
+choosing legacy does not disable it. The new concession release still needs
+reviewed deployed manifests and production
 proving keys before live wallet use. Cover does not remove those blockers. Tests
 use fake transports/local SOCKS and TLS fixtures, including downgrade rejection,
 remote DNS, TLS rejection, bounded concurrency/read sizes and joined shutdown;

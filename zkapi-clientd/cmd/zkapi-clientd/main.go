@@ -212,7 +212,7 @@ Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
 Vault: flag > ZKAPI_VAULT_PROTOCOL > saved set-vault-protocol > concession.
 Legacy selects the pinned old executable, requires a saved legacy choice or explicit --config-dir,
-and does not support native rewriter/cover. No automatic fallback or note conversion.
+and preserves native rewriter/cover settings. No automatic fallback or note conversion.
 Config: ZKAPI_CLIENTD_CONFIG_DIR or the OS user config directory / zkapi-clientd.
 Mainnet is the default; Sepolia keeps a separate wallet.
 The network proxy is off by default. Verbose modes log private message content.`)

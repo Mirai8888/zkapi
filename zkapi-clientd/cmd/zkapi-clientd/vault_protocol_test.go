@@ -31,9 +31,11 @@ func TestVaultProtocolSelection(t *testing.T) {
 }
 func TestLegacyDispatchPreservesProfileAndCommand(t *testing.T) {
 	c := legacySelectionConfig()
-	for _, args := range [][]string{{"serve", "--model", "example/model"}, {"withdraw", "--public"}, {"config", "--usd", "20"}} {
+	c.Rewriter = rewriter.Config{URL: "http://localhost:8012", Model: "m"}
+	c.Cover = cover.Config{Rate: 5, Concurrency: 4, URLs: "https://cover.example/static"}
+	for _, args := range [][]string{{"serve", "--model", "example/model"}, {"withdraw", "--public"}, {"config", "--usd", "20"}, {"set-rewriter"}, {"set-cover"}} {
 		bin, got, err := legacyDispatchPlan("/private/legacy", true, c, args, "/bundle/bin/zkapi-clientd-concession-tor")
-		want := append([]string{"/bundle/bin/zkapi-clientd-tor-mode", "--config-dir", "/private/legacy"}, args...)
+		want := append([]string{"/bundle/bin/zkapi-clientd-legacy-privacy", "--config-dir", "/private/legacy"}, args...)
 		if err != nil || bin != want[0] || !reflect.DeepEqual(got, want) {
 			t.Fatal("wrong protocol dispatch", got, err)
 		}
@@ -41,13 +43,11 @@ func TestLegacyDispatchPreservesProfileAndCommand(t *testing.T) {
 }
 func TestLegacyDispatchRefusesPrivacyDowngradesAndStackMixing(t *testing.T) {
 	good := legacySelectionConfig()
-	cases := []config.Config{good, good, good, good, good, good}
-	cases[0].Rewriter = rewriter.Config{URL: "http://localhost:8012", Model: "m"}
-	cases[1].Cover = cover.Config{Rate: 5}
-	cases[2].ZKAPI.ExternalCompanion = true
-	cases[3].ZKAPI.Binary = "zkapi-walletd"
-	cases[4].ZKAPI.ExitRPCURL = "http://127.0.0.1:8545"
-	cases[5].ZKAPI.ProofSetupDir = ""
+	cases := []config.Config{good, good, good, good}
+	cases[0].ZKAPI.ExternalCompanion = true
+	cases[1].ZKAPI.Binary = "zkapi-walletd"
+	cases[2].ZKAPI.ExitRPCURL = "http://127.0.0.1:8545"
+	cases[3].ZKAPI.ProofSetupDir = ""
 	for _, c := range cases {
 		if _, _, err := legacyDispatchPlan("/legacy", true, c, []string{"serve"}, "/bundle/bin/client"); err == nil {
 			t.Fatal("unsafe downgrade accepted")
@@ -56,7 +56,7 @@ func TestLegacyDispatchRefusesPrivacyDowngradesAndStackMixing(t *testing.T) {
 	if _, _, err := legacyDispatchPlan("/legacy", false, good, []string{"serve"}, "/bundle/bin/client"); err == nil {
 		t.Fatal("implicit profile accepted")
 	}
-	for _, args := range [][]string{{"set-rewriter"}, {"set-cover"}, {"config", "--zkapi-binary=/wrong/companion"}, {"config", "-proof-setup-dir", "/wrong/keys"}} {
+	for _, args := range [][]string{{"config", "--zkapi-binary=/wrong/companion"}, {"config", "-proof-setup-dir", "/wrong/keys"}} {
 		if _, _, err := legacyDispatchPlan("/legacy", true, good, args, "/bundle/bin/client"); err == nil {
 			t.Fatal("stack override accepted", args)
 		}

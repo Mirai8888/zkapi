@@ -12,8 +12,8 @@ $CLIENT set-vault-protocol --clear     # restore default: concession
 ```
 
 Use `--config-dir DIR` when editing a non-default profile. Saving legacy requires
-a compatible existing legacy profile; it refuses enabled native rewriter/cover
-rather than disabling them. The preference editor always runs locally, allowing
+a compatible existing legacy profile. Native rewriter/cover settings are
+preserved and implemented by both protocol stacks. The preference editor always runs locally, allowing
 you to switch back even when legacy is selected. No network calls or payments.
 
 For an optional one-command override, use the **global** option before the command:
@@ -52,17 +52,38 @@ cannot operate an old vault by replacing a contract address.
 
 Legacy dispatch verifies SHA-256 pins for the local historical executables:
 
-- sibling `bin/zkapi-clientd-tor-mode`, preserved development client (source
-  checkpoint `be04d85`, not the upstream 0.1.7 recovery release);
+- sibling `bin/zkapi-clientd-legacy-privacy`, legacy protocol source checkpoint
+  `be04d85` plus current shared privacy code (not upstream 0.1.7);
 - the legacy profile's explicitly configured absolute companion path, matching
   the preserved `bin/zkapi-walletd` artifact.
 
 The profile must also explicitly name its absolute original proving-setup path;
 the old companion validates its own proving/deployment pins. External companions
 and companion/setup overrides through this dispatcher are refused. Missing or
-changed binaries fail, with no PATH lookup or concession fallback. Updating the
-legacy bundle requires reviewing and updating these pins in source. This is a
-local development pairing, not a downloadable production bundle.
+changed binaries fail, with no PATH lookup, privacy-less legacy fallback or
+concession fallback. This is a local development pairing, not a downloadable
+production bundle. The original `zkapi-clientd-tor-mode` remains untouched for
+historical recovery, but is no longer selected by this dispatcher.
+
+### Shared privacy implementation and rebuilding
+
+`bash zkapi-clientd/scripts/build-legacy-privacy.sh` reconstructs the pinned old
+protocol source in a temporary directory, applies `packaging/legacy/privacy.patch`
+(the adapter wiring), and overlays current files listed in
+`packaging/legacy/shared-files.txt`. Rewriter, target transcript, server preview,
+cover worker and their tests are shared verbatim—not independent forks. The
+script runs the legacy race suite and vet, builds `bin/zkapi-clientd-legacy-privacy`,
+and updates `cmd/zkapi-clientd/legacy_client.sha256`. Rebuild the primary client
+afterward to embed that pin. The script uses the local Git checkpoint and current
+Go toolchain; it never touches live profiles or starts a wallet. Run it after
+shared privacy changes so both protocol engines stay in sync.
+
+Switching protocols therefore preserves rewriter URL/key/model, exact saved
+rewrites during each process lifetime, conversation-aware OR-key reuse rules,
+Tor isolation, preview mode, and cover rate/targets/concurrency. Stopping and
+restarting still clears in-memory transcripts and keys in either protocol;
+unknown history is rewritten before inference. Protocol-specific proof, payment,
+withdrawal and deployment checks necessarily remain different.
 
 The dispatcher replaces itself with the legacy executable, preserving terminal
 interaction, signals, profile locks and exit status. It does not sign or deposit
@@ -73,11 +94,10 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
 
 - **Concession remains `not_deployed`** on both shipping networks, with missing
   production proving keys. Selection does not make it available.
-- The preserved legacy binary predates native rewriter and cover traffic.
-  Profiles enabling those features are rejected rather than silently sending
-  raw prompts or dropping cover. New concession exit/bundler settings are also
-  incompatible. Use a compatible existing legacy profile, not a sanitized copy
-  that silently loses privacy requirements. Rewriter/cover are not ported back.
+- The new legacy engine implements native rewriting and cover traffic, with the
+  same default 5/s when cover is enabled. New concession exit/bundler settings
+  are still incompatible with the old on-chain exit protocol and are refused;
+  switching vaults does not translate them.
 - Upstream's planned legacy 0.1.7 recovery line closes deposits and retires
   admission on a schedule. This selector does not establish that historical
   deposits or inference are still available today, and cannot bypass gateway,
@@ -95,6 +115,9 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
   only through its matching protocol and original state/proving assets.
 
 No service is restarted or live deposit attempted by implementing this option.
-Unit tests cover dispatch arguments, environment precedence, executable pins,
-required explicit profiles and refusal of privacy/companion downgrades. Live
-legacy deposit acceptance and new-vault availability have not been verified.
+Both engines run the shared privacy regression tests, including no raw user
+history at the target, OR-key continuity, rewrite/route failure before payment,
+SSE previews, bounded cover workers and SOCKS/TLS fail-closed behavior. Dispatcher
+tests verify privacy settings are accepted unchanged and only the privacy-enabled
+legacy artifact is selected. No live legacy deposit acceptance or new-vault
+availability has been verified.

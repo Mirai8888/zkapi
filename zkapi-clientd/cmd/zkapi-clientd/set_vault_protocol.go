@@ -12,7 +12,7 @@ import (
 
 func runSetVaultProtocol(dir string, args []string, out io.Writer) error {
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
-		fmt.Fprintln(out, "Usage: zkapi-clientd set-vault-protocol [legacy | concession | --clear]\nShow/save this profile's vault stack. Default: concession. Stop serve before edits. No wallet migration or payment. Legacy does not support native rewriter/cover.")
+		fmt.Fprintln(out, "Usage: zkapi-clientd set-vault-protocol [legacy | concession | --clear]\nShow/save this profile's vault stack. Default: concession. Stop serve before edits. No wallet migration or payment. Both protocols preserve native rewriter/cover settings.")
 		return nil
 	}
 	if len(args) > 1 {
@@ -53,7 +53,7 @@ func runSetVaultProtocol(dir string, args []string, out io.Writer) error {
 	effective, _ := vaultProtocol(next)
 	fmt.Fprintf(out, "Vault protocol saved: %s. Subsequent commands use this profile's selection; no state migrated, request or transaction sent.\n", effective)
 	if next == "legacy" {
-		fmt.Fprintln(out, "Legacy uses the preserved old client: no native rewriter/cover, high deposit gas, and service availability is not verified.")
+		fmt.Fprintln(out, "Legacy uses its privacy-enabled protocol engine with unchanged rewriter/cover settings. Deposit gas remains high and service availability is not verified.")
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,7 +18,12 @@ import (
 // The legacy and concession stacks prove different statements. Dispatch a
 // complete pinned legacy release; never replace the concession vault address,
 // reinterpret notes, translate signed journals, or relax deployment gates.
-const legacyClientHash = "815af672b686060b836a35427695a713cdd6c03600d0a8cd0c2dad4b261d0100"
+//
+//go:embed legacy_client.sha256
+var legacyClientPin string
+
+var legacyClientHash = strings.TrimSpace(legacyClientPin)
+
 const legacyCompanionHash = "84d57456c3cdea682e5201d1bb29a5219753404d390140c30897fe0b3cf06909"
 
 func vaultProtocol(flagValue string) (string, error) {
@@ -59,9 +65,9 @@ func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []st
 		return "", nil, errors.New("legacy selection requires a command")
 	}
 	switch args[0] {
-	case "serve", "config", "withdraw", "list-models", "set-model", "version", "help":
+	case "serve", "config", "withdraw", "list-models", "set-model", "set-rewriter", "set-cover", "version", "help":
 	default:
-		return "", nil, errors.New("command unavailable in the preserved legacy stack; native rewriter and cover traffic require the concession client")
+		return "", nil, errors.New("command unavailable in the legacy protocol stack")
 	}
 	// Companion/setup overrides would invalidate the stack checked below. Edit
 	// a legacy profile with its own legacy tooling, not through this dispatch.
@@ -72,10 +78,8 @@ func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []st
 			return "", nil, errors.New("legacy dispatch cannot override its pinned companion/setup; use a prepared legacy profile")
 		}
 	}
-	// Do not silently turn off privacy settings when crossing protocol releases.
-	if c.Rewriter.Enabled() || c.Cover.Enabled() {
-		return "", nil, errors.New("preserved legacy client does not implement native rewriting or cover traffic; refusing to ignore enabled privacy settings; keep this profile unchanged and use a compatible legacy profile")
-	}
+	// Shared rewriter/cover settings pass unchanged to the privacy-enabled
+	// legacy engine. Never fall back to the older privacy-less executable.
 	if c.ZKAPI.ExitRPCURL != "" || c.ZKAPI.BundlerURL != "" || c.ZKAPI.WithdrawalFees != "" {
 		return "", nil, errors.New("preserved legacy client cannot interpret concession exit options")
 	}
@@ -85,7 +89,7 @@ func legacyDispatchPlan(dir string, explicitDir bool, c config.Config, args []st
 	if !filepath.IsAbs(c.ZKAPI.Binary) || !filepath.IsAbs(c.ZKAPI.ProofSetupDir) {
 		return "", nil, errors.New("legacy profile must explicitly name absolute paths to its companion and original verified proving setup")
 	}
-	binary := filepath.Join(filepath.Dir(executable), "zkapi-clientd-tor-mode")
+	binary := filepath.Join(filepath.Dir(executable), "zkapi-clientd-legacy-privacy")
 	// The legacy companion verifies its own deployment and proving-key pins.
 	forwarded := append([]string{binary, "--config-dir", dir}, args...)
 	return binary, forwarded, nil
@@ -117,7 +121,7 @@ func dispatchLegacy(dir string, explicitDir bool, args []string) error {
 	if err := checkProtocolArtifact(c.ZKAPI.Binary, legacyCompanionHash); err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "Vault protocol: legacy (zkapi-v2-note-bound-v1), using pinned legacy client and companion. No native rewriter/cover. Historical deposit gas is high; legacy admission may be closed or retired. Selection is not funding approval or proof of live availability.")
+	fmt.Fprintln(os.Stderr, "Vault protocol: legacy (zkapi-v2-note-bound-v1), using pinned legacy protocol engine and companion; shared rewriter/cover settings preserved. Historical deposit gas is high; legacy admission may be closed or retired. Selection is not funding approval or proof of live availability.")
 	// Replace, rather than detach: terminal interaction, signals, daemon locks
 	// and exit status remain owned by the selected native protocol client.
 	return syscall.Exec(binary, forwarded, os.Environ())

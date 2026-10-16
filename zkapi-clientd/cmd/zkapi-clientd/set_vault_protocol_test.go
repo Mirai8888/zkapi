@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/config"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/cover"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 )
 
 func TestSavedVaultProtocolRoundTripAndLock(t *testing.T) {
@@ -58,6 +60,9 @@ func TestSavedLegacyNeedsNoRepeatedFlagAndEditorRemainsLocal(t *testing.T) {
 	next := c
 	next.ZKAPI.Binary = "/bundle/bin/zkapi-walletd"
 	next.ZKAPI.ProofSetupDir = "/bundle/share/proof-setup"
+	next.RelayURL = "tor://127.0.0.1:9050"
+	next.Rewriter = rewriter.Config{URL: "http://localhost:8012", Model: "m", APIKey: "rewriter-test-secret"}
+	next.Cover = cover.Config{Rate: 5, Concurrency: 4, URLs: "https://cover.example/static"}
 	if err := config.Update(dir, c, next); err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +79,10 @@ func TestSavedLegacyNeedsNoRepeatedFlagAndEditorRemainsLocal(t *testing.T) {
 	}
 	if err := run([]string{"set-vault-protocol", "concession"}); err != nil {
 		t.Fatal("cannot switch out of legacy", err)
+	}
+	after, err := config.Load(dir)
+	if err != nil || after != next {
+		t.Fatal("vault selection changed privacy/configuration settings", err)
 	}
 	info, err := os.Stat(filepath.Join(dir, "vault-protocol"))
 	if err != nil || info.Mode().Perm() != 0600 {

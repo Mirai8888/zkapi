@@ -1,0 +1,39 @@
+name: Research mixnet experiment
+
+on:
+  push:
+    paths: ['research-mixnet/**', '.github/workflows/research-mixnet.yml']
+  pull_request:
+    paths: ['research-mixnet/**', '.github/workflows/research-mixnet.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: research-mixnet
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: research-mixnet/go.mod
+          cache-dependency-path: research-mixnet/go.sum
+      - run: go mod verify
+      - run: make test
+      - run: make vet
+      - name: Check reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - run: make build
+      - name: Synthetic headless transport smoke test
+        run: ./bin/research-mixnet demo

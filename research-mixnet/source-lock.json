@@ -1,0 +1,12 @@
+{
+  "upstream_repository": "https://github.com/vbuterin/zkapi",
+  "upstream_branch": "feat/client-concession-local",
+  "upstream_commit": "0fb263b0da04986cfe5c63b12340c1581018ae9b",
+  "packet_implementation": "github.com/katzenpost/katzenpost/core/sphinx",
+  "packet_module_version": "v0.0.107",
+  "hpqc_module_version": "v0.0.93",
+  "experiment_suite": "X25519 NIKE Sphinx; classical",
+  "go_toolchain": "go1.27.2",
+  "live_wallet_integration": false,
+  "production_ready": false
+}

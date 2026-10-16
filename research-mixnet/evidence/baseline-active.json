@@ -1,0 +1,138 @@
+{
+  "status": "loopback_experiment_only",
+  "crypto": "Katzenpost Sphinx v0.0.107; X25519 classical",
+  "cell_bytes": 4522,
+  "epoch_seconds": 6.009852416,
+  "clients": 2,
+  "submitted_jobs": 2,
+  "completed_jobs": 2,
+  "synthetic_round_trip_ms": [
+    1868,
+    987
+  ],
+  "upload_cover_cells_before_jobs": 22,
+  "download_cover_cells_before_jobs": 4,
+  "scheduled_bidirectional_cell_mib_per_client_hour": 248.40087890625,
+  "links": [
+    {
+      "name": "client-0-upload",
+      "scheduled_slots": 48,
+      "queued_cells": 1,
+      "locally_generated_cover_cells": 47,
+      "successful_cells": 47,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 1,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 212534
+    },
+    {
+      "name": "client-1-upload",
+      "scheduled_slots": 48,
+      "queued_cells": 1,
+      "locally_generated_cover_cells": 47,
+      "successful_cells": 47,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 1,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 212534
+    },
+    {
+      "name": "forward-1",
+      "scheduled_slots": 96,
+      "queued_cells": 93,
+      "locally_generated_cover_cells": 3,
+      "successful_cells": 95,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 1,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 429590
+    },
+    {
+      "name": "forward-2",
+      "scheduled_slots": 96,
+      "queued_cells": 93,
+      "locally_generated_cover_cells": 3,
+      "successful_cells": 96,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 0,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 434112
+    },
+    {
+      "name": "forward-3",
+      "scheduled_slots": 96,
+      "queued_cells": 93,
+      "locally_generated_cover_cells": 3,
+      "successful_cells": 96,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 0,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 434112
+    },
+    {
+      "name": "worker-return",
+      "scheduled_slots": 96,
+      "queued_cells": 2,
+      "locally_generated_cover_cells": 94,
+      "successful_cells": 95,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 1,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 429590
+    },
+    {
+      "name": "reverse-1",
+      "scheduled_slots": 96,
+      "queued_cells": 93,
+      "locally_generated_cover_cells": 3,
+      "successful_cells": 96,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 0,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 434112
+    },
+    {
+      "name": "reverse-2",
+      "scheduled_slots": 96,
+      "queued_cells": 93,
+      "locally_generated_cover_cells": 3,
+      "successful_cells": 96,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 0,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 434112
+    },
+    {
+      "name": "client-0-download",
+      "scheduled_slots": 48,
+      "queued_cells": 42,
+      "locally_generated_cover_cells": 6,
+      "successful_cells": 48,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 0,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 217056
+    },
+    {
+      "name": "client-1-download",
+      "scheduled_slots": 48,
+      "queued_cells": 48,
+      "locally_generated_cover_cells": 0,
+      "successful_cells": 47,
+      "failed_slots": 0,
+      "cancellation_interrupted_slots": 1,
+      "missed_clock_slots": 0,
+      "queue_drops": 0,
+      "successful_cell_bytes": 212534
+    }
+  ]
+}

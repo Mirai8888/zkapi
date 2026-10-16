@@ -1,5 +1,12 @@
 # zkAPI
 
+**Product fork:** our headless private research work starts in
+[`research-mixnet/`](research-mixnet/README.md). It includes a local Sphinx/SURB
+transport experiment with continuous scheduled cover in both directions, tests,
+an application research brief and production milestones. This is a synthetic
+loopback prototype; it does not provide a production anonymity service or change
+the upstream wallet/deployment status described below.
+
 zkAPI lets you pay for AI and other APIs with ETH and make unlinkable requests.
 It keeps API usage separate from your on-chain deposit: the service can verify
 that you can pay without learning which deposit is yours.

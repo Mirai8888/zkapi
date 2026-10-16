@@ -631,15 +631,10 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 			return errors.New("invalid public return value")
 		}
 		if record.Return.Sweep {
-			var code string
-			if err := h.addressRPC(ctx, config, "eth_getCode", []any{to, "pending"}, &code); err != nil {
-				return err
-			}
-			if code != "0x" {
-				return errors.New("choose an exact ETH amount when returning to a contract account")
-			}
 			if mode := quoteMode(ctx); mode != nil && mode.Capture != nil {
-				value.SetInt64(0)
+				// Start with a nonzero transfer; smart/delegated wallets may have
+				// a payable receive path different from a zero-value call.
+				value.SetInt64(1)
 			}
 		}
 	}
@@ -677,10 +672,7 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 	if err != nil {
 		return err
 	}
-	if kind == "return" && record.Return.Sweep {
-		if gas.Uint64() != 21000 {
-			return errors.New("maximum public return requires an ordinary Ethereum account")
-		}
+	if kind == "return" && record.Return.Sweep && gas.Uint64() == 21000 {
 		gasLimit = 21000
 	}
 	fees, err := h.addressLowFees(ctx, config, gasLimit)
@@ -697,6 +689,16 @@ func (h *FundingHandler) signAddressTransaction(ctx context.Context, config fund
 			return errAddressNeedsETH
 		}
 		value.Sub(balance, reserve)
+		// Check the exact swept amount as well, including value-dependent
+		// recipient code. Never sign a sweep simulated only with a probe value.
+		input["value"] = "0x" + value.Text(16)
+		if err := h.addressRPC(ctx, config, "eth_call", params, &simulated); err != nil {
+			return errors.New("public return simulation failed; no transaction was sent")
+		}
+		exactGas, err := h.addressQuantity(ctx, config, "eth_estimateGas", params)
+		if err != nil || !exactGas.IsUint64() || exactGas.Uint64() > gasLimit {
+			return errors.New("public return gas changed with its value; choose an exact amount; no transaction was sent")
+		}
 		record.Return.AmountWei = value.String()
 	}
 	if mode != nil && mode.Capture != nil {

@@ -1,6 +1,7 @@
 # Client configuration and use
 
-The public commands are `zkapi-clientd config` and `zkapi-clientd serve`.
+The public commands are `zkapi-clientd config`, `zkapi-clientd serve`,
+`zkapi-clientd withdraw`, `zkapi-clientd list-models`, and `zkapi-clientd set-model`.
 The client only supports zkAPI private ETH balances. Ticket issuance, import,
 redemption and ticket-based inference are not included.
 
@@ -61,10 +62,81 @@ Esc or `q` cancels a selection. Text prompts remain available when output is
 redirected. Ctrl+C stops safely and preserves saved progress; run
 `zkapi-clientd config` again to continue.
 
-`serve` does not prompt or authorize funding. Missing prerequisites point back
-to `config`. Configuration stops temporary services it starts; an existing
-compatible service it reused remains running. Stop a running service before
-editing its configuration.
+### Model catalog and default selection
+
+```sh
+zkapi-clientd list-models                 # sorted IDs and per-query USD caps
+zkapi-clientd set-model provider/model    # validate against live policy and save
+zkapi-clientd set-model                   # show the saved default
+zkapi-clientd set-model --clear           # remove it
+```
+
+These use the selected configuration profile (`--config-dir` goes before the
+command). Catalog and model validation use public endpoints through the saved
+relay/Tor transport; no funded note, running daemon, companion or paid key is
+needed. The list marks the saved default. Caps are spending authorizations,
+not predicted token charges.
+
+Stop `serve` before changing the default: `set-model` uses the same exclusive
+configuration lock and atomic update as other settings, preserving credentials
+and wallet files. The saved default supplies `model` only when an inference
+request omits the field; explicit models take precedence and invalid explicit
+values still fail validation. It also supplies the funding recommendation model.
+`serve --model MODEL` overrides only the funding recommendation for that run.
+With neither a saved default nor `--model`, the conservative funding cap applies.
+Saved selection is validated again by inference policy when requests are made.
+
+The saved `default_model` field requires this updated binary; older releases
+with strict configuration decoding may reject it. Use `set-model --clear` before
+rolling back to an older binary.
+
+### One-command funding and withdrawal
+
+```sh
+zkapi-clientd serve --model anthropic/claude-sonnet-4.5
+zkapi-clientd withdraw          # guided full private-balance withdrawal
+zkapi-clientd withdraw --public # return unused ETH from the funding address
+```
+
+**Starting `serve` authorizes opening a missing private note** using the available public ETH minus the quoted maximum network fee allowance,
+once the funding address meets the minimum threshold. It displays the chain, ETH receiving address, total required balance and
+additional ETH to send, then polls every five seconds. No terminal confirmation
+is required for this deposit. Ctrl+C stops waiting and preserves saved progress.
+A funded existing note is reused without another deposit. A depleted but still
+open note must be closed with `withdraw` before opening another.
+
+For a new deposit the recommended principal is
+`max(3 × model per-query spending cap in ETH, 10 × estimated deposit gas in ETH)`.
+The total to fund includes the quoted network fee reserve/buffer **in addition**
+to this principal; existing public ETH reduces the top-up. The model cap is the
+same reviewed policy used by inference, converted using the verified native ETH
+price quote—not a prediction of actual token usage. `--model` only selects the
+recommendation; it does not constrain subsequent application requests. Without
+it or a saved default, the highest currently supported tier ($6 per query) is used. Price/gas are
+snapshots. The recommendation is a minimum threshold, not a deposit cap.
+When funded, `serve` resizes the unsigned draft to
+`floor((public balance − maximum fee allowance) / 1 gwei)` and re-quotes/simulates
+that amount before approval. Gas changes can require a smaller requote; repeated
+instability stops without approval rather than looping indefinitely. The final
+amount becomes fixed for approval/recovery. ETH arriving after that sizing step
+is not automatically added. Unused fee allowance and sub-gwei dust remain public.
+An older saved unsigned amount serves as the minimum threshold and can grow;
+explicit manual/config deposits still keep the selected amount.
+A pending signed deposit is recovered, not replaced or enlarged. Uncertain/reverted states
+and reserved withdrawals require recovery and are not automatically approved.
+
+`withdraw` prompts for a destination, quotes fees, asks for approval, then waits
+for finality or resumes saved progress. This legacy deployment needs public ETH
+for withdrawal gas; the command shows any shortfall. After private completion,
+`withdraw` also quotes a sweep of the remaining public balance to the same
+destination and asks for that transaction's fee approval, without another command.
+An interrupted public return resumes its saved transaction. A completed return
+is not repeatedly swept for fee dust; use `withdraw --public` for a standalone
+return or later funds. Tiny balances may be below the cost of a return.
+Actual fees can be lower than the reserved maximum, leaving a public remainder.
+Both work without a running daemon by owning a temporary runtime, and leave an
+existing compatible daemon running. Missing installation/network prerequisites
+still point to `config`. Stop a running service before editing configuration.
 
 ## Sepolia
 
@@ -80,21 +152,98 @@ the other network's recovery data.
 
 ## Tor
 
-Start Tor with a local SOCKS listener, then select its numeric loopback address:
+Run Tor with a numeric loopback SOCKS listener and authentication isolation:
+
+```text
+SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+```
+
+Select explicit Tor mode once, then use the daemon as an ordinary
+OpenAI-compatible server (no `zkapi-tor-cli.sh` wrapper is needed):
 
 ```sh
-zkapi-clientd config --relay-url socks5://127.0.0.1:9050
+zkapi-clientd config --relay-url tor://127.0.0.1:9050
 zkapi-clientd serve
 ```
 
-The client passes destination names to SOCKS5 for remote DNS and keeps HTTPS
-certificate verification. The Go frontend and the wallet companion use the
-same route. If Tor is unavailable, requests fail instead of connecting directly.
-Keep the local OpenAI-compatible API at its loopback URL. Stop a running
-`serve` before changing its saved transport. `HTTP_PROXY`, `HTTPS_PROXY`, and
-`ALL_PROXY` do not change this client's route.
-On macOS, `torify zkapi-clientd serve` alone does not route the Go client; set
-the SOCKS5 relay URL above even when launching it through `torify`.
+Point your application's OpenAI base URL at the daemon's `/v1` endpoint.
+For each queued completion the daemon compares the canonical JSON messages
+with the immediately preceding request:
+
+- The full previous message array must be a prefix of the new one. Equal
+  histories (retries/regenerations) also count. JSON object-key order and
+  whitespace do not matter; role, tool calls and multimodal content do.
+- A continuation keeps its random SOCKS authentication identity and may reuse
+  its OpenRouter key within the configured fixed reuse window, provider expiry
+  and unchanged spending cap. A fresh key does not itself change that identity.
+- A non-prefix request gets a fresh isolation identity and cannot reuse the
+  previous key, even if the key is unexpired. Normal lease retirement/settlement
+  completes before another key is obtained. Inference is never auto-retried.
+- Comparisons are serialized through the end of the preceding response stream.
+  Only the previous request's message hashes are retained in memory, not raw
+  prompts; restarting forgets both conversation identity and reusable keys.
+
+This is a history heuristic, not conversation authentication. Identical
+histories from different apps are indistinguishable. Interleaved chats,
+truncation, edited history, or changing a system message can rotate identity.
+Changing only model/generation parameters does not; key-budget checks still
+apply. Do not use a shared daemon as an isolation boundary between users.
+
+Tor must honor `IsolateSOCKSAuth`; SOCKS authentication alone cannot verify that
+Tor configuration. Different identities cannot share circuits under that
+setting, but may use the same exit IP. Keeping an identity lets Tor reuse a
+circuit; it does not pin the circuit indefinitely. No global `NEWNYM` is sent.
+TLS connections are not pooled across requests. Payment, verifier, model and
+RPC traffic use separate per-connection identities, never the conversation's.
+The managed companion uses the same Tor SOCKS listener through its local
+CONNECT bridge; external companions are rejected in explicit Tor mode.
+
+Remote DNS and HTTPS certificate verification remain enabled. Tor mode requires
+SOCKS username/password authentication and never falls back to unauthenticated
+SOCKS or direct access. It does not install or start Tor, provide cover traffic,
+or hide prompt content from OpenRouter. Timing correlation remains possible.
+Plain `socks5://IP:PORT` remains available but has no conversation isolation.
+
+Keep the local API at its loopback URL. Stop `serve` before changing saved
+transport settings. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `torify` alone
+do not select the Go client's route. See [PRIVACY.md](PRIVACY.md) for other limits.
+
+## Live diagnostics
+
+```sh
+zkapi-clientd serve --semi-verbose  # compact previews and operation lines
+zkapi-clientd serve --verbose       # message content/chunks plus detailed request events
+```
+
+These are runtime-only, mutually exclusive flags. Normal mode does not log
+prompt/response content. Both diagnostic modes deliberately expose private
+content to stdout (and potentially journald, terminal scrollback or log files).
+Never enable them on shared logs. Provider keys, SOCKS identities, wallet secrets
+and raw remote error messages are not logged. Control characters are quoted to
+prevent messages from injecting terminal commands or fake log lines.
+
+Semi-verbose shows received prompt text and final response text using the first
+32 and last 32 Unicode characters plus a character count (short messages are
+shown once). Prompt messages are joined with newlines; structured multimodal
+content and tool calls are represented as JSON. Response previews include
+reasoning/tool content when present. Verbose prints content as it arrives,
+including SSE deltas, without waiting for the response to finish. A response
+record above 1 MiB is omitted from diagnostics and marked `preview_incomplete`;
+inference forwarding is not truncated. Partial/cancelled responses are marked.
+
+Conversation lines distinguish new histories from prefix continuations. Tor
+start/finish lines measure SOCKS connection establishment, **not** an observed
+circuit build: SOCKS does not expose Tor circuit IDs or build/reuse decisions.
+Payment lines show the authorized micro-USD cap and key acquisition; wallet
+settlement events report the verified ETH charge and remaining private balance.
+The current wallet event feed does **not** expose a separate refund/change
+amount. The logger says so rather than inventing a refund by subtracting an ETH
+charge from a USD cap. Session events are polled every five seconds; transport
+and message events are emitted as they happen. Historical retained wallet
+session events can be displayed on startup.
+
+The daemon must be restarted with the flag to enable diagnostics; these flags
+do not attach to or reconfigure an already-running daemon.
 
 ## Deployment origins
 
@@ -131,12 +280,15 @@ funded transaction.
 Ctrl+C preserves saved progress. A signed pending withdrawal resumes its exact
 transaction without another approval. A reverted transaction is never retried
 automatically. Explicit recovery offers a reviewed retry or confirmation of a
-matching payout submitted independently. Public ETH return remains a separate
-wallet menu action with its own approval. Return quotes expire after 30 seconds;
+matching payout submitted independently. The public ETH return follows private
+withdrawal in the same command, with its own approval. Return quotes expire after 30 seconds;
 if one expires before signing, run the same wallet menu again and review a
 fresh quote. A saved signed return resumes its original transaction instead.
 
-Returning `all` requires an ordinary Ethereum account with no deployed code.
+Returning `all` supports ordinary and payable contract/delegated accounts.
+Both a probe and the exact swept value are simulated. Value-dependent gas that
+exceeds the quoted allowance fails closed; select an exact amount for such a
+recipient. Unused maximum fee allowance may remain public.
 For a delegated or contract recipient, choose an exact ETH amount and leave
 room for the displayed maximum fee. The exact-amount path still simulates the
 transfer and requires destination, amount and fee approval.

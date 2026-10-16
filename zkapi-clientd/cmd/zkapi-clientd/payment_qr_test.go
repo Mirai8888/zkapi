@@ -152,7 +152,7 @@ func TestPrintSetupPaymentQR(t *testing.T) {
 	if err := printSetupPaymentQR(&out, q); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Network: Ethereum Mainnet", "Send: 0.000750001000029999 ETH", "To: " + q.Address, "Payment URI: ethereum:" + q.Address + "@1?value=750001000029999", paymentQRColors, paymentQRReset} {
+	for _, want := range []string{"Network: Ethereum Mainnet", "Send at least: 0.00076 ETH", "To: " + q.Address, "Payment URI: ethereum:" + q.Address + "@1?value=750001000029999", paymentQRColors, paymentQRReset} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %q from payment instructions", want)
 		}

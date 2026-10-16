@@ -145,7 +145,7 @@ func TestSelectNetworkPreservesCustomVerifier(t *testing.T) {
 }
 
 func TestLoadPreservesRelaySelection(t *testing.T) {
-	for _, relayURL := range []string{"", "wss://relay.example/", "ws://127.0.0.1:8765/"} {
+	for _, relayURL := range []string{"", "wss://relay.example/", "ws://127.0.0.1:8765/", "socks5://127.0.0.1:9050", "tor://127.0.0.1:9050"} {
 		t.Run(relayURL, func(t *testing.T) {
 			c, err := Default()
 			if err != nil {

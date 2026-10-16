@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/activity"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
 )
 
 const (
@@ -38,6 +39,7 @@ type Config struct {
 	InferenceBaseURL string        `json:"inference_base_url"`
 	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
 	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
+	TorMode          bool          `json:"-"` // HTTPClient must use relay's tor:// transport
 }
 
 type Client struct {
@@ -49,6 +51,7 @@ type Client struct {
 	leaseGroup     *leaseGroup // accessed only while owning requestSlot
 	now            func() time.Time
 	cachedLease    *reusableLease // accessed only while owning requestSlot
+	conversation   conversation   // accessed only while owning requestSlot
 	keySerial      uint64         // process-local display number; contains no key material
 	config         Config
 	local          *http.Client
@@ -268,6 +271,16 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var identity string
+	if c.config.TorMode {
+		var err error
+		previous := c.conversation.serial
+		identity, err = c.selectConversation(body)
+		if err != nil {
+			return nil, err
+		}
+		c.reportConversation(ctx, previous)
+	}
 	lease, err := c.waitForLease(ctx, body)
 	if err != nil {
 		return nil, err
@@ -277,7 +290,11 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 		c.cachedLease = nil
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.InferenceBaseURL+"/chat/completions", bytes.NewReader(body))
+	inferenceCtx := ctx
+	if c.config.TorMode {
+		inferenceCtx = relay.WithTorIdentity(ctx, identity)
+	}
+	req, err := http.NewRequestWithContext(inferenceCtx, http.MethodPost, c.config.InferenceBaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		c.cachedLease = nil
 		return nil, fmt.Errorf("create inference request: %w", err)
@@ -356,11 +373,15 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 		// slides, and a different coarse cap cannot expand an existing key.
 		if cached := c.cachedLease; cached != nil && c.config.KeyReuseWindow > 0 &&
 			cached.budget == limit && c.now().Before(cached.until) {
+			activity.Diagnostic(ctx, "key=%d reused (within expiry/window and budget)", cached.serial)
 			activity.Report(ctx, activity.Event{Kind: activity.KeyReused, Key: cached.serial})
 			return cached.providerLease, nil
 		}
 		c.cachedLease = nil
 		leaseBody, _ := json.Marshal(map[string]uint64{"request_limit_micro_usd": limit})
+		if !waiting {
+			activity.Diagnostic(ctx, "payment: requesting key; authorized spending cap=%d micro-USD (not a charge or ETH transfer)", limit)
+		}
 		lease, err := c.request(ctx, http.MethodPost, "/oa/v1/lease", leaseBody)
 		if !isPendingSettlement(err) {
 			if err != nil {
@@ -368,6 +389,7 @@ func (c *Client) waitForLease(ctx context.Context, body json.RawMessage) (provid
 			}
 			accepted, err := c.acceptLease(lease, limit)
 			if err == nil {
+				activity.Diagnostic(ctx, "payment: key=%d acquired; actual ETH charge reported after settlement", accepted.serial)
 				activity.Report(ctx, activity.Event{Kind: activity.KeyFresh, Key: accepted.serial})
 			}
 			return accepted, err

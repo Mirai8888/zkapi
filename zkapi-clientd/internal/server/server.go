@@ -38,6 +38,7 @@ type API struct {
 	pending chan struct{}
 	// RequireAPIKey opts into bearer authentication for inference routes. Local
 	// management always requires its credentials, regardless of this setting.
+	DefaultModel  string
 	RequireAPIKey bool
 	// Admin is optional local wallet management. All of its routes require the
 	// private CLI credential; an inference API key cannot authorize wallet use.
@@ -179,6 +180,19 @@ var fields = map[string]bool{
 	"modalities": true, "audio": true, "prediction": true,
 }
 
+func sanitizeWithDefault(body []byte, model string) (json.RawMessage, bool, error) {
+	if model != "" {
+		var values map[string]json.RawMessage
+		if json.Unmarshal(body, &values) == nil && values != nil {
+			if _, exists := values["model"]; !exists {
+				values["model"], _ = json.Marshal(model)
+				body, _ = json.Marshal(values)
+			}
+		}
+	}
+	return sanitize(body)
+}
+
 func sanitize(body []byte) (json.RawMessage, bool, error) {
 	var values map[string]json.RawMessage
 	if err := json.Unmarshal(body, &values); err != nil || values == nil {
@@ -245,7 +259,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "invalid_body", "Request body is too large or unreadable (16 MiB maximum).")
 		return
 	}
-	clean, streaming, err := sanitize(body)
+	clean, streaming, err := sanitizeWithDefault(body, a.DefaultModel)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -263,6 +277,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 408, "request_cancelled", "The request was canceled while waiting for inference.")
 		return
 	}
+	promptDiagnostic(ctx, clean)
 	response, err := a.backend.Complete(ctx, clean)
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -324,10 +339,14 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	diagnostic := newResponseDiagnostic(ctx, streaming)
+	responseComplete := false
+	defer func() { diagnostic.finish(responseComplete) }()
 	buffer := make([]byte, 16*1024)
 	for {
 		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
+			diagnostic.add(buffer[:n])
 			_ = control.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := w.Write(buffer[:n]); err != nil {
 				return
@@ -341,6 +360,7 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if readErr != nil {
+			responseComplete = readErr == io.EOF
 			if readErr != io.EOF {
 				panic(http.ErrAbortHandler)
 			}

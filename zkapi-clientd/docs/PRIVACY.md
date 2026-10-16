@@ -16,6 +16,17 @@ falls back to direct HTTPS. A loopback SOCKS5 route can send destination DNS
 and HTTPS traffic through Tor when Tor is running locally. It also fails closed
 if the proxy is unavailable. Environment proxy variables are ignored.
 
+Explicit `tor://IP:PORT` mode additionally assigns random SOCKS authentication
+identities to conversations. Tor must enable `IsolateSOCKSAuth`; the daemon
+cannot inspect that setting through SOCKS. The full previous request's messages
+must be a prefix of the current messages to keep the identity. A new identity
+also discards the cached provider key. Payment and other background traffic get
+separate per-connection identities. No raw prompt is retained for matching,
+only message hashes in memory. Identical histories are indistinguishable;
+interleaved or edited chats rotate conservatively. This is not a multi-user
+security boundary, a guarantee of different exit IPs, or protection against
+traffic timing analysis. See [Tor mode](CLI_ZKAPI.md#tor).
+
 The client keeps the deployed manifest/contract pins and normal station/key
 verification binding. Unverified continuation requires the compiled `oa-station`
 Ed25519 public key, scoped to `https://verifier2.openanonymity.ai`, and local
@@ -49,7 +60,8 @@ this station-pin check.
 The default key-reuse window is a fixed 60 seconds from acquisition, capped by
 the provider's expiry; reusing a key does not extend it. Compatible requests can
 share access, including different chats, local clients, and automatic title and
-follow-up requests.
+follow-up requests. In explicit Tor mode this is restricted to prefix-continuing
+conversations; unrelated histories never share the cached key.
 The provider can link all requests using the same key, and its original
 aggregate spending cap is shared. Expiry, errors and cancellation discard
 cached access. The cache is memory-only and does not survive a restart.

@@ -118,7 +118,7 @@ func TestGuidedWithdrawalWaitsForFeesAndApprovesFreshQuote(t *testing.T) {
 		t.Fatalf("unexpected calls: ui=%+v service=%+v", u, f)
 	}
 	output := u.String()
-	if strings.Count(output, "Scan with an Ethereum wallet") != 2 || strings.Count(output, "Destination:") != 1 || strings.Count(output, "Waiting for ETH:") != 2 {
+	if strings.Count(output, "Scan with an Ethereum wallet") != 2 || strings.Count(output, "Destination:") != 1 || strings.Count(output, "Waiting for ETH:") != 0 {
 		t.Fatal(output)
 	}
 	for _, forbidden := range []string{"withdrawal quote", "quoted:", "--approve", "Quote expires", "Local signing address"} {
@@ -396,7 +396,7 @@ func TestGuidedWithdrawalQRRefreshOnlyWhenBufferExhausted(t *testing.T) {
 	if err := guidedWithdrawal(context.Background(), f, u, immediateWizardPoll); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(u.String(), "Scan with an Ethereum wallet") != 2 || strings.Count(u.String(), "Waiting for ETH:") != 3 {
+	if strings.Count(u.String(), "Scan with an Ethereum wallet") != 2 || strings.Count(u.String(), "Waiting for ETH:") != 0 {
 		t.Fatal(u.String())
 	}
 }

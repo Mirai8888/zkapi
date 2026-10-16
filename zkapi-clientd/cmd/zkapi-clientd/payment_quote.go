@@ -143,10 +143,10 @@ func printPaymentQuote(out io.Writer, q zkapi.AddressPaymentQuote, command strin
 		fmt.Fprintln(out, "Destination:", q.Destination)
 	}
 	fmt.Fprintf(out, "Local signing address: %s\nAvailable public balance: %s ETH\n", q.Address, fundingUnits(q.BalanceWei, 18))
-	fmt.Fprintf(out, "Estimated network fee: %s ETH\nRequired fee allowance: %s ETH\nMaximum approved fee allowance: %s ETH (Low)\nOptional fee buffer: %s ETH\n", fundingUnits(q.ExpectedFeeWei, 18), fundingUnits(q.RequiredFeeWei, 18), fundingUnits(q.FeeReserveWei, 18), fundingUnits(q.FeeBufferWei, 18))
+	fmt.Fprintf(out, "Estimated network fee: %s ETH\nRequired fee allowance: %s ETH\nMaximum approved fee allowance: %s ETH (Low)\n", fundingUnits(q.ExpectedFeeWei, 18), fundingUnits(q.RequiredFeeWei, 18), fundingUnits(q.FeeReserveWei, 18))
 	if strings.TrimLeft(q.ShortfallWei, "0") != "" {
-		fmt.Fprintf(out, "Required top-up: %s ETH\nRecommended top-up including buffer: %s ETH\nSend on %s to %s\nPayment URI: ethereum:%s@%d?value=%s\n", fundingUnits(q.ShortfallWei, 18), fundingUnits(q.RecommendedTopUpWei, 18), fundingNetwork(q.ChainID), q.Address, q.Address, q.ChainID, q.RecommendedTopUpWei)
-		fmt.Fprintln(out, "After funds arrive, request a fresh quote. The optional buffer does not block a funded transaction.")
+		fmt.Fprintf(out, "%s\nSend on %s to %s\nPayment URI: ethereum:%s@%d?value=%s\n", paymentSendLine(q), fundingNetwork(q.ChainID), q.Address, q.Address, q.ChainID, q.RecommendedTopUpWei)
+		fmt.Fprintln(out, "After funds arrive, request a fresh quote.")
 	} else {
 		fmt.Fprintln(out, "The existing balance covers the required amount; no top-up is needed.")
 	}

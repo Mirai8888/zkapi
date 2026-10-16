@@ -69,6 +69,7 @@ type Config struct {
 	// ManagementToken is a separate owner-only credential. It must never be
 	// published with config.json or shared with inference API clients.
 	ManagementToken       string `json:"-"`
+	DefaultModel          string `json:"default_model,omitempty"`
 	Listen                string `json:"listen"`
 	APIKey                string `json:"api_key"`
 	KeyReuseWindowSeconds int    `json:"key_reuse_window_seconds"`
@@ -76,9 +77,22 @@ type Config struct {
 	Backend               string `json:"backend"`           // fixed to zkapi; retained for existing profile compatibility
 	OrgURL                string `json:"org_url,omitempty"` // legacy profile field; unused
 	VerifierURL           string `json:"verifier_url"`
-	RelayURL              string `json:"relay_url"` // empty uses direct HTTPS; nonempty selects Wisp or loopback SOCKS5
+	RelayURL              string `json:"relay_url"` // empty: direct; wss: Wisp; socks5: proxy; tor: conversation isolation
 	Concurrency           int    `json:"concurrency"`
 	ZKAPI                 ZKAPI  `json:"zkapi"`
+}
+
+// ValidModelID excludes whitespace and terminal control characters.
+func ValidModelID(id string) bool {
+	if len(id) == 0 || len(id) > 256 {
+		return false
+	}
+	for _, r := range id {
+		if r <= 32 || r >= 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func DefaultDir() (string, error) {
@@ -147,6 +161,9 @@ func Default() (Config, error) {
 }
 
 func Validate(c Config) error {
+	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
+		return errors.New("invalid default model ID")
+	}
 	if c.KeyReuseWindowSeconds < 0 || c.KeyReuseWindowSeconds > MaxKeyReuseWindowSeconds {
 		return errors.New("key_reuse_window_seconds must be between 0 and 300 (0 disables reuse)")
 	}
@@ -178,6 +195,9 @@ func Validate(c Config) error {
 	}
 	if _, err := relay.NewClient(c.RelayURL); err != nil {
 		return err
+	}
+	if relay.IsTor(c.RelayURL) && c.ZKAPI.ExternalCompanion {
+		return errors.New("Tor mode requires the managed companion so payment traffic uses the configured Tor bridge")
 	}
 	if c.ZKAPI.Network != "mainnet" && c.ZKAPI.Network != "sepolia" {
 		return errors.New("ZKAPI network must be mainnet or sepolia")

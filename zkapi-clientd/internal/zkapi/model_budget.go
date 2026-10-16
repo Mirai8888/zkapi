@@ -93,6 +93,15 @@ func (c *Client) modelBudgets(ctx context.Context) (map[string]uint64, error) {
 	return budgets, nil
 }
 
+// ModelRequestBudget returns the reviewed per-query cap without acquiring a key.
+func (c *Client) ModelRequestBudget(ctx context.Context, model string) (uint64, error) {
+	body, err := json.Marshal(map[string]string{"model": model})
+	if err != nil {
+		return 0, err
+	}
+	return c.requestBudget(ctx, body)
+}
+
 func (c *Client) requestBudget(ctx context.Context, body json.RawMessage) (uint64, error) {
 	var request struct {
 		Model string `json:"model"`
@@ -120,7 +129,7 @@ func (c *Client) requestBudget(ctx context.Context, body json.RawMessage) (uint6
 			return 0, err
 		}
 		if !catalog[base] && !catalog[request.Model] {
-			return 0, &Error{http.StatusBadRequest, "model_budget_unavailable"}
+			return 0, &Error{http.StatusBadRequest, "model_not_found"}
 		}
 		budget = untieredModelBudget(base)
 	}
@@ -175,6 +184,12 @@ func (c *Client) Models(ctx context.Context) (json.RawMessage, error) {
 	if err := c.Check(ctx); err != nil {
 		return nil, err
 	}
+	return c.PublicModels(ctx)
+}
+
+// PublicModels reads only public catalog/policy metadata: no funded wallet,
+// companion, lease acquisition, or provider credential is required.
+func (c *Client) PublicModels(ctx context.Context) (json.RawMessage, error) {
 	budgets, err := c.modelBudgets(ctx)
 	if err != nil {
 		return nil, err

@@ -29,7 +29,7 @@ func parseConfigureOptions(args []string, out io.Writer) (configureOptions, erro
 	f.SetOutput(out)
 	f.StringVar(&o.network, "network", "", "zkAPI network: mainnet or sepolia")
 	f.StringVar(&o.listen, "listen", "", "numeric loopback API address and port")
-	f.StringVar(&o.relay, "relay-url", "", "Wisp relay URL or loopback socks5://IP:PORT (Tor); empty selects direct HTTPS")
+	f.StringVar(&o.relay, "relay-url", "", "Wisp, socks5://IP:PORT, or conversation-isolated tor://IP:PORT; empty selects direct HTTPS")
 	f.StringVar(&o.binary, "zkapi-binary", "", "path to the installed zkAPI companion")
 	f.StringVar(&o.proofs, "proof-setup-dir", "", "path to the installed proving assets")
 	f.StringVar(&o.usd, "usd", "", "skip the new-deposit USD amount prompt (prompt default: 20; network fees are extra)")
@@ -260,7 +260,9 @@ func applyConfigureOptions(c config.Config, o configureOptions) config.Config {
 
 func showConfigureSummary(c config.Config, ui setupPrompter) {
 	transport := "direct HTTPS"
-	if strings.HasPrefix(c.RelayURL, "socks5://") {
+	if strings.HasPrefix(c.RelayURL, "tor://") {
+		transport = "Tor conversation isolation enabled (Tor IsolateSOCKSAuth required)"
+	} else if strings.HasPrefix(c.RelayURL, "socks5://") {
 		transport = "SOCKS5 proxy enabled"
 	} else if c.RelayURL != "" {
 		transport = "Wisp relay enabled"
@@ -269,6 +271,8 @@ func showConfigureSummary(c config.Config, ui setupPrompter) {
 	showClientConnection(c, ui)
 	if c.KeyReuseWindowSeconds == 0 {
 		ui.Printf("Ephemeral key reuse: disabled; fresh key per inference request. New keys may wait for earlier settlement.\n")
+	} else if strings.HasPrefix(c.RelayURL, "tor://") {
+		ui.Printf("Ephemeral key reuse: up to %d seconds within prefix-continuing conversations only; fresh key on each conversation change.\n", c.KeyReuseWindowSeconds)
 	} else {
 		ui.Printf("Ephemeral key reuse: fixed window up to %d seconds; different chats and local clients can share a key and its spending cap. The provider can link those requests.\n", c.KeyReuseWindowSeconds)
 	}

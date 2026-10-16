@@ -164,7 +164,7 @@ func TestGuidedFundingWaitsForMoneyThenApprovesFreshFixedQuote(t *testing.T) {
 	if f.approveCalls != 1 || f.resumeCalls != 1 || f.quoteCalls != 5 || polls != 3 || u.confirms != 0 || u.continues != 1 || u.asks != 1 {
 		t.Fatalf("unexpected flow: %+v polls=%d UI=%+v", f, polls, u)
 	}
-	for _, want := range []string{"Funding address:", "Waiting for ETH:", "Funds available.", "Deposit confirmed.", "Private balance:"} {
+	for _, want := range []string{"To:", "Send at least:", "Funds available.", "Deposit confirmed.", "Private balance:"} {
 		if !strings.Contains(u.String(), want) {
 			t.Fatalf("missing %q", want)
 		}
@@ -552,9 +552,9 @@ func TestGuidedFundingPartialPaymentsAndFeesUpdateWithoutPrompting(t *testing.T)
 		t.Fatal("waiting did not poll automatically", err)
 	}
 	for _, want := range []string{
-		"Waiting for ETH: receiving account balance 0.000000000000000000 ETH; still needed 0.000750001000025000 ETH.",
-		"Waiting for ETH: receiving account balance 0.000100000000000000 ETH; still needed 0.000650001000025000 ETH.",
-		"?value=650001000030000", "?value=650001000031000",
+		"Send at least: 0.00076 ETH",
+		"Send at least: 0.00066 ETH (account already has 0.00010 ETH)",
+		"?value=650001000030000",
 	} {
 		if !strings.Contains(u.String(), want) {
 			t.Fatalf("missing updated payment information %q", want)
@@ -635,7 +635,7 @@ func TestGuidedFundingRefreshFailurePreservesVisibleBalanceWithoutApproval(t *te
 	}
 	err := guidedFunding(context.Background(), f, "20", u, func(context.Context) error { return context.Canceled })
 	if !errors.Is(err, context.Canceled) || f.approveCalls+u.continues+u.confirms != 0 ||
-		!strings.Contains(u.String(), "receiving account balance 0.000100000000000000 ETH") ||
+		!strings.Contains(u.String(), "account already has 0.00010 ETH") ||
 		!strings.Contains(u.String(), "Could not refresh the funding quote") {
 		t.Fatal("refresh failure hid the last balance or authorized a transaction", err)
 	}

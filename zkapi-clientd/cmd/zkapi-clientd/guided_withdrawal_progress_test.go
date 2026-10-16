@@ -27,11 +27,8 @@ func TestGuidedWithdrawalRefreshesFeePaymentInPlace(t *testing.T) {
 	waits := 0
 	err := guidedWithdrawal(context.Background(), f, u, func(context.Context) error {
 		waits++
-		if !strings.Contains(u.active, "Waiting for ETH:") {
-			t.Fatal("the fee wait has no live status")
-		}
-		if waits == 2 && !strings.Contains(u.active, "Maximum network fee: 0.000000000000034000 ETH") {
-			t.Fatal("fee status stayed stale while the previous QR buffer remained usable")
+		if u.active != "" || !strings.Contains(u.payments[len(u.payments)-1], "Send at least:") {
+			t.Fatal("fee wait must show payment instructions without redundant status")
 		}
 		if waits == 3 {
 			return context.Canceled

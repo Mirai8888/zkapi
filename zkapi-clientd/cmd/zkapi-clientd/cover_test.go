@@ -20,14 +20,14 @@ func TestCoverConfigPreservesOtherSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runCoverConfig(dir, c, []string{"--urls", "https://cover.example/private-path", "--rate", "0.2"}, &out); err != nil {
+	if err := runCoverConfig(dir, c, []string{"--urls", "https://cover.example/private-path"}, &out); err != nil {
 		t.Fatal(err)
 	}
 	next, err := config.Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.Cover.Rate != 0.2 || next.Cover.Concurrency != 4 {
+	if next.Cover.Rate != 5 || next.Cover.Concurrency != 4 {
 		t.Fatal("missing cover settings")
 	}
 	without := next

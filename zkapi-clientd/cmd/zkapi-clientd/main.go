@@ -40,6 +40,7 @@ func run(args []string) error {
 	var err error
 	global := flag.NewFlagSet("zkapi-clientd", flag.ContinueOnError)
 	global.StringVar(&dir, "config-dir", dir, "private configuration and wallet directory")
+	protocolFlag := global.String("vault-protocol", os.Getenv("ZKAPI_VAULT_PROTOCOL"), "vault stack: concession (default) or legacy; legacy requires explicit --config-dir")
 	showVersion := global.Bool("version", false, "print version")
 	global.Usage = help
 	if err := global.Parse(args); err != nil {
@@ -48,6 +49,16 @@ func run(args []string) error {
 		}
 		return err
 	}
+	protocol, err := vaultProtocol(*protocolFlag)
+	if err != nil {
+		return err
+	}
+	explicitDir := false
+	global.Visit(func(f *flag.Flag) {
+		if f.Name == "config-dir" && dir != "" {
+			explicitDir = true
+		}
+	})
 	if *showVersion {
 		fmt.Println("zkapi-clientd", version)
 		return nil
@@ -77,6 +88,9 @@ func run(args []string) error {
 	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return err
+	}
+	if protocol == "legacy" {
+		return dispatchLegacy(dir, explicitDir, args)
 	}
 	if args[0] == "config" {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -167,7 +181,7 @@ func run(args []string) error {
 }
 
 func help() {
-	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] COMMAND
+	fmt.Fprintln(os.Stderr, `Usage: zkapi-clientd [--config-dir DIR] [--vault-protocol concession|legacy] COMMAND
 
   config                 Show status, configure or edit settings, and prepare the wallet
   serve [--model MODEL]  Open a missing note when funded, then serve inference
@@ -179,6 +193,9 @@ func help() {
 
 Run zkapi-clientd config --help for configuration options.
 Run zkapi-clientd --version to show the installed version.
+Vault: --vault-protocol or ZKAPI_VAULT_PROTOCOL (default: concession).
+Legacy selects the pinned old executable, requires an explicit existing --config-dir,
+and does not support native rewriter/cover. No automatic fallback or note conversion.
 Config: ZKAPI_CLIENTD_CONFIG_DIR or the OS user config directory / zkapi-clientd.
 Mainnet is the default; Sepolia keeps a separate wallet.
 The network proxy is off by default. Verbose modes log private message content.`)

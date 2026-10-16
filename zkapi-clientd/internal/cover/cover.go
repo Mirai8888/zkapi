@@ -20,7 +20,7 @@ import (
 	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
 )
 
-const DefaultRate = 0.2
+const DefaultRate = 5
 const DefaultConcurrency = 4
 const ResponseLimit = 64 << 10
 const RequestTimeout = 20 * time.Second

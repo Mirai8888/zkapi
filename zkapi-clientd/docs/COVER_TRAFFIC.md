@@ -17,7 +17,7 @@ CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
 # permission to poll. No service is contacted by this configuration command.
 $CLIENT set-cover \
   --urls 'https://your-domain.example/cover-a.txt https://your-domain.example/cover-b.json' \
-  --rate 0.2 --concurrency 4
+  --rate 5 --concurrency 4
 
 $CLIENT set-cover          # safe status, no destination paths
 $CLIENT serve             # normal deployment/funding gates still apply
@@ -25,7 +25,7 @@ $CLIENT set-cover --clear  # with daemon stopped: remove settings
 ```
 
 Rate is the mean attempted arrivals/second, not guaranteed throughput. Range
-0.01–5, default 0.2 (about 12 arrivals/minute). Maximum in-flight requests is
+0.01–5, default 5 (about 300 arrivals/minute). Maximum in-flight requests is
 1–8, default 4. `--urls` is required each time settings are replaced; 1–16
 whitespace-separated HTTPS URLs, port 443 only. Credentials, query strings,
 fragments and literal local/private addresses are rejected. Names are resolved
@@ -34,10 +34,10 @@ Do not configure sensitive URLs, signed paths, state-changing GET endpoints,
 paid APIs, zkAPI/OpenRouter/payment endpoints or a service without permission.
 
 Unlike the old helper, no collection of third-party APIs is hammered by default.
-The old rate of 5/s is still an explicit option but can generate considerable
-load. At 0.2/s with every response hitting the 64 KiB cap, response payload alone
-could approach 45 MiB/hour, excluding TLS/Tor overhead. Five per second can exceed
-1 GiB/hour. Actual throughput can be lower because arrivals are dropped when
+The default 5/s can generate considerable load. With every response hitting the
+64 KiB cap, response payload alone can exceed 1 GiB/hour, excluding TLS/Tor
+overhead. More noise is not necessarily stronger anonymity. Reduce `--rate` if
+needed. Existing saved rates are not changed by upgrading. Actual throughput can be lower because arrivals are dropped when
 busy. Cover consumes bandwidth and remote resources, **not zkAPI credit**.
 
 Settings are saved atomically under the existing profile lock. Wallet records,

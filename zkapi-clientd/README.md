@@ -8,9 +8,18 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 > this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
 > binary paths, preserved Tor features, withdrawal options and deployment blockers.
 
+## Vault protocol selection
+
+`--vault-protocol concession|legacy` selects the complete protocol stack before
+loading it; default is concession. `ZKAPI_VAULT_PROTOCOL` can set the default.
+Legacy requires an explicit existing `--config-dir`, uses the pinned historical
+client/companion, and does not support native rewriting/cover. No address swap,
+state conversion, deposit-closure bypass, or fallback from undeployed concession
+networks. See [protocol selection and limitations](docs/VAULT_PROTOCOL.md).
+
 ## Optional Tor cover traffic
 
-`set-cover --urls 'https://your-domain.example/cover.txt' --rate 0.2`
+`set-cover --urls 'https://your-domain.example/cover.txt' --rate 5`
 configures bounded background HTTPS noise during native `serve`. Use a small
 resource you control or have permission to poll. Requires authenticated `tor://`
 routing; no wallet credit, prompt content or inference identities are used.

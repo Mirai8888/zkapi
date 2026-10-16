@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 	"io"
 	"net"
 	"net/http"
@@ -33,13 +34,15 @@ const (
 // repository's zkapi-walletd (crates/zkapi-companion); a daemon that does not
 // speak the bridge protocol or authenticate is rejected.
 type Config struct {
-	ClientURL        string        `json:"client_url"`
-	BridgeToken      string        `json:"bridge_token"`
-	Network          string        `json:"network"` // empty means mainnet; Sepolia is explicit
-	InferenceBaseURL string        `json:"inference_base_url"`
-	HTTPClient       *http.Client  `json:"-"` // remote HTTPS, direct or over Wisp as configured
-	KeyReuseWindow   time.Duration `json:"-"` // fixed, in-memory window; zero disables reuse
-	TorMode          bool          `json:"-"` // HTTPClient must use relay's tor:// transport
+	Rewriter         rewriter.Config `json:"-"`
+	TorEndpoint      string          `json:"-"`
+	ClientURL        string          `json:"client_url"`
+	BridgeToken      string          `json:"bridge_token"`
+	Network          string          `json:"network"` // empty means mainnet; Sepolia is explicit
+	InferenceBaseURL string          `json:"inference_base_url"`
+	HTTPClient       *http.Client    `json:"-"` // remote HTTPS, direct or over Wisp as configured
+	KeyReuseWindow   time.Duration   `json:"-"` // fixed, in-memory window; zero disables reuse
+	TorMode          bool            `json:"-"` // HTTPClient must use relay's tor:// transport
 	// ExitRPCURL is the user's own Ethereum RPC (--exit-rpc-url): deployment
 	// checks also run through it, and exit transactions are sent through it.
 	ExitRPCURL string `json:"exit_rpc_url,omitempty"`
@@ -182,6 +185,12 @@ func validNullifierText(value string) bool {
 }
 
 func New(config Config) (*Client, error) {
+	if err := config.Rewriter.Validate(); err != nil {
+		return nil, err
+	}
+	if config.Rewriter.Enabled() && config.TorMode && !relay.IsTor(config.TorEndpoint) {
+		return nil, errors.New("rewriter Tor preparation requires a Tor endpoint")
+	}
 	if config.KeyReuseWindow < 0 || config.KeyReuseWindow > 5*time.Minute {
 		return nil, errors.New("zkAPI key reuse window must be between zero and five minutes")
 	}
@@ -401,6 +410,15 @@ func (c *Client) Complete(ctx context.Context, body json.RawMessage) (*http.Resp
 			return nil, err
 		}
 		c.reportConversation(ctx, previous)
+	}
+	// Conversation classification uses the original incoming history, never the
+	// nondeterministic rewrite. Prior turns remain as supplied by the caller.
+	if c.config.Rewriter.Enabled() {
+		var err error
+		body, err = c.rewritePrompt(ctx, body, identity)
+		if err != nil {
+			return nil, err
+		}
 	}
 	lease, err := c.waitForLease(ctx, body)
 	if err != nil {

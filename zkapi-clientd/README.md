@@ -8,6 +8,13 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 > this build. See [local migration status](docs/LOCAL_PROTOCOL_MIGRATION.md) for
 > binary paths, preserved Tor features, withdrawal options and deployment blockers.
 
+## Optional prompt rewriter
+
+`set-rewriter --url http://localhost:8011 --model qwen3.8-flash-next`
+configures direct normalization of the latest user message, with an immediate
+streamed preview. This discloses original text to the rewriter and does not
+anonymize earlier history. See [configuration, privacy limits and client display](docs/REWRITER.md).
+
 ## Quick start
 
 Install or update:

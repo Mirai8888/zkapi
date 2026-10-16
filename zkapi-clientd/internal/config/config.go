@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 	"io"
 	"net"
 	"net/url"
@@ -77,6 +78,7 @@ type ZKAPI struct {
 }
 
 type Config struct {
+	Rewriter rewriter.Config `json:"rewriter,omitzero"`
 	// ManagementToken is a separate owner-only credential. It must never be
 	// published with config.json or shared with inference API clients.
 	ManagementToken       string `json:"-"`
@@ -172,6 +174,9 @@ func Default() (Config, error) {
 }
 
 func Validate(c Config) error {
+	if err := c.Rewriter.Validate(); err != nil {
+		return err
+	}
 	if c.DefaultModel != "" && !ValidModelID(c.DefaultModel) {
 		return errors.New("invalid default model ID")
 	}

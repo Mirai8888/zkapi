@@ -65,8 +65,8 @@ func run(args []string) error {
 		help()
 		return nil
 	}
-	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" {
-		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, or set-model (--help for usage)")
+	if args[0] != "config" && args[0] != "serve" && args[0] != "withdraw" && args[0] != "list-models" && args[0] != "set-model" && args[0] != "set-rewriter" {
+		return errors.New("unknown command; use zkapi-clientd config, serve, withdraw, list-models, set-model, or set-rewriter (--help for usage)")
 	}
 	if dir == "" {
 		dir, err = config.DefaultDir()
@@ -98,12 +98,18 @@ func run(args []string) error {
 		fmt.Println("Usage: zkapi-clientd list-models\n       zkapi-clientd set-model [MODEL | --clear]\nList public model IDs/caps, or show/save/clear the default model. No payments. Stop serve before changing the saved default.")
 		return nil
 	}
+	if args[0] == "set-rewriter" && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		return runRewriterConfig(dir, config.Config{}, args[1:], os.Stdout)
+	}
 	c, err := config.Load(dir)
 	if err != nil {
 		return configurationRequired(err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if args[0] == "set-rewriter" {
+		return runRewriterConfig(dir, c, args[1:], os.Stdout)
+	}
 	if args[0] == "list-models" || args[0] == "set-model" {
 		return runModels(ctx, dir, c, args[0], args[1:], os.Stdout)
 	}
@@ -160,6 +166,7 @@ func help() {
   config                 Show status, configure or edit settings, and prepare the wallet
   serve [--model MODEL]  Open a missing note when funded, then serve inference
   withdraw [OPTIONS]     Guided withdrawal; --escape / --fees payout / --public
+  set-rewriter [OPTIONS] Configure direct prompt normalization; --help for options
   list-models            List supported model IDs and per-query caps
   set-model [MODEL]      Show or save the default model (--clear removes it)
 
@@ -222,7 +229,7 @@ func serveConfig(c config.Config, args []string) (config.Config, error) {
 }
 
 func zkConfig(c config.Config, client *http.Client) zkapi.Config {
-	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
+	return zkapi.Config{ClientURL: c.ZKAPI.ClientURL, BridgeToken: c.ZKAPI.BridgeToken, Network: c.ZKAPI.Network, HTTPClient: client, KeyReuseWindow: time.Duration(c.KeyReuseWindowSeconds) * time.Second, TorMode: relay.IsTor(c.RelayURL), TorEndpoint: c.RelayURL, Rewriter: c.Rewriter, ExitRPCURL: c.ZKAPI.ExitRPCURL, BundlerURL: c.ZKAPI.BundlerURL}
 }
 
 type zkInference struct{ *zkapi.Client }
@@ -385,6 +392,10 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
 		return err
 	}
 	api.DefaultModel = c.DefaultModel
+	api.RewriterNotice = c.Rewriter.Notice
+	if c.Rewriter.Enabled() {
+		fmt.Fprintln(out, "WARNING: rewriter enabled: latest user text goes DIRECTLY to the configured rewriter, outside Tor/zkAPI. Style rewriting does not guarantee anonymity; prior history remains unchanged.")
+	}
 	api.RequireAPIKey = c.RequireAPIKey
 	api.Status = server.ServiceStatus{Backend: c.Backend}
 	api.Status.Network = c.ZKAPI.Network

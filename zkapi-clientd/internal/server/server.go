@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"github.com/ethereum/zkapi/zkapi-clientd/internal/rewriter"
 	"io"
 	"mime"
 	"net"
@@ -38,8 +39,9 @@ type API struct {
 	pending chan struct{}
 	// RequireAPIKey opts into bearer authentication for inference routes. Local
 	// management always requires its credentials, regardless of this setting.
-	DefaultModel  string
-	RequireAPIKey bool
+	RewriterNotice string
+	DefaultModel   string
+	RequireAPIKey  bool
 	// Admin is optional local wallet management. All of its routes require the
 	// private CLI credential; an inference API key cannot authorize wallet use.
 	Admin           http.Handler
@@ -278,24 +280,34 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	promptDiagnostic(ctx, clean)
+	var selected struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(clean, &selected)
+	notice := &completionNotice{streaming: streaming, mode: a.RewriterNotice, model: selected.Model}
+	ctx = notice.context(ctx, w)
 	response, err := a.backend.Complete(ctx, clean)
 	if err != nil {
+		if errors.Is(err, rewriter.ErrFailed) {
+			notice.writeError(w, 502, "rewrite_failed", rewriter.ErrFailed.Error())
+			return
+		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			writeError(w, 408, "request_cancelled", "The request was canceled or timed out while waiting for inference.")
+			notice.writeError(w, 408, "request_cancelled", "The request was canceled or timed out while waiting for inference.")
 			return
 		}
 		// Transport/issuer errors may include secrets, submitted JSON or URLs.
 		// Do not expose them to either HTTP clients or service logs.
 		var safe *BackendError
 		if errors.As(err, &safe) && safe.Status >= 400 && safe.Status <= 599 {
-			writeError(w, safe.Status, safe.Code, safe.Message)
+			notice.writeError(w, safe.Status, safe.Code, safe.Message)
 			return
 		}
-		writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
+		notice.writeError(w, 502, "anonymous_access_failed", "Anonymous access could not be prepared. Check funding with zkapi-clientd config; relay and verifier availability are also required.")
 		return
 	}
 	if response == nil || response.Body == nil {
-		writeError(w, 502, "invalid_upstream_response", "The inference provider returned an invalid response.")
+		notice.writeError(w, 502, "invalid_upstream_response", "The inference provider returned an invalid response.")
 		return
 	}
 	defer response.Body.Close()
@@ -319,21 +331,32 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		if retry := response.Header.Get("Retry-After"); retry != "" {
 			w.Header().Set("Retry-After", retry)
 		}
-		writeError(w, status, "upstream_error", "The inference provider rejected the request.")
+		notice.writeError(w, status, "upstream_error", "The inference provider rejected the request.")
 		return
 	}
 	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if streaming && contentType != "text/event-stream" {
-		writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
+		notice.writeError(w, 502, "stream_unavailable", "The inference provider did not return an event stream.")
 		return
 	}
 	if !streaming && contentType != "application/json" {
-		writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
+		notice.writeError(w, 502, "invalid_upstream_response", "The inference provider did not return JSON.")
 		return
 	}
-	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(response.StatusCode)
+	if !streaming && notice.notice != nil {
+		body, err := notice.annotateJSON(response.Body)
+		if err != nil {
+			notice.writeError(w, 502, "invalid_upstream_response", "The inference provider did not return valid JSON.")
+			return
+		}
+		writeJSON(w, response.StatusCode, body)
+		return
+	}
+	if !notice.started {
+		w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(response.StatusCode)
+	}
 	if streaming {
 		if err := control.Flush(); err != nil {
 			return

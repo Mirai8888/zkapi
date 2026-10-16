@@ -10,10 +10,12 @@ A local OpenAI-compatible API, paid from your private ETH balance. No OA account
 
 ## Vault protocol selection
 
-`--vault-protocol concession|legacy` selects the complete protocol stack before
-loading it; default is concession. `ZKAPI_VAULT_PROTOCOL` can set the default.
-Legacy requires an explicit existing `--config-dir`, uses the pinned historical
-client/companion, and does not support native rewriting/cover. No address swap,
+`set-vault-protocol legacy|concession` saves this profile's protocol stack;
+no arguments show it, and `--clear` restores the concession default. Subsequent
+commands use the saved choice without exports or repeated flags. Optional
+`--vault-protocol` overrides it for one command. Legacy requires a compatible
+existing profile, uses the pinned historical client/companion, and does not
+support native rewriting/cover. No address swap,
 state conversion, deposit-closure bypass, or fallback from undeployed concession
 networks. See [protocol selection and limitations](docs/VAULT_PROTOCOL.md).
 

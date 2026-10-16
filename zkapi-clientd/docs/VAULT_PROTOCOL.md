@@ -1,6 +1,22 @@
 # Selecting the on-chain vault protocol
 
-Use the **global** option before the command:
+Save a per-profile preference, just like the default model:
+
+```sh
+CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
+$CLIENT set-vault-protocol legacy
+$CLIENT set-vault-protocol             # show saved choice
+$CLIENT serve                         # uses that choice, no repeated flag
+$CLIENT set-vault-protocol concession  # switch with daemon stopped
+$CLIENT set-vault-protocol --clear     # restore default: concession
+```
+
+Use `--config-dir DIR` when editing a non-default profile. Saving legacy requires
+a compatible existing legacy profile; it refuses enabled native rewriter/cover
+rather than disabling them. The preference editor always runs locally, allowing
+you to switch back even when legacy is selected. No network calls or payments.
+
+For an optional one-command override, use the **global** option before the command:
 
 ```sh
 CLIENT=$HOME/zkapi/zkapi-clientd/bin/zkapi-clientd-concession-tor
@@ -15,12 +31,17 @@ $CLIENT --vault-protocol concession --config-dir /absolute/path/to/concession-pr
 $CLIENT --vault-protocol legacy --config-dir /absolute/path/to/legacy-profile withdraw
 ```
 
-`ZKAPI_VAULT_PROTOCOL=legacy` or `concession` sets the default; an explicit flag
-wins. Without either, concession remains the default. The selector is not stored
-in `config.json`: the old decoder would reject that field. Set the environment
-in your service definition for a persistent preference. No files or profiles
-are copied, rewritten or created by selection. `version`/top-level `help` report
-the dispatcher; command-specific help in legacy mode requires its valid profile.
+Precedence: explicit `--vault-protocol` > `ZKAPI_VAULT_PROTOCOL` (if set) > saved
+profile preference > concession. No export or repeated flag is needed. Remove an
+old environment override if you want the saved setting to take effect.
+
+The owner-only `vault-protocol` file in the profile stores this preference;
+`config.json` stays byte-for-byte unchanged because the legacy decoder rejects
+unknown fields. Updates use the same `daemon.lock`, stale-snapshot protection,
+atomic rename and fsync pattern as model configuration. Stop serve before edits.
+`--clear` removes the preference. No wallet/profile conversion or credential
+copying. `version`/top-level `help` report the dispatcher; command-specific help
+in legacy mode requires its valid profile.
 
 ## This selects a stack, not an address
 
@@ -67,7 +88,8 @@ by itself, add approval flags, call raw contracts, or modify transaction journal
 - Keep separate profile directories for the two stacks: funding records and
   pending signed transactions must not be repurposed across deployments. For
   recovery, point explicitly at the **original** legacy profile. An environment
-  default config directory does not satisfy the legacy explicit-profile rule.
+  default config directory alone does not satisfy the legacy explicit-profile
+  rule; a saved `legacy` selection does, so you need not repeat `--config-dir`.
   Use distinct API/companion ports if running both stacks concurrently.
 - Configuration/profile edits do not migrate notes. A note remains withdrawable
   only through its matching protocol and original state/proving assets.
